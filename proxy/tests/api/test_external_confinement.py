@@ -1,12 +1,12 @@
-"""External-session confinement middleware (``middleware.py`` +
+"""External-session confinement (``middleware._session_refusal`` +
 ``auth/external_endpoints.py``).
 
 Parametrised over the WHOLE router table: for an external principal (a
 session token carrying ``ext`` and no user) every endpoint outside the
 allowlist answers 403 before its handler runs; allowlisted endpoints reach
-their handler. A token whose session is not live answers 401 everywhere. A
-user-tied phone token (``ext`` + ``user_sub``) is only liveness-checked.
-Plain session tokens are untouched.
+their handler. A token whose session is not live answers 401 everywhere,
+``ext`` or not. A user-tied phone token (``ext`` + ``user_sub``) and a
+plain session token are only liveness-checked.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from auth.external_endpoints import (
     is_external_endpoint_allowed,
 )
 from auth.session_token import create_session_token
-from core.session import session_manager
+from core.session import session_state
 
 LIVE_SID = str(uuid.uuid4())
 DEAD_SID = str(uuid.uuid4())
@@ -61,8 +61,8 @@ def _routes() -> list[tuple[str, str]]:
 
 
 @pytest.fixture(autouse=True)
-def _live_registry(monkeypatch):
-    monkeypatch.setattr(session_manager, "is_session_registered", lambda sid: sid == LIVE_SID)
+def _live_registry():
+    session_state.mark_starting(LIVE_SID, 3600)
 
 
 def _headers(sid: str, *, user_sub: str = "", external: str | None = "phone:+3021") -> dict:
@@ -95,6 +95,8 @@ def test_allowlist_is_small_and_exact():
         f"{m} {p}" for m, p in _routes() if is_external_endpoint_allowed(m, _concrete(p))
     )
     assert allowed == [
+        "DELETE /v1/mcp-gateway/{mcp}/{rest:path}",
+        "GET /v1/mcp-gateway/{mcp}/{rest:path}",
         "POST /v1/hooks/document-preview",
         "POST /v1/hooks/file",
         "POST /v1/hooks/file-written",
@@ -109,6 +111,7 @@ def test_allowlist_is_small_and_exact():
         "POST /v1/hooks/subagent",
         "POST /v1/hooks/tool-result",
         "POST /v1/internal/memory/op",
+        "POST /v1/mcp-gateway/{mcp}/{rest:path}",
     ]
 
 
@@ -126,10 +129,12 @@ def test_user_tied_phone_token_is_not_confined():
     assert not _blocked(resp)
 
 
-def test_plain_session_token_is_untouched():
-    resp = client.get("/v1/tasks", headers=_headers(DEAD_SID, external=None))
+def test_plain_session_token_is_only_liveness_checked():
+    resp = client.get("/v1/tasks", headers=_headers(LIVE_SID, external=None))
     assert resp.status_code != 401 or resp.json().get("detail") != SESSION_DEAD_DETAIL
     assert not _blocked(resp)
+    resp = client.get("/v1/tasks", headers=_headers(DEAD_SID, external=None))
+    assert resp.status_code == 401 and resp.json()["detail"] == SESSION_DEAD_DETAIL
 
 
 def test_traversal_never_matches_the_allowlist():

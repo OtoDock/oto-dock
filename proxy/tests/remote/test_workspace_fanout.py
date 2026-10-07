@@ -13,13 +13,23 @@ import hashlib
 from types import SimpleNamespace
 
 from core import placement
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 
 def _h(b: bytes) -> str:
     return "sha256:" + hashlib.sha256(b).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _no_platform_ahead_marks():
+    # A fan-out marks its targets (remote_file_flow's platform-ahead map):
+    # none may outlive a test into another module's reads.
+    from core.remote import remote_file_flow
+    remote_file_flow._platform_ahead.clear()
+    yield
+    remote_file_flow._platform_ahead.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +58,7 @@ def _setup_layer(monkeypatch, sessions, secs):
 
 
 def _sec(username, role):
-    return SimpleNamespace(placement=placement.LOCAL_PLACEMENT, username=username, role=role)
+    return SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), username=username, role=role)
 
 
 def test_fanout_excludes_source_machine(temp_db, monkeypatch):
@@ -215,6 +225,123 @@ async def test_fan_out_write_pushes_to_targets(temp_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_target_the_fan_out_missed_keeps_the_platform_ahead(temp_db, tmp_path, monkeypatch):
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    target = tmp_path / "agent-1" / "workspace" / "x.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"data")
+    monkeypatch.setattr(
+        workspace_fanout, "fanout_targets",
+        lambda a, r, *, exclude_machine_id=None: ["m1", "m2", "m3"],
+    )
+    fake_cm = AsyncMock()
+    fake_cm.satellite_supports_file_stat = MagicMock(return_value=True)
+    fake_cm.stat_file = AsyncMock(return_value={"exists": True, "size": 1, "mtime_ns": 5})
+    seen_during: dict[str, dict] = {}
+
+    async def push(mid, *a, **kw):
+        # While its push runs, a target is marked: a read there serves the
+        # platform copy.
+        seen_during[mid] = dict(remote_file_flow._platform_ahead[(mid, "agent-1", "workspace/x.md")])
+        if mid == "m3":
+            raise RuntimeError("socket gone")
+        return mid == "m1"
+    fake_cm.push_file.side_effect = push
+    from core.remote import satellite_connection as sc
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
+    remote_file_flow._pull_stat_records.clear()
+    try:
+        await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
+        st = target.stat()
+        assert all(m["in_flight_until"] > 0 for m in seen_during.values()) and len(seen_during) == 3
+        assert set(remote_file_flow._platform_ahead) == {
+            ("m2", "agent-1", "workspace/x.md"), ("m3", "agent-1", "workspace/x.md"),
+        }
+        for marker in remote_file_flow._platform_ahead.values():
+            assert (marker["size"], marker["mtime_ns"], marker["in_flight_until"]) == (st.st_size, st.st_mtime_ns, 0.0)
+            assert marker["machine"] == {"exists": True, "size": 1, "mtime_ns": 5}
+    finally:
+        remote_file_flow._pull_stat_records.clear()
+
+
+@pytest.mark.asyncio
+async def test_the_in_flight_mark_is_set_again_at_the_transfer_slot(temp_db, tmp_path, monkeypatch):
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    target = tmp_path / "agent-1" / "workspace" / "x.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"data")
+    monkeypatch.setattr(
+        workspace_fanout, "fanout_targets",
+        lambda a, r, *, exclude_machine_id=None: ["m1"],
+    )
+    marks: list[str] = []
+    real = remote_file_flow.note_platform_ahead
+
+    def note(mid, *a, **kw):
+        if kw.get("in_flight_s"):
+            marks.append(mid)
+        return real(mid, *a, **kw)
+    monkeypatch.setattr(remote_file_flow, "note_platform_ahead", note)
+    fake_cm = AsyncMock()
+    fake_cm.push_file = AsyncMock(return_value=True)
+    from core.remote import satellite_connection as sc
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
+    await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
+    assert marks == ["m1", "m1"]  # before the gather, then at the slot
+    assert ("m1", "agent-1", "workspace/x.md") not in remote_file_flow._platform_ahead
+
+
+@pytest.mark.asyncio
+async def test_a_fan_out_of_older_bytes_leaves_a_newer_writes_mark(temp_db, tmp_path, monkeypatch):
+    # While the fan-out of B1 is on its way to m1 and m2, m1's and m2's own
+    # session writes B2 and its push to them fails (a B2 mark on each). The
+    # B1 fan-out then acks on m1 and fails on m2: neither clears nor
+    # overwrites the B2 mark, so a read there keeps serving B2.
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    target = tmp_path / "agent-1" / "workspace" / "x.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"B1")
+    monkeypatch.setattr(
+        workspace_fanout, "fanout_targets",
+        lambda a, r, *, exclude_machine_id=None: ["m1", "m2"],
+    )
+    fake_cm = AsyncMock()
+    fake_cm.satellite_supports_file_stat = MagicMock(return_value=True)
+    fake_cm.stat_file = AsyncMock(return_value={"exists": True, "size": 2, "mtime_ns": 5})
+    newer: dict[str, tuple[int, int]] = {}
+
+    async def push(mid, *a, **kw):
+        target.write_bytes(b"B2 bytes")
+        st = target.stat()
+        newer[mid] = (st.st_size, st.st_mtime_ns)
+        remote_file_flow.note_platform_ahead(mid, "agent-1", "workspace/x.md", *newer[mid])
+        if mid == "m2":
+            return False
+        return True
+    fake_cm.push_file.side_effect = push
+    from core.remote import satellite_connection as sc
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
+    remote_file_flow._pull_stat_records.clear()
+    try:
+        await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"B1")
+        for mid in ("m1", "m2"):
+            marker = remote_file_flow._platform_ahead[(mid, "agent-1", "workspace/x.md")]
+            assert (marker["size"], marker["mtime_ns"]) == newer[mid]
+    finally:
+        remote_file_flow._pull_stat_records.clear()
+        remote_file_flow._platform_ahead.clear()
+
+
+@pytest.mark.asyncio
 async def test_fan_out_delete_broadcasts(temp_db, monkeypatch):
     from services.remote import workspace_fanout
     monkeypatch.setattr(
@@ -350,7 +477,7 @@ async def test_apply_captures_conflict_on_cross_user_clobber(temp_db, tmp_path, 
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-alice" if u == "alice" else None,
         notifs=notifs,
     )
@@ -438,7 +565,7 @@ async def test_apply_same_user_no_conflict(temp_db, tmp_path, monkeypatch):
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-bob",
         notifs=notifs,
     )
@@ -475,7 +602,7 @@ async def test_apply_no_conflict_when_base_matches(temp_db, tmp_path, monkeypatc
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-alice",
         notifs=notifs,
     )
@@ -511,7 +638,7 @@ async def test_apply_delete_writes_tombstone_and_captures(temp_db, tmp_path, mon
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-bob",
         notifs=notifs,
     )
@@ -538,7 +665,7 @@ async def test_apply_agent_mismatch_rejected(temp_db, tmp_path, monkeypatch):
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="manager", username="bob", agent="real-agent", display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), role="manager", username="bob", agent="real-agent", display_name="Bob"),
         loser_sub_for=lambda u: "user-viewer",
         notifs=notifs,
     )
@@ -632,7 +759,7 @@ async def test_fan_out_failed_push_marks_row_failed(temp_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fan_out_respects_global_gate(temp_db, monkeypatch):
+async def test_fan_out_gate_is_per_machine(temp_db, monkeypatch):
     import asyncio
     import config
     from core.remote import transfer_gate
@@ -655,7 +782,8 @@ async def test_fan_out_respects_global_gate(temp_db, monkeypatch):
     big = b"x" * (600 * 1024)
     await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
     transfer_gate.reset_for_tests()
-    assert state["max_active"] == 1          # gate caps concurrency
+    # One slot per machine: three machines push at once, none waits on another.
+    assert state["max_active"] == 3
     assert fake_cm.push_file.await_count == 3  # every machine still pushed
     # base-advance intact for all acked machines
     item = tr.snapshot_inflight()[0]
@@ -686,10 +814,26 @@ async def test_gate_queued_state_reaches_registry(temp_db, monkeypatch):
 
     fake_cm.push_file.side_effect = _push
     big = b"x" * (600 * 1024)
-    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    # m1's one slot is held by another push: m1 queues, m2 never does.
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold():
+        async with transfer_gate.slot("m1", "agent-1", "other.bin", 600 * 1024):
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(_hold())
+    await held.wait()
+    fan_out = asyncio.create_task(
+        workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big))
+    while ("m2", "done") not in seen_states:
+        await asyncio.sleep(0.01)
+    release.set()
+    await asyncio.gather(holder, fan_out)
     transfer_gate.reset_for_tests()
-    # With one slot and two machines, ONE of them was queued first.
-    assert ("m1", "queued") in seen_states or ("m2", "queued") in seen_states
+    assert ("m1", "queued") in seen_states
+    assert ("m2", "queued") not in seen_states
     # Both passed through active and reached done.
     for mid in ("m1", "m2"):
         assert (mid, "active") in seen_states
@@ -754,8 +898,9 @@ async def test_atomic_write_refuses_a_bad_rel_as_value_error(temp_db, tmp_path, 
 @pytest.mark.asyncio
 async def test_fan_out_write_pushes_the_checked_descriptor_and_records_its_hash(temp_db, tmp_path, monkeypatch):
     """A Path source is opened beneath the agents root once; ``push_file``
-    receives the descriptor's own path and the merge base records the hash
-    taken from that descriptor before any push."""
+    receives the descriptor's own path and the hash taken from that
+    descriptor (sent as the frame's hash, never taken again), and the merge
+    base records that hash."""
     import config
     from services.remote import workspace_fanout as wf
     from storage.files import sync_state_store
@@ -769,7 +914,8 @@ async def test_fan_out_write_pushes_the_checked_descriptor_and_records_its_hash(
 
     async def _push(mid, ref, source, **kw):
         seen["source"] = source
-        seen["bytes"] = source.read_bytes()
+        seen["bytes"] = source if isinstance(source, bytes) else source.read_bytes()
+        seen["content_hash"] = kw.get("content_hash")
         return True
 
     cm = SimpleNamespace(push_file=_push)
@@ -780,7 +926,10 @@ async def test_fan_out_write_pushes_the_checked_descriptor_and_records_its_hash(
     await wf.fan_out_write("agent-1", "workspace/x.md", f)
     assert str(seen["source"]).startswith(("/proc/self/fd/", "/dev/fd/"))
     assert seen["bytes"] == b"hello"
+    assert seen["content_hash"] == _h(b"hello")
     assert recorded and recorded[0][:4] == ("m1", "agent-1", "workspace/x.md", _h(b"hello"))
+    await wf.fan_out_write("agent-1", "workspace/x.md", b"inline")
+    assert seen["content_hash"] == _h(b"inline")
 
 
 @pytest.mark.asyncio
@@ -852,3 +1001,29 @@ def test_fanout_targets_takes_the_shared_only_answer_without_a_store_read(temp_d
     assert fanout_targets("agent-1", "users/alice/workspace/x.md", shared_only=False) == ["mA"]
     assert fanout_targets("agent-1", "users/alice/workspace/x.md", shared_only=True) == []
     assert has_fanout_candidates("agent-1", "users/alice/workspace/x.md", shared_only=True) is False
+
+
+@pytest.mark.asyncio
+async def test_a_tracked_push_moves_its_row_at_most_twice_a_second(temp_db, monkeypatch):
+    """A push now reports every acked chunk: the registry row is updated at
+    most every 0.5 s, and its terminal always lands."""
+    workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch, machines=("m1",))
+    calls: list[tuple[int, int]] = []
+    real = tr.progress
+
+    async def _spy(tid, mid, sent, total):
+        calls.append((sent, total))
+        await real(tid, mid, sent, total)
+
+    monkeypatch.setattr(tr, "progress", _spy)
+
+    async def _push(mid, ref, source, *, progress_cb=None, **kw):
+        for sent in range(1, 50):
+            await progress_cb(sent * 1024, 50 * 1024)
+        await progress_cb(50 * 1024, 50 * 1024)
+        return True
+
+    fake_cm.push_file.side_effect = _push
+    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", b"x" * (600 * 1024))
+    assert len(calls) <= 4
+    assert calls[-1][0] == calls[-1][1]

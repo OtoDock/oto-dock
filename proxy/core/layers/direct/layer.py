@@ -25,7 +25,7 @@ from core.execution_layer import (
 )
 from core.session.session_state import (
     _record_session_use, cleanup_session_permission_state, register_session_state,
-    set_session_mode,
+    set_session_mode, mark_starting, clear_starting, session_is_held, START_MARK_TTL_S,
 )
 from core.layers.direct.session import (
     DirectSession,
@@ -203,7 +203,7 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
         question_tool_holds_turn=False,       # no question tool
     ),
     model_policy=ModelPolicy(
-        default_model="claude-sonnet-5",      # tier 3 — the first usable tier for real work
+        default_model="claude-sonnet-5-5",    # tier 3 — the first usable tier for real work
         model_filter_policy="all",            # every provider filtered to active subscriptions
         pricing_editable=True,                # BYO keys are metered per model
     ),
@@ -392,12 +392,19 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         external claim from the live context. A failed start drops the
         registration again (see the CLI layer).
         """
-        register_session_state(session_id, config.permission_mode, config.security_context)
+        held = session_is_held(session_id)
+        mark_starting(session_id, START_MARK_TTL_S)
         try:
-            await self._start_session_impl(session_id, config)
-        except BaseException:
-            cleanup_session_permission_state(session_id)
-            raise
+            register_session_state(session_id, config.permission_mode, config.security_context,
+                                   token_minted_at=config.token_minted_at)
+            try:
+                await self._start_session_impl(session_id, config)
+            except BaseException:
+                if not held:
+                    cleanup_session_permission_state(session_id)
+                raise
+        finally:
+            clear_starting(session_id)
 
     async def _start_session_impl(
         self, session_id: str, config: AgentConfig,
@@ -525,10 +532,10 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         # Bind subscription for pool cleanup
         if config.subscription_id:
             from services.engines.subscription_pool import bind_session
-            bind_session(
+            await asyncio.wrap_future(bind_session(
                 session_id, config.subscription_id,
                 layer="direct-llm", user_sub=config.subscription_user_sub,
-            )
+            ))
 
 
     async def _send_turn(
@@ -651,10 +658,10 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 else:
                     session.api_key = sub_handle.api_key
                     session.endpoint_url = sub_handle.endpoint_url
-                subscription_pool.bind_session(
+                await asyncio.wrap_future(subscription_pool.bind_session(
                     session_id, sub_handle.subscription_id,
                     layer="direct-llm", user_sub=session.user_sub or "",
-                )
+                ))
                 # The history is provider-shaped (OpenAI tool_calls / reasoning
                 # items / tool messages, Anthropic content blocks / tool_result
                 # messages, provider image blocks) and the new provider would

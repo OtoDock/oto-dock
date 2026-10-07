@@ -101,6 +101,22 @@ SAVED = frozenset(k.name for k in KINDS.values() if k.saved)
 SHAREABLE = frozenset(k.name for k in KINDS.values() if k.shareable)
 
 
+#: Event fields a live frame carries and a stored row never does: the
+#: document preview's WOPI token (a card from history mints its own).
+LIVE_ONLY_KEYS = ("access_token", "access_token_ttl")
+
+
+def for_viewer(event: dict, pusher: str, viewer: str) -> dict:
+    """``event`` as one viewer's connection gets it: the live-only fields
+    (the pushing session's edit-capable WOPI token) go only to the person
+    whose session pushed it; every other viewer of the chat gets the frame
+    without them, and their pane mints its own role-gated token. No known
+    pusher keeps the token from everyone."""
+    if not any(k in event for k in LIVE_ONLY_KEYS) or (pusher and viewer == pusher):
+        return event
+    return {k: v for k, v in event.items() if k not in LIVE_ONLY_KEYS}
+
+
 def kind_of(event_type: str | None) -> ArtifactKind | None:
     """The row for an event type, ``None`` for anything that is not an
     artifact kind (a text or tool block, a blocking prompt) — total, so a
@@ -164,14 +180,20 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
         return {
             "type": wire.DOCUMENT_PREVIEW,
             "wopi_url": perm_data["wopi_url"],
+            # The WOPI token rides the live frame only (LIVE_ONLY_KEYS).
+            "access_token": perm_data.get("access_token", ""),
+            "access_token_ttl": perm_data.get("access_token_ttl", 0),
             "filename": perm_data["filename"],
             "file_id": perm_data["file_id"],
             "download_url": perm_data["download_url"],
-            # Version-pinned snapshot identity: the dashboard renders a
-            # superseded block from ITS OWN snapshot via
-            # /v1/documents/snapshot-wopi-url ("" = no snapshot → chip).
+            # Version-pinned snapshot identity: the pane opens this push's
+            # version through /v1/documents/snapshot-wopi-url ("" = no copy,
+            # the version reads "no longer available").
             "snapshot_id": perm_data.get("snapshot_id", ""),
             "generation": perm_data.get("generation", 0),
+            # The push's number among the file's pushes in this chat (the
+            # card's "version N"; the documents listing is the authority).
+            "version": perm_data.get("version", 0),
         }
     if et == "ui":
         # Every field rides along: this dict is json.dumps-persisted verbatim,

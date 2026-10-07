@@ -65,6 +65,7 @@ KNOWN_DOTDOT_SITES: dict[str, tuple[str, int]] = {
     "proxy/services/mcp/mcp_manifest_parse.py": ("a JSONPath expression's recursive descent, not a path", 1),
     "proxy/services/mcp/mcp_output_relocation.py": ("a basename scraped from a tool's output text", 1),
     "proxy/services/path_policy_v2.py": ("the UX reject of a relative '..' tool path (frozen)", 1),
+    "proxy/services/webhooks/vendor_http.py": ("a vendor URL's path value; it never names a file", 1),
     "satellite/sessions/session_manager.py": ("the satellite-host ABSOLUTE path rule, and the credentials_update slug (a NAME)", 2),
     "satellite/transport/file_sync.py": ("sync-rule NAMES (the twin)", 1),
     "mcps/custom/delegation-mcp/server.py": ("an output_dir validator in the MCP; the proxy re-validates with the helper", 1),

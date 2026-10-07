@@ -528,3 +528,90 @@ def test_active_seed_never_reads_per_chat(temp_db, _as, monkeypatch):
     rows = asyncio.run(api.list_active_chats(user=u))["chats"]
     assert [r["id"] for r in rows] == [own, run_chat, warm]
     assert rows[1]["title"] == "Nightly report"
+
+
+# --- the 1 s memo -------------------------------------------------------------
+
+def test_two_seeds_within_a_second_share_one_job_and_viewers_do_not(temp_db, monkeypatch):
+    from api.agents import chats as chats_api
+    chats_api._active_memo.reset()
+    jobs = []
+    real = chats_api._active_rows
+
+    def counted(u, streaming, warming, since):
+        jobs.append(u.sub)
+        return real(u, streaming, warming, since)
+
+    monkeypatch.setattr(chats_api, "_active_rows", counted)
+    try:
+        app.dependency_overrides[get_current_user] = _user
+        assert client.get("/v1/chats/active").status_code == 200
+        assert client.get("/v1/chats/active").status_code == 200
+        assert jobs == ["user-alice"]
+        app.dependency_overrides[get_current_user] = lambda: _user(sub="user-bob")
+        assert client.get("/v1/chats/active").status_code == 200
+        assert jobs == ["user-alice", "user-bob"]
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        chats_api._active_memo.reset()
+
+
+@pytest.mark.asyncio
+async def test_the_memo_single_flights_shields_and_forgets_a_failure():
+    from api.agents.chats import _ActiveMemo
+    memo = _ActiveMemo(ttl=0.2, cap=2)
+    gate = asyncio.Event()
+    runs = 0
+
+    async def job():
+        nonlocal runs
+        runs += 1
+        await gate.wait()
+        return [runs]
+
+    first = asyncio.create_task(memo.get(("k",), job))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(memo.get(("k",), job))
+    await asyncio.sleep(0)
+    second.cancel()                       # a tab that navigated away
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    gate.set()
+    assert await first == [1] and runs == 1
+    assert await memo.get(("k",), job) == [1]          # served from the memo
+    assert memo.hits == 2
+
+    async def failing():
+        raise RuntimeError("db down")
+
+    with pytest.raises(RuntimeError):
+        await memo.get(("x",), failing)
+    assert ("x",) not in memo._done and ("x",) not in memo._flights
+    await asyncio.sleep(0.25)
+    assert await memo.get(("k",), job) == [2]          # expired: a fresh job
+    # The cap: expired entries are pruned first, then the oldest.
+    memo._store(("a",), []); memo._store(("b",), []); memo._store(("c",), [])
+    assert len(memo._done) == 2 and ("c",) in memo._done
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_caller_cancels_nobody_elses_rows():
+    from api.agents.chats import _ActiveMemo
+    memo = _ActiveMemo(ttl=1.0, cap=4)
+    gate = asyncio.Event()
+
+    async def job():
+        await gate.wait()
+        return ["rows"]
+
+    first = asyncio.create_task(memo.get(("k",), job))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(memo.get(("k",), job))
+    await asyncio.sleep(0)
+    first.cancel()                        # the tab that started the job navigated away
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    gate.set()
+    assert await second == ["rows"]       # the joiner still gets the rows
+    assert await memo.get(("k",), job) == ["rows"]   # and the memo holds them
+    assert ("k",) not in memo._flights

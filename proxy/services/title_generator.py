@@ -74,8 +74,10 @@ def deterministic_title(text: str) -> str:
         cut = True
     return title + ("…" if cut else "")
 
-# Per-provider title model (the cheap/fast tier). Ollama / LiteLLM resolve their
-# model dynamically from the configured local Direct-LLM models.
+# Per-provider title model: the cheapest capable model each provider offers
+# (Anthropic's is Sonnet 5.5, tier 3: Haiku 4.5 has no successor). Ollama /
+# LiteLLM resolve their model dynamically from the configured local Direct-LLM
+# models.
 _PROVIDER_TITLE_MODEL = {
     # gpt-oss-120b is a reasoning model, which is fine here: on Groq its
     # thinking rides a separate ``message.reasoning`` field (never content, so
@@ -84,9 +86,11 @@ _PROVIDER_TITLE_MODEL = {
     # effort "low" so reasoning-capable title models think minimally.
     # A change here needs the hosted relay's row first (relay_vendors.py in
     # otodock-commercial): the relay rejects a model it does not price.
+    # Anthropic has no Haiku newer than 4.5, which is near retirement with no
+    # successor, so its row is Sonnet 5.5 (about twice Haiku's cost per title).
     "groq": "openai/gpt-oss-120b",
     "openai": "gpt-6-luna",
-    "anthropic": "claude-haiku-4-5",
+    "anthropic": "claude-sonnet-5-5",
 }
 # Auto-resolution order when the admin hasn't pinned a model.
 _LADDER = ["groq", "openai", "anthropic", "ollama"]
@@ -111,11 +115,12 @@ _TITLE_SYS = (
     "Generate a concise chat title (max 6 words) capturing the topic. "
     "Start with one relevant emoji. Output only the title — no quotes, no preamble."
 )
-# Generous cap: a title is ~10 tokens, but gpt-6-luna and gpt-oss-120b are
-# REASONING models whose thinking tokens are billed as output and must fit under
-# this cap too — a tiny cap (e.g. 24) lets reasoning exhaust the budget and
-# yields an EMPTY title. Non-reasoning models (claude-haiku) emit ~10 tokens
-# and stop, so this is only a ceiling for them, never a cost.
+# Generous cap: a title is ~10 tokens, but gpt-6-luna, gpt-oss-120b and
+# claude-sonnet-5-5 are REASONING models whose thinking tokens are billed as
+# output and must fit under this cap too — a tiny cap (e.g. 24) lets reasoning
+# exhaust the budget and yields an EMPTY title. A non-reasoning model (an
+# admin's claude-haiku-4-5 pin) emits ~10 tokens and stops, so this is only a
+# ceiling for it, never a cost.
 _MAX_TOKENS = 1024
 _INPUT_CHARS = 4000        # hard cap on the prompt+excerpt fed to the model (cost bound)
 _EXCERPT_CHARS = 1500      # cap on the assistant excerpt specifically
@@ -242,12 +247,15 @@ def resolve_title_provider() -> tuple[str, str, str, str] | None:
 
 
 def title_generation_status() -> dict:
-    """Admin GET payload: the enable flag, the pinned model (''=Auto), whether the
+    """Admin GET payload: the enable flag, the pinned model as it runs (a retired
+    id's successor; ''=Auto), whether the
     feature is currently ACTIVE (enabled + a provider resolves, no mint), the
     effective provider/model, and the dropdown options (each configured provider's
     title model; the frontend prepends an Auto entry)."""
     enabled = task_store.get_platform_setting(_SETTING_ENABLED) != "0"
     selected = (task_store.get_platform_setting(_SETTING_MODEL) or "").strip()
+    # What _select_provider runs for the pin: a retired id's successor.
+    pinned = config.successor_model(selected)
     options = []
     for provider in _LADDER:
         if _provider_configured(provider):
@@ -259,9 +267,23 @@ def title_generation_status() -> dict:
                     "label": entry["label"] if entry else provider.title(),
                 })
     sel = _select_provider()
+    # A pin the ladder no longer offers (Haiku 4.5 since the Anthropic row
+    # moved to Sonnet 5.5) runs whenever its provider is configured, so the
+    # dropdown lists it, or the page would show Auto while the pinned model
+    # titles every chat. The test is the provider, not _select_provider(),
+    # which is None while titles are off: the disabled <select> shows the
+    # pin that runs again when they are switched back on.
+    pin_provider = config.get_model_provider(pinned) if pinned else ""
+    pin_listed = bool(pinned and _provider_configured(pin_provider))
+    if pin_listed and pinned not in {o["model"] for o in options}:
+        entry = _direct_provider(pin_provider)
+        options.append({"provider": pin_provider, "model": pinned,
+                        "label": entry["label"] if entry else pin_provider.title()})
     return {
         "enabled": enabled,
-        "selected_model": selected,
+        # The model that runs, so the <select> matches an option: the raw id
+        # of a retired pin (gpt-5.6-luna) matches none and shows Auto.
+        "selected_model": pinned if pin_listed else selected,
         "active": enabled and sel is not None,
         "active_provider": sel[0] if sel else "",
         "active_model": sel[1] if sel else "",
@@ -288,7 +310,7 @@ async def generate_title(
     user_prompt: str, assistant_excerpt: str,
     provider: str, model: str, api_key: str, base_url: str,
 ) -> tuple[str, object]:
-    """Call the provider's cheap title model. Returns ``(title, ProviderUsage)``;
+    """Call the provider's title model. Returns ``(title, ProviderUsage)``;
     raises on a provider error event (caller swallows)."""
     from core.layers.providers import get_adapter, ProviderUsage
 
@@ -310,7 +332,8 @@ async def generate_title(
         max_tokens=_MAX_TOKENS,
         endpoint_url=(base_url or None),
         # "low" = minimal thinking on reasoning-capable title models (gpt-6-luna,
-        # gpt-oss-120b); the adapters drop it for non-reasoning models/providers.
+        # gpt-oss-120b, claude-sonnet-5-5); the adapters drop it for
+        # non-reasoning models/providers.
         effort="low",
     ):
         if ev.type == "text_delta":

@@ -15,7 +15,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_human, UserContext
+from auth.providers import get_current_user, require_human, UserContext, require_user
 from api.auth.openai_oauth import limit_connect_start
 from core.layers.cli import oauth as claude_oauth
 from services.engines import subscription_pool
@@ -23,7 +23,8 @@ from storage.billing import subscription_status, subscription_store
 from auth import roles
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 #: The vendor this login route belongs to — the engine's ``identity.vendor_id``
 #: and the provider its OAuth rows carry, named once.
@@ -255,17 +256,53 @@ async def oauth_exchange(
     # leaving whatever the owner later set via the scope checkboxes.
     is_platform = meta["owner_type"] == "platform"
     owner_sub = user.sub
-    # include_disabled: a reconnect on an admin-disabled row must MATCH it
-    # (and keep it disabled, below) — excluding it here would fork a second
-    # ACTIVE row for the same account, silently routing around the admin.
-    existing = subscription_store.list_subscriptions(
-        layer=req.layer,
-        owner_sub=owner_sub,
-        include_disabled=True,
-    )
-    existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == _VENDOR]
-    match = _match_existing(existing_oauth, identity=identity, account_uuid=account_uuid)
 
+    def _match_or_create() -> tuple[dict | None, dict | None, str]:
+        """``(match, None, "")`` for the row already holding this account,
+        ``(None, row, "")`` for the row created for it, ``(None, None,
+        identity)`` when a parallel connect won the insert."""
+        # include_disabled: a reconnect on an admin-disabled row must MATCH it
+        # (and keep it disabled, below) — excluding it here would fork a second
+        # ACTIVE row for the same account, silently routing around the admin.
+        existing = subscription_store.list_subscriptions(
+            layer=req.layer,
+            owner_sub=owner_sub,
+            include_disabled=True,
+        )
+        existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == _VENDOR]
+        match = _match_existing(existing_oauth, identity=identity, account_uuid=account_uuid)
+        if match:
+            return match, None, ""
+        try:
+            return None, subscription_store.add_subscription(
+                layer=req.layer,
+                provider=_VENDOR,
+                auth_type="oauth",
+                owner_sub=owner_sub,
+                use_personal=True,
+                # Admins' personal connects ALSO contribute to the shared agent pool
+                # by default (so agent-scoped tasks work without the admin knowing to
+                # tick it). Non-admins can never contribute (the admin gate above).
+                contribute_platform=is_platform or roles.is_admin(user.role),
+                label=label,
+                credential_data=credential_data,
+                oauth_email=identity,
+            ), ""
+        except subscription_store.SubscriptionExists:
+            # A parallel connect of the same account won the insert: name the
+            # row it holds instead of a bare 500.
+            rows = subscription_store.list_subscriptions(
+                layer=req.layer, owner_sub=owner_sub, include_disabled=True,
+            )
+            held = _match_existing(
+                [s for s in rows if s["auth_type"] == "oauth" and s["provider"] == _VENDOR],
+                identity=identity, account_uuid=account_uuid,
+            )
+            return None, None, (held or {}).get("oauth_email") or identity
+
+    match, sub, conflict = await asyncio.to_thread(_match_or_create)
+    if conflict:
+        raise HTTPException(409, f"That account ({conflict}) is already connected.")
     created = match is None
     previous_status = match.get("status") if match else None
     if match:
@@ -289,7 +326,7 @@ async def oauth_exchange(
                 subscription_pool.clear_refresh_backoff(sub_id)
 
         await asyncio.to_thread(_apply_reconnect)
-        sub = subscription_store.get_subscription(sub_id)
+        sub = await asyncio.to_thread(subscription_store.get_subscription, sub_id)
         logger.info(f"Updated existing OAuth subscription {sub_id[:8]} with fresh tokens")
         # The exchange rotated the grant OUTSIDE the rotation chokepoint —
         # push the fresh token into live bound sessions' credential files.
@@ -297,33 +334,6 @@ async def oauth_exchange(
         # 401-recovery re-reads the same stale file forever without this.
         await asyncio.to_thread(subscription_pool.fan_out_current_token, sub_id)
     else:
-        try:
-            sub = subscription_store.add_subscription(
-                layer=req.layer,
-                provider=_VENDOR,
-                auth_type="oauth",
-                owner_sub=owner_sub,
-                use_personal=True,
-                # Admins' personal connects ALSO contribute to the shared agent pool
-                # by default (so agent-scoped tasks work without the admin knowing to
-                # tick it). Non-admins can never contribute (the admin gate above).
-                contribute_platform=is_platform or roles.is_admin(user.role),
-                label=label,
-                credential_data=credential_data,
-                oauth_email=identity,
-            )
-        except subscription_store.SubscriptionExists:
-            # A parallel connect of the same account won the insert: name the
-            # row it holds instead of a bare 500.
-            rows = subscription_store.list_subscriptions(
-                layer=req.layer, owner_sub=owner_sub, include_disabled=True,
-            )
-            held = _match_existing(
-                [s for s in rows if s["auth_type"] == "oauth" and s["provider"] == _VENDOR],
-                identity=identity, account_uuid=account_uuid,
-            )
-            shown = (held or {}).get("oauth_email") or identity
-            raise HTTPException(409, f"That account ({shown}) is already connected.")
         logger.info(f"Created new OAuth subscription {sub['id'][:8]}")
 
     # A freshly (re)connected account may be the replacement that sessions

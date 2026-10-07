@@ -2,6 +2,7 @@ import type { ChatMessage } from '@/api/chats'
 import type { MessageBlock } from '@/components/chat/types'
 import { eventToBlock } from './messageBlocks'
 import { REPLAYABLE_ARTIFACT_EVENT_TYPES, identityKey } from './kinds/artifact'
+import { WIRE } from '@/api/wireEvents'
 
 // Replay-on-open rule for interactive PiP artifact windows.
 //
@@ -17,9 +18,10 @@ import { REPLAYABLE_ARTIFACT_EVENT_TYPES, identityKey } from './kinds/artifact'
 // every loaded row is newer than the last prompt, so all of it qualifies.
 //
 // On top of that:
-//   - a kind with an identity (lib/kinds/artifact.ts: a document_preview by
-//     file_id, a ui by path) dedupes on it, latest wins — the same in-place
-//     replace identity the live pty_artifact handler uses;
+//   - a document push is skipped: it opens in the chat's document pane;
+//   - a kind with an identity (lib/kinds/artifact.ts: a ui by path) dedupes
+//     on it, latest wins — the same in-place replace identity the live
+//     pty_artifact handler uses;
 //   - rows the server marked dismissed (chat-level preview dismissals) and
 //     ids in the caller's per-browser X-dismiss set are dropped;
 //   - capped to the newest MAX_REPLAY_WINDOWS so a display-heavy turn can't
@@ -45,6 +47,8 @@ export function replayableDisplayEvents(
   for (let i = lastUserIdx + 1; i < messages.length; i++) {
     const m = messages[i]
     if (m.role !== 'event' || !REPLAYABLE_ARTIFACT_EVENT_TYPES.has(m.event_type) || !m.event_data) continue
+    // A document opens in the chat's document pane, never as a window.
+    if (m.event_type === WIRE.DOCUMENT_PREVIEW) continue
     let evt: any
     try { evt = JSON.parse(m.event_data) } catch { continue }
     if (!evt || evt.dismissed) continue

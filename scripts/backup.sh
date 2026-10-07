@@ -24,6 +24,11 @@
 # means this host. The rest of the agent tree (workspaces, knowledge, config)
 # is the operator's own file backup, as the install docs say.
 #
+# Exit status: 0 when every file asked for was written; 3 when the apps
+# archive was written but one or more app databases could not be copied
+# (each named on stderr, the archive holds the rest); 1 on any other failure,
+# with no partial file left behind.
+#
 # Schedule it from cron/systemd-timer for unattended backups. Restore with restore.sh.
 set -euo pipefail
 
@@ -147,8 +152,8 @@ for agent in sorted(os.listdir(agents)):
             if not _is_regular(src):
                 print(f"skip (symlink or special file): {src}", file=sys.stderr)
                 continue
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+                try:
                     # read-only URI: never create/modify the live DB; NOT
                     # immutable=1 (that returns an empty DB while a writer holds it).
                     # The path is percent-encoded: the file name is the app's
@@ -165,12 +170,17 @@ for agent in sorted(os.listdir(agents)):
                     st = os.stat(src)
                     info.mode = st.st_mode & 0o7777
                     info.mtime = st.st_mtime
-                    with open(tmp.name, "rb") as fh:
-                        out.addfile(info, fh)
+                    fh = open(tmp.name, "rb")
+                except Exception as e:  # one bad app must not cancel everyone's backup
+                    errors += 1
+                    print(f"error backing up {src}: {e}", file=sys.stderr)
+                    continue
+                # Not caught: a failure while the member is written leaves a
+                # partial member in the stream, so the program ends there and
+                # the script keeps no archive.
+                with fh:
+                    out.addfile(info, fh)
                 n_db += 1
-            except Exception as e:  # one bad app must not cancel everyone's backup
-                errors += 1
-                print(f"error backing up {src}: {e}", file=sys.stderr)
     for tree in ("app-releases", "shares"):
         path = os.path.join(adir, tree)
         if os.path.isdir(path) and not os.path.islink(path):
@@ -180,7 +190,8 @@ msg = f"{n_db} app database(s) copied"
 if errors:
     msg += f", {errors} error(s)"
 print(msg, file=sys.stderr)
-sys.exit(1 if errors else 0)  # flag an incomplete archive rather than pass silently
+# 3: the archive is whole, the databases named above are missing from it.
+sys.exit(3 if errors else 0)
 PY
 )
 
@@ -199,23 +210,31 @@ if [ "$WITH_APPS" = true ]; then
       exit 1
     fi
     echo "Apps: reading ${AGENTS_DIR} on this host → ${APPS_OUT}"
-    apps_ok=1
-    printf '%s\n' "$APPS_PY" | python3 - "$AGENTS_DIR" > "$APPS_OUT.part" || apps_ok=0
+    apps_rc=0
+    printf '%s\n' "$APPS_PY" | python3 - "$AGENTS_DIR" > "$APPS_OUT.part" || apps_rc=$?
   elif [ -n "$PROXY_CID" ]; then
     echo "Apps: reading the agents volume inside the proxy container ${PROXY_CID} → ${APPS_OUT}"
-    apps_ok=1
-    printf '%s\n' "$APPS_PY" | docker exec -i "$PROXY_CID" python3 - /opt/otodock/agents > "$APPS_OUT.part" || apps_ok=0
+    apps_rc=0
+    printf '%s\n' "$APPS_PY" | docker exec -i "$PROXY_CID" python3 - /opt/otodock/agents > "$APPS_OUT.part" || apps_rc=$?
   else
     echo "error: no running otodock-proxy container and no agents directory at $AGENTS_DIR (set OTODOCK_AGENTS_DIR, or start the stack)" >&2
     exit 1
   fi
-  # Keep whatever was archived (the readable apps) but fail loudly if a db errored.
-  mv "$APPS_OUT.part" "$APPS_OUT"
-  [ "$apps_ok" = 1 ] || { echo "Apps: backup INCOMPLETE: a database errored (see above); the archive holds the rest" >&2; exit 1; }
+  # 0: the archive is complete. 3: the program's own status, the archive is
+  # whole but databases are missing (named above): kept, and the run exits 3.
+  # Anything else (no python3, the container gone, a crash or a failed write
+  # mid-stream) leaves a cut archive: the trap removes the .part.
+  case "$apps_rc" in
+    0|3) mv "$APPS_OUT.part" "$APPS_OUT" ;;
+    *) echo "Apps: backup FAILED (exit $apps_rc, see above); no archive kept" >&2; exit 1 ;;
+  esac
   echo "Apps: $(du -h "$APPS_OUT" | cut -f1)  ${APPS_OUT}"
+  # A kept archive counts for the retention whether it is complete or not,
+  # so a database that keeps failing never stops old archives from going.
   if [ "$RETAIN" -gt 0 ]; then
     # shellcheck disable=SC2012
     ls -1t "$OUT_DIR"/otodock-apps-*.tar.gz 2>/dev/null \
       | tail -n +"$((RETAIN + 1))" | xargs -r rm -f
   fi
+  [ "$apps_rc" = 0 ] || { echo "Apps: backup INCOMPLETE: a database errored (see above); the archive holds the rest" >&2; exit 3; }
 fi

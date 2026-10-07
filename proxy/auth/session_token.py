@@ -83,12 +83,16 @@ def create_session_token(
     user_sub: str = "",
     *,
     external: str | None = None,
+    issued_at: int | None = None,
 ) -> str:
     """Generate a JWT scoped to one agent session.
 
     Token is valid for 24h (sessions rarely last longer; reaped at 15min idle).
     It carries ``iat``: a token minted before its user's last password
-    change is refused (``auth/providers``).
+    change is refused (``auth/providers``), and one minted before its
+    session's floor (``session_state.register_session_state``) too; a
+    builder that records the floor it mints against passes ``issued_at``
+    so the two are the same instant.
 
     Args:
         session_id: chat / task / phone session id.
@@ -113,7 +117,7 @@ def create_session_token(
         external = _live_external_claim(session_id)
     if session_id and user_sub:
         _remember_session_user(session_id, user_sub)
-    now = int(time.time())
+    now = int(time.time()) if issued_at is None else int(issued_at)
     payload = {
         "type": "session",
         "sid": session_id,

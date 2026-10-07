@@ -11,8 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from auth.providers import get_current_user, require_auth, require_admin, UserContext
+from auth.providers import get_current_user, require_auth, require_admin, UserContext, require_user
 from storage.billing import subscription_status, subscription_store
+from storage.pg import run_db
 from core.execution_layer import PROVIDER_LOCAL, LayerCapabilities, provider_entry
 from core.session.session_manager import (
     capabilities_for_path, get_all_capabilities, get_all_layers, get_layer_capabilities,
@@ -21,7 +22,8 @@ from services.engines import subscription_pool
 from auth import roles
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 # ---------------------------------------------------------------------------
@@ -219,48 +221,51 @@ async def admin_list_layers(user: UserContext = Depends(get_current_user)):
     _require_admin(user)
 
     capabilities = get_all_capabilities()
-    layers = []
 
-    for path, caps in capabilities.items():
-        # The admin tab manages the platform pool + owner-less infra (relay / migrated
-        # shared keys). list_admin_managed keeps owner-less subs visible even with
-        # 'Agent pool' off, so toggling it can't make them vanish. is_mine drives which
-        # rows show edit controls (the caller's own accounts). Local endpoints are
-        # listed ONCE across the engines in ``local_endpoints`` below, not per layer.
-        platform_subs = [
-            s for s in subscription_store.list_admin_managed(layer=path)
-            if s.get("auth_type") != "local_endpoint"
+    def _job() -> dict:
+        layers = []
+        for path, caps in capabilities.items():
+            # The admin tab manages the platform pool + owner-less infra (relay / migrated
+            # shared keys). list_admin_managed keeps owner-less subs visible even with
+            # 'Agent pool' off, so toggling it can't make them vanish. is_mine drives which
+            # rows show edit controls (the caller's own accounts). Local endpoints are
+            # listed ONCE across the engines in ``local_endpoints`` below, not per layer.
+            platform_subs = [
+                s for s in subscription_store.list_admin_managed(layer=path)
+                if s.get("auth_type") != "local_endpoint"
+            ]
+            for s in platform_subs:
+                s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
+            _attach_windows(platform_subs)
+            # Count personal accounts (without exposing details)
+            personal_subs = subscription_store.list_subscriptions(
+                layer=path, use_personal=True, include_disabled=True,
+            )
+            # Get models (sync builtins first)
+            subscription_store.sync_builtin_models(path, caps.get("models", []))
+            models = subscription_store.list_models(layer=path)
+            # Pool stats
+            pool = subscription_store.get_pool_stats(path)
+
+            layers.append({
+                "name": path,
+                "display_name": caps.get("display_name", path),
+                "capabilities": caps,
+                "subscriptions": {
+                    "platform": platform_subs,
+                    "user_count": len(personal_subs),
+                },
+                "models": models,
+                "pool_stats": pool,
+            })
+
+        local_endpoints = [
+            _annotate_local_group(g, user)
+            for g in subscription_store.list_local_endpoint_groups()
         ]
-        for s in platform_subs:
-            s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
-        _attach_windows(platform_subs)
-        # Count personal accounts (without exposing details)
-        personal_subs = subscription_store.list_subscriptions(
-            layer=path, use_personal=True, include_disabled=True,
-        )
-        # Get models (sync builtins first)
-        subscription_store.sync_builtin_models(path, caps.get("models", []))
-        models = subscription_store.list_models(layer=path)
-        # Pool stats
-        pool = subscription_store.get_pool_stats(path)
+        return {"layers": layers, "local_endpoints": local_endpoints}
 
-        layers.append({
-            "name": path,
-            "display_name": caps.get("display_name", path),
-            "capabilities": caps,
-            "subscriptions": {
-                "platform": platform_subs,
-                "user_count": len(personal_subs),
-            },
-            "models": models,
-            "pool_stats": pool,
-        })
-
-    local_endpoints = [
-        _annotate_local_group(g, user)
-        for g in subscription_store.list_local_endpoint_groups()
-    ]
-    return {"layers": layers, "local_endpoints": local_endpoints}
+    return await run_db(_job)
 
 
 # ---------------------------------------------------------------------------
@@ -275,11 +280,15 @@ async def admin_list_subscriptions(
     _require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
-    subs = subscription_store.list_admin_managed(layer=layer)
-    for s in subs:
-        s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
-    _attach_windows(subs)
-    return {"subscriptions": subs}
+
+    def _job() -> list[dict]:
+        subs = subscription_store.list_admin_managed(layer=layer)
+        for s in subs:
+            s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
+        _attach_windows(subs)
+        return subs
+
+    return {"subscriptions": await run_db(_job)}
 
 
 @router.post("/v1/admin/execution-layers/{layer}/subscriptions")
@@ -317,17 +326,22 @@ async def admin_add_subscription(
     if req.auth_type == "relay":
         if not (entry or {}).get("relay_path"):
             raise HTTPException(400, f"hosted relay not available for provider: {req.provider}")
-        for s in subscription_store.list_subscriptions(
-            layer=layer, contribute_platform=True, include_disabled=True,
-        ):
-            if s.get("provider") == req.provider and s.get("auth_type") == "relay":
-                return s
-        sub = subscription_store.add_subscription(
-            layer=layer, provider=req.provider, auth_type="relay",
-            owner_sub="", use_personal=False, contribute_platform=True,
-            label=req.label or "OtoDock Hosted", credential_data={},
-        )
-        await _subscriptions_changed(layer)
+
+        def _relay_job() -> tuple[dict, bool]:
+            for s in subscription_store.list_subscriptions(
+                layer=layer, contribute_platform=True, include_disabled=True,
+            ):
+                if s.get("provider") == req.provider and s.get("auth_type") == "relay":
+                    return s, False
+            return subscription_store.add_subscription(
+                layer=layer, provider=req.provider, auth_type="relay",
+                owner_sub="", use_personal=False, contribute_platform=True,
+                label=req.label or "OtoDock Hosted", credential_data={},
+            ), True
+
+        sub, created = await run_db(_relay_job)
+        if created:
+            await _subscriptions_changed(layer)
         return sub
 
     # Build credential data
@@ -346,7 +360,8 @@ async def admin_add_subscription(
             cred_data["api_key"] = req.api_key
 
     try:
-        sub = subscription_store.add_subscription(
+        sub = await run_db(
+            subscription_store.add_subscription,
             layer=layer,
             provider=req.provider,
             auth_type=req.auth_type,
@@ -372,22 +387,26 @@ async def admin_update_subscription(
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
-    # Owner-or-infra only: an admin manages their OWN accounts (and owner-less
-    # platform infra like the relay) — never another admin's connected account.
-    existing = subscription_store.get_subscription(sub_id)
-    if not existing:
-        raise HTTPException(404, "Subscription not found")
-    if existing.get("owner_sub") not in ("", user.sub):
-        raise HTTPException(403, "Not your subscription")
-    if req.status is not None and req.status not in subscription_status.STATUSES:
-        raise HTTPException(400, f"status must be one of {sorted(subscription_status.STATUSES)}")
-    result = subscription_store.update_subscription(
-        sub_id,
-        label=req.label,
-        status=req.status,
-        use_personal=req.use_personal,
-        contribute_platform=req.contribute_platform,
-    )
+
+    def _job() -> dict | None:
+        # Owner-or-infra only: an admin manages their OWN accounts (and owner-less
+        # platform infra like the relay) — never another admin's connected account.
+        existing = subscription_store.get_subscription(sub_id)
+        if not existing:
+            raise HTTPException(404, "Subscription not found")
+        if existing.get("owner_sub") not in ("", user.sub):
+            raise HTTPException(403, "Not your subscription")
+        if req.status is not None and req.status not in subscription_status.STATUSES:
+            raise HTTPException(400, f"status must be one of {sorted(subscription_status.STATUSES)}")
+        return subscription_store.update_subscription(
+            sub_id,
+            label=req.label,
+            status=req.status,
+            use_personal=req.use_personal,
+            contribute_platform=req.contribute_platform,
+        )
+
+    result = await run_db(_job)
     if not result:
         raise HTTPException(404, "Subscription not found")
     # Live sessions follow the selection: a scope/status change here may have
@@ -405,7 +424,7 @@ async def admin_delete_subscription(
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
-    sub = subscription_store.get_subscription(sub_id)
+    sub = await run_db(subscription_store.get_subscription, sub_id)
     if not sub:
         raise HTTPException(404, "Subscription not found")
     # Owner-or-infra only (see admin_update_subscription).
@@ -417,7 +436,7 @@ async def admin_delete_subscription(
     # writes the honest value back. Live sessions still block — unless the
     # admin forces it, in which case the rebind fan-out re-homes them onto
     # the remaining selection (or blocks them until one is connected).
-    _stored, live = subscription_pool.reconcile_active_sessions(sub_id)
+    _stored, live = await run_db(subscription_pool.reconcile_active_sessions, sub_id)
     if live > 0 and not force:
         raise HTTPException(
             409,
@@ -425,7 +444,7 @@ async def admin_delete_subscription(
             "close, or delete with force=true to move them to another "
             "subscription.",
         )
-    deleted = subscription_store.delete_subscription(sub_id)
+    deleted = await run_db(subscription_store.delete_subscription, sub_id)
     if not deleted:
         raise HTTPException(404, "Subscription not found")
     subscription_pool.schedule_rebind("admin subscription delete")
@@ -463,6 +482,11 @@ def _annotate_local_group(g: dict, user: UserContext) -> dict:
         for layer, eng in g["engines"].items()
     }
     return out
+
+
+def _local_group_view(group: str, user: UserContext) -> dict:
+    """The annotated group, or the 404 (a store read: run it on the DB lane)."""
+    return _annotate_local_group(_local_group(group), user)
 
 
 async def _local_endpoint_changed(layers) -> None:
@@ -503,19 +527,25 @@ async def admin_add_local_endpoint(
         # the suffix again to reach /api/tags).
         url += api_path
     key = subscription_store.local_endpoint_group_key(req.provider, url)
-    if any(g["group"] == key for g in subscription_store.list_local_endpoint_groups()):
-        raise HTTPException(409, "This endpoint is already connected — use its engine checkboxes")
     cred_data: dict = {"endpoint_url": url}
     if req.api_key:
         cred_data["api_key"] = req.api_key
-    for layer in layers:
-        subscription_store.add_subscription(
-            layer=layer, provider=req.provider, auth_type="local_endpoint",
-            owner_sub=user.sub, use_personal=True, contribute_platform=True,
-            label=req.label, credential_data=cred_data,
-        )
+
+    def _job() -> bool:
+        if any(g["group"] == key for g in subscription_store.list_local_endpoint_groups()):
+            return False
+        for layer in layers:
+            subscription_store.add_subscription(
+                layer=layer, provider=req.provider, auth_type="local_endpoint",
+                owner_sub=user.sub, use_personal=True, contribute_platform=True,
+                label=req.label, credential_data=cred_data,
+            )
+        return True
+
+    if not await run_db(_job):
+        raise HTTPException(409, "This endpoint is already connected — use its engine checkboxes")
     await _local_endpoint_changed(layers)
-    return _annotate_local_group(_local_group(key), user)
+    return await run_db(_local_group_view, key, user)
 
 
 @router.put("/v1/admin/execution-layers/local-endpoints/{group}")
@@ -531,24 +561,28 @@ async def admin_set_local_endpoint_engine(
     _require_admin(user)
     if req.layer not in _layers_with_auth_type("local_endpoint"):
         raise HTTPException(400, f"Local endpoints cannot serve: {req.layer}")
-    g = _local_group(group)
-    _require_group_owner(g, user)
-    eng = g["engines"].get(req.layer)
-    if req.enabled:
-        if eng is None:
-            sibling = next(iter(g["engines"].values()))
-            cred_data = subscription_store.get_credential_data(sibling["id"])
-            subscription_store.add_subscription(
-                layer=req.layer, provider=g["provider"], auth_type="local_endpoint",
-                owner_sub=user.sub, use_personal=True, contribute_platform=True,
-                label=g["label"], credential_data=cred_data,
-            )
-        elif eng["status"] != subscription_status.ACTIVE:
-            subscription_store.update_subscription(eng["id"], status=subscription_status.ACTIVE)
-    elif eng is not None and eng["status"] == subscription_status.ACTIVE:
-        subscription_store.update_subscription(eng["id"], status=subscription_status.DISABLED)
+
+    def _job() -> None:
+        g = _local_group(group)
+        _require_group_owner(g, user)
+        eng = g["engines"].get(req.layer)
+        if req.enabled:
+            if eng is None:
+                sibling = next(iter(g["engines"].values()))
+                cred_data = subscription_store.get_credential_data(sibling["id"])
+                subscription_store.add_subscription(
+                    layer=req.layer, provider=g["provider"], auth_type="local_endpoint",
+                    owner_sub=user.sub, use_personal=True, contribute_platform=True,
+                    label=g["label"], credential_data=cred_data,
+                )
+            elif eng["status"] != subscription_status.ACTIVE:
+                subscription_store.update_subscription(eng["id"], status=subscription_status.ACTIVE)
+        elif eng is not None and eng["status"] == subscription_status.ACTIVE:
+            subscription_store.update_subscription(eng["id"], status=subscription_status.DISABLED)
+
+    await run_db(_job)
     await _local_endpoint_changed([req.layer])
-    return _annotate_local_group(_local_group(group), user)
+    return await run_db(_local_group_view, group, user)
 
 
 @router.delete("/v1/admin/execution-layers/local-endpoints/{group}")
@@ -558,14 +592,14 @@ async def admin_delete_local_endpoint(
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
-    g = _local_group(group)
+    g = await run_db(_local_group, group)
     _require_group_owner(g, user)
     # Same rule as the subscription delete: live bindings decide, the stored
     # counter is reconciled first, and `force` deletes past live sessions
     # (the rebind fan-out re-homes them).
     busy = []
     for layer, e in g["engines"].items():
-        _stored, live = subscription_pool.reconcile_active_sessions(e["id"])
+        _stored, live = await run_db(subscription_pool.reconcile_active_sessions, e["id"])
         if live > 0:
             busy.append(f"{layer} ({live})")
     if busy and not force:
@@ -574,8 +608,12 @@ async def admin_delete_local_endpoint(
             "them to close, or delete with force=true to move them to another "
             "subscription.",
         )
-    for e in g["engines"].values():
-        subscription_store.delete_subscription(e["id"])
+
+    def _delete_job() -> None:
+        for e in g["engines"].values():
+            subscription_store.delete_subscription(e["id"])
+
+    await run_db(_delete_job)
     await _local_endpoint_changed(list(g["engines"]))
     return {"deleted": True}
 
@@ -594,9 +632,13 @@ async def admin_list_models(
         raise HTTPException(400, f"Invalid layer: {layer}")
     # Sync builtins from capabilities
     caps = get_all_capabilities().get(layer)
-    if caps:
-        subscription_store.sync_builtin_models(layer, caps.get("models", []))
-    return {"models": subscription_store.list_models(layer=layer)}
+
+    def _job() -> list[dict]:
+        if caps:
+            subscription_store.sync_builtin_models(layer, caps.get("models", []))
+        return subscription_store.list_models(layer=layer)
+
+    return {"models": await run_db(_job)}
 
 
 @router.post("/v1/admin/execution-layers/{layer}/models")
@@ -611,7 +653,8 @@ async def admin_add_model(
     if not req.model_id or not req.display_name:
         raise HTTPException(400, "model_id and display_name required")
     _validate_tier_fields(req.tier, req.good_at)
-    model = subscription_store.add_model(
+    model = await run_db(
+        subscription_store.add_model,
         layer=layer,
         model_id=req.model_id,
         display_name=req.display_name,
@@ -641,13 +684,18 @@ async def admin_discover_models(
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
 
-    sub = subscription_store.get_subscription(req.subscription_id)
+    def _job() -> tuple[dict | None, dict]:
+        sub = subscription_store.get_subscription(req.subscription_id)
+        if not sub or sub["layer"] != layer:
+            return sub, {}
+        return sub, subscription_store.get_credential_data(req.subscription_id)
+
+    sub, creds = await run_db(_job)
     if not sub:
         raise HTTPException(404, "Subscription not found")
     if sub["layer"] != layer:
         raise HTTPException(400, "Subscription does not belong to this layer")
 
-    creds = subscription_store.get_credential_data(req.subscription_id)
     provider = sub["provider"]
 
     from core.layers.providers import get_adapter
@@ -680,18 +728,21 @@ async def admin_bulk_add_models(
     if bad:
         raise HTTPException(400, f"Invalid layer: {', '.join(bad)}")
 
-    added = []
-    for target in targets:
-        for m in req.models:
-            model = subscription_store.add_model(
-                layer=target,
-                model_id=m["model_id"],
-                display_name=m["display_name"],
-                provider=req.provider,
-                is_builtin=False,
-            )
-            added.append(model)
+    def _job() -> list[dict]:
+        added = []
+        for target in targets:
+            for m in req.models:
+                model = subscription_store.add_model(
+                    layer=target,
+                    model_id=m["model_id"],
+                    display_name=m["display_name"],
+                    provider=req.provider,
+                    is_builtin=False,
+                )
+                added.append(model)
+        return added
 
+    added = await run_db(_job)
     return {"models": added, "count": len(added)}
 
 
@@ -704,30 +755,34 @@ async def admin_toggle_model(
 ):
     _require_admin(user)
     tier_sent = "tier" in req.model_fields_set
-    if tier_sent or req.good_at is not None:
-        # The registry owns a builtin's tier: the next sync would overwrite
-        # an admin edit, so refuse it instead of accepting it silently.
-        row = subscription_store.get_model(model_id)
-        if not row:
-            raise HTTPException(404, "Model not found")
-        if row.get("is_builtin"):
-            raise HTTPException(
-                400, "A builtin model's tier comes with the platform; tag custom models only")
-        _validate_tier_fields(req.tier, req.good_at)
-    result = subscription_store.update_model(
-        model_id,
-        enabled=req.enabled,
-        context_window=req.context_window,
-        pricing_input=req.pricing_input,
-        pricing_output=req.pricing_output,
-        pricing_cache_write=req.pricing_cache_write,
-        pricing_cache_read=req.pricing_cache_read,
-        supports_reasoning=req.supports_reasoning,
-        supports_xhigh=req.supports_xhigh,
-        tier=req.tier if tier_sent else None,
-        clear_tier=tier_sent and req.tier is None,
-        good_at=req.good_at,
-    )
+
+    def _job() -> dict | None:
+        if tier_sent or req.good_at is not None:
+            # The registry owns a builtin's tier: the next sync would overwrite
+            # an admin edit, so refuse it instead of accepting it silently.
+            row = subscription_store.get_model(model_id)
+            if not row:
+                raise HTTPException(404, "Model not found")
+            if row.get("is_builtin"):
+                raise HTTPException(
+                    400, "A builtin model's tier comes with the platform; tag custom models only")
+            _validate_tier_fields(req.tier, req.good_at)
+        return subscription_store.update_model(
+            model_id,
+            enabled=req.enabled,
+            context_window=req.context_window,
+            pricing_input=req.pricing_input,
+            pricing_output=req.pricing_output,
+            pricing_cache_write=req.pricing_cache_write,
+            pricing_cache_read=req.pricing_cache_read,
+            supports_reasoning=req.supports_reasoning,
+            supports_xhigh=req.supports_xhigh,
+            tier=req.tier if tier_sent else None,
+            clear_tier=tier_sent and req.tier is None,
+            good_at=req.good_at,
+        )
+
+    result = await run_db(_job)
     if not result:
         raise HTTPException(404, "Model not found")
     return result
@@ -740,7 +795,7 @@ async def admin_delete_model(
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
-    deleted = subscription_store.delete_model(model_id)
+    deleted = await run_db(subscription_store.delete_model, model_id)
     if not deleted:
         raise HTTPException(404, "Model not found or is a builtin model")
     return {"deleted": True}
@@ -754,10 +809,14 @@ async def admin_delete_model(
 async def admin_pool_status(user: UserContext = Depends(get_current_user)):
     _require_admin(user)
     capabilities = get_all_capabilities()
-    return {
-        path: subscription_store.get_pool_stats(path)
-        for path in capabilities
-    }
+
+    def _job() -> dict:
+        return {
+            path: subscription_store.get_pool_stats(path)
+            for path in capabilities
+        }
+
+    return await run_db(_job)
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +830,7 @@ async def admin_set_platform_auth(
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
-    subscription_store.set_user_allow_platform_auth(user_sub, req.allowed)
+    await run_db(subscription_store.set_user_allow_platform_auth, user_sub, req.allowed)
     subscription_pool.schedule_rebind("platform-auth toggle")
     return {"user_sub": user_sub, "allow_platform_auth": req.allowed}
 
@@ -785,35 +844,37 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
     """List execution layers with user's own subscriptions and platform availability."""
     user = require_auth(user)
     capabilities = get_all_capabilities()
-    allow_platform = subscription_store.get_user_allow_platform_auth(user.sub)
-    layers = []
 
-    for path, caps in capabilities.items():
-        user_subs = subscription_store.list_subscriptions(
-            layer=path, owner_sub=user.sub, include_disabled=True,
-        )
-        _attach_windows(user_subs)
-        # "Platform available" = the user may borrow a platform API credential here
-        # (Platform Auth on AND a borrowable admin sub exists — NOT admin OAuth).
-        platform_available = subscription_pool.borrowable_pool_available(path, user.sub)
+    def _job() -> list[dict]:
+        allow_platform = subscription_store.get_user_allow_platform_auth(user.sub)
+        layers = []
+        for path, caps in capabilities.items():
+            user_subs = subscription_store.list_subscriptions(
+                layer=path, owner_sub=user.sub, include_disabled=True,
+            )
+            _attach_windows(user_subs)
+            # "Platform available" = the user may borrow a platform API credential here
+            # (Platform Auth on AND a borrowable admin sub exists — NOT admin OAuth).
+            platform_available = subscription_pool.borrowable_pool_available(path, user.sub)
 
-        layers.append({
-            "name": path,
-            "display_name": caps.get("display_name", path),
-            # The engine's descriptor rides with its row, as it does on the
-            # admin tab: the user card reads its vendor, account label, auth
-            # types and login flow here instead of comparing the engine id.
-            "capabilities": caps,
-            "user_subscriptions": user_subs,
-            "platform_available": platform_available,
-            "allow_platform_auth": allow_platform,
-            # Server-computed "can this user run this engine" — the single
-            # predicate behind the chat-page engine/model filtering and the
-            # cross-engine switch options. Never re-derive client-side.
-            "can_run": subscription_pool.user_can_run(path, user.sub),
-        })
+            layers.append({
+                "name": path,
+                "display_name": caps.get("display_name", path),
+                # The engine's descriptor rides with its row, as it does on the
+                # admin tab: the user card reads its vendor, account label, auth
+                # types and login flow here instead of comparing the engine id.
+                "capabilities": caps,
+                "user_subscriptions": user_subs,
+                "platform_available": platform_available,
+                "allow_platform_auth": allow_platform,
+                # Server-computed "can this user run this engine" — the single
+                # predicate behind the chat-page engine/model filtering and the
+                # cross-engine switch options. Never re-derive client-side.
+                "can_run": subscription_pool.user_can_run(path, user.sub),
+            })
+        return layers
 
-    return {"layers": layers}
+    return {"layers": await run_db(_job)}
 
 
 @router.post("/v1/users/me/execution-layers/{layer}/subscriptions")
@@ -842,7 +903,8 @@ async def user_add_subscription(
         raise HTTPException(400, "api_key is required")
 
     try:
-        sub = subscription_store.add_subscription(
+        sub = await run_db(
+            subscription_store.add_subscription,
             layer=layer,
             provider=provider,
             auth_type="api_key",
@@ -880,17 +942,21 @@ async def user_update_subscription(
     (non-admin connects can never contribute).
     """
     user = require_auth(user)
-    sub = subscription_store.get_subscription(sub_id)
-    if not sub or sub.get("owner_sub") != user.sub:
-        raise HTTPException(404, "Subscription not found")
-    if req.contribute_platform is not None and not roles.is_admin(user.role):
-        raise HTTPException(403, "Only admins can change agent-pool contribution")
-    updated = subscription_store.update_subscription(
-        sub_id,
-        label=req.label,
-        use_personal=req.use_personal,
-        contribute_platform=req.contribute_platform,
-    )
+
+    def _job() -> dict | None:
+        sub = subscription_store.get_subscription(sub_id)
+        if not sub or sub.get("owner_sub") != user.sub:
+            raise HTTPException(404, "Subscription not found")
+        if req.contribute_platform is not None and not roles.is_admin(user.role):
+            raise HTTPException(403, "Only admins can change agent-pool contribution")
+        return subscription_store.update_subscription(
+            sub_id,
+            label=req.label,
+            use_personal=req.use_personal,
+            contribute_platform=req.contribute_platform,
+        )
+
+    updated = await run_db(_job)
     # Live sessions follow the checkbox: benching this account re-homes its
     # bound sessions onto the remaining selection right away.
     subscription_pool.schedule_rebind("user subscription update")
@@ -904,10 +970,16 @@ async def user_delete_subscription(
     user: UserContext | None = Depends(get_current_user),
 ):
     user = require_auth(user)
-    # Verify ownership
-    sub = subscription_store.get_subscription(sub_id)
-    if not sub or sub.get("owner_sub") != user.sub:
+
+    def _job() -> bool:
+        # Verify ownership
+        sub = subscription_store.get_subscription(sub_id)
+        if not sub or sub.get("owner_sub") != user.sub:
+            return False
+        subscription_store.delete_subscription(sub_id)
+        return True
+
+    if not await run_db(_job):
         raise HTTPException(404, "Subscription not found")
-    subscription_store.delete_subscription(sub_id)
     subscription_pool.schedule_rebind("user subscription delete")
     return {"deleted": True}

@@ -14,8 +14,9 @@ feature is enabled on the install.
   views; **Create Agent** and **Browse Community** *(admin/creator)* — a template's
   card shows the apps and checks it ships and, per installed agent, an **Update** when
   the catalog is newer *(admin, or a creator who manages that agent; also a banner on
-  that agent's Config tab)*; Departments tab *(admin/creator)*; **Shared with me**
-  (apps and chats others shared with you; it appears once there is one) *(any)*.
+  that agent's Config tab)*; Departments tab *(admin/creator)*. What others shared
+  with you is under **Shared with you** at the top of the notifications panel (the bell on
+  the chat page) *(any)*.
 - **Avatar menu** → User Settings *(any)* · Agent Settings *(any with access — tabs
   vary)* · Admin *(admin)* · Logout.
 
@@ -30,7 +31,8 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   ("Agents know which app I am looking at", "Agents may open apps on my screen", both on
   by default) · Memory ("Clear my memory across all agents").
 - **Integrations**: **Connected Accounts** (per-service OAuth sign-in / personal access
-  tokens with optional account labels; per-account Reconnect/Disconnect; **Subscribe to
+  tokens with optional account labels; per-account Reconnect/Disconnect; an account whose token can no longer be
+  refreshed shows **Reconnect needed** with the reason; **Subscribe to
   events** for vendors with event APIs, **Subscribe as** yourself or an agent this
   account serves as service account — managers of that agent only; Personal-only
   agents are not offered) · **API Keys** (personal webhook-trigger keys,
@@ -55,7 +57,8 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 ## Agent Settings (avatar menu → Agent Settings, or /agents/<name>)
 
 - **Overview** *(any with access)*: description, tool chips, recent activity; managers
-  also see visibility mode + assigned users with roles.
+  also see visibility mode + assigned users with roles (on a Shared only agent a viewer or
+  contributor kept from an older install is marked "no chat access").
 - **MCPs** *(manager)*: per-tool enable checkboxes; service-account binding per capable
   tool; beneath a binding, **Subscribe to events for this agent** and the agent's own
   event subscriptions (what agent-scope triggers and shared apps need); Browse
@@ -65,8 +68,9 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 - **Configuration** *(manager; some rows gated higher)*: name/description/color · AI
   Engines multi-select · **Execution Target** *(admin, remote machines)* · **Department
   + Level** *(admin/creator)* · Default Model (Auto = the engine's default by tier) /
-  Session Mode (headless vs interactive) / Effort · Visibility & workspace mode · Admin
-  Only + Default-for-new-users *(admin)* ·
+  Session Mode (headless vs interactive) / Effort · Visibility & workspace mode (switching
+  to Shared only lists the viewers and contributors who lose their assignment, to confirm)
+  · Admin Only + Default-for-new-users *(admin; editor or manager on a Shared only agent)* ·
   **Memory** card (scope toggles, clear agent memory) · **Delegation Targets**
   (hand-ticked targets; the department's show locked) ·
   **Shared Knowledge** (share/attach libraries — *mutations admin/creator*) · a
@@ -91,8 +95,13 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   accounts; admin)*.
 - **An app's menu**: Open full screen *(any who sees it)* · **Share** *(owner; editor+
   for a shared app)* · Roll back · View the working copy · Logs · **Settings** (the
-  app's secrets) · Unpin / Unpin for everyone · Delete app and its data *(all: owner;
-  editor+ for a shared app)* · Hide for me *(a shared app or one shared with you, any)*.
+  app's secrets) · Unpin / Unpin for everyone (Stop app on an app with a server) ·
+  Delete app and its data *(all: owner; editor+ for a shared app)* · Hide for me *(a
+  shared app, one shared with you, or one placed here by a share, any)* · Remove for me
+  *(in place of Hide for me on an app you accepted into this agent and no agent or
+  department share also places here: removes your share)* · Where it comes from and Remove from this agent *(an app
+  another agent's share placed here; the remove for an editor or manager of this agent,
+  an admin for a department's)*.
   Logs, View the working copy, Settings and Delete appear only on an app with a server,
   Roll back once there is an earlier release. Admins hold the same authority on every
   app.
@@ -104,23 +113,31 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 - **Overview**: platform-wide runs/schedules overview (the runs table; a run that
   finished with background work still running shows an "N left running" badge).
 - **Users**: add user (invite link / temp password), platform role (Admin / Creator /
-  Member), per-agent role assignments, **Platform Auth** toggle (borrow platform API
-  credentials), reset password, delete.
+  Member; lowering it signs the person out on every device), per-agent role assignments (a Shared only agent offers editor and manager
+  only), **Platform Auth** toggle (borrow platform API credentials), reset password,
+  delete (the person's folders move to an archive, listed under Setup → System Settings).
 - **Usage** ("Usage & Limits"): totals, daily chart, per-provider/model costs,
   per-user usage + limit overrides, agent-scoped usage, **Agent Budgets**, role default
   budgets (weekly/monthly).
 - **MCP Servers**: core/custom/community inventory; enable/config/instances/delete per
-  tool; **Check Updates**; **Install** (ZIP); **Browse Community**.
+  tool; **Check Updates**; **Install** (ZIP); **Browse Community**. **Check Updates**
+  results stay on the page; an MCP whose catalog source changed shows the old and new
+  source, the credential plan and **Switch** *(admin)*; an install ahead of the catalog
+  shows **Revert to catalog**. An MCP whose vendor server signs people in
+  itself shows this install's client registration at the vendor (client id,
+  callback, times) with **Forget**.
 - **Skills**: installed skill packages; Check Updates / Update / Delete; **Browse
-  Community Skills**; ZIP install.
+  Community Skills**; ZIP install (a package ahead of the catalog is left alone and shows
+  a revert).
 - **MCP Requests**: approval queue for tool + skill requests (kind badge); approve with
   instance picker; amber **Needs instance** state resolves itself once an instance
   covers the agent.
 - **Remote Machines**: platform machine pairing + cards (capabilities, CLI versions,
   capacity, max sessions, auto-update, filesystem/device grants); the list of
   user-paired machines, each removable by an admin (the owner is told).
-- **Shares**: every link made on the install (target, creator, password or none,
-  Buttons, opens, expiry), each revocable.
+- **Shares**: every share on the install, to people, agents and departments with its
+  standing, and every link (target, creator, password or none, Buttons, opens,
+  expiry); kind, agent and standing filters; each revocable, notifying nobody.
 - **Monitoring**: Scheduled Tasks · Triggers · Notifications · Task History · Meetings
   — cross-agent, cross-user audit views.
 - **Setup** — tabs in order:
@@ -135,13 +152,20 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
     PIN, call log) · call prompts · languages · turn classifier · infrastructure ·
     advanced tuning.
   - **Security**: require 2FA, passkey mode, password policy, SMTP, Turnstile bot
-    protection, OAuth bearer allowlist, **Sharing** (External links · Links without a
-    password · User directory when sharing · Longest link expiry).
+    protection, OAuth bearer allowlist, **Sharing** (Sharing to agents · Sharing to
+    departments · External links · Links without a password · User directory when
+    sharing · Longest share expiry).
   - **System Settings**: timezone · session/login timeouts · "Allow users to pair their
     own remote machines" · offline-fallback toggles · interactive-terminal kill switch
-    · concurrency/idle timeout · memory knobs · storage & retention · **Storage
-    Quotas** (per-agent shared + per-user folder caps) · chat title generation ·
-    **Automatic MCP Updates** (weekly, includes skill packages).
+    · concurrency/idle timeout · memory knobs · storage & retention · **Archive of
+    removed people** (a deleted person's folders: kept 180 days by default, 0 keeps them
+    for ever, its own on/off; the list with each archive's size and date, and **Delete
+    now**) · **Storage Quotas** (per-agent shared + per-user folder caps) · chat title
+    generation (Auto: the first configured Direct LLM provider, Groq, then OpenAI,
+    then Anthropic, whose title model is Sonnet 5.5, then a local Ollama model; a
+    pinned model keeps titling while its provider is configured) ·
+    **Automatic MCP Updates** (weekly, includes skill packages; never applies a catalog
+    source change, which waits for an admin's Switch, and never moves an install back).
 
 ## Quick answers to frequent "where/who" questions
 
@@ -159,6 +183,7 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 | Pair a team server | Admin → Remote Machines *(admin)* |
 | Set spending limits | Admin → Usage *(admin)* |
 | Set disk quotas | Setup → System Settings → Storage Quotas *(admin)* |
+| Delete a removed person's archived files, or change how long they are kept | Setup → System Settings → Archive of removed people *(admin)* |
 | Configure voice | Setup → Audio *(admin)*; per-user prefs in User Settings → Audio |
 | Set up phone numbers | Setup → Phone *(admin)* |
 | Turn on the wake word | User Settings → General → Wake word *(any)* |
@@ -166,11 +191,16 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 | Let an agent react to GitHub/Slack/… events | Agent Settings → MCPs → the MCP → Subscribe to events for this agent *(manager)*, or Connected Accounts → Subscribe to events → Subscribe as: the agent |
 | Approve an agent's tool/skill request | Admin → MCP Requests *(admin)* |
 | Approve an app | its approval card, on the app *(its owner; editor+ for a shared app, a manager when its scripts receive the agent's accounts; admin)* |
-| Share an app or a chat, make a link | the app's ⋯ menu → Share, or the chat's row → Share *(owner; editor+ for a shared app or a Shared only agent's chat)* |
-| See or revoke every link, switch links off | Admin → Shares; Setup → Security → Sharing *(admin)* |
+| Share an app or a chat, make a link | the app's ⋯ menu → Share, or the chat's row → Share *(owner; editor+ for a shared app or a Shared only agent's chat; with an agent: editor+ on it too; with a department: admin)* |
+| See or revoke every share or link, switch links off | Admin → Shares; Setup → Security → Sharing *(admin)* |
+| Switch sharing to agents or departments off | Setup → Security → Sharing *(admin; new shares refused, existing ones stand)* |
 | Set an app's secret | the app's ⋯ menu → Settings *(owner; editor+ for a shared app)* |
 | Roll back an app | the app's ⋯ menu → Roll back *(owner; editor+ for a shared app)*, or ask the agent |
 | Create a check or make one mandatory | Agent Settings → Checks *(manager)*; to attach one to a chat, ask the agent *(any)* |
 | Change how a department delegates | Agents page → Departments → the department's mode and reach *(admin, or the creator who made it)* |
 | Remove someone's machine | Admin → Remote Machines *(admin)* |
 | Pick the dictation language | hold the chat's microphone button, or User Settings → Audio *(any)* |
+| Find a message sent while the agent was busy | the faded "queued" bubbles at the end of the conversation *(any; the x takes it back, Edit returns it to the composer)* |
+| Retry a turn that stopped with a card | **Send again** on the card *(the chat's author; once no turn runs)* |
+| Sign in to a hosted MCP server that signs people in itself | User Settings → Integrations → Connected Accounts *(any)*; the install's registration at the vendor is under Admin → MCP Servers → Forget *(admin)* |
+| Switch a machine's automatic updates off | Admin → Remote Machines → the machine card *(admin)* |

@@ -182,7 +182,7 @@ async def test_a_changed_source_identity_is_refused_before_any_file_moves(
     with pytest.raises(HTTPException) as ei:
         await _install_packaged(tmp_path, _packaged(second, runtime=runtime), "b")
     assert ei.value.status_code == 409
-    assert "Update refused" in ei.value.detail and "Uninstall it" in ei.value.detail
+    assert "Update refused" in ei.value.detail and "switch it" in ei.value.detail
     assert (target / "README.md").read_text() == "Pkg a.\n"
     assert sorted(p.relative_to(target) for p in target.rglob("*")) == before
     assert not target.with_suffix(".bak").exists()

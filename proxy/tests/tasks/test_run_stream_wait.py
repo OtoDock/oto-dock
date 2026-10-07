@@ -14,6 +14,8 @@ import json
 
 import httpx
 import pytest
+
+from auth.providers import UserContext
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -46,10 +48,22 @@ def stream_client(temp_db, monkeypatch):
     monkeypatch.setattr(tasks_api.scheduler, "unsubscribe_run",
                         lambda run_id, q: None)
     monkeypatch.setattr(config, "is_master_key", lambda k: k == "test-key")
+    admin = UserContext(sub="local:admin", email="a@x", name="a", role="admin", agents=[])
+    caller = {"user": admin}
+
+    async def _principal(request):
+        return caller["user"]
+
+    monkeypatch.setattr(tasks_api, "get_current_user", _principal)
 
     app = FastAPI()
     app.include_router(tasks_api.router)
-    return TestClient(app)
+    # The tasks router requires a principal (auth.providers.require_user).
+    from auth.providers import get_current_user as _gcu
+    app.dependency_overrides[_gcu] = lambda: caller["user"]
+    client = TestClient(app)
+    client.caller = caller
+    return client
 
 
 def _frames(resp_text: str) -> list[dict]:
@@ -63,7 +77,7 @@ def _frames(resp_text: str) -> list[dict]:
 class TestStreamStatusFrame:
     def test_pending_run_emits_status_frame_before_events(self, stream_client):
         task_store.create_run("run-s1", "task-x", "pa", "manual", None, "p")
-        r = stream_client.get("/v1/tasks/runs/run-s1/stream?key=test-key")
+        r = stream_client.get("/v1/tasks/runs/run-s1/stream")
         assert r.status_code == 200
         frames = _frames(r.text)
         assert frames[0] == {"type": "status", "status": "pending"}
@@ -72,9 +86,18 @@ class TestStreamStatusFrame:
     def test_terminal_run_has_no_status_frame(self, stream_client):
         task_store.create_run("run-s2", "task-x", "pa", "manual", None, "p")
         task_store.update_run("run-s2", status="completed", output_text="hi")
-        r = stream_client.get("/v1/tasks/runs/run-s2/stream?key=test-key")
+        r = stream_client.get("/v1/tasks/runs/run-s2/stream")
         frames = _frames(r.text)
         assert [f["type"] for f in frames] == ["text", "done"]
+
+
+class TestStreamAuth:
+    def test_a_key_in_the_query_string_is_not_read(self, stream_client):
+        """F57/F70: the master key never authenticates through ``?key=``."""
+        task_store.create_run("run-s3", "task-x", "pa", "manual", None, "p")
+        stream_client.caller["user"] = None
+        r = stream_client.get("/v1/tasks/runs/run-s3/stream?key=test-key")
+        assert r.status_code == 401
 
 
 class TestQueuedRunVisibility:

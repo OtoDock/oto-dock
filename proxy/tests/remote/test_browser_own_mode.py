@@ -264,3 +264,68 @@ def test_machine_rows_expose_flag_not_ciphertext(monkeypatch):
     m = _machine(browser_extension_token_set=True)
     rm._shape_browser_fields(m)
     assert m["browser_mode"] == "own" and m["browser_extension_token_set"] is True
+
+
+# ---------------------------------------------------------------------------
+# F47: unattended sessions and the saved token
+# ---------------------------------------------------------------------------
+
+def test_the_unattended_permission_is_stored_and_reported(machine):
+    remote_store.set_browser_mode(machine["id"], "own")
+    remote_store.set_browser_extension_token(machine["id"], "T" * 43)
+    target = _p(placement.KIND_ADMIN_REMOTE, machine["id"])
+    assert remote_store.get_target_browser_settings(target).unattended is False
+    remote_store.set_browser_unattended(machine["id"], True)
+    s = remote_store.get_target_browser_settings(target)
+    assert (s.extension_token, s.unattended) == ("T" * 43, True)
+    # Clearing the token clears the permission: a new token starts attended-only.
+    remote_store.set_browser_extension_token(machine["id"], None)
+    remote_store.set_browser_extension_token(machine["id"], "U" * 43)
+    assert remote_store.get_target_browser_settings(target).unattended is False
+    # Revoking browser control clears it with the rest of the consent.
+    remote_store.set_browser_unattended(machine["id"], True)
+    remote_store.set_device_grants(machine["id"], [])
+    row = remote_store.get_remote_machine(machine["id"])
+    assert row["browser_unattended"] is False
+
+
+def test_the_upgrade_keeps_unattended_use_where_a_token_is_saved(machine):
+    """The forward migration adds the column once and sets it where a token
+    is stored; a database that already has it is left alone."""
+    from storage import schema
+    from storage.pg import get_conn
+    remote_store.set_browser_mode(machine["id"], "own")
+    remote_store.set_browser_extension_token(machine["id"], "T" * 43)
+    other = remote_store.create_remote_machine(
+        machine_id=str(uuid.uuid4()), name=f"no-token-{uuid.uuid4().hex[:6]}",
+        registered_by="user-sub-admin")
+    with get_conn() as conn:
+        conn.execute("ALTER TABLE remote_machines DROP COLUMN browser_unattended")
+        schema.run_migrations(conn)
+        conn.commit()
+    rows = {r["id"]: r["browser_unattended"] for r in (
+        remote_store.get_remote_machine(machine["id"]), remote_store.get_remote_machine(other["id"]))}
+    assert rows == {machine["id"]: True, other["id"]: False}
+    # Run again on a database that has the column: an owner's later choice stays.
+    remote_store.set_browser_unattended(machine["id"], False)
+    with get_conn() as conn:
+        schema.run_migrations(conn)
+        conn.commit()
+    assert remote_store.get_remote_machine(machine["id"])["browser_unattended"] is False
+
+
+def test_the_unattended_routes(monkeypatch):
+    client, writes = _make_app(monkeypatch, role="admin", sub="user-sub-admin", machine=_machine())
+    monkeypatch.setattr(remote_store, "set_browser_unattended",
+                        lambda mid, on: writes.append(("unattended", mid, on)))
+    r = client.put(f"{ADMIN}/browser-unattended", json={"enabled": True})
+    assert r.status_code == 200 and r.json() == {"ok": True, "browser_unattended": True}
+    owner, owner_writes = _make_app(monkeypatch, role="creator", sub="user-sub-owner",
+                                    machine=_machine(pairing_scope="user", registered_by="user-sub-owner",
+                                                     browser_mode="dedicated"))
+    monkeypatch.setattr(remote_store, "set_browser_unattended",
+                        lambda mid, on: owner_writes.append(("unattended", mid, on)))
+    assert owner.put(f"{MINE}/browser-unattended", json={"enabled": True}).status_code == 422
+    assert owner.put(f"{MINE}/browser-unattended", json={"enabled": False}).status_code == 200
+    assert writes == [("unattended", "machine-1", True)]
+    assert owner_writes == [("unattended", "machine-1", False)]

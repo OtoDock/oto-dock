@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from core import placement
 from api.apps import manifest as _mf
+from auth import roles
 from api.media.ui import (
     _placeholder,
     _ui_response,
@@ -466,8 +467,50 @@ def app_access(row: dict, user: UserContext) -> bool:
 
 
 def _granted(row: dict, user: UserContext) -> bool:
+    """A live share admits the viewer: their own person share, or an agent
+    or department placement on an agent they hold (SHARING.md)."""
     from storage.sharing import share_store
-    return share_store.internal_grant("app", row.get("id") or "", user.sub) is not None
+    app_id = row.get("id") or ""
+    if share_store.internal_grant("app", app_id, user.sub) is not None:
+        return True
+    return bool(share_store.placements_for_user(app_id, user.sub, list(user.agents)))
+
+
+def _viewer_share(row: dict, user: UserContext) -> tuple[dict | None, dict | None]:
+    """How a share reaches this viewer, for the page's words: their person
+    share (``granted``), and the placement with the agent it sits in for
+    them: in the agent they placed their own share in, the row the Apps
+    panel shows there (an agent share, then a department share, then their
+    own: ``share_store._merged``), so the page offers that row's menu;
+    otherwise the strongest agent or department placement on an agent they
+    hold. None, None for an owner, a member or an admin."""
+    from storage.sharing import share_store
+    if user.is_admin:
+        return None, None
+    if row.get("username"):
+        if (row.get("owner_sub") or "") == user.sub:
+            return None, None
+    elif user.can_access_agent(row.get("agent") or ""):
+        return None, None
+    app_id = row.get("id") or ""
+    grant = share_store.internal_grant("app", app_id, user.sub)
+    placed = share_store.placements_for_user(app_id, user.sub, list(user.agents))
+    own = (grant.get("placed_agent") or "") if grant else ""
+    if own and not user.can_access_agent(own):
+        own = ""
+    team = sorted((p for p in placed if p["agent"] == own),
+                  key=lambda p: p["kind"] != share_store.AGENT) if own else []
+    placement = None
+    if own and not team:
+        placement = {"kind": grant["grantee_kind"], "share_id": grant["id"],
+                     "agent": own, "from_agent": row.get("agent") or "",
+                     "role_cap": grant["role_cap"], "shared_by": grant.get("created_by") or ""}
+    elif team or placed:
+        p = team[0] if team else placed[0]
+        placement = {"kind": p["kind"], "share_id": p["share_id"],
+                     "agent": p["agent"], "from_agent": row.get("agent") or "",
+                     "role_cap": p["role_cap"], "shared_by": p.get("shared_by") or ""}
+    return grant, placement
 
 
 def _scope_access(row: dict, user: UserContext) -> bool:
@@ -526,10 +569,12 @@ def _app_document(row: dict, user: UserContext, preview: bool) -> tuple[str, str
     """``(kind, content)`` for the serve route: the release copy (verified
     against its hash) unless the row has none, or the owner or an editor
     asked for a preview of the working file; ``missing`` when the working
-    file is gone, ``unreadable`` when it is not a regular file inside the
-    agent's tree (a link is never followed), ``damaged`` when the release no
-    longer matches. Sync."""
+    file is gone, ``too_large`` when it is over ``FILE_APP_MAX_BYTES``,
+    ``unreadable`` when it is not a regular file inside the agent's tree (a
+    link is never followed), ``damaged`` when the release no longer
+    matches. Sync."""
     from services.apps import releases
+    from services.infra import safe_fs
     if row.get("release_path") and not (preview and _can_approve_surface(row, user)):
         try:
             data = releases.read_release(row)
@@ -542,6 +587,8 @@ def _app_document(row: dict, user: UserContext, preview: bool) -> tuple[str, str
         return "ok", releases.read_working_file(row).decode("utf-8", "replace")
     except FileNotFoundError:
         return "missing", name
+    except safe_fs.FileTooLarge:
+        return "too_large", name
     except OSError:
         return "unreadable", name
 
@@ -581,6 +628,15 @@ async def serve_app(
             _placeholder(f"The app file <code>{name}</code> was deleted from the workspace."),
             origin, 404,
         )
+    if kind == "too_large":
+        from services.apps import releases
+        name = html_escape.escape(content)
+        return _ui_response(
+            _placeholder(f"The app file <code>{name}</code> is larger than "
+                         f"{releases.FILE_APP_MAX_BYTES // (1024 * 1024)} MB, the most a "
+                         "single-file app can be."),
+            origin, 404,
+        )
     if kind == "unreadable":
         name = html_escape.escape(content)
         return _ui_response(
@@ -615,10 +671,8 @@ async def cut_and_point(row: dict, source) -> dict:
     async with _deploy_lock(row["id"]):
         try:
             rel, sha = await asyncio.to_thread(releases.cut_release, row, source)
-        except releases.ReleaseInvalid:
-            raise HTTPException(status_code=400, detail=(
-                f"apps/{row.get('slug')}.html is not a regular file in the workspace: "
-                "pin it again with html"))
+        except releases.ReleaseInvalid as e:
+            raise HTTPException(status_code=400, detail=f"{e.reason}: pin it again with html")
         fresh = await asyncio.to_thread(task_store.set_app_release, row["id"], rel, sha)
     return fresh or row
 
@@ -792,7 +846,11 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             if has_mcp_tool and not _mf.sub_can_approve_surface(
                     row.get("approved_by") or "", row):
                 stale = True
-        can_approve = _can_approve_surface(row, u)
+        # A placed row (SHARING.md) is never managed here (its management is
+        # the home agent's); its viewer_role is the role every floor judges,
+        # the strongest share admitting the viewer, whichever panel lists it.
+        placed = row.get("placement")
+        can_approve = _can_approve_surface(row, u) and not placed
         steps = _mf.parse_steps(row)
         # A shared app whose steps receive the agent's service accounts is
         # approved by a manager only (APPS.md "Steps": the token leaves the
@@ -817,6 +875,9 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "id": row["id"],
             "slug": row["slug"],
             "title": row["title"],
+            # The row's own agent: a placed row's frame and cards subscribe
+            # to it, never to the panel's host.
+            "agent": agent,
             "scope": db_apps.app_scope(row.get("username")),
             "pin_scope": ("chat" if row.get("scope_chat_id")
                           else "project" if row.get("scope_project_id")
@@ -829,7 +890,7 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "actions_approved": approved and not stale,
             "approval_stale": stale,
             "can_approve": can_approve,
-            "can_manage": _can_manage(row, u),
+            "can_manage": _can_manage(row, u) and not placed,
             # The role this viewer's action floors are judged against
             # (``min_role``); the host page hides nothing but can say why.
             "viewer_role": _mf.caller_role(row, u),
@@ -837,7 +898,7 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             # (rows still return — the client's hidden affordance restores).
             "hidden_for_me": bool(row.get("hidden_for_me")),
             # Another user's personal app the viewer holds a share on
-            # (SHARING.md): listed under "Shared with me", never managed.
+            # (SHARING.md): a row of their "Shared with you", never managed.
             "granted": bool(row.get("granted")),
             # The release served (0 = the working file) and whether the
             # menu may offer Roll back.
@@ -869,8 +930,50 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             # APPS.md "External links": what a link may do, with defaults.
             "external": _mf.parse_external(row),
             **_runtime_fields(row, u),
+            **(_placement_fields(placed, u) if placed else {}),
         })
     return out
+
+
+def _placement_fields(info: dict, u: UserContext) -> dict:
+    """What a placed row adds (SHARING.md): where it comes from, who shared
+    it, the cap, and whether this viewer may remove it from this agent (an
+    editor or manager of the receiving agent for an agent share, an admin
+    for a department share, which ends it for the whole department; nobody
+    for a person's own placement: they remove it for themselves, which
+    revokes their share). The source team's pending release is theirs alone. The names
+    ride the list read; a single-row read looks them up."""
+    from storage.agents import agent_store
+    from storage.sharing import share_store
+    kind = info.get("kind") or ""
+    host = info.get("agent") or ""
+    source = {} if "from_agent_name" in info else (
+        agent_store.get_agent(info.get("from_agent") or "") or {})
+    sharer = {} if "shared_by_name" in info else (
+        task_store.get_user(info.get("shared_by") or "") or {})
+    if kind == share_store.AGENT:
+        can_remove = u.can_edit_agent(host)
+    elif kind == share_store.DEPARTMENT:
+        can_remove = u.is_admin
+    else:
+        can_remove = False
+    return {
+        "placement": {
+            "kind": kind,
+            "share_id": info.get("share_id") or "",
+            "from_agent": info.get("from_agent") or "",
+            "from_agent_name": (info.get("from_agent_name") or source.get("display_name")
+                                or info.get("from_agent") or ""),
+            "agent": host,
+            "role_cap": info.get("role_cap") or roles.VIEWER,
+            "shared_by": info.get("shared_by") or "",
+            "shared_by_name": (info.get("shared_by_name") or sharer.get("display_name")
+                               or sharer.get("name") or ""),
+            "can_remove": can_remove,
+        },
+        "deploy_state": db_apps.DEPLOY_IDLE,
+        "pending_release": 0,
+    }
 
 
 def _secret_fields(row: dict) -> list[dict]:
@@ -1006,7 +1109,8 @@ async def list_apps(
                 template_app_seeder.heal_missing(agent, u.sub, username)
             except Exception:
                 logger.exception("template app heal failed for %s", agent)
-        return shape_app_rows(task_store.list_apps(agent, username, viewer_sub=u.sub), u)
+        return shape_app_rows(task_store.list_apps(
+            agent, username, viewer_sub=u.sub, with_placements=not u.is_api_key), u)
 
     return {"apps": await asyncio.to_thread(_load)}
 
@@ -1018,7 +1122,9 @@ async def read_app(
 ):
     """One app in the list shape (the full-screen page's header and
     manifest), plus its agent and, for a chat-scoped pin, the chat it
-    belongs to. Denied is the same 404 as missing, like the serve route."""
+    belongs to; for a viewer a share admits, how (``granted`` for their own
+    share, ``placement`` with the agent it sits in for them). Denied is the
+    same 404 as missing, like the serve route."""
     u = require_auth(user)
 
     def _load() -> dict | None:
@@ -1028,6 +1134,15 @@ async def read_app(
         shaped = shape_app_rows([row], u)[0]
         shaped["agent"] = row.get("agent") or ""
         shaped["chat_id"] = row.get("scope_chat_id") or ""
+        if not u.is_api_key:
+            grant, placement = _viewer_share(row, u)
+            if grant:
+                shaped["granted"] = True
+                shaped["share_id"] = grant["id"]
+            if placement:
+                shaped.update(_placement_fields(placement, u))
+                shaped["can_manage"] = False
+                shaped["can_approve"] = False
         return shaped
 
     out = await asyncio.to_thread(_load)
@@ -1191,7 +1306,8 @@ async def call_catalog_method(
     row = await asyncio.to_thread(_visible_row, app_id, u)
     if not row:
         raise HTTPException(status_code=404, detail="App not found")
-    entry = _catalog_entry(row, u, method=method)
+    role = await asyncio.to_thread(_mf.caller_role, row, u)
+    entry = _catalog_entry(row, u, method=method, role=role)
     args = req.args if req else None
     if entry.get("args_schema"):
         validated, err = _mf.validate_args(entry["args_schema"], args)
@@ -1202,7 +1318,8 @@ async def call_catalog_method(
 
     def _run() -> dict:
         try:
-            return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "", row, u, args)}
+            return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "", row, u, args,
+                                                              role=role)}
         except ValueError as e:
             return {"ok": False, "reason": str(e)}
         except PermissionError as e:

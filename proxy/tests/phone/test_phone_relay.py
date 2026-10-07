@@ -17,7 +17,7 @@ from fastapi import HTTPException
 
 import config
 from api.phone import phone_relay
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 
 
 class _FakeResponse:
@@ -83,7 +83,7 @@ def test_relay_requires_phone_mcp_assignment(monkeypatch, temp_db):
     from storage import database as task_store
     task_store.upsert_user("user-1", "user-1@test.com", "User 1", "member")
     _assigned(monkeypatch, ["notifications-mcp"])
-    token = create_session_token("sid-1", "some-agent", "user-1")
+    token = live_session_token("sid-1", "some-agent", "user-1")
     with pytest.raises(HTTPException) as e:
         asyncio.run(phone_relay._require_phone_agent(f"Bearer {token}"))
     assert e.value.status_code == 403
@@ -196,7 +196,7 @@ def relay_app(monkeypatch, fake_daemon, temp_db):
 
 
 def _post(client, sub, body=None, sid="sid-1"):
-    token = create_session_token(sid, AGENT, sub)
+    token = live_session_token(sid, AGENT, sub)
     return client.post(
         "/v1/phone/calls",
         json=body or {"phone_number": "+302101234567", "task_description": "book a table"},
@@ -317,12 +317,12 @@ def test_the_live_context_is_the_acting_role(relay_app, fake_daemon):
 
 def test_external_and_stale_tokens_are_refused(relay_app, fake_daemon):
     sub = _user("ed5", "editor")
-    ext = create_session_token("sid-e", AGENT, sub, external="phone:x")
+    ext = live_session_token("sid-e", AGENT, sub, external="phone:x")
     r = relay_app.post("/v1/phone/calls",
                        json={"phone_number": "+30210", "task_description": "t"},
                        headers={"Authorization": f"Bearer {ext}"})
     assert r.status_code == 403
-    ghost = create_session_token("sid-g", AGENT, "nobody-here")
+    ghost = live_session_token("sid-g", AGENT, "nobody-here")
     r = relay_app.post("/v1/phone/calls",
                        json={"phone_number": "+30210", "task_description": "t"},
                        headers={"Authorization": f"Bearer {ghost}"})
@@ -406,12 +406,12 @@ def test_call_ids_are_bound_to_the_placing_principal(relay_app, fake_daemon):
     assert _post(relay_app, owner, sid="sid-a1").status_code == 202  # the daemon says c-1
 
     def _get(sub, sid, suffix=""):
-        tok = create_session_token(sid, AGENT, sub)
+        tok = live_session_token(sid, AGENT, sub)
         return relay_app.get(f"/v1/phone/calls/c-1{suffix}",
                              headers={"Authorization": f"Bearer {tok}"})
 
     def _answer(sub, sid):
-        tok = create_session_token(sid, AGENT, sub)
+        tok = live_session_token(sid, AGENT, sub)
         return relay_app.post("/v1/phone/calls/c-1/answer", json={"answer": "yes"},
                               headers={"Authorization": f"Bearer {tok}"})
 
@@ -423,7 +423,7 @@ def test_call_ids_are_bound_to_the_placing_principal(relay_app, fake_daemon):
     assert _get(owner, "sid-a2", "/wait?timeout=1").status_code == 202
     assert _answer(owner, "sid-a2").status_code == 202
     # An unknown call id, and an agent-scope session against a person's call.
-    tok = create_session_token("sid-a2", AGENT, owner)
+    tok = live_session_token("sid-a2", AGENT, owner)
     assert relay_app.get("/v1/phone/calls/c-nope",
                          headers={"Authorization": f"Bearer {tok}"}).status_code == 404
     _with_live_context("sid-task", "manager")
@@ -440,13 +440,13 @@ def test_agent_scope_calls_belong_to_the_agent(relay_app, fake_daemon):
     _with_live_context("sid-t2", "manager")
     try:
         assert _post(relay_app, "", sid="sid-t1").status_code == 202
-        tok = create_session_token("sid-t2", AGENT, "")
+        tok = live_session_token("sid-t2", AGENT, "")
         assert relay_app.get("/v1/phone/calls/c-1",
                              headers={"Authorization": f"Bearer {tok}"}).status_code == 202
     finally:
         _drop_live_context("sid-t1")
         _drop_live_context("sid-t2")
     person = _user("p1", "editor")
-    tok = create_session_token("sid-p", AGENT, person)
+    tok = live_session_token("sid-p", AGENT, person)
     assert relay_app.get("/v1/phone/calls/c-1",
                          headers={"Authorization": f"Bearer {tok}"}).status_code == 404

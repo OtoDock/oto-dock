@@ -7,6 +7,7 @@ regular files).
 
 import base64
 import os
+import time
 from pathlib import Path
 
 
@@ -209,3 +210,25 @@ def test_hash_cache_stores_the_raw_digest_and_primes_tolerantly(tmp_path, monkey
     h = file_sync._hash_file_cached(f, st_old)
     assert h == file_sync._hash_file(f)
     assert file_sync._HASH_CACHE_MAX >= 200_000
+
+
+def test_a_forgotten_hash_is_read_again_from_the_file(tmp_path, monkeypatch):
+    """``forget_hash`` drops one path's entry: a same-size rewrite that kept
+    its mtime is hashed again by the next pass, the other entries stay."""
+    from core.remote import file_sync
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", type(file_sync._HASH_CACHE)())
+    f, other = tmp_path / "f.txt", tmp_path / "other.txt"
+    f.write_bytes(b"aaaa")
+    other.write_bytes(b"bbbb")
+    old = time.time() - 60
+    for p in (f, other):
+        os.utime(p, (old, old))
+        file_sync._hash_file_cached(p, os.stat(p))
+    st = os.stat(f)
+    f.write_bytes(b"cccc")
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert file_sync._hash_file_cached(f, os.stat(f)) != file_sync._hash_file(f)
+    file_sync.forget_hash(f)
+    file_sync.forget_hash(tmp_path / "never-cached.txt")
+    assert str(f) not in file_sync._HASH_CACHE and str(other) in file_sync._HASH_CACHE
+    assert file_sync._hash_file_cached(f, os.stat(f)) == file_sync._hash_file(f)

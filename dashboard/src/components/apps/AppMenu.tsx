@@ -2,14 +2,20 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import type { PinnedApp } from '../../api/apps'
+import { GRANTEE_KIND } from '../../api/shares'
 import { appKind } from '../../lib/kinds/app'
+import { unpinWords } from './appRow'
 import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '../ui/popoverPosition'
 
 /**
  * The app's three-dot menu — one component for the active chip, the solo
- * frame corner and the full-screen page: Open full screen, Share (arrives
- * with sharing), Hide for me (shared rows, any role), Unpin (the host's
- * two-step confirm; editor+ on shared rows, owner on personal ones).
+ * frame corner and the full-screen page: Open full screen, Share, Hide for
+ * me (shared rows, any role), Unpin (the host's two-step confirm; editor+
+ * on shared rows, owner on personal ones; "Stop app" for an app whose live
+ * release runs a server, `unpinWords`). A row placed here by a share
+ * adds Where it comes from and its removal: "Remove from this agent" for a
+ * team placement, "Remove for me" (the revoke of the viewer's own share)
+ * in place of Hide for me on a person's own placement.
  *
  * The panel is portaled to the body at fixed coordinates: the chip strip is
  * a horizontal scroller, and a scroller clips its overflow on BOTH axes.
@@ -36,13 +42,23 @@ interface Props {
   previewing?: boolean
   /** Folder apps: delete the app with its data (the host asks for the slug). */
   onDelete?: () => void
+  /** A placed row (SHARING.md): where it comes from (the host shows a
+      notice), and "Remove from this agent" for whoever may (an editor or
+      manager of the receiving agent for an agent share, an admin for a
+      department share). */
+  onWhereFrom?: () => void
+  onRemoveFromAgent?: () => void
+  /** A person's own placement: revoke their share (the host confirms
+      first); offered in place of Hide for me when the host passes it. */
+  onRemoveForMe?: () => void
   /** Chip placement: light glyph on the chip's own color. */
   onChip?: boolean
 }
 
 export default function AppMenu({
   app, fullScreen = false, onHideForMe, onUnpin, onShare, onRollback, onLogs, onSettings,
-  onTogglePreview, previewing = false, onDelete, onChip = false,
+  onTogglePreview, previewing = false, onDelete, onWhereFrom, onRemoveFromAgent, onRemoveForMe,
+  onChip = false,
 }: Props) {
   // What the app's kind can do (lib/kinds/app.ts) decides which rows show.
   const kind = appKind(app)
@@ -91,9 +107,12 @@ export default function AppMenu({
     }
   }, [open])
 
-  // Shared rows and rows shared WITH this viewer can be parked off their own
-  // list; a personal row of one's own has the real unpin instead.
-  const canHide = (app.scope === 'shared' || !!app.granted) && app.pin_scope !== 'chat' && app.pin_scope !== 'project' && !!onHideForMe
+  // A person's own placement is removed (its share revoked) rather than parked.
+  const removesForMe = app.placement?.kind === GRANTEE_KIND.PERSON && !!onRemoveForMe
+  // Shared rows, rows shared WITH this viewer and rows placed here by a
+  // share can be parked off their own list; a personal row of one's own has
+  // the real unpin instead.
+  const canHide = !removesForMe && (app.scope === 'shared' || !!app.granted || !!app.placement) && app.pin_scope !== 'chat' && app.pin_scope !== 'project' && !!onHideForMe
   const canUnpin = app.can_manage && !!onUnpin
   const item = 'block w-full px-3 py-1.5 text-left text-xs text-p-text transition-colors hover:bg-p-surface-hover disabled:cursor-not-allowed disabled:text-p-text-light disabled:hover:bg-transparent'
 
@@ -165,9 +184,26 @@ export default function AppMenu({
               Hide for me
             </button>
           )}
+          {onWhereFrom && app.placement && (
+            <button role="menuitem" className={item} onClick={() => { close(); onWhereFrom() }}>
+              Where it comes from
+            </button>
+          )}
+          {onRemoveFromAgent && app.placement?.can_remove && (
+            <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onRemoveFromAgent() }}
+              title="Everyone here loses it. The app stays with its own agent.">
+              Remove from this agent
+            </button>
+          )}
+          {removesForMe && (
+            <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onRemoveForMe?.() }}
+              title="Removes the share. The person who shared it can share it again.">
+              Remove for me
+            </button>
+          )}
           {canUnpin && (
             <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onUnpin?.() }}>
-              {app.scope === 'shared' ? 'Unpin for everyone' : 'Unpin'}
+              {unpinWords(app).action}
             </button>
           )}
           {onDelete && kind.deletable && app.can_manage && (

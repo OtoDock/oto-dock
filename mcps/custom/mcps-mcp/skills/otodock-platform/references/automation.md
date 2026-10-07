@@ -30,10 +30,24 @@ conversation.
   beside the task name; an app-handler task row carries no model (no LLM turn).
 - Tasks sharing a fire time have their session starts spaced a few seconds apart
   automatically; fire times stay exact. Runs that die on an engine/provider error are
-  reported **failed** with the provider message — never a silent empty success. A run
+  reported **failed** with the provider message — never a silent empty success. A turn
+  the model's safety classifier declines, or one that reaches the subscription's usage
+  limit, ends at once. The chat shows the reason (and the reset time for a limit), the
+  run is reported failed with it (the alert reads "Task stopped: declined" or "Task
+  stopped: usage limit"), and a delegating agent is told how to continue: on another
+  model (`delegate(continue_id=…, model=…)`), after the reset for a limit, or, when
+  Codex stopped after too many denied actions ("Task stopped: declined"), after a
+  permission-mode change. A run
   that completes while a background command is still running is marked **N left
   running** in the runs table (`Left running: N` in `get_task_history`); the session
-  stays warm for that work up to its ceiling, and its output is not part of the run.
+  stays warm for that work up to its ceiling, and its output is not part of the run. On
+  Claude, a headless chat's or task's background command stops after 30 minutes unless the
+  agent gave it a longer timeout (2 hours at most); a longer job is a task of its own.
+- **Transferred rows**: when a creator loses the editor role on the agent (or is
+  removed from it, or deleted), their agent-scope tasks, triggers and notifications keep
+  running under the admin who made the change and show "transferred from <person>" on
+  their rows (hover for the date). A transferred task runs without writing knowledge
+  until a manager of the agent (or an admin) adopts it by editing its prompt.
 - **Managing**: Agent Settings → Monitoring → Scheduled Tasks (run/pause/resume/delete,
   role-gated per row); run history in the sidebar's Task history view (rename/delete,
   role-gated); a finished run's chat can be continued — and, once over, switched to

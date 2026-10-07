@@ -42,8 +42,10 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 import config
+from adapters.phone import is_outbound
 from auth import roles
 from auth.session_token import validate_session_token
+from services.phone import daemon_url
 from storage.pg import run_db, run_db_fast
 
 logger = logging.getLogger("claude-proxy")
@@ -126,6 +128,9 @@ async def _require_phone_agent(authorization: str | None) -> _Caller:
     if payload.get("ext"):
         raise HTTPException(
             status_code=403, detail="External sessions cannot use the phone relay")
+    from core.session.session_state import session_token_refusal
+    if session_token_refusal(payload):
+        raise HTTPException(status_code=401, detail="Invalid API key")
     from auth.providers import session_token_holder_ok
     if not await run_db_fast(session_token_holder_ok, payload):
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -199,7 +204,7 @@ async def _pinned_route(caller: _Caller, named: str) -> str:
             status_code=403, detail="Calls run on the route pinned to this agent's instance")
     route = await run_db(phone_route_store.get_route, pinned)
     if (route is None or route.get("agent") != caller.agent
-            or route.get("direction") != "outbound" or not route.get("enabled")):
+            or not is_outbound(route.get("direction")) or not route.get("enabled")):
         raise HTTPException(
             status_code=403,
             detail="The pinned route is not an enabled outbound route of this agent")
@@ -291,6 +296,9 @@ def _audit(caller: _Caller, route_id: str, decision: str) -> None:
 async def _relay(method: str, path: str, *, params: dict | None = None,
                  json_body: dict | None = None, read_timeout: float = 30.0) -> Response:
     """Forward one request to the phone daemon and pass the response through."""
+    refused = await daemon_url.refusal()
+    if refused:
+        raise HTTPException(status_code=502, detail=f"Phone daemon not contacted: {refused}")
     url = f"{config.PHONE_SERVER_URL}{path}"
     try:
         async with httpx.AsyncClient(

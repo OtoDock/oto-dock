@@ -13,8 +13,6 @@ Every ``core.*`` import stays function-local so the standalone scheduler can
 import this package without the platform.
 """
 
-import functools
-import json
 import logging
 
 from storage import database as task_store
@@ -48,13 +46,12 @@ async def try_steer_continue(
     (``steered: True``) or None, in which case the caller queues a run
     exactly as before. Accept is exactly-once: an accepted steer never also
     creates a run."""
+    from core.events import input_queue
+    from core.events.common_events import TurnInput
     from core.events.stream_pump import _active_pumps
     from core.session import session_kind
     from core.session.session_delivery import chat_layer
-    from core.session.session_state import push_pump_event
-    from core.events import chat_writer
     from storage.pg import run_db
-    from ws import wire_events as wire
 
     from core.session import interactive_session
 
@@ -125,15 +122,13 @@ async def try_steer_continue(
         "agent_color": delegating.get("color", ""),
         "badge": "delegated by",
     }
-    await chat_writer.submit(
-        chat_id,
-        functools.partial(task_store.add_chat_message, chat_id, "user", prompt,
-                          event_data=json.dumps(meta)),
-        label="lane_steer_row",
-    )
-    push_pump_event(chat_id, {
-        "type": wire.STEERED, "text": prompt, "chat_id": chat_id, "event_data": meta,
-    })
+    # Recorded by the pump in stream order: the blocks the worker produced
+    # before it are saved first, so the row sorts where the engine read it.
+    qi = input_queue.QueuedInput(queue_id="", chat_id=chat_id, author_sub="",
+                                 item=TurnInput(prompt))
+    if not pump.record_steer(qi, extra_meta=meta, frame_extra={"event_data": meta}):
+        await input_queue.record_steer_late(chat_id, qi, extra_meta=meta,
+                                            frame_extra={"event_data": meta})
     logger.info(
         f"lane steer: follow-up steered into run={run['id']} chat={chat_id[:8]} "
         f"by {source_agent}"

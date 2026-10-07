@@ -271,6 +271,15 @@ class ConfigManager:
             }
         return eligible
 
+    def pbx_hosts(self) -> list[str]:
+        """Every configured PBX host, deduplicated in order: each server's
+        ``ami_host`` and the flat one. The AudioSocket accept path keeps a
+        reserve for the addresses these resolve to."""
+        hosts = [str(entry.get("ami_host") or "").strip()
+                 for entry in self._servers.values()]
+        hosts.append(self.ami_host.strip())
+        return list(dict.fromkeys(h for h in hosts if h))
+
     def get_outbound_route(self, route_id: str) -> PhoneRoute | None:
         """Get a specific outbound route by ID."""
         return self._routes_outbound.get(route_id)

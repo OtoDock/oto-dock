@@ -647,21 +647,27 @@ def _discover_apps(template_dir: Path, *, collaborative: bool = True,
 
 def _read_app_item(d: Path, label: str, visibility: str) -> AppItem:
     from services.apps import releases
+    # Every file of the folder is read without following a link
+    # (``template_sig.read_file``), the two documents and the hashed tree.
     try:
-        doc = json.loads((d / template_sig.MANIFEST_DOC).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+        doc = json.loads(template_sig.read_file(d, template_sig.MANIFEST_DOC).decode("utf-8"))
+    except OSError:
+        raise TemplateValidationError(f"{label}/app.json is not a regular file")
+    except ValueError as e:
         raise TemplateValidationError(f"{label}/app.json is not valid JSON: {e}")
     if not isinstance(doc, dict):
         raise TemplateValidationError(f"{label}/app.json must be an object")
     blueprint: dict = {}
-    bp_path = d / template_sig.BLUEPRINT_DOC
-    if bp_path.is_file():
-        try:
-            blueprint = json.loads(bp_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            raise TemplateValidationError(f"{label}/blueprint.json is not valid JSON: {e}")
-        if not isinstance(blueprint, dict):
-            raise TemplateValidationError(f"{label}/blueprint.json must be an object")
+    try:
+        blueprint = json.loads(template_sig.read_file(d, template_sig.BLUEPRINT_DOC).decode("utf-8"))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise TemplateValidationError(f"{label}/blueprint.json is not a regular file")
+    except ValueError as e:
+        raise TemplateValidationError(f"{label}/blueprint.json is not valid JSON: {e}")
+    if not isinstance(blueprint, dict):
+        raise TemplateValidationError(f"{label}/blueprint.json must be an object")
     if visibility == "user":
         _check_user_app_rules(doc, label)
     _check_blueprint_triggers(doc, blueprint, label, d.name)
@@ -674,7 +680,10 @@ def _read_app_item(d: Path, label: str, visibility: str) -> AppItem:
         raise TemplateValidationError(f"{label}: {e.reason}")
     if not any(rel == "client/index.html" for rel, _ in files):
         raise TemplateValidationError(f"{label}: client/index.html is missing — the page every viewer opens")
-    tree = template_sig.tree_sha(files)
+    try:
+        tree = template_sig.tree_sha(d, [rel for rel, _ in files])
+    except OSError:
+        raise TemplateValidationError(f"{label}: a file changed while it was read; it must be a regular file")
     roles = blueprint.get("roles")
     if roles is not None and not isinstance(roles, list):
         raise TemplateValidationError(f"{label}/blueprint.json: roles must be a list or null")

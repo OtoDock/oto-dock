@@ -1,13 +1,19 @@
 """Shares (SHARING.md): who may hand an app or a chat to someone else, and
-the surfaces a grantee uses.
+the surfaces a recipient uses.
 
 Every route that creates or changes a share is HUMAN-ONLY (``require_human``):
 a share is an exfiltration channel, so no session token or API key — the
 credentials a prompt can wield — ever reaches it. Authority follows the
 target: the owner of a personal app, editor or above on a shared app, and
 never a Dock pin (a chat- or project-scoped app is reachable only with its
-chat). Grantees are platform users; a grant is a union on top of the
-default visibility and changes nothing when memberships change.
+chat). A share names a person, an agent or a department and carries a role
+cap; a person's app share waits in their "Shared with you" section until
+they accept it into one of their agents (it opens meanwhile), an agent share
+lands in that agent's Apps panel (editor or above on the receiving agent
+shares to it; nobody below), a department share lands in every agent of the
+department. Placements follow the membership and
+department rows at read time; a person share itself changes nothing when
+memberships change.
 """
 
 import asyncio
@@ -20,9 +26,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 import config
+from api.apps import manifest as _mf
 from api.apps.apps import _can_manage, _visible_row
 from api.media.ui import request_origin
-from auth import confirm, rate_limiter
+from auth import confirm, rate_limiter, roles
 from auth.password import MAX_PASSWORD_BYTES, HashBusy, hash_password_async
 from auth.providers import (
     UserContext,
@@ -30,21 +37,27 @@ from auth.providers import (
     require_admin,
     require_auth,
     require_human,
+    require_user,
 )
 from services.apps import audience
+from services.sharing import share_inbox
 from storage import database as task_store
+from storage.agents import agent_store, db_departments
 from storage.sharing import share_store
 from core.session import session_kind
 from core.session.visibility import is_task_chat_owner
 
 logger = logging.getLogger("claude-proxy.shares")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 MAX_EXPIRY_DAYS_HARD = 3650
 SETTING_DIRECTORY = "user_directory_visible_to_members"
 SETTING_MAX_EXPIRY = "sharing_max_expiry_days"
 SETTING_EXTERNAL = "sharing_external_enabled"
 SETTING_PUBLIC = "sharing_public_links_enabled"
+SETTING_TO_AGENTS = share_store.SETTING_TO_AGENTS
+SETTING_TO_DEPARTMENTS = share_store.SETTING_TO_DEPARTMENTS
 EXTERNAL_DEFAULT_EXPIRY = "30d"
 # Link passwords: eight characters from an alphabet without look-alikes.
 _LINK_PW_CHARS = "abcdefghjkmnpqrstuvwxyz23456789"
@@ -54,9 +67,13 @@ class ShareCreateRequest(BaseModel):
     target_kind: str
     target_id: str
     scope: str = "internal"
-    # Internal: the grantee's sub (from the directory) or their exact
-    # username or email.
+    # Internal: who receives it. A person's sub (from the directory), exact
+    # username or email; an agent's slug; a department's id.
+    grantee_kind: str = share_store.PERSON
     grantee: str = ""
+    # The role the recipient acts with on the app (``roles.AGENT_ROLES``,
+    # viewer when empty); never above the sharer's own.
+    role_cap: str = ""
     # ISO instant, a number of days as "30d", or "never"; empty = no
     # expiry (external links default to 30 days, so a link that must not
     # expire says "never"). An admin cap refuses "never".
@@ -84,6 +101,17 @@ class SharePatchRequest(BaseModel):
     link_password: str | None = None
     password: str = ""
     confirm_token: str = ""
+
+
+class ShareAcceptRequest(BaseModel):
+    # A person's app share: the agent to place it in (one they hold).
+    agent: str = ""
+
+
+class SharePlacementRequest(BaseModel):
+    # An agent or department placement: the agent whose panel the viewer
+    # hides or restores it in. A person's own share needs no body.
+    agent: str = ""
 
 
 def _setting_on(key: str) -> bool:
@@ -212,11 +240,13 @@ def _snapshot_for(u: UserContext, share: dict, chat: dict, include_tools: bool) 
 
 
 def _check_chat_share_cap(u: UserContext) -> None:
+    """The cap on a person's live CHAT shares (the snapshots it bounds); app
+    shares of every kind are not counted."""
     from services.sharing import chat_snapshot
-    n = share_store.count_live_shares_by(u.sub)
+    n = share_store.count_live_shares_by(u.sub, target_kind="chat")
     if n >= chat_snapshot.MAX_CHAT_SHARES_PER_USER:
         raise HTTPException(status_code=400,
-                            detail=f"You already have {n} live shares — revoke one first")
+                            detail=f"You already have {n} live chat shares — revoke one first")
 
 
 def _resolve_grantee(identifier: str) -> dict | None:
@@ -234,7 +264,51 @@ def _resolve_grantee(identifier: str) -> dict | None:
     return None
 
 
-def _shape(row: dict) -> dict:
+def _resolve_cap(req_cap: str, row: dict, u: UserContext, target_kind: str) -> str:
+    """The role cap a share carries: viewer for a chat (a copy is
+    read-only); for an app, the word asked for (viewer when empty), never
+    above the sharer's own standing on the app (``caller_role``: admin, the
+    owner of a personal app as its manager, else their per-agent row)."""
+    cap = (req_cap or "").strip() or roles.VIEWER
+    if target_kind != "app":
+        return roles.VIEWER
+    if cap not in roles.AGENT_ROLES:
+        raise HTTPException(status_code=400, detail="role_cap must be one of "
+                            + ", ".join(roles.AGENT_ROLES))
+    own = _mf.caller_role(row, u)
+    if roles.rank(cap) > roles.rank(own):
+        raise HTTPException(status_code=400,
+                            detail=f"You cannot share above your own role ({roles.label(own)})")
+    return cap
+
+
+def _visible_agents(u: UserContext, directory: bool) -> list[dict]:
+    """The agents a share may name, as the popover lists them: every agent
+    while the directory is open to the viewer (admin-only agents only to an
+    admin), the viewer's own agents while it is closed."""
+    if not _setting_on(SETTING_TO_AGENTS):
+        return []
+    out = []
+    for a in agent_store.get_all_agents():
+        if a.get("admin_only") and not u.is_admin:
+            continue
+        if not directory and not u.can_access_agent(a["slug"]):
+            continue
+        out.append({"slug": a["slug"], "display_name": a.get("display_name") or a["slug"],
+                    "color": a.get("color") or ""})
+    return out
+
+
+def _visible_departments(u: UserContext) -> list[dict]:
+    if not u.is_admin or not _setting_on(SETTING_TO_DEPARTMENTS):
+        return []
+    return [{"id": d["id"], "name": d.get("name") or d["id"]}
+            for d in db_departments.list_departments()]
+
+
+def _shape(row: dict, viewer_sub: str | None = None) -> dict:
+    """A share for the API; ``placed_agent`` (the agent the recipient chose)
+    is the recipient's own and shows to them alone."""
     grantee = None
     if row.get("grantee_sub"):
         grantee = {
@@ -242,13 +316,29 @@ def _shape(row: dict) -> dict:
             "name": row.get("grantee_display_name") or row.get("grantee_name") or "",
             "username": row.get("grantee_username") or "",
         }
+    to_agent = None
+    if row.get("grantee_agent"):
+        to_agent = {"slug": row["grantee_agent"],
+                    "name": row.get("to_agent_name") or row["grantee_agent"]}
+    to_department = None
+    if row.get("grantee_department"):
+        to_department = {"id": row["grantee_department"],
+                         "name": row.get("to_department_name") or ""}
     return {
         "id": row["id"],
         "target_kind": row["target_kind"],
         "target_id": row.get("app_id") or row.get("chat_id") or "",
         "scope": row["scope"],
         "state": row.get("state") or "active",
+        "grantee_kind": row.get("grantee_kind") or "",
         "grantee": grantee,
+        "to_agent": to_agent,
+        "to_department": to_department,
+        "role_cap": row.get("role_cap") or roles.VIEWER,
+        "decision": row.get("decision") or "",
+        "decided_by": row.get("decided_by") or "",
+        "decided_by_name": row.get("decider_display_name") or row.get("decider_name") or "",
+        "placed_agent": (row.get("placed_agent") or "") if viewer_sub and row.get("grantee_sub") == viewer_sub else "",
         "hidden_by_grantee": bool(row.get("hidden_by_grantee")),
         "public": bool(row.get("public")),
         "allow_actions": bool(row.get("allow_actions")),
@@ -272,7 +362,7 @@ async def list_shares(
 
     def _load() -> list[dict]:
         _share_target(u, target_kind, target)
-        return [_shape(r) for r in share_store.list_target_shares(target_kind, target)]
+        return [_shape(r, u.sub) for r in share_store.list_target_shares(target_kind, target)]
 
     return {"shares": await asyncio.to_thread(_load)}
 
@@ -355,21 +445,33 @@ async def _create_external(req: ShareCreateRequest, u: UserContext, request: Req
     return out
 
 
+def _target_words(row: dict, target_kind: str) -> tuple[str, str]:
+    """The title and the agent of a share's target, for a notice."""
+    if target_kind == "app":
+        return (row.get("title") or row.get("slug") or ""), (row.get("agent") or "")
+    return (row.get("title") or "a chat"), (row.get("agent") or "")
+
+
 @router.post("/v1/shares")
 async def create_share(
     req: ShareCreateRequest,
     request: Request,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Grant a platform user access to an app (internal share), or make a
-    link (external). With the user directory closed to members, a known and
-    an unknown identifier get the same answer, so the route is no existence
-    oracle; the sharer sees the grant in their share list when it landed."""
+    """Share an app or a chat with a person, an app with an agent or a
+    department (internal), or make a link (external). With the user
+    directory closed to members, a known and an unknown identifier get the
+    same answer, so the route is no existence oracle; the sharer sees the
+    share in their share list when it landed."""
     u = require_human(user)
     if req.scope == "external":
         return await _create_external(req, u, request)
     if req.scope != "internal":
         raise HTTPException(status_code=400, detail="scope must be 'internal' or 'external'")
+    kind = (req.grantee_kind or share_store.PERSON).strip()
+    if kind not in share_store.GRANTEE_KINDS:
+        raise HTTPException(status_code=400, detail="grantee_kind must be one of "
+                            + ", ".join(share_store.GRANTEE_KINDS))
     allowed, retry_after = rate_limiter.hit("share_create", u.sub)
     if not allowed:
         raise HTTPException(status_code=429,
@@ -377,61 +479,134 @@ async def create_share(
 
     def _create() -> dict:
         row = _share_target(u, req.target_kind, req.target_id)
-        if req.target_kind == "chat":
+        is_app = req.target_kind == "app"
+        if not is_app:
             _check_chat_share_cap(u)
+        if kind != share_store.PERSON:
+            # A chat share is a read-only copy for a person (an agent has no
+            # section to read it from); a personal app runs on its owner's
+            # authority and goes dormant when the owner leaves its agent, so
+            # a team never depends on one (the operator, 2026-10-04).
+            if not is_app:
+                raise HTTPException(status_code=400, detail="A chat is shared with people only")
+            if row.get("username"):
+                raise HTTPException(status_code=400,
+                                    detail="A personal app is shared with people only. An "
+                                           "app meant for a team is the agent's shared app.")
+            if kind == share_store.AGENT and not _setting_on(SETTING_TO_AGENTS):
+                raise HTTPException(status_code=403,
+                                    detail="Sharing to agents is turned off by an admin")
+            if kind == share_store.DEPARTMENT:
+                if not u.is_admin:
+                    raise HTTPException(status_code=403,
+                                        detail="Only an admin shares with a department")
+                if not _setting_on(SETTING_TO_DEPARTMENTS):
+                    raise HTTPException(status_code=403,
+                                        detail="Sharing to departments is turned off by an admin")
+        cap = _resolve_cap(req.role_cap, row, u, req.target_kind)
         directory = _directory_open(u)
-        grantee = _resolve_grantee(req.grantee)
-        if grantee is None:
-            if directory:
-                raise HTTPException(status_code=404, detail="No such user")
-            return {"status": "ok"}
-        if grantee["sub"] == u.sub:
-            raise HTTPException(status_code=400, detail="You already have access")
-        if req.target_kind == "app" and (row.get("owner_sub") or "") == grantee["sub"]:
-            raise HTTPException(status_code=400, detail="That user owns this app")
+        title, agent = _target_words(row, req.target_kind)
+        fields: dict = {"grantee_kind": kind, "role_cap": cap}
+        notify: dict | None = None
+        if kind == share_store.PERSON:
+            grantee = _resolve_grantee(req.grantee)
+            if grantee is None:
+                if directory:
+                    raise HTTPException(status_code=404, detail="No such user")
+                return {"status": "ok"}
+            if grantee["sub"] == u.sub:
+                raise HTTPException(status_code=400, detail="You already have access")
+            if is_app and (row.get("owner_sub") or "") == grantee["sub"]:
+                raise HTTPException(status_code=400, detail="That user owns this app")
+            fields.update(grantee_sub=grantee["sub"],
+                          decision=share_store.PENDING if is_app else share_store.ACCEPTED,
+                          decided_by=None if is_app else u.sub)
+            # A person share also fires a notification (toast and push)
+            # beside its section item.
+            notify = {"subs": [grantee["sub"]], "what": "app" if is_app else "chat"}
+        elif kind == share_store.AGENT:
+            slug = (req.grantee or "").strip()
+            target = agent_store.get_agent(slug) if slug else None
+            if not target or (target.get("admin_only") and not u.is_admin):
+                if directory:
+                    raise HTTPException(status_code=404, detail="No such agent")
+                return {"status": "ok"}
+            if not directory and not u.can_access_agent(slug):
+                # With the directory closed an agent the sharer does not
+                # hold answers like an unknown one (no existence oracle):
+                # they could never share to it.
+                return {"status": "ok"}
+            if slug == (row.get("agent") or ""):
+                raise HTTPException(status_code=400, detail="That is the app's own agent")
+            if not u.can_edit_agent(slug):
+                raise HTTPException(status_code=403,
+                                    detail="Sharing with an agent needs the editor role or "
+                                           "above on it")
+            fields.update(grantee_agent=slug, decision=share_store.ACCEPTED, decided_by=u.sub)
+        else:
+            dept_id = (req.grantee or "").strip()
+            dept = db_departments.get_department(dept_id) if dept_id else None
+            if not dept:
+                raise HTTPException(status_code=404, detail="No such department")
+            fields.update(grantee_department=dept_id, decision=share_store.ACCEPTED,
+                          decided_by=u.sub)
         expires_at = _parse_expiry(req.expires_in, _max_expiry_days())
         try:
             share = share_store.create_internal_share(
-                target_kind=req.target_kind, target_id=req.target_id,
-                grantee_sub=grantee["sub"], created_by=u.sub, expires_at=expires_at,
+                target_kind=req.target_kind, target_id=req.target_id, created_by=u.sub,
+                expires_at=expires_at, **fields,
             )
         except share_store.ShareExists:
             if directory:
-                raise HTTPException(status_code=409, detail="Already shared with that user")
+                raise HTTPException(status_code=409, detail="Already shared with that "
+                                    + ("user" if kind == share_store.PERSON else kind))
             return {"status": "ok"}
-        if req.target_kind == "chat":
+        if not is_app:
             _snapshot_for(u, share, row, bool(req.include_tools))
         else:
             audience.forget(req.target_id)
-        out = {"status": "ok"} if not directory else {"status": "ok", "share": _shape(share)}
-        is_app = req.target_kind == "app"
-        out["_notify"] = {
-            "grantee_sub": grantee["sub"],
-            "title": (row.get("title") or row.get("slug") or "") if is_app else (row.get("title") or "a chat"),
-            "agent": row.get("agent") or "",
-            "href": f"/apps/{row['id']}" if is_app else f"/shared/{share['id']}",
-            "sharer": u.display_name or u.name or u.email,
-            "what": "app" if is_app else "chat",
-        }
+        # The INSERT answers the bare row: the names the dialog shows at
+        # once come from what the route already resolved.
+        if kind == share_store.PERSON:
+            share.update(grantee_display_name=grantee.get("display_name") or "",
+                         grantee_name=grantee.get("name") or "",
+                         grantee_username=grantee.get("username") or "")
+        elif kind == share_store.AGENT:
+            share["to_agent_name"] = target.get("display_name") or slug
+        else:
+            share["to_department_name"] = dept.get("name") or ""
+        shaped = _shape(share, u.sub)
+        shaped["landed"] = share["decision"] == share_store.ACCEPTED
+        out = {"status": "ok"} if not directory else {"status": "ok", "share": shaped}
+        if notify is not None:
+            notify.update(title=title, agent=agent, sharer=u.display_name or u.name or u.email,
+                          href=(f"/apps/{row['id']}" if is_app else f"/shared/{share['id']}"))
+        out["_notify"] = notify
+        out["_targets"] = share_inbox.targets_for(share)
         return out
 
     out = await asyncio.to_thread(_create)
     notify = out.pop("_notify", None)
+    targets = out.pop("_targets", None)
+    if targets:
+        await share_inbox.send(targets)
     if notify:
         from services.notifications import notification_manager
-        try:
-            await notification_manager.fire_notification(
-                title=f"{notify['sharer']} shared “{notify['title']}” with you",
-                body=("Open it from Shared with me, or from this notice."
-                      if notify.get("what") == "app" else
-                      "A read-only copy of the conversation as it stood when it was shared."),
-                severity="info", scope="user", target=notify["grantee_sub"],
-                source="share", agent_slug=notify["agent"] or None, href=notify["href"],
-            )
-        except Exception:
-            logger.exception("share notification failed")
-        logger.info(f"Share created: kind={req.target_kind}, target={req.target_id}, "
-                    f"by={u.sub[:16]}")
+        body = ("Accept it into one of your agents from Shared with you, or open it from "
+                "this notice." if notify["what"] == "app" else
+                "A read-only copy of the conversation as it stood when it was shared.")
+        for sub in notify["subs"]:
+            try:
+                await notification_manager.fire_notification(
+                    title=f"{notify['sharer']} shared “{notify['title']}” with you",
+                    body=body, severity="info", scope="user", target=sub,
+                    source="share", agent_slug=notify["agent"] or None, href=notify["href"],
+                )
+            except Exception:
+                logger.exception("share notification failed")
+    if out.get("share") or notify or targets:
+        logger.info(f"Share created: kind={req.target_kind}, to={kind}, "
+                    f"target={req.target_id}, by={u.sub[:16]}")
     return out
 
 
@@ -442,10 +617,13 @@ async def patch_share(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Revoke, resume, re-date a share, or flip a link's Buttons switch (on
-    needs the confirm) or password. A revoke: the creator, an admin, or
-    whoever may share the target today. Anything else: whoever may share
-    the target today, the creator included (a demoted creator cannot
-    re-date or resume a grant). A revoked share stays revoked."""
+    needs the confirm) or password. A revoke: the creator, an admin, an
+    editor or manager of the agent an agent share names ("Remove from this
+    agent"), the person an app share names while it is pending or accepted
+    ("Remove for me"), or whoever may share the target today. Anything
+    else: whoever may share the target today, the creator included (a
+    demoted creator cannot re-date or resume a grant). A revoked share
+    stays revoked."""
     u = require_human(user)
     new_password = ""
     if req.link_password is not None and not req.revoke:
@@ -460,29 +638,51 @@ async def patch_share(
     if req.allow_actions:
         await confirm.confirm_human(u, password=req.password, confirm_token=req.confirm_token)
 
-    def _authorized() -> tuple[dict, str]:
-        """The live share and its target id, once the caller may make this
-        change to it."""
+    def _receiving_editor(share: dict) -> bool:
+        return (share.get("grantee_kind") == share_store.AGENT
+                and u.can_edit_agent(share.get("grantee_agent") or ""))
+
+    def _own_app_grant(share: dict) -> bool:
+        # A chat share is left out: it needs no decision, the person hides
+        # it, and a revoke would close the creator's own view of the copy.
+        return (share.get("scope") == share_store.INTERNAL
+                and share.get("grantee_kind") == share_store.PERSON
+                and share.get("grantee_sub") == u.sub
+                and share.get("target_kind") == "app"
+                and share.get("decision") in (share_store.PENDING, share_store.ACCEPTED))
+
+    def _authorized() -> tuple[dict, str, bool]:
+        """The live share, its target id and whether the caller's only
+        right is their own (a person removing a share of theirs), once the
+        caller may make this change to it."""
         share = share_store.get_share(share_id)
         if not share or share.get("revoked_at"):
             raise HTTPException(status_code=404, detail="Share not found")
         target_id = share.get("app_id") or share.get("chat_id") or ""
         # An admin's revoke needs no view of the target: an unpinned app or
         # a deleted chat still leaves a link the admin list must close.
-        if not (req.revoke and (share.get("created_by") == u.sub or u.is_admin)):
+        team_right = (share.get("created_by") == u.sub or u.is_admin
+                      or _receiving_editor(share))
+        own_only = bool(req.revoke) and not team_right and _own_app_grant(share)
+        if not (req.revoke and team_right) and not own_only:
             _may_still_share(u, share["target_kind"], target_id)
         if new_password and (share.get("scope") != "external" or share.get("public")):
             raise HTTPException(status_code=400, detail="Only a password link has a password")
-        return share, target_id
+        return share, target_id, own_only
 
     new_password_hash = ""
     if new_password:
         await asyncio.to_thread(_authorized)
         new_password_hash = await _link_password_hash(new_password)
 
-    def _apply() -> dict:
-        share, target_id = _authorized()
-        if req.revoke:
+    def _apply() -> tuple[dict, dict]:
+        share, target_id, own_only = _authorized()
+        if req.revoke and own_only:
+            if not share_store.revoke_share(
+                    share_id, decisions=(share_store.PENDING, share_store.ACCEPTED)):
+                # Declined or revoked since the read above.
+                raise HTTPException(status_code=404, detail="Share not found")
+        elif req.revoke:
             share_store.revoke_share(share_id)
         elif req.resume:
             if share["target_kind"] == "app":
@@ -501,38 +701,202 @@ async def patch_share(
             share_store.set_password_hash(share_id, new_password_hash)
         audience.forget(target_id)
         fresh = share_store.get_share(share_id) or share
-        return _shape(fresh)
+        targets = share_inbox.targets_for(fresh) if fresh.get("scope") == "internal" else {}
+        return _shape(fresh, u.sub), targets
 
-    return await asyncio.to_thread(_apply)
+    shaped, targets = await asyncio.to_thread(_apply)
+    if targets:
+        await share_inbox.send(targets)
+    return shaped
 
 
-@router.get("/v1/shares/mine")
-async def list_my_shares(user: UserContext | None = Depends(get_current_user)):
-    """What was shared with the caller ("Shared with me"): live grants only,
-    each with the page that opens it. Needs no agent access."""
-    u = require_auth(user)
+# ───────────────────────── the "Shared with you" section ────────────────────
 
-    def _load() -> list[dict]:
-        out = []
-        for r in share_store.list_grants_for(u.sub):
-            target_id = r.get("app_id") or r.get("chat_id") or ""
-            out.append({
-                "id": r["id"],
-                "target_kind": r["target_kind"],
-                "target_id": target_id,
-                "title": r.get("target_title") or r.get("app_slug") or "",
-                "agent": r.get("agent") or "",
-                "shared_by": r.get("created_by") or "",
-                "shared_by_name": r.get("creator_name") or "",
-                "created_at": r.get("created_at") or "",
-                "expires_at": r.get("expires_at"),
-                "hidden": bool(r.get("hidden_by_grantee")),
-                "href": (f"/apps/{target_id}" if r["target_kind"] == "app"
-                         else f"/shared/{r['id']}"),
-            })
-        return out
 
-    return {"shares": await asyncio.to_thread(_load)}
+def _inbox_item(r: dict) -> dict:
+    """One row of the section, with the actions its kind offers: a pending
+    app share takes a decision (and opens meanwhile); a received app or a
+    chat opens and hides."""
+    is_app = r["target_kind"] == "app"
+    target_id = r.get("app_id") or r.get("chat_id") or ""
+    waiting = is_app and r.get("decision") == share_store.PENDING
+    actions = ["accept", "decline"] if waiting else ["open", "hide"]
+    return {
+        "id": r["id"],
+        "kind": r["target_kind"],
+        "target_id": target_id,
+        "title": r.get("target_title") or r.get("app_slug") or "",
+        "agent": r.get("agent") or "",
+        "agent_name": r.get("agent_display_name") or r.get("agent") or "",
+        "agent_color": r.get("agent_color") or "",
+        "shared_by": r.get("created_by") or "",
+        "shared_by_name": r.get("creator_display_name") or r.get("creator_name") or "",
+        "created_at": r.get("created_at") or "",
+        "expires_at": r.get("expires_at"),
+        "role_cap": r.get("role_cap") or roles.VIEWER,
+        "href": f"/apps/{target_id}" if is_app else f"/shared/{r['id']}",
+        "placed_agent": r.get("placed_now") or "",
+        "actions": actions,
+    }
+
+
+@router.get("/v1/shares/inbox")
+async def share_inbox_read(user: UserContext | None = Depends(get_current_user)):
+    """The viewer's "Shared with you" section (SHARING.md): their own live
+    shares, pending first, with each item's actions, and the count of
+    decisions waiting on them."""
+    u = require_human(user)
+
+    def _load() -> dict:
+        rows = share_store.inbox_for(u.sub)
+        pending = share_store.pending_count_for([u.sub]).get(u.sub, 0)
+        return {"items": [_inbox_item(r) for r in rows], "pending": pending}
+
+    return await asyncio.to_thread(_load)
+
+
+def _own_app_share(u: UserContext, share_id: str) -> dict:
+    """The viewer's own live app share, or the same 404 as a missing one
+    (a chat needs no decision; another person's share is not theirs to see)."""
+    share = share_store.get_share(share_id)
+    if (not share or not share_store.is_live(share) or share.get("scope") != "internal"
+            or share.get("grantee_kind") != share_store.PERSON
+            or share.get("grantee_sub") != u.sub):
+        raise HTTPException(status_code=404, detail="Share not found")
+    if share["target_kind"] != "app":
+        raise HTTPException(status_code=400, detail="A chat needs no decision")
+    return share
+
+
+@router.post("/v1/shares/{share_id}/accept")
+async def accept_share(
+    share_id: str,
+    req: ShareAcceptRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """A person accepts an app into one of their agents (the body names
+    it, one they hold; an accepted share may be moved to another). The
+    app's own agent is never a place: a member sees it there already."""
+    u = require_human(user)
+
+    def _apply() -> tuple[dict, dict]:
+        share = _own_app_share(u, share_id)
+        agent = (req.agent or "").strip()
+        if not agent:
+            raise HTTPException(status_code=400, detail="Choose an agent to place it in")
+        if not u.can_access_agent(agent) or not agent_store.get_agent(agent):
+            raise HTTPException(status_code=403, detail="You are not a member of that agent")
+        row = task_store.get_app(share["app_id"]) or {}
+        if agent == (row.get("agent") or ""):
+            raise HTTPException(status_code=400, detail="That is the app's own agent")
+        left = share.get("placed_agent") or ""
+        if not share_store.set_decision(share_id, share_store.ACCEPTED, u.sub,
+                                        placed_agent=agent):
+            # Declined or revoked since the read above.
+            raise HTTPException(status_code=404, detail="Share not found")
+        audience.forget(share["app_id"])
+        fresh = share_store.get_share(share_id) or share
+        targets = share_inbox.targets_for(fresh)
+        if left and left != agent:
+            # A move: the panel the app left changed too.
+            targets.setdefault(u.sub, set()).add(left)
+        return _shape(fresh, u.sub), targets
+
+    shaped, targets = await asyncio.to_thread(_apply)
+    await share_inbox.send(targets)
+    return {"status": "ok", "share": shaped}
+
+
+@router.post("/v1/shares/{share_id}/decline")
+async def decline_share(
+    share_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """A person declines an app share waiting on them. The row stays in
+    the sharer's list as declined (until they remove it, or 30 days); a new
+    share to the same person replaces it. One they accepted is removed
+    with the share's revoke ("Remove for me")."""
+    u = require_human(user)
+
+    def _apply() -> tuple[dict, dict]:
+        share = _own_app_share(u, share_id)
+        if share["decision"] != share_store.PENDING:
+            raise HTTPException(status_code=400, detail="Only a share waiting for a decision "
+                                                        "can be declined")
+        targets = share_inbox.targets_for(share)
+        if not share_store.set_decision(share_id, share_store.DECLINED, u.sub,
+                                        expect=share_store.PENDING):
+            # Revoked, declined or accepted since the read above.
+            raise HTTPException(status_code=404, detail="Share not found")
+        audience.forget(share["app_id"])
+        fresh = share_store.get_share(share_id) or share
+        return _shape(fresh, u.sub), targets
+
+    shaped, targets = await asyncio.to_thread(_apply)
+    await share_inbox.send(targets)
+    return {"status": "ok", "share": shaped}
+
+
+def _set_hidden(u: UserContext, share_id: str, agent: str, hidden: bool) -> tuple[str, dict]:
+    """A viewer's own hide of a share: their person share (an app or a
+    chat), or an agent or department placement in the agent the body names,
+    which they must hold. Returns the app id (empty for a chat) and the
+    frame targets."""
+    share = share_store.get_share(share_id)
+    if not share or share.get("revoked_at") or share.get("scope") != "internal":
+        raise HTTPException(status_code=404, detail="Share not found")
+    kind = share.get("grantee_kind")
+    app_id = share.get("app_id") or ""
+    if kind == share_store.PERSON:
+        if share.get("grantee_sub") != u.sub:
+            raise HTTPException(status_code=404, detail="Share not found")
+        share_store.set_share_hidden(share_id, u.sub, hidden)
+        placed = share.get("placed_agent") or ""
+        return app_id, {u.sub: {placed} if placed else set()}
+    agent = (agent or "").strip()
+    if not agent or not u.can_access_agent(agent):
+        raise HTTPException(status_code=404, detail="Share not found")
+    if not share_store.placement_for(app_id, agent, u.sub):
+        raise HTTPException(status_code=404, detail="Share not found")
+    share_store.set_placement_hidden(app_id, agent, u.sub, hidden)
+    return app_id, {u.sub: {agent}}
+
+
+@router.post("/v1/shares/{share_id}/hide")
+async def hide_share(
+    share_id: str,
+    req: SharePlacementRequest | None = None,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Hide a received share for the viewer alone: their own share leaves
+    the section (an app also leaves its panel), a placed app leaves the
+    panel of the agent the body names. Nothing is revoked."""
+    u = require_human(user)
+    agent = req.agent if req else ""
+    app_id, targets = await asyncio.to_thread(_set_hidden, u, share_id, agent, True)
+    if app_id:
+        audience.forget(app_id)
+    await share_inbox.send(targets)
+    return {"status": "ok"}
+
+
+@router.post("/v1/shares/{share_id}/unhide")
+async def unhide_share(
+    share_id: str,
+    req: SharePlacementRequest | None = None,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Restore a hide. Idempotent."""
+    u = require_human(user)
+    agent = req.agent if req else ""
+    app_id, targets = await asyncio.to_thread(_set_hidden, u, share_id, agent, False)
+    if app_id:
+        audience.forget(app_id)
+    await share_inbox.send(targets)
+    return {"status": "ok"}
+
+
+# ───────────────────────── snapshots, settings, the directory ───────────────
 
 
 def _snapshot_viewer(u: UserContext, share: dict) -> bool:
@@ -582,32 +946,6 @@ async def read_snapshot(share_id: str, user: UserContext | None = Depends(get_cu
     return await asyncio.to_thread(_load)
 
 
-@router.get("/v1/shares/{share_id}/ui/{token}")
-async def read_snapshot_ui(share_id: str, token: str, request: Request,
-                           user: UserContext | None = Depends(get_current_user)):
-    """A snapshot's artifact page, in the same sandbox as any artifact."""
-    from api.media.ui import _placeholder, _ui_response, inject_runtime, is_full_document, wrap_fragment
-    from services.sharing import chat_snapshot
-    origin = request_origin(request)
-    if user is None:
-        return _ui_response(_placeholder("Sign in to OtoDock to view this artifact."), origin, 401)
-
-    def _load() -> str | None:
-        share = _load_snapshot_share(user, share_id)
-        path = chat_snapshot.file_path(share, token)
-        return path.read_text("utf-8", "replace") if path else None
-
-    try:
-        content = await asyncio.to_thread(_load)
-    except HTTPException:
-        content = None
-    if content is None:
-        return _ui_response(_placeholder("This artifact no longer exists."), origin, 404)
-    if is_full_document(content):
-        return _ui_response(inject_runtime(content), origin)
-    return _ui_response(wrap_fragment(content), origin)
-
-
 @router.get("/v1/shares/{share_id}/media/{token}")
 async def read_snapshot_media(share_id: str, token: str,
                               user: UserContext | None = Depends(get_current_user)):
@@ -635,45 +973,86 @@ async def read_snapshot_media(share_id: str, token: str,
 @router.get("/v1/sharing/settings")
 async def sharing_settings(user: UserContext | None = Depends(get_current_user)):
     """What the share form needs from the admin's sharing settings: the
-    longest expiry (null when unset), so a link offers no expiry only
-    while nothing caps it."""
-    require_human(user)
-    return {"max_expiry_days": await asyncio.to_thread(_max_expiry_days)}
+    longest expiry (null when unset), whether shares to agents and to
+    departments are on, and whether the directory is open to the viewer."""
+    u = require_human(user)
+
+    def _load() -> dict:
+        return {
+            "max_expiry_days": _max_expiry_days(),
+            "sharing_to_agents_enabled": _setting_on(SETTING_TO_AGENTS),
+            "sharing_to_departments_enabled": _setting_on(SETTING_TO_DEPARTMENTS),
+            "directory_open": _directory_open(u),
+        }
+
+    return await asyncio.to_thread(_load)
 
 
 @router.get("/v1/users/directory")
 async def user_directory(user: UserContext | None = Depends(get_current_user)):
-    """The people a share can go to. 404 when an admin closed the directory
-    to members (they then share by exact username or email)."""
+    """Who a share can go to. ``users`` is null when an admin closed the
+    directory to members (they then share by exact username or email);
+    ``agents`` lists every agent while the directory is open (admin-only
+    agents to an admin), else the viewer's own; ``departments`` for an
+    admin. A switch turned off empties its list."""
     u = require_human(user)
 
-    def _load() -> list[dict] | None:
-        if not _directory_open(u):
-            return None
-        return [{
-            "sub": row["sub"],
-            "name": row.get("display_name") or row.get("name") or "",
-            "username": row.get("username") or "",
-        } for row in task_store.list_users() if row["sub"] != u.sub]
+    def _load() -> dict:
+        directory = _directory_open(u)
+        users = None
+        if directory:
+            users = [{
+                "sub": row["sub"],
+                "name": row.get("display_name") or row.get("name") or "",
+                "username": row.get("username") or "",
+            } for row in task_store.list_users() if row["sub"] != u.sub]
+        return {"users": users, "agents": _visible_agents(u, directory),
+                "departments": _visible_departments(u)}
 
-    users = await asyncio.to_thread(_load)
-    if users is None:
-        raise HTTPException(status_code=404, detail="The user directory is not available")
-    return {"users": users}
+    return await asyncio.to_thread(_load)
+
+
+ADMIN_LIST_MAX = 500
+_ADMIN_SCOPES = {share_store.INTERNAL: (share_store.INTERNAL,),
+                 share_store.EXTERNAL: (share_store.EXTERNAL,),
+                 "all": share_store.SCOPES}
 
 
 @router.get("/v1/admin/shares")
-async def admin_list_shares(user: UserContext | None = Depends(get_current_user)):
-    """Every external link on the platform (admin)."""
+async def admin_list_shares(
+    kind: str = Query("all"),
+    agent: str = Query(""),
+    standing: str = Query(""),
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Every share on the platform (admin): the shares to people, agents
+    and departments (``internal``) and the links (``external``), the newest
+    ``ADMIN_LIST_MAX`` of each kind asked, filtered by agent and standing in
+    the query; ``truncated`` names a kind that was cut. A link row keeps its
+    shape; every row adds ``title``, ``agent`` and ``standing``."""
     require_admin(user)
+    scopes = _ADMIN_SCOPES.get(kind)
+    if scopes is None:
+        raise HTTPException(status_code=400, detail="kind must be internal, external or all")
+    standing = (standing or "").strip()
+    if standing and standing not in share_store.ADMIN_STANDINGS:
+        raise HTTPException(status_code=400, detail="standing must be one of "
+                            + ", ".join(share_store.ADMIN_STANDINGS))
+    agent = (agent or "").strip()
 
-    def _load() -> list[dict]:
-        out = []
-        for r in share_store.list_external_shares():
-            shaped = _shape(r)
-            shaped["title"] = r.get("target_title") or ""
-            shaped["agent"] = r.get("agent") or ""
-            out.append(shaped)
-        return out
+    def _load() -> dict:
+        shares: list[dict] = []
+        truncated: dict[str, bool] = {}
+        for scope in scopes:
+            rows = share_store.list_admin_shares(scope, agent=agent, standing=standing,
+                                                 limit=ADMIN_LIST_MAX + 1)
+            truncated[scope] = len(rows) > ADMIN_LIST_MAX
+            for r in rows[:ADMIN_LIST_MAX]:
+                shaped = _shape(r)
+                shaped["title"] = r.get("target_title") or ""
+                shaped["agent"] = r.get("agent") or ""
+                shaped["standing"] = r.get("standing") or ""
+                shares.append(shaped)
+        return {"shares": shares, "truncated": truncated}
 
-    return {"shares": await asyncio.to_thread(_load)}
+    return await asyncio.to_thread(_load)

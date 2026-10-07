@@ -14,6 +14,7 @@ import logging
 import secrets
 import time
 
+from adapters.phone import INBOUND
 from storage.prefs import audio_provider_store
 from storage.identity import credential_store
 from storage import database as task_store
@@ -267,7 +268,7 @@ def assemble_phone_config() -> dict:
     # the raw rows themselves stay clean.
     routes = phone_route_store.get_all_routes()
     for r in routes:
-        if r.get("direction") == "inbound":
+        if r.get("direction") == INBOUND:
             pin = phone_route_store.get_route_pin(r["id"])
             if pin:
                 r["pin"] = pin

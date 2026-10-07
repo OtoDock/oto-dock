@@ -27,13 +27,14 @@ from storage.automation import run_status, trigger_store
 from storage.pg import run_db
 from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from auth.providers import UserContext, get_current_user, require_agent_access, require_auth, require_user
 from auth import roles
 from core.session import visibility as _vis
 from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.task-api")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 # --- Auth helpers ---
@@ -666,10 +667,13 @@ async def list_tasks(
     # The run counts, one grouped query (see _run_count_for).
     counts = await run_db(task_store.count_runs_by_task, [t.id for t in all_tasks])
     platform_tz = config.get_platform_timezone()
+    from services.agents import offboarding_transfer
+    moved_from = await run_db(offboarding_transfer.transferred_from_names,
+                              [t.transferred_from for t in all_tasks])
     views = []
     for t in all_tasks:
         job = {"next_run_time": next_fires[t.id]} if t.id in next_fires else None
-        d = _task_view(t, u, resolve, job, platform_tz)
+        d = _task_view(t, u, resolve, job, platform_tz, moved_from=moved_from)
         d["run_count"] = _run_count_for(t, counts.get(t.id, 0))
         views.append(d)
     return {"tasks": views}
@@ -757,11 +761,14 @@ def _make_model_resolver():
 
 
 def _task_view(t, u: UserContext, resolve, job: dict | None,
-               platform_tz: str | None = None) -> dict:
+               platform_tz: str | None = None, *, moved_from: dict | None = None) -> dict:
     """One task row as both schedules pages and the schedules MCP read it:
     the definition, what it runs on, the zone it fires in, its schedule in
-    words, and the caller's permission flags."""
+    words, who it was transferred from, and the caller's permission flags.
+    ``moved_from`` is ``offboarding_transfer.transferred_from_names`` for the
+    rows being shown."""
     d = t.model_dump()
+    d["transferred_from_name"] = (moved_from or {}).get(d.get("transferred_from") or "", "")
     d["next_run_time"] = job["next_run_time"] if job else None
     # The zone the cron and a naive run_at are read in: the row's own, else
     # the platform's — no non-admin endpoint carries the platform zone, and
@@ -1439,9 +1446,12 @@ async def get_task(
             raise HTTPException(404, "Task not found")
 
     def _build() -> dict:
+        from services.agents import offboarding_transfer
         next_fire = scheduler.next_run_time(task_id)
         d = _task_view(task_def, u, _make_model_resolver(),
-                       {"next_run_time": next_fire} if next_fire else None)
+                       {"next_run_time": next_fire} if next_fire else None,
+                       moved_from=offboarding_transfer.transferred_from_names(
+                           [dyn.get("transferred_from") or ""]))
         d["transferred_from"] = dyn.get("transferred_from") or ""
         d["transferred_at"] = dyn.get("transferred_at") or ""
         history = task_store.count_runs_by_task([task_id]).get(task_id, 0)
@@ -1520,25 +1530,14 @@ async def list_schedules(user: UserContext | None = Depends(get_current_user)):
 async def stream_run_output(
     run_id: str,
     request: Request,
-    key: str | None = Query(None),
-    authorization: str | None = Header(None),
 ):
     """SSE endpoint for live run output. Used by the schedules-mcp ``run_task(wait=true)``
     tool so spawned tasks can stream output back to the calling agent.
 
-    Accepts auth via Authorization header, ?key= query param (browser
-    EventSource API can't set custom headers, so MCPs that don't run with
-    a session cookie pass the master API key via the query string), or
-    session cookie.
-    """
-    # Try cookie/header auth first, fall back to ?key= for EventSource clients
-    # that can't set Authorization headers.
-    user = await get_current_user(request)
-    if user is None and key:
-        if config.is_master_key(key):
-            user = UserContext(sub="api-key", email="api@internal", name="API Key",
-                              role="admin", agents=[], is_api_key=True)
-    require_auth(user)
+    Auth: the session token in the Authorization header, or the dashboard
+    session cookie. A key in the query string is not read (it would land
+    in access logs)."""
+    user = require_auth(await get_current_user(request))
 
     # Permission check before starting stream
     pre_run = await asyncio.to_thread(task_store.get_run, run_id)

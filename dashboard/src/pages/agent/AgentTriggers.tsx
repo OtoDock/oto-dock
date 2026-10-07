@@ -12,6 +12,7 @@ import { canManageAgent } from '../../lib/permissions'
 import { CreateTriggerModal, EditTriggerModal, FireTestModal } from './AgentTriggers.modals'
 import { AgentApiKeysSection } from './AgentTriggers.apiKeys'
 import { TaskModelChip, linkedTaskModel } from '../../components/common/TaskModelChip'
+import TransferredFrom from '../../components/TransferredFrom'
 
 type ScopeFilter = 'all' | 'user' | 'agent'
 type StatusFilter = 'all' | 'active' | 'paused'
@@ -160,6 +161,7 @@ function TriggerRow({ trigger }: { trigger: Trigger }) {
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="font-medium text-p-text">{trigger.name}</span>
+            <TransferredFrom row={trigger} />
             {chips.map((c) => (
               <span
                 key={c.label}

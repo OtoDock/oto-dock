@@ -8,6 +8,7 @@ resolve the row the way unpin does.
 import asyncio
 import logging
 import os
+import secrets
 import shutil
 from pathlib import Path
 
@@ -198,13 +199,17 @@ async def hook_app_check(req: HookAppDeployRequest, authorization: str | None = 
                 "manifest": manifest, "server": server, "render": report.as_dict(),
                 **lint, **extra}
     # Not deployed yet: no page to render (the first deploy renders before
-    # it goes live); the server is smoke-started on scratch data.
-    stub = {"id": f"check-{slug}", "agent": ctx.agent, "slug": slug, "username": username,
-            "owner_sub": owner_sub, "actions": m.actions_json, "title": m.title}
+    # it goes live); the server is smoke-started on scratch data. Each check
+    # has its own stub id, so its own release root and supervisor key: a
+    # concurrent check of the slug keeps its copy when this one ends. A
+    # crash leaves the stub root to the boot reconcile (no row has its id).
+    stub = {"id": f"check-{slug}-{secrets.token_hex(4)}", "agent": ctx.agent, "slug": slug,
+            "username": username, "owner_sub": owner_sub, "actions": m.actions_json, "title": m.title}
     try:
         smoke = await _smoke_copy(stub, source)
     finally:
         await asyncio.to_thread(releases.remove_release_dir, stub)
+        app_supervisor.forget(stub["id"])
     return {"status": "ok" if smoke.get("ok") else "failed", "slug": slug,
             "files": len(files), "title": m.title, "manifest": manifest, **lint,
             "render": {"status": "unavailable",
@@ -280,7 +285,7 @@ async def hook_app_preview(req: HookAppDeployRequest, authorization: str | None 
     server = "none"
     if (releases.preview_dir(row) / "server").is_dir():
         try:
-            inst = await app_supervisor.start(row, "preview")
+            inst = await app_supervisor.start(row, app_supervisor.PREVIEW)
             server = inst.state
         except app_supervisor.AppUnavailable as e:
             server = f"failed: {e.reason}"
@@ -329,7 +334,7 @@ async def hook_app_restart(req: HookAppDeployRequest, authorization: str | None 
     found_vis, row = await _find_app_row(ctx, req.slug, req.visibility)
     if found_vis == SCOPE_AGENT:
         _require_shared_pin_authority(ctx, "")
-    await app_supervisor.stop(row["id"], "live")
+    await app_supervisor.stop(row["id"], app_supervisor.LIVE)
     try:
         inst = await app_supervisor.ensure_up(row)
         state = inst.state
@@ -348,19 +353,48 @@ class HookDescribeRequest(BaseModel):
 @router.post("/v1/hooks/apps/describe")
 async def hook_app_describe(req: HookDescribeRequest, authorization: str | None = Header(None)):
     """``describe_app(agent, slug)`` (APPS.md "Bindings"): the signed exports
-    of an APPROVED shared folder app of an agent the session may reach —
-    its own, a delegation target, or one the session's user is a member of;
-    404 otherwise (never an oracle)."""
+    of an APPROVED folder app of an agent the session may reach — its own,
+    a delegation target, or one the session's user is a member of — or of
+    an app a share placed in the session's agent (SHARING.md "Agents use a
+    placed app"), which answers with the placement and the session's call
+    line and, when no edge reaches its home agent, no ``binding``; 404
+    otherwise (never an oracle)."""
     from api.apps import app_bindings
+    from api.hooks.pins import placement_identity
     ctx = await _ctx(authorization, req.session_id)
     slug = _slug(req.slug)
     agent = (req.agent or "").strip().lower() or ctx.agent
-    reach = await asyncio.to_thread(app_bindings.reachable_agents, ctx.agent, ctx.username or "")
-    row = await asyncio.to_thread(task_store.get_app_by_slug, agent, "", slug) if agent in reach else None
-    if not row or row.get("hidden") or not db_apps.app_kind_of(row).serves_tree \
-            or not task_store.app_actions_approved(row):
+
+    def _resolve() -> tuple[dict | None, bool, dict | None]:
+        from storage.sharing import share_store
+        own, person_sub = placement_identity(ctx)
+        reach = app_bindings.reachable_agents(ctx.agent, ctx.username or "")
+        row = task_store.get_app_by_slug(agent, "", slug) if agent in reach else None
+        via_placement = False
+        if row is None:
+            # Among the placed rows (a placed personal row too): the shared
+            # row first when a personal one shares the slug.
+            rows = [r for r in share_store.placements_for_agent(ctx.agent, person_sub)
+                    if r.get("agent") == agent and r.get("slug") == slug]
+            rows.sort(key=lambda r: bool(r.get("username")))
+            row = rows[0] if rows else None
+            via_placement = row is not None
+        if not row or row.get("hidden") or not db_apps.app_kind_of(row).serves_tree \
+                or not task_store.app_actions_approved(row):
+            return None, False, None
+        return row, via_placement, share_store.placement_role(row["id"], ctx.agent, person_sub, own)
+
+    row, via_placement, placement = await asyncio.to_thread(_resolve)
+    if not row:
         raise HTTPException(status_code=404, detail=f"no app '{slug}' of agent '{agent}' to bind to")
-    return {"status": "ok", **app_bindings.describe(row)}
+    out = {"status": "ok", **app_bindings.describe(row)}
+    if via_placement:
+        out["binding"] = None
+    if placement is not None:
+        out["placement"] = {"kind": placement["source"], "share_id": placement["share_id"],
+                            "role_cap": placement["role_cap"], "role": placement["role"]}
+        out["call"] = f"POST $PROXY_URL/v1/apps/{row['id']}/api/<method> with your session token"
+    return out
 
 
 class HookExportRequest(BaseModel):

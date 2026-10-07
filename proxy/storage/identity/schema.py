@@ -43,10 +43,29 @@ def init_identity(conn) -> None:
             must_change_password BOOLEAN DEFAULT FALSE,
             is_owner BOOLEAN DEFAULT FALSE,
             password_changed_at TEXT,
-            default_agents_assigned BOOLEAN NOT NULL DEFAULT FALSE
+            default_agents_assigned BOOLEAN NOT NULL DEFAULT FALSE,
+            -- The person's token epoch: every session cookie and agent
+            -- session token minted before it is refused. Stamped by a
+            -- password set and by an admin "sign out everywhere"; NULL =
+            -- never bumped (auth/providers.py).
+            token_epoch_at TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    # The sign-in ids a logout revoked (auth/session_revocation.py), kept
+    # until the cookie they revoked could no longer be presented.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS revoked_session_ids (
+            id TEXT PRIMARY KEY,
+            user_sub TEXT NOT NULL,
+            expires_at DOUBLE PRECISION NOT NULL,
+            revoked_at TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_revoked_session_ids_expires "
+        "ON revoked_session_ids(expires_at)"
+    )
     # Single-owner invariant, enforced at the DB so the setup wizard can't race
     # two concurrent fresh-install POSTs into two ``is_owner`` admins. The
     # partial unique index allows at most one row with is_owner=TRUE; the second
@@ -267,4 +286,37 @@ def init_identity(conn) -> None:
             set_at TEXT NOT NULL,
             UNIQUE(mcp_name, agent_name)
         )
+    """)
+
+    # The OAuth clients this install registered at vendors' authorization
+    # servers (RFC 7591; storage/identity/oauth_client_registrations.py):
+    # one live row per issuer and callback URL, secrets Fernet-encrypted
+    # with the credential-store key, revoked rows kept because token files
+    # point at them by id.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_client_registrations (
+            id SERIAL PRIMARY KEY,
+            issuer TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            registration_endpoint TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            client_secret_enc TEXT NOT NULL DEFAULT '',
+            client_secret_expires_at TEXT NOT NULL DEFAULT '',
+            token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none',
+            registration_client_uri TEXT NOT NULL DEFAULT '',
+            registration_access_token_enc TEXT NOT NULL DEFAULT '',
+            client_name TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL DEFAULT '',
+            revoked_at TEXT NOT NULL DEFAULT '',
+            revoked_reason TEXT NOT NULL DEFAULT '',
+            requested_auth_method TEXT NOT NULL DEFAULT '',
+            resources TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_oauth_client_registrations_live
+        ON oauth_client_registrations(issuer, redirect_uri)
+        WHERE revoked_at = ''
     """)

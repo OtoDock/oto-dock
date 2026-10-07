@@ -92,10 +92,10 @@ def _write_codex_hooks(codex_dir: Path) -> None:
     # scripts self-gate (the interactive TUI's OTO_INTERACTIVE).
     hooks = {
         "hooks": {
-            "PreToolUse": [_hook("permission_gate.py", 604800)],
+            "PreToolUse": [_hook("permission_gate.py", config.HOOK_WAIT_S)],
             "PostToolUse": [_hook("tool_result_forwarder.py", 10)],
             "SubagentStop": [_hook("subagent_tracker.py", 10)],
-            "Stop": [_hook("stop_tracker.py", 604800)],
+            "Stop": [_hook("stop_tracker.py", config.HOOK_WAIT_S)],
         },
     }
     (codex_dir / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
@@ -135,21 +135,45 @@ def _inject_display_env_toml(toml_content: str) -> str:
     return _re.sub(r"(env\s*=\s*\{)([^}]*)\}", _append, toml_content)
 
 
+# The bridges' hold while the platform cannot be reached (the permission
+# gate's twin, ``proxy/hooks/permission_gate.py``): retried with this backoff
+# for up to two minutes, then denied; a refused token gets a short ladder.
+_HOOK_HOLD_S = 120.0
+_HOOK_BACKOFF = (2.0, 4.0, 8.0, 15.0)
+_HOOK_AUTH_LADDER = (2.0, 4.0, 8.0)
+# A wait on a person streams a keepalive every 30 s.
+_HOOK_SOCK_READ_S = 150
+
+
+def _will_retry(params) -> bool:
+    """Whether Codex retries the error an ``error`` notification reports: the
+    flag sits at the params' top level (app-server 0.156.1), older builds
+    nested it in ``error``. A retried error does not end the turn."""
+    if not isinstance(params, dict):
+        return False
+    if "willRetry" in params:
+        return bool(params.get("willRetry"))
+    return bool((params.get("error") or {}).get("willRetry"))
+
+
 def _validate_config_toml(text: str, path: Path) -> None:
     """Best-effort TOML validation before handing a config to codex: the strict
     TUI hard-exits (code 1, blank terminal) on invalid TOML and the app-server
     silently "uses defaults" (drops every MCP) — both are hard to diagnose from
     the outside, so make the corruption LOUD at the write site. Warn-only: the
-    satellite's floor is py3.10 (no tomllib) and the proxy-side writer already
-    fail-closes; here a visible ERROR beats killing the spawn inconsistently
-    across hosts."""
+    proxy-side writer already fail-closes; here a visible ERROR beats killing
+    the spawn. The host floor (3.10) has no tomllib and parses with the
+    shipped tomli, the same parser."""
     try:
-        import tomllib
+        import tomllib as toml
     except ModuleNotFoundError:
-        return
+        try:
+            import tomli as toml  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            return
     try:
-        tomllib.loads(text)
-    except tomllib.TOMLDecodeError as e:
+        toml.loads(text)
+    except toml.TOMLDecodeError as e:
         logger.error("generated codex config.toml is INVALID (%s): %s", path, e)
 
 
@@ -700,8 +724,7 @@ class CodexSession:
                         f"without a contextCompaction item"
                     )
                     return None
-                if method == "error" and not (
-                        (params.get("error") or {}).get("willRetry")):
+                if method == "error" and not _will_retry(params):
                     logger.warning(
                         f"Codex [{self.session_id[:8]}] compaction error: "
                         f"{(params.get('error') or {}).get('message')}"
@@ -777,7 +800,14 @@ class CodexSession:
             # Daemon died between turns — re-warm + resume.
             logger.info(f"Codex daemon dead for {self.session_id}; re-warming")
             self._client = None
+            before = self.thread_id
             await self.start()
+            if self.thread_id and self.thread_id != before and self._forward_event:
+                # The resume was refused and a new thread started: the
+                # platform routes this session's events by its thread, so
+                # it hears of the new one before the turn's first event (the
+                # marker it turns the start's codex_thread_id frame into).
+                await self._forward_event({"type": "_resume_handle", "handle": self.thread_id})
 
         if inject_time:
             prompt = f"[Current time: {_format_time()}]\n{prompt}"
@@ -865,8 +895,7 @@ class CodexSession:
             is_main = (not ev_tid) or (not self.thread_id) or (ev_tid == self.thread_id)
             if is_main and method == "turn/completed":
                 self._main_turn_done.set()
-            elif (is_main and method == "error"
-                    and not (params or {}).get("error", {}).get("willRetry")):
+            elif is_main and method == "error" and not _will_retry(params):
                 self._main_turn_done.set()
 
     async def _forward(self, event: dict) -> None:
@@ -939,6 +968,19 @@ class CodexSession:
     def is_alive(self) -> bool:
         return not self._closed and self._client is not None and self._client.is_alive
 
+    # What the connect report reads (sessions/alive_report.py).
+    @property
+    def resume_handle(self) -> str:
+        return self.thread_id or ""
+
+    @property
+    def turn_active(self) -> bool:
+        return self._turn_lock.locked()
+
+    @property
+    def mcp_server_names(self) -> list[str]:
+        return list(self._mcp_server_names)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -978,30 +1020,17 @@ class CodexSession:
         The satellite is the JSON-RPC client but the decision authority lives on
         the proxy, so we POST the translated tool to ``/v1/hooks/permission`` over
         the loopback tunnel (the same channel the CLI hook uses) and block on the
-        proxy's verdict. Fail-closed (deny) if the tunnel/credentials are missing
-        or the request fails — e.g. a WS drop mid-wait — so the daemon's escape is
-        rejected cleanly and resilience reconnect handles the turn.
+        proxy's verdict. Held while the platform cannot be reached
+        (``_post_to_platform``), then fail-closed (deny), so the daemon's escape
+        is rejected cleanly.
         """
         if not self._proxy_url or not self._proxy_api_key:
             logger.warning("Codex approval: no proxy tunnel coords; denying")
             return {"decision": "deny"}
-        import aiohttp
-        try:
-            async with aiohttp.ClientSession() as http:
-                async with http.post(
-                    f"{self._proxy_url}/v1/hooks/permission",
-                    json={"session_id": self.session_id,
-                          "tool_name": tool_name, "tool_input": tool_input},
-                    headers={"Authorization": f"Bearer {self._proxy_api_key}"},
-                    timeout=aiohttp.ClientTimeout(total=604800),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Codex approval: proxy returned {resp.status}; denying")
-                        return {"decision": "deny"}
-                    return await resp.json()
-        except Exception as e:  # noqa: BLE001 — fail closed on any transport error
-            logger.warning(f"Codex approval: tunnel call failed ({e}); denying")
-            return {"decision": "deny"}
+        data = await self._post_to_platform("/v1/hooks/permission", {
+            "session_id": self.session_id, "tool_name": tool_name, "tool_input": tool_input,
+        })
+        return data if isinstance(data, dict) else {"decision": "deny"}
 
     async def _ask_question_remote(self, questions: list) -> dict:
         """Injected question authority for request_user_input (remote).
@@ -1010,29 +1039,67 @@ class CodexSession:
         the proxy dashboard, so we POST the questions to ``/v1/hooks/codex-question``
         over the loopback tunnel and block on the proxy surfacing the card + the
         human answer. Returns the answers MAP ``{<id>: {"answers": [...]}}``.
-        Fail-safe to empty answers on any transport error so the held turn unwinds
-        (the model continues rather than hanging), matching the local decline path.
+        Empty answers when the platform stays unreachable, so the held turn
+        unwinds (the model continues rather than hanging), matching the local
+        decline path.
         """
         if not self._proxy_url or not self._proxy_api_key:
             logger.warning("Codex question: no proxy tunnel coords; empty answer")
             return {}
+        data = await self._post_to_platform("/v1/hooks/codex-question", {
+            "session_id": self.session_id, "questions": questions,
+        })
+        return ((data if isinstance(data, dict) else {}).get("answers")) or {}
+
+    async def _post_to_platform(self, path: str, body: dict):
+        """POST a bridge's request to the platform over the loopback tunnel.
+
+        The platform answers a wait on a person with whitespace keepalives and
+        the JSON last. While it cannot be reached (a connection error, the
+        tunnel's 502/503/504, a body that ends before its JSON: a proxy restart,
+        a dropped socket) the call is held and retried for up to
+        ``_HOOK_HOLD_S`` from the first failure (a prompt may wait days before
+        its stream drops); a refused token gets a short ladder (the satellite
+        reports its sessions a moment after it reconnects). The parsed JSON,
+        or None when the platform stayed unreachable or refused."""
         import aiohttp
-        try:
-            async with aiohttp.ClientSession() as http:
-                async with http.post(
-                    f"{self._proxy_url}/v1/hooks/codex-question",
-                    json={"session_id": self.session_id, "questions": questions},
-                    headers={"Authorization": f"Bearer {self._proxy_api_key}"},
-                    timeout=aiohttp.ClientTimeout(total=604800),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Codex question: proxy returned {resp.status}; empty answer")
-                        return {}
-                    data = await resp.json()
-                    return (data or {}).get("answers") or {}
-        except Exception as e:  # noqa: BLE001 — never hang the turn on a transport error
-            logger.warning(f"Codex question: tunnel call failed ({e}); empty answer")
-            return {}
+        loop = asyncio.get_running_loop()
+        deadline = None
+        unreachable = auth = 0
+        while True:
+            status = 0
+            try:
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(
+                        f"{self._proxy_url}{path}", json=body,
+                        headers={"Authorization": f"Bearer {self._proxy_api_key}"},
+                        timeout=aiohttp.ClientTimeout(
+                            total=None, sock_connect=10, sock_read=_HOOK_SOCK_READ_S),
+                    ) as resp:
+                        status = resp.status
+                        if status == 200:
+                            text = (await resp.text()).strip()
+                            if text:
+                                return json.loads(text)
+                            status = 0  # the stream ended before its JSON
+            except Exception as e:  # noqa: BLE001 — fail closed: held, then refused
+                logger.info("Codex bridge: %s unreachable (%s)", path, e)
+                status = 0
+            if status == 401 and auth < len(_HOOK_AUTH_LADDER):
+                await asyncio.sleep(_HOOK_AUTH_LADDER[auth])
+                auth += 1
+                continue
+            if status not in (0, 502, 503, 504):
+                logger.warning("Codex bridge: %s refused (%s)", path, status)
+                return None
+            wait = _HOOK_BACKOFF[min(unreachable, len(_HOOK_BACKOFF) - 1)]
+            if deadline is None:
+                deadline = loop.time() + _HOOK_HOLD_S
+            if loop.time() + wait > deadline:
+                logger.warning("Codex bridge: %s unreachable for %.0fs", path, _HOOK_HOLD_S)
+                return None
+            await asyncio.sleep(wait)
+            unreachable += 1
 
     def _track_item_paths(self, params: dict) -> None:
         """Record a fileChange item's target paths (from ``item/started``) so a

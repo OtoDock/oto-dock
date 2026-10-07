@@ -26,8 +26,8 @@ def _seed_agent(slug: str) -> None:
 
 
 def _headers(agent_for_token: str, agent_named: str, user_sub: str = "") -> dict:
-    from auth.session_token import create_session_token
-    token = create_session_token(str(uuid.uuid4()), agent_for_token, user_sub)
+    from tests.conftest import live_session_token
+    token = live_session_token(str(uuid.uuid4()), agent_for_token, user_sub)
     return {"Authorization": f"Bearer {token}", "X-Agent-Name": agent_named}
 
 

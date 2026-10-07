@@ -16,8 +16,10 @@ from core import placement
 from storage import database as task_store
 from storage.automation import run_status
 from storage.pg import run_db
-from core.events import chat_writer
+from core.events import chat_writer, input_queue, turn_ending
+from core.events.common_events import CommonEvent, ERROR
 from core.session.session_state import (
+    _chat_streaming_state,
     get_session_mode,
     get_user_tz,
     set_session_user_tz,
@@ -28,6 +30,7 @@ from core.events.stream_pump import (
     _pending_permissions,
 )
 from core.session import session_kind, warmup_registry, interactive_session
+from core.session import visibility as _vis
 # Imported by ws/dashboard.py AFTER its helpers are defined —
 # safe intra-unit circularity (see the class assembly there).
 from ws.dashboard import (
@@ -40,12 +43,71 @@ from ws.dashboard import (
 )
 from auth.providers import UserContext
 from ws import wire_events as wire
+from ws.dashboard_chat_text import grace_layer
 
 logger = logging.getLogger("claude-proxy")
 
 
+_NO_CUT = object()
+
+
+def _cut_rows(rows: list[dict], cuts: dict[str, int | None], floors: dict[str, int],
+              ) -> tuple[list[dict], dict[str, int]]:
+    """The rows a history frame carries and the floors the next delta reads
+    above. A chat in ``cuts`` has a live pump: its rows above the cutoff are
+    withheld (user rows exempt) and never raise its floor, so they come
+    with the next delta; a cutoff of None withholds nothing. A floor only
+    rises: a chat with no row carried keeps the floor it had."""
+    kept: list[dict] = []
+    carried: dict[str, int] = {}
+    for m in rows:
+        chat = m.get("chat_id") or ""
+        cut = cuts.get(chat, _NO_CUT)
+        above = cut is not _NO_CUT and cut is not None and int(m["id"]) > cut
+        if above and m.get("role") != "user":
+            continue
+        kept.append(m)
+        if not above:
+            carried[chat] = max(carried.get(chat, 0), int(m["id"]))
+    return kept, {c: max(prev, carried.get(c, 0)) for c, prev in floors.items()}
+
+
+def _inject_lost_ending(pump, reason: str) -> None:
+    """The ``lost`` ending onto a pump a reap is about to abort: the viewer
+    gets ``error`` then ``done``, the chat its ``turn_ended`` row. The
+    producer's cancellation follows it on the event queue."""
+    ending = turn_ending.TurnEnding(reason=turn_ending.LOST, detail=reason)
+    pump.event_queue.put_nowait(CommonEvent(type=ERROR, data={
+        "message": ending.line(), "ending": ending.as_dict()}))
+
+
+def _encode_history(frame: dict, rows: list[dict]) -> str:
+    """The history frame's text with ``rows`` as its ``messages``, one dumps
+    per row (a worker thread encoding a long history yields the GIL between
+    rows instead of holding it for one call)."""
+    opts = {"separators": (",", ":"), "ensure_ascii": False}
+    head = json.dumps(frame, **opts)
+    body = ",".join(json.dumps(r, **opts) for r in rows)
+    return head[:-1] + ',"messages":[' + body + "]}"
+
+
 class ChatResumeMixin:
     """resume_chat: history replay, the visit path, restore and the lazy warmup"""
+
+    # The live blocks each live pump held when the last resume took its cut,
+    # {chat_id: (pump, blocks)}: the next attach to that pump replays the
+    # ones a save persisted since (``_stream_via_pump``). One-shot.
+    _resume_live: dict | None = None
+
+    async def _queue_snapshot(self, pump=None) -> dict:
+        """The QUEUE_SNAPSHOT frame for the viewed chat: every message
+        waiting in its queue (``core/events/input_queue.py``), whoever typed
+        it; on a task chat viewed through a sibling run's pump, that pump's
+        chat's queue."""
+        cid = pump.chat_id if pump is not None else self.chat_id
+        q = await input_queue.loaded(cid)
+        return {"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id,
+                "messages": q.snapshot()}
 
     def _viewer_context(self) -> UserContext:
         """The connection's viewer as the principal the REST rules judge:
@@ -60,6 +122,7 @@ class ChatResumeMixin:
 
     async def _handle_resume_chat(self, msg: dict):
         self.promised_pump_chat = None  # every resume resets the previous promise
+        self._resume_live = None
         self._detach_pty_viewer()  # leaving any interactive chat we were viewing
 
         cid = msg.get("chat_id", "")
@@ -72,14 +135,21 @@ class ChatResumeMixin:
             await self._send_error("Chat not found")
             return
         # Imported here: the agents API package imports this module's assembly.
-        from api.agents.agents import can_open_chat
-        if not await run_db(can_open_chat, self._viewer_context(), chat):
+        from api.agents.chats import can_access_chat
+        if not await run_db(can_access_chat, self._viewer_context(), chat):
             await self._send_error("Access denied")
             return
         # A chat this user may open but not drive (a Shared-only chat below
         # the editor tier, a task run they cannot continue): this connection
         # watches it and is never its notification sink or its time zone.
-        self._view_only = bool(await self._deny_task_continue(cid, chat, quiet=True))
+        refusal = await self._deny_task_continue(cid, chat, quiet=True)
+        self._view_only = bool(refusal)
+        # The sentence a chat that runs as the agent refuses this person with:
+        # the dashboard locks its mode, model and terminal pickers on it. A
+        # task chat keeps its own gate and locks nothing here.
+        drive_refusal = (refusal if _vis.is_shared_chat_owner(chat.get("user_sub"))
+                         and not session_kind.is_task_chat_id(cid) else "")
+        locked = {"drive_refusal": drive_refusal} if drive_refusal else {}
 
         # In-flight warmup re-attach: if a warmup is still running (fresh
         # satellite first chat, ~90s MCP install) and our WS reconnected,
@@ -130,7 +200,9 @@ class ChatResumeMixin:
                 # A warmup is mid-spawn — the session is coming up; never
                 # offer cross-engine options against it.
                 "process_alive": True,
+                **locked,
             })
+            self._history_floors = None
             for past_ev in list(inflight.event_history):
                 await self._send(past_ev)
             # Install events are delivered out-of-band via the per-user
@@ -146,10 +218,12 @@ class ChatResumeMixin:
         self.chat_id = cid
         self.agent_name = chat["agent"]
         # A pick made in the new-chat state (deferred for the chat that
-        # warmup would mint) must not follow this socket into an existing
-        # chat's re-warm — the reapply after an inline warmup reads these.
-        self.deferred_model = ""
-        self.deferred_mode = ""
+        # warmup would mint), or for another chat, must not follow this
+        # socket into this chat's re-warm; one made for this chat while its
+        # session was away waits for its next start.
+        if self.deferred_for != cid:
+            self.deferred_model = ""
+            self.deferred_mode = ""
         # Resolve execution layer from the chat's stored path AND pinned
         # target, falling back to agent defaults. The pin matters: the
         # liveness/resume checks this layer serves must ask the machine the
@@ -172,25 +246,12 @@ class ChatResumeMixin:
         # Every other chat loads the newest page; older turns lazy-load on scroll-up.
         is_task_chat = session_kind.is_task_chat_id(cid)
 
-        def _history_job():
-            # A chat-lane job: the page read lands BEHIND the pump's queued
-            # saves for this chat, so a resume right after a turn sees its
-            # rows; the plans + panel-restore state ride the same job.
-            if is_task_chat:
-                msgs, more = task_store.get_chat_messages(cid), False
-            else:
-                msgs, more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
-            return msgs, more, task_store.get_chat_plans(cid), _build_chat_restore(cid)
-
-        messages, has_more, plans, restore = await chat_writer.submit(
-            cid, _history_job, label="history_read",
-        )
-
-        # Multi-turn task runs: include messages from all turns in the session.
-        # Each turn has its own chat_id (task-{runId}) but shares session_id.
-        # For turns with an active pump, truncate THAT turn's messages only
-        # (live_state from the pump will provide the streaming content).
-        active_task_pump = None
+        # Multi-turn task runs: each turn has its own chat_id (task-{runId})
+        # on one session_id, and the siblings' rows ride this view. Their
+        # pumps are looked up BEFORE the rows are read: a pump that ends in
+        # between drained its rows before it deregistered, and its cutoff
+        # then keeps them all.
+        related_chats: list[str] = []
         if is_task_chat:
             run_id = session_kind.run_id_of_chat(cid)
 
@@ -206,31 +267,78 @@ class ChatResumeMixin:
                         if r["id"] != run_id and r.get("chat_id") and r["chat_id"] != cid]
 
             related_chats = await run_db(_related_chats_job)
-            # The pumps are looked up BEFORE the rows are read: a pump that
-            # ends in between drained its rows before it deregistered, and its
-            # cutoff then keeps them all.
-            related_pumps = [_active_pumps.get(c) for c in related_chats]
-            related_rows = await run_db(
-                lambda: [task_store.get_chat_messages(c) for c in related_chats]
-            ) if related_chats else []
-            for rp, extra_msgs in zip(related_pumps, related_rows):
-                # If this turn has an active pump, truncate only ITS messages
-                if rp and not rp.is_done:
-                    active_task_pump = rp
-                    # id-based cutoff: withhold the in-flight tail (live_state
-                    # provides it). A row-count slice would over-keep once the
-                    # window is paged, re-rendering live rows as ghost bubbles.
-                    # USER rows are exempt: a mid-turn STEERED message persists
-                    # above the cutoff and the pump replay never re-sends user
-                    # rows, so filtering it would make the message vanish on revisit.
-                    extra_msgs = [
-                        m for m in extra_msgs
-                        if rp._db_msg_cutoff_id is None  # start job pending: no row of that turn exists yet
-                        or int(m["id"]) <= rp._db_msg_cutoff_id
-                        or m.get("role") == "user"
-                    ]
-                if extra_msgs:
-                    messages.extend(extra_msgs)
+        related_pumps = [_active_pumps.get(c) for c in related_chats]
+        # A pump writing a steer's or a drained batch's rows: its blocks so
+        # far are saved and the rows follow on its lane. The lane is drained
+        # first, so the cut below never shows the rows above the blocks
+        # they follow.
+        for p in (_active_pumps.get(cid), *related_pumps):
+            if p is not None and not p.is_done and getattr(p, "accepts_in_flight", 0):
+                await chat_writer.drain(p.chat_id, timeout=2.0)
+        # Each live pump's cutoff and live blocks, taken together before any
+        # read (no await in between). A save landing during the reads raises
+        # the cutoff and trims the blocks it persisted: the cut below uses the
+        # cutoff of this instant, and the attach replays the blocks persisted
+        # since, so a row the reads missed is in the live state instead. A
+        # pump whose start job has not landed (cutoff None) is not held.
+        held: dict[str, tuple] = {}
+        for p in (_active_pumps.get(cid), *related_pumps):
+            if p is not None and not p.is_done and p._db_msg_cutoff_id is not None:
+                live = _chat_streaming_state.get(p.chat_id) or {}
+                held[p.chat_id] = (p, p._db_msg_cutoff_id, list(live.get("live_blocks") or ()))
+
+        def _cut_of(p) -> int | None:
+            h = held.get(p.chat_id)
+            return h[1] if h is not None and h[0] is p else p._db_msg_cutoff_id
+
+        # A delta carries only the rows above the floors of the last history
+        # this connection got for THIS chat: when the client takes deltas and
+        # asked for one (its post-done refetch, `delta`) or the server
+        # re-sends after a turn (`_delta`). Never on a resync, never without
+        # a base: a chat the floors do not name is sent in full.
+        prev_floors = (self._history_floors[1]
+                       if self._history_floors and self._history_floors[0] == cid else None)
+        as_delta = bool(
+            self._history_deltas and prev_floors is not None and not msg.get("_resync")
+            and (msg.get("delta") or msg.get("_delta")))
+        read_floors = {c: int((prev_floors or {}).get(c, 0)) if as_delta else 0
+                       for c in (cid, *related_chats)}
+        if as_delta:
+            # A sibling's row with a lower id can commit after a higher one
+            # was observed: its lane is drained before the read.
+            for c in related_chats:
+                await chat_writer.drain(c, timeout=2.0)
+
+            def _delta_job():
+                return (task_store.get_chat_messages_since(read_floors),
+                        task_store.get_chat_plans(cid), _build_chat_restore(cid))
+
+            rows, plans, restore = await chat_writer.submit(
+                cid, _delta_job, label="history_delta",
+            )
+            has_more = False
+        else:
+            def _history_job():
+                # A chat-lane job: the page read lands BEHIND the pump's queued
+                # saves for this chat, so a resume right after a turn sees its
+                # rows; the plans + panel-restore state ride the same job.
+                if is_task_chat:
+                    msgs, more = task_store.get_chat_messages(cid), False
+                else:
+                    msgs, more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
+                return msgs, more, task_store.get_chat_plans(cid), _build_chat_restore(cid)
+
+            rows, has_more, plans, restore = await chat_writer.submit(
+                cid, _history_job, label="history_read",
+            )
+            if related_chats:
+                for extra in await run_db(
+                        lambda: [task_store.get_chat_messages(c) for c in related_chats]):
+                    rows.extend(extra)
+        # A live sibling turn: its in-flight tail is withheld below (the
+        # live_state replays it), and it is the pump this view attaches to
+        # when the primary chat has none.
+        active_task_pump = next((rp for rp in related_pumps if rp and not rp.is_done), None)
 
         # Restore plan filename from DB so subsequent pumps reuse it
         if plans and not self.chat_plan_filename:
@@ -264,7 +372,11 @@ class ChatResumeMixin:
             # incident — reaped at idle=505s, answer orphaned). Silence only
             # ARMS a liveness probe; an alive process gets a long leash and
             # is reaped only past the CLI turn ceiling.
-            _hard_stale = _idle is not None and _idle > config.CLAUDE_TIMEOUT
+            # A prompt waiting on a person is silence by design (its own
+            # wait bounds it), never a wedge.
+            from core.session.session_state import has_pending_prompt
+            _hard_stale = (_idle is not None and _idle > config.CLAUDE_TIMEOUT
+                           and not has_pending_prompt(_wedged.session_id))
             _proc_dead = False
             if _stale and not _severed and not _hard_stale:
                 _proc_dead = await self.layer.probe_session_process_dead(
@@ -311,6 +423,7 @@ class ChatResumeMixin:
                                     completed_at=datetime.now(timezone.utc).isoformat(),
                                 )
                         await run_db(_fail_run)
+                _inject_lost_ending(_wedged, _reason)
                 _wedged.abort()
                 if _wedged._task is not None:
                     # Wait WITHOUT cancelling — the pump's finally persists the
@@ -339,78 +452,98 @@ class ChatResumeMixin:
         # An ACTIVE external session (phone today; website/webhook later) owns
         # this chat's stream out-of-band. Never attach to its pump — that would
         # steal the stream and kill the live call. Serve the FULL persisted
-        # transcript read-only instead (no truncation, no attach below).
-        view_only_external = bool(
-            pump and not pump.is_done
-            and pump.source_type in session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES
+        # transcript read-only instead (no truncation, no attach below). A
+        # phone conversation is the call's between its turns too: this socket
+        # never binds the call's session (the drive gate refuses every frame
+        # on it, and a bound session would still take its viewer's slot).
+        view_only_external = (
+            session_kind.of_chat(chat) is session_kind.PHONE
+            or _vis.is_phone_chat_owner(chat.get("user_sub"))
+            or bool(pump and not pump.is_done
+                    and pump.source_type in session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES)
         )
+        # The rows a live pump still streams are withheld by id (the live
+        # stream re-sends them; a count slice breaks under paging). USER rows
+        # are exempt: a mid-turn STEERED message (persisted the moment the
+        # daemon accepts it, id ABOVE the cutoff) is NOT part of the pump's
+        # replayed blocks, so filtering it made the message vanish when the
+        # user switched away and back mid-turn. A cutoff of None (the start
+        # job pending: no row of that turn exists yet) withholds nothing.
+        cuts: dict[str, int | None] = {}
         if pump and not pump.is_done and not view_only_external:
-            # Primary chat has active pump — withhold ITS in-flight tail by id
-            # (the live stream re-sends it; a count slice breaks under paging).
-            # USER rows are exempt: a mid-turn STEERED message (persisted the
-            # moment the daemon accepts it, id ABOVE the cutoff) is NOT part of
-            # the pump's replayed blocks, so filtering it made the message
-            # vanish when the user switched away and back mid-turn. The pump
-            # never re-sends user rows (queued-not-yet-delivered messages ride
-            # queue_snapshot and aren't persisted yet), so no double-render.
-            messages = [
-                m for m in messages
-                if pump._db_msg_cutoff_id is None  # start job pending: no row of this turn exists yet
-                or int(m["id"]) <= pump._db_msg_cutoff_id
-                or m.get("role") == "user"
-            ]
+            cuts[cid] = _cut_of(pump)
         elif active_task_pump:
-            # Related turn has active pump — primary messages are complete,
-            # related turn's messages already truncated above
+            # Related turn has active pump — primary messages are complete
             pump = active_task_pump
+        for rp in related_pumps:
+            if rp and not rp.is_done:
+                cuts[rp.chat_id] = _cut_of(rp)
+        self._resume_live = {c: (h[0], h[2]) for c, h in held.items()}
+        messages, new_floors = _cut_rows(rows, cuts, read_floors)
+        if is_task_chat:
+            # The turns as they happened: a reload and a delta converge on
+            # one order, whichever run a row belongs to.
+            messages.sort(key=lambda m: int(m["id"]))
 
-        await self._send({"type": wire.CHAT_HISTORY,
-                     "chat_id": cid,
-                     # Agent of record, from the chat row — the frontend uses it
-                     # to normalize a mismatched /chat/:name/:chatId URL (a
-                     # deep-link/redirect can carry the wrong slug; the route
-                     # param is otherwise trusted for the UI shell).
-                     "agent": chat["agent"],
-                     "messages": messages,
-                     "has_more": has_more,
-                     "restore": restore,
-                     "plans": [{"filename": p["filename"], "content": p["content"],
-                                "status": p["status"]} for p in plans],
-                     "total_cost": total_cost,
-                     "context_used": context_used,
-                     "context_max": context_max,
-                     "cache_read": cache_read,
-                     "cache_write": cache_write,
-                     "output_tokens": output_tokens,
-                     "execution_path": effective_exec_path,
-                     "execution_mode": chat.get("execution_mode", ""),
-                     "model": chat.get("model", ""),
-                     # The chat's stored permission mode. The frontend applies
-                     # it for task-run chats (the scheduler's 'auto' posture)
-                     # so the permission chip reflects the RUN's real mode,
-                     # not the viewer's sticky selection.
-                     "mode": chat.get("permission_mode", "default"),
-                     # Best-effort process liveness (in-memory only, no RPC) —
-                     # gates the cross-engine model options client-side. An
-                     # active pump also means alive (the attach below streams
-                     # it); a pending/running TASK RUN counts as alive too
-                     # (parked/spawning runs have no session yet but must
-                     # keep the picker locked). The switch op re-checks
-                     # authoritatively.
-                     "process_alive": (
-                         bool(pump and not pump.is_done)
-                         or await task_run_active_async(chat["id"])
-                         or await chat_process_alive(chat)
-                     )})
+        frame = {"type": wire.CHAT_HISTORY_DELTA if as_delta else wire.CHAT_HISTORY,
+                 "chat_id": cid,
+                 # Agent of record, from the chat row — the frontend uses it
+                 # to normalize a mismatched /chat/:name/:chatId URL (a
+                 # deep-link/redirect can carry the wrong slug; the route
+                 # param is otherwise trusted for the UI shell).
+                 "agent": chat["agent"],
+                 "has_more": has_more,
+                 "restore": restore,
+                 "plans": [{"filename": p["filename"], "content": p["content"],
+                            "status": p["status"]} for p in plans],
+                 "total_cost": total_cost,
+                 "context_used": context_used,
+                 "context_max": context_max,
+                 "cache_read": cache_read,
+                 "cache_write": cache_write,
+                 "output_tokens": output_tokens,
+                 "execution_path": effective_exec_path,
+                 "execution_mode": chat.get("execution_mode", ""),
+                 "model": chat.get("model", ""),
+                 # The chat's stored permission mode. The frontend applies
+                 # it for task-run chats (the scheduler's 'auto' posture)
+                 # so the permission chip reflects the RUN's real mode,
+                 # not the viewer's sticky selection.
+                 "mode": chat.get("permission_mode", "default"),
+                 # Best-effort process liveness (in-memory only, no RPC) —
+                 # gates the cross-engine model options client-side. An
+                 # active pump also means alive (the attach below streams
+                 # it); a pending/running TASK RUN counts as alive too
+                 # (parked/spawning runs have no session yet but must
+                 # keep the picker locked). The switch op re-checks
+                 # authoritatively.
+                 "process_alive": (
+                     bool(pump and not pump.is_done)
+                     or await task_run_active_async(chat["id"])
+                     or await chat_process_alive(chat)
+                 ),
+                 **locked}
+        # The attach that follows (below: a live pump that is neither done
+        # nor an external session's) sends the turn's live_state: the client
+        # holds these rows and paints both at once.
+        if pump and not pump.is_done and not view_only_external:
+            frame["live_pending"] = True
+        if as_delta:
+            frame["since_id"] = min(read_floors.values())
+        # Encoded off the loop, row by row: a long history's dump never holds
+        # the loop, and the thread yields between rows.
+        if await self._send_text(await asyncio.to_thread(_encode_history, frame, messages)):
+            self._history_floors = (cid, new_floors)
 
         if view_only_external:
             # Read-only view of a live external session: history is sent, but we
             # do NOT acquire the session slot, send warmup_ready, or promise a
             # pump attach — leaving the phone/webhook driver's stream untouched
             # so the call keeps playing and tears down normally.
+            kind = pump.source_type if pump else session_kind.of_chat(chat).source_type
             logger.info(
-                f"WS dashboard: chat={cid} driven by an active "
-                f"{pump.source_type} session — read-only view, not attaching"
+                f"WS dashboard: chat={cid} is driven by a {kind} session — "
+                f"read-only view, not attaching"
             )
             return
 
@@ -448,16 +581,8 @@ class ChatResumeMixin:
             # client against the pump's actual queue. Backend is the source
             # of truth; without this a reload mid-streaming would show
             # stale entries (we might have missed a queue_sent during the
-            # disconnect). list() snapshots safely without holding the
-            # producer's reference.
-            await self._send({
-                "type": wire.QUEUE_SNAPSHOT,
-                "chat_id": self.chat_id,
-                "messages": [
-                    {"text": q.text, **q.frame_fields()}
-                    for q in list(getattr(pump, "message_queue", []) or [])
-                ],
-            })
+            # disconnect).
+            await self._send(await self._queue_snapshot(pump))
             # live_state is sent from _stream_via_pump AFTER attach() to avoid race
             self.promised_pump_chat = cid  # consumed by _enter_pump_loop
             logger.info(f"WS dashboard: active pump found for chat={self.chat_id}, will attach")
@@ -497,10 +622,15 @@ class ChatResumeMixin:
                     "turn_open": isess.turn_open,
                     **(await run_db(self._target_mismatch_fields, self.chat_id)),
                 })
-                await self._send({"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id, "messages": []})
+                await self._send(await self._queue_snapshot())
                 # Client attaches the PTY viewer via pty_attach (see _dispatch).
                 return
-            if self.layer and await self.layer.is_session_alive(old_session_id):
+            # A machine in its reconnect grace is coming back: its session
+            # stays the chat's (a turn sent meanwhile waits for it).
+            if self.layer and (
+                    await self.layer.is_session_alive(old_session_id)
+                    or grace_layer(old_session_id, self.layer).is_session_grace_held(
+                        old_session_id)):
                 # Confirm the concurrency slot (idempotent for a tracked
                 # session), using the chat's pinned target so a REMOTE session
                 # stays off G.
@@ -530,9 +660,9 @@ class ChatResumeMixin:
                     "interactive": False,
                     **(await run_db(self._target_mismatch_fields, self.chat_id)),
                 })
-                # No active pump → queue is empty by definition. Emit so
-                # the client clears any reload-persisted stale entries.
-                await self._send({"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id, "messages": []})
+                # No active pump: the chat's queue. Emit so the client
+                # clears any reload-persisted stale entries.
+                await self._send(await self._queue_snapshot())
                 return
 
         # Session dead or doesn't exist — DON'T spawn a new process just for browsing.
@@ -581,8 +711,9 @@ class ChatResumeMixin:
         })
         # Lazy path — no pump, no session yet. Clear any persisted queue
         # on the client (rare but possible if user reloaded after a turn
-        # finished but before sending again).
-        await self._send({"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id, "messages": []})
+        # finished but before sending again), keeping what the chat's
+        # queue holds.
+        await self._send(await self._queue_snapshot())
         logger.info(
             f"WS dashboard resume_chat (lazy): session dead/missing, "
             f"chat={self.chat_id}, agent={self.agent_name} — will warmup on first message"

@@ -156,6 +156,8 @@ describe('warmupFailSubtype', () => {
   })
   it('keeps availability and crash reasons distinct', () => {
     expect(warmupFailSubtype('target_unavailable')).toBe('target_unavailable')
+    // A chat that runs as the agent, below the editor role: a role card.
+    expect(warmupFailSubtype('below_editor')).toBe('below_editor')
     expect(warmupFailSubtype('throttled')).toBe('session_error')
     expect(warmupFailSubtype(undefined)).toBe('session_error')
     expect(warmupFailSubtype('anything_else')).toBe('session_error')

@@ -406,8 +406,8 @@ def worker_temp_path(container_path: str, suffix: str) -> str:
 
 def cleanup_partials(container_path: str) -> None:
     """Remove the temps a killed or failed worker left beside
-    ``container_path`` (``.<name>.<hex>.partial``) and its temp in the system
-    temp dir; best-effort."""
+    ``container_path`` (``.<name>.<hex>.partial``, the name cut to safe_fs's
+    temp length) and its temp in the system temp dir; best-effort."""
     with contextlib.suppress(OSError):
         os.unlink(worker_temp_path(container_path, ".pdf"))
     parent, name = os.path.split(container_path)
@@ -416,7 +416,7 @@ def cleanup_partials(container_path: str) -> None:
     except OSError:
         return
     for entry in entries:
-        if entry.startswith(f".{name}.") and entry.endswith(".partial"):
+        if safe_fs.is_partial_of(entry, name):
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(parent, entry))
 
@@ -469,9 +469,12 @@ _WRITE_OP_ADVICE = (
 _libreoffice_lock = asyncio.Lock()
 
 # The profile the headless conversions run under: formulas are never
-# recalculated on load, links are never updated, macros never run (the
-# document under conversion is untrusted input; LibreOffice 7.4 is already
-# inert on these by default and the profile pins it).
+# recalculated on load, links are never updated, macros never run, and a
+# linked graphic is never loaded (an HTML image reference, an ODF or OOXML
+# linked picture: LibreOffice 7.4 loads them from any path it can read
+# unless BlockUntrustedRefererLinks is set; an embedded picture still
+# renders). The document under conversion is untrusted input; LibreOffice
+# 7.4 is inert on the first three by default and the profile pins them.
 _LO_PROFILE_DIR = os.environ.get("FILETOOLS_LO_PROFILE", "/tmp/file-tools-lo-profile")
 _LO_REGISTRY = """<?xml version="1.0" encoding="UTF-8"?>
 <oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -481,6 +484,7 @@ _LO_REGISTRY = """<?xml version="1.0" encoding="UTF-8"?>
 <item oor:path="/org.openoffice.Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value></prop></item>
 <item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
 <item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop></item>
 </oor:items>
 """
 
@@ -510,8 +514,9 @@ async def _libreoffice_convert(
     name and must never write into the tree itself."""
     if output_dir is None:
         output_dir = str(Path(input_path).parent)
-    profile = _libreoffice_profile()
     async with _libreoffice_lock:
+        # Under the lock: a drift rewrite never lands while a run reads it.
+        profile = await asyncio.to_thread(_libreoffice_profile)
         proc = await asyncio.create_subprocess_exec(
             "libreoffice", f"-env:UserInstallation=file://{profile}",
             "--headless", "--norestore", "--convert-to",
@@ -545,9 +550,11 @@ async def _notify_file_written(file_path: str) -> bool:
 
     For remote agent sessions, the proxy uses this signal to push the file
     from its platform-side cache back to the satellite so the agent CLI and
-    downstream MCPs on the satellite see the updated content. No-op for
-    local sessions (proxy returns `local: true`). Fire-and-forget — the
-    tool's success is independent of sync success.
+    downstream MCPs on the satellite see the updated content. On a local
+    session the proxy pushes nothing (it answers `local: true`) and, like
+    on a remote one, announces the change with `file_updated` unless the
+    file still holds the bytes its newest push's document knows.
+    Fire-and-forget — the tool's success is independent of sync success.
     """
     session_id, auth = _current_session()
     if not PROXY_URL or not session_id or not auth:
@@ -570,8 +577,9 @@ async def _notify_file_written(file_path: str) -> bool:
 async def _push_preview(file_path: str, filename: str | None = None):
     """Push a document preview event to the dashboard via proxy hook.
 
-    Also notifies the proxy that the file was written so remote sessions
-    can sync the new bytes back to the satellite (no-op for local).
+    Also notifies the proxy that the file was written first, so a remote
+    session's machine holds the new bytes before the preview, and every
+    open view of the file hears of the change.
     """
     session_id, auth = _current_session()
     if not PROXY_URL or not session_id or not auth:

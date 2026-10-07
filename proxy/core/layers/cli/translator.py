@@ -24,6 +24,7 @@ from core.layers.cli.helpers import (
     _SKIP_INLINE_TOOLS,
 )
 from core.session.session_state import get_subagent_registry
+from core.events import turn_ending
 from core.events.bg_command_state import (
     get_bg_command_registry, shorten_label, TERMINAL_STATUSES,
 )
@@ -100,6 +101,27 @@ def _truncate_workflow_previews(workflow_progress):
     return out
 
 
+def _reached_window(info: dict) -> str:
+    """The window a rejected ``rate_limit_event`` reached, in the windows' own
+    keys: ``five_hour`` / ``seven_day`` (account-wide), ``scoped:<family>``
+    for a model family's weekly window (``seven_day_<family>``); "" for a
+    type the platform does not know (no window: the pool's usual cooldown).
+    The same rule files the event's window sample (``usage.from_event``)."""
+    from core.layers.cli.usage import event_reached_key
+    return event_reached_key(info.get("rateLimitType"))
+
+
+def _rejected_resets_at(info: dict) -> str:
+    """The reset instant of a rejected ``rate_limit_event``: its own
+    ``resetsAt``, else the reached window's."""
+    at = turn_ending.epoch_to_iso(info.get("resetsAt"))
+    if at:
+        return at
+    windows = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
+    reached = windows.get(str(info.get("rateLimitType") or ""))
+    return turn_ending.epoch_to_iso(reached.get("resetsAt")) if isinstance(reached, dict) else ""
+
+
 class ClaudeCLIEventTranslator:
     """Stateful per-turn translator: raw NDJSON → ClaudeStreamChunk.
 
@@ -118,6 +140,7 @@ class ClaudeCLIEventTranslator:
         "actual_session_id",
         "block_types",
         "active_tool",
+        "open_tools",
         "has_emitted_text",
         "_tool_inputs",
         "_tool_input_names",
@@ -127,6 +150,10 @@ class ClaudeCLIEventTranslator:
         "_pending_task_creates",
         "_bg_bash_commands",
         "_in_settle",
+        "ending_emitted",
+        "_limit_notice",
+        "_limit_resets_at",
+        "_limit_window",
     )
 
     def __init__(self, session_id: str) -> None:
@@ -136,6 +163,11 @@ class ClaudeCLIEventTranslator:
         # Per-turn parsing state
         self.block_types: dict[int, dict] = {}
         self.active_tool: dict | None = None
+        # The tool calls the model issued whose result has not come back
+        # (``tool_use`` block ids until the ``user`` message carrying their
+        # ``tool_result``): the turn's life while it streams nothing
+        # (core/events/turn_life.py reads it through the session loops).
+        self.open_tools: set[str] = set()
         self.has_emitted_text: bool = False
         self._tool_inputs: dict[int, list[str]] = {}
         self._tool_input_names: dict[int, str] = {}
@@ -168,6 +200,15 @@ class ClaudeCLIEventTranslator:
         # model → mark_done(surfaced=False) (drives the task producer's
         # review-turn decision).
         self._in_settle: bool = False
+        # A typed turn ending (a decline or a usage limit) is emitted once;
+        # the engine's own error result that follows it is not repeated.
+        self.ending_emitted: bool = False
+        # The engine's limit notice (its synthetic assistant message), and
+        # the reset instant and the reached window of the last rejected
+        # rate-limit event.
+        self._limit_notice: str = ""
+        self._limit_resets_at: str = ""
+        self._limit_window: str = ""
 
     def reset_for_new_turn(self) -> None:
         """Full reset for a brand-new turn.
@@ -178,6 +219,7 @@ class ClaudeCLIEventTranslator:
         """
         self.block_types.clear()
         self.active_tool = None
+        self.open_tools.clear()
         self.has_emitted_text = False
         self._tool_inputs.clear()
         self._tool_input_names.clear()
@@ -215,6 +257,7 @@ class ClaudeCLIEventTranslator:
         if msg_type == "control_response":
             return []
         if msg_type == "assistant":
+            self._note_limit_notice(data)
             return []
         if msg_type == "user":
             return self._handle_user(data)
@@ -228,6 +271,9 @@ class ClaudeCLIEventTranslator:
             # it to services.engines.subscription_windows and drop it.
             info = data.get("rate_limit_info")
             if isinstance(info, dict):
+                if info.get("status") == "rejected":
+                    self._limit_resets_at = _rejected_resets_at(info)
+                    self._limit_window = _reached_window(info)
                 return [ClaudeStreamChunk(event_type="rate_limit", event_data=info)]
             return []
 
@@ -486,35 +532,59 @@ class ClaudeCLIEventTranslator:
         return []
 
     def _handle_message_delta(self, event: dict) -> list[ClaudeStreamChunk]:
-        """Surface safety refusals; everything else in message_delta stays silent.
+        """A safety-classifier decline ends the turn; everything else in
+        message_delta stays silent.
 
-        Fable 5's safety classifiers can decline a request (``stop_reason:
-        "refusal"``, HTTP 200). In non-interactive stream-json Claude Code does
-        NOT auto-fall-back to Opus 5 (only the interactive TUI switches
-        models itself) — the turn just ends, which without this handler renders
-        as a silently empty assistant reply. Emit a clear user-visible error
-        instead, with the classifier category/explanation when present.
+        The classifier can decline a request (``stop_reason: "refusal"``, HTTP
+        200). Claude Code then goes on by itself ("continuing once with that
+        noted"), so the decline is a typed ending: the turn's owner ends the
+        process when it sees it, and the chat, the run and the delegator get
+        one reason instead of a silently empty reply.
         """
         delta = event.get("delta", {}) or {}
         if delta.get("stop_reason") != "refusal":
             return []
         details = delta.get("stop_details") or event.get("stop_details") or {}
-        category = details.get("category") or ""
-        explanation = details.get("explanation") or ""
-        parts = ["The model declined this request"]
-        parts.append(f" (safety classifier: {category})" if category else " (safety classifier)")
-        parts.append(".")
-        if explanation:
-            parts.append(f" {explanation}")
-        parts.append(
-            " You can rephrase the request, or switch this chat to another"
-            " model (e.g. Opus 5) and retry."
-        )
-        return [ClaudeStreamChunk(
-            text="".join(parts),
+        return self._ending_chunks(turn_ending.TurnEnding(
+            reason=turn_ending.DECLINED, detail=str(details.get("category") or ""),
+        ))
+
+    def _note_limit_notice(self, data: dict) -> None:
+        """Claude Code answers a usage limit with a synthetic assistant message
+        (model ``<synthetic>``, ``error: "rate_limit"``) and then an error
+        result; the message's text is the notice the ending carries."""
+        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        text = "".join(
+            b.get("text", "") for b in (message.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "text"
+        ).strip()
+        if data.get("error") == "rate_limit" or (
+                message.get("model") == "<synthetic>" and turn_ending.is_limit_text(text)):
+            self._limit_notice = text or self._limit_notice
+
+    def _ending_chunks(self, ending: "turn_ending.TurnEnding") -> list[ClaudeStreamChunk]:
+        """The turn's typed ending, once: an open tool block is closed first
+        (its call never ran)."""
+        if self.ending_emitted:
+            return []
+        self.ending_emitted = True
+        self.open_tools.clear()
+        chunks: list[ClaudeStreamChunk] = []
+        if self.active_tool:
+            chunks.append(ClaudeStreamChunk(
+                event_type="tool_end",
+                event_data={"tool_id": self.active_tool["tool_id"], "name": self.active_tool["name"]},
+                session_id=self.actual_session_id,
+            ))
+            self.active_tool = None
+        chunks.append(ClaudeStreamChunk(
+            event_type="turn_ending",
+            event_data=ending.as_dict(),
+            text=ending.line(),
             session_id=self.actual_session_id,
             is_error=True,
-        )]
+        ))
+        return chunks
 
     def _handle_content_block_start(self, event: dict) -> list[ClaudeStreamChunk]:
         chunks: list[ClaudeStreamChunk] = []
@@ -549,6 +619,8 @@ class ClaudeCLIEventTranslator:
         elif cb_type == "tool_use":
             tool_name = cb.get("name", "")
             self.active_tool = {"name": tool_name, "tool_id": cb.get("id", "")}
+            if cb.get("id"):
+                self.open_tools.add(cb["id"])
             chunks.append(ClaudeStreamChunk(
                 event_type="tool_start",
                 event_data={"name": tool_name, "tool_id": cb.get("id", "")},
@@ -749,14 +821,18 @@ class ClaudeCLIEventTranslator:
         )
 
     def _handle_user(self, data: dict) -> list[ClaudeStreamChunk]:
-        """Tool results ride back as `user` messages. The only thing mined
-        here is the CLI-assigned task id a TaskCreate result carries
+        """Tool results ride back as `user` messages: each closes its tool
+        call (``open_tools``). The only thing mined besides is the
+        CLI-assigned task id a TaskCreate result carries
         ("Task #N created successfully: …") — the tool INPUT has no id, so
         the checklist item can only be inserted once the result lands."""
-        if not self._pending_task_creates:
-            return []
         content = (data.get("message") or {}).get("content")
         if not isinstance(content, list):
+            return []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                self.open_tools.discard(block.get("tool_use_id", ""))
+        if not self._pending_task_creates:
             return []
         inserted = False
         for block in content:
@@ -796,6 +872,7 @@ class ClaudeCLIEventTranslator:
                 session_id=self.actual_session_id,
             ))
             self.active_tool = None
+        self.open_tools.clear()
 
         result_text = data.get("result", "")
         is_error = bool(data.get("is_error", False))
@@ -806,12 +883,21 @@ class ClaudeCLIEventTranslator:
             errors_list = data.get("errors", [])
             if errors_list:
                 error_text = "; ".join(str(e) for e in errors_list)
-        if error_text and is_error:
-            chunks.append(ClaudeStreamChunk(
-                text=error_text,
-                session_id=self.actual_session_id,
-                is_error=True,
-            ))
+        if is_error and self.ending_emitted:
+            pass  # the typed ending already said it
+        elif is_error and (self._limit_notice or turn_ending.is_limit_text(error_text)):
+            chunks.extend(self._ending_chunks(turn_ending.TurnEnding(
+                reason=turn_ending.LIMIT,
+                resets_at=self._limit_resets_at,
+                detail=(self._limit_notice or error_text).strip(),
+                window=self._limit_window,
+            )))
+        elif error_text and is_error:
+            # The engine's own error result (a dropped connection, a bad
+            # request): the process answered and stays, the ending says so.
+            chunks.extend(self._ending_chunks(turn_ending.TurnEnding(
+                reason=turn_ending.ERROR, detail=error_text.strip(),
+            )))
         elif (result_text and not self.has_emitted_text
                 and result_text != RESUME_HANDSHAKE_RESULT):
             # Result text wasn't streamed via stream_events. The resume
@@ -887,6 +973,7 @@ class ClaudeCLIEventTranslator:
         """
         self.block_types.clear()
         self.active_tool = None
+        self.open_tools.clear()
         self.has_emitted_text = False
         self._tool_inputs.clear()
         self._tool_input_names.clear()
@@ -905,6 +992,7 @@ class ClaudeCLIEventTranslator:
         """
         self.block_types.clear()
         self.active_tool = None
+        self.open_tools.clear()
         self.has_emitted_text = False
         self._tool_inputs.clear()
         self._tool_input_names.clear()

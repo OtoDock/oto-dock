@@ -384,6 +384,14 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
               Install
             </button>
           )}
+          {showAdminInstall && !installing && mcp.source_changed && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
+              title="The catalog entry moved to another source. Run Check Updates on the MCP Servers page and switch it there."
+            >
+              source changed
+            </span>
+          )}
           {showAdminInstall && !installing && mcp.update_available && (
             <button
               onClick={handleInstall}

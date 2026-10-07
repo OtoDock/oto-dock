@@ -22,6 +22,31 @@ def test_auth_config_exposes_connectivity_flags(monkeypatch):
     assert "relay_enabled" not in data
 
 
+def _collabora_origin(monkeypatch, collabora: str, dashboard: str) -> str:
+    monkeypatch.setattr(config, "COLLABORA_URL", collabora)
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", dashboard)
+    return client.get("/auth/config").json()["collabora_origin"]
+
+
+def test_auth_config_collabora_origin_is_empty_in_sub_path_mode(monkeypatch):
+    assert _collabora_origin(monkeypatch, "https://dash.example.com/collabora",
+                             "https://dash.example.com") == ""
+
+
+def test_auth_config_collabora_origin_names_an_editor_on_its_own_host(monkeypatch):
+    assert _collabora_origin(monkeypatch, "https://collabora.example.com/",
+                             "https://dash.example.com") == "https://collabora.example.com"
+
+
+def test_auth_config_collabora_origin_names_another_port_of_the_same_host(monkeypatch):
+    assert _collabora_origin(monkeypatch, "https://host:9980",
+                             "https://host") == "https://host:9980"
+
+
+def test_auth_config_collabora_origin_is_empty_when_neither_is_set(monkeypatch):
+    assert _collabora_origin(monkeypatch, "", "") == ""
+
+
 def test_auth_config_relay_available_when_base_set(monkeypatch):
     monkeypatch.setattr(config, "OTODOCK_AIR_GAPPED", False)  # connected
     monkeypatch.setattr(config, "OTODOCK_RELAY_BASE", "https://api.otodock.io")

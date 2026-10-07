@@ -58,6 +58,7 @@ TOOL_ROLES = {
     "AskUserQuestion": "question",
     "request_user_input": "question",
     "CodexEscalation": "escalation",
+    "CodexTerminalInput": "escalation",
 }
 
 # Roles whose calls already have dedicated rich rendering (the question

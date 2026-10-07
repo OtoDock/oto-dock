@@ -28,6 +28,7 @@ This module owns no business logic — it's a thin wrapper around
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import logging
 import uuid
@@ -42,9 +43,10 @@ from storage.identity import credential_store
 from storage import database as task_store
 from services.billing import relay_client
 from services.mcp import mcp_registry
-from services.oauth import oauth_engine, oauth_account_store
+from services.oauth import mcp_authorization, oauth_engine, oauth_account_store
+from storage.pg import run_db
 from auth.oauth_providers import canonical_provider_id, get_provider
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_admin, require_human
 
 logger = logging.getLogger("claude-proxy.oauth-api")
 router = APIRouter()
@@ -65,6 +67,9 @@ class OAuthStartRequest(BaseModel):
 class OAuthExchangeRequest(BaseModel):
     code: str
     state: str
+    # The authorization response's issuer (RFC 9207), when the deep link
+    # carried one.
+    iss: str = ""
 
 
 class OAuthDisconnectRequest(BaseModel):
@@ -161,18 +166,6 @@ def _error_html(provider: str, message: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _require_dashboard_user(user: UserContext) -> None:
-    if user.is_api_key:
-        raise HTTPException(403, "Dashboard only")
-
-
-def _require_admin(user: UserContext) -> None:
-    if user.is_service:
-        return  # the trusted master key is admin-equivalent (service-to-service)
-    if not user.is_admin:
-        raise HTTPException(403, "Admin only")
-
-
 def _redirect_uri(provider: str) -> str:
     """Public callback URL for this provider, derived from DASHBOARD_PUBLIC_URL."""
     base = config.DASHBOARD_PUBLIC_URL.rstrip("/") if config.DASHBOARD_PUBLIC_URL else ""
@@ -227,7 +220,7 @@ async def oauth_start(
     user: UserContext = Depends(get_current_user),
 ):
     """Initiate the OAuth flow. Returns ``{url}`` for the consent popup."""
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
     _validate_services_against_manifest(body.mcp_name, body.services)
     # A caller-supplied label rides the state to the callback where it
@@ -247,12 +240,21 @@ async def oauth_start(
     oauth_block = manifest.credentials.oauth or {}
     redirect_uri = _redirect_uri(provider)
 
+    # The MCP server names its own authorization server: the install signs
+    # in through the client it registered there (or registers first). The
+    # rule (`registered_client_mode`) also decides which token files count
+    # as connected, so the two never disagree.
+    if await run_db(mcp_authorization.registered_client_mode, manifest):
+        return await _start_registered_client(
+            provider, body, manifest, oauth_block, redirect_uri, user,
+        )
+
     # HOSTED: no install-side app credential. Mint state for the install's
     # CSRF, then ask the relay for the vendor consent URL. The relay holds
     # OtoDock's client_secret, is the redirect target, performs the exchange,
     # and bounces the user's tokens back to install_callback echoing state.
     # Stub raises RelayNotConfigured (→ 503) until the relay is built.
-    if relay_client.hosted_oauth_active(body.mcp_name, manifest):
+    if await run_db(relay_client.hosted_oauth_active, body.mcp_name, manifest):
         state = oauth_engine.create_state(
             user_sub=user.sub,
             mcp_name=body.mcp_name,
@@ -281,7 +283,9 @@ async def oauth_start(
 
     # SELF-MANAGED: confirm OAuth app credentials are configured (DB lookup).
     app_cred = oauth_block.get("app_credential", "")
-    creds = credential_store.get_infra_credentials(app_cred) if app_cred else {}
+    creds = (
+        await run_db(credential_store.get_infra_credentials, app_cred) if app_cred else {}
+    )
     client_id, client_secret = oauth_engine._resolve_app_credentials(
         oauth_block, creds,
     )
@@ -375,6 +379,77 @@ async def oauth_start(
     return {"url": url}
 
 
+async def _start_registered_client(
+    provider: str, body: OAuthStartRequest, manifest, oauth_block: dict,
+    redirect_uri: str, user: UserContext,
+) -> dict:
+    """The consent URL of a connect through the client this install
+    registered at the MCP server's own authorization server
+    (``credentials.oauth.authorization_server``).
+
+    Nothing leaves the install before the MCP host is on the admin's bearer
+    allowlist for the provider: that row approves where the install
+    registers and sends the code (the allowed host's own metadata names the
+    server). Then discovery, the registration (once per server and
+    callback), the state (the engine mints the PKCE verifier) and the URL,
+    with none of the app-flow extras.
+    """
+    from urllib.parse import urlsplit
+
+    from storage.identity import bearer_allowlist
+
+    host = (urlsplit(manifest.server.url_template or "").hostname or "").lower()
+    if not await run_db(bearer_allowlist.is_host_allowed, provider, host):
+        raise HTTPException(
+            400,
+            f"An admin must allow {host} for {provider} in Admin > Security "
+            "before accounts can be connected.",
+        )
+    block = oauth_block.get("authorization_server") or {}
+    try:
+        server = await mcp_authorization.discover(
+            manifest.server.url_template, issuer_override=str(block.get("issuer") or ""),
+        )
+        registration = await mcp_authorization.ensure_registration(
+            server, redirect_uri=redirect_uri, block=block,
+            scope=mcp_authorization.registration_scope(block, oauth_block),
+            for_resource=mcp_authorization.canonical_resource(manifest.server.url_template or ""),
+        )
+    except mcp_authorization.AuthorizationError as e:
+        raise HTTPException(e.status, str(e))
+    scope = mcp_authorization.scopes_for(
+        block,
+        service_scopes=mcp_registry.build_oauth_scopes(body.mcp_name, body.services),
+        server=server,
+    )
+    state = oauth_engine.create_state(
+        user_sub=user.sub,
+        mcp_name=body.mcp_name,
+        provider_id=provider,
+        services=body.services,
+        account_label_hint=body.account_label,
+        mobile=body.mobile,
+        redirect_uri=redirect_uri,
+        mcp_authorization={
+            "registration_id": registration["id"],
+            "client_id": registration["client_id"],
+            "issuer": server.issuer,
+            "resource": server.resource,
+            "token_endpoint": server.token_endpoint,
+            "revocation_endpoint": server.revocation_endpoint,
+            "scope": scope,
+            "iss_parameter_supported": server.iss_parameter_supported,
+        },
+    )
+    challenge = oauth_engine.peek_state_extra(state).get("code_challenge", "")
+    url = mcp_authorization.build_authorize_url(
+        server.authorization_endpoint,
+        client_id=registration["client_id"], redirect_uri=redirect_uri,
+        scope=scope, state=state, code_challenge=challenge, resource=server.resource,
+    )
+    return {"url": url}
+
+
 @router.get("/v1/oauth/{provider}/callback")
 async def oauth_callback(
     provider: str,
@@ -382,6 +457,7 @@ async def oauth_callback(
     code: str = Query(None),
     state: str = Query(None),
     error: str = Query(None),
+    iss: str = Query(None),
 ):
     """OAuth callback — web popup (HTML) or mobile deep-link (302)."""
     # Reject an unknown provider before reflecting it anywhere; the canonical
@@ -392,6 +468,17 @@ async def oauth_callback(
     except KeyError:
         return HTMLResponse(_error_html("", "Unknown provider"), status_code=400)
     if error:
+        # An error response of a registered-client sign-in must name the
+        # state's issuer too (RFC 9207); the state is not consumed for it.
+        expected, iss_required = oauth_engine.peek_state_issuer(state or "")
+        if expected and iss and iss.rstrip("/") != expected.rstrip("/"):
+            return HTMLResponse(_error_html(
+                provider, "The authorization response names another issuer",
+            ))
+        if expected and iss_required and not iss:
+            return HTMLResponse(_error_html(
+                provider, "The authorization response carries no issuer",
+            ))
         return HTMLResponse(_error_html(provider, f"Provider returned: {error}"))
     if not code or not state:
         return HTMLResponse(_error_html(provider, "Missing code or state parameter"))
@@ -399,7 +486,9 @@ async def oauth_callback(
     # We can't pre-validate state without consuming it. Peek by validating;
     # validate_state is one-shot, so the rest of the flow must succeed.
     try:
-        result = await oauth_engine.do_oauth_exchange(code=code, state_token=state)
+        result = await oauth_engine.do_oauth_exchange(
+            code=code, state_token=state, iss=iss or "",
+        )
     except Exception as e:
         # Never reflect the exception text — it can carry vendor response
         # bodies / internal URLs. Full detail goes to the server log only.
@@ -432,7 +521,7 @@ async def oauth_exchange(
     The mobile app receives the auth code via the otodock:// deep link and
     POSTs it here. State carries user_sub and is verified to match.
     """
-    _require_dashboard_user(user)
+    require_human(user)
 
     # Peek at state's user_sub before consuming — but validate_state is
     # one-shot. We need to consume + check + (if mismatched) raise.
@@ -440,11 +529,13 @@ async def oauth_exchange(
     # user must retry, which is the correct UX.
     try:
         result = await oauth_engine.do_oauth_exchange(
-            code=body.code, state_token=body.state,
+            code=body.code, state_token=body.state, iss=body.iss or "",
         )
     except Exception as e:
+        # Never reflect the exception text: it can carry a vendor's response
+        # or a store error. The log has it.
         logger.exception("OAuth exchange failed (provider=%s)", provider)
-        raise HTTPException(400, str(e)) from e
+        raise HTTPException(400, f"Token exchange failed ({type(e).__name__})") from e
 
     if result.state.user_sub != user.sub:
         raise HTTPException(403, "State was issued for a different user")
@@ -464,7 +555,7 @@ async def list_oauth_accounts(
     there is no platform service-account tier; every user connects their
     own account.
     """
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(mcp_name, provider)
     accounts = await asyncio.to_thread(
         credential_store.list_user_accounts, user.sub, mcp_name,
@@ -490,7 +581,7 @@ async def oauth_disconnect(
     own user-scope subscriptions plus any agent-scope subscriptions whose
     binding points at this account), then deletes the token file + DB rows.
     """
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
 
     # Pick the right token dir for revoke (need the refresh token before
@@ -508,17 +599,37 @@ async def oauth_disconnect(
             f"credentials.oauth block",
         )
 
+    try:
+        oauth_account_store.validate_account_label(body.account_label)
+    except ValueError:
+        raise HTTPException(400, "Invalid account label")
     username = await asyncio.to_thread(
         task_store.get_username_by_sub, user.sub,
     )
     token_dir = (
-        oauth_account_store.get_token_dir(username, provider_id=provider_id)
+        await asyncio.to_thread(
+            oauth_account_store.get_token_dir, username, provider_id=provider_id,
+        )
         if username else None
     )
 
+    # The whole disconnect runs under the account lock the refresh worker
+    # holds across a rewrite, so a refresh in flight cannot recreate the
+    # file after the delete.
+    from core.credentials import credential_locks
+    async with credential_locks.get_lock(user.sub, provider_id, body.account_label):
+        return await _disconnect_locked(
+            provider, provider_id, body, user, manifest, token_dir,
+        )
+
+
+async def _disconnect_locked(
+    provider: str, provider_id: str, body: OAuthDisconnectRequest,
+    user: UserContext, manifest, token_dir,
+) -> dict:
     if token_dir is not None:
-        token_data = oauth_account_store.read_account_token(
-            token_dir, body.account_label,
+        token_data = await asyncio.to_thread(
+            oauth_account_store.read_account_token, token_dir, body.account_label,
         ) or {}
 
         refresh_token = (
@@ -530,12 +641,16 @@ async def oauth_disconnect(
             # which holds the secret. Best-effort either way: a stub
             # RelayNotConfigured (relay unbuilt) is swallowed below and local
             # cleanup proceeds.
-            via_relay = bool((token_data.get("extra") or {}).get("via_relay"))
+            extra = token_data.get("extra") or {}
+            via_relay = bool(extra.get("via_relay"))
+            registered = extra.get("flow") == oauth_account_store.MCP_AUTHORIZATION_FLOW
             try:
                 if via_relay:
                     await relay_client.oauth_revoke(
                         provider_id=provider, token=refresh_token,
                     )
+                elif registered:
+                    await _revoke_registered_client(token_data, refresh_token)
                 else:
                     oauth_block = (manifest.credentials.oauth or {}) if manifest else {}
                     app_cred = oauth_block.get("app_credential", "")
@@ -579,10 +694,11 @@ async def oauth_disconnect(
                     mcp_name=body.mcp_name, account_label=body.account_label,
                     agent=b.get("agent_name"),
                 )
-                await asyncio.to_thread(
+                await asyncio.to_thread(functools.partial(
                     credential_store.remove_service_agent_binding,
                     body.mcp_name, b.get("agent_name"),
-                )
+                    owner_sub=user.sub, account_label=body.account_label,
+                ))
     except Exception:
         logger.exception(
             "Subscription cleanup raised for %s/%s (continuing with disconnect)",
@@ -590,7 +706,9 @@ async def oauth_disconnect(
         )
 
     if token_dir is not None:
-        oauth_account_store.delete_account_token(token_dir, body.account_label)
+        await asyncio.to_thread(
+            oauth_account_store.delete_account_token, token_dir, body.account_label,
+        )
 
     # Delete DB rows (the caller's user account).
     await asyncio.to_thread(
@@ -603,6 +721,28 @@ async def oauth_disconnect(
         provider, body.mcp_name, user.sub[:8], body.account_label,
     )
     return {"status": "ok"}
+
+
+async def _revoke_registered_client(token_data: dict, refresh_token: str) -> None:
+    """Revoke a token the MCP server's own authorization server issued to
+    the client this install registered: at the endpoint the file names, on
+    the issuer's origin, with the registration's secret when it has one."""
+    from storage.identity import oauth_client_registrations as regs
+
+    extra = token_data.get("extra") or {}
+    method = str(extra.get("token_endpoint_auth_method") or "none")
+    secret = ""
+    if method != "none":
+        reg_id = int(extra.get("registration_id") or 0)
+        row = await run_db(regs.get, reg_id)
+        if row is not None and row.get("issuer") == str(extra.get("issuer") or ""):
+            secret = await run_db(regs.client_secret, reg_id) or ""
+    await mcp_authorization.revoke(
+        str(extra.get("revocation_endpoint") or ""),
+        issuer=str(extra.get("issuer") or ""), token=refresh_token,
+        method=method, client_id=str(token_data.get("client_id") or ""),
+        client_secret=secret,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +824,7 @@ async def device_code_start(
     Stateless — no server-side state token. The polling endpoint trusts
     the caller's session for user/mcp/account context.
     """
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
     _validate_services_against_manifest(body.mcp_name, body.services)
 
@@ -731,7 +871,7 @@ async def device_code_poll(
     On success runs the same persist path as the authorization-code flow
     (token file + DB rows) and returns ``{status, email, account_label}``.
     """
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
     _validate_services_against_manifest(body.mcp_name, body.services)
 
@@ -805,7 +945,7 @@ async def s2s_exchange(
     ``{account_label}`` — they can then bind it to an agent as its service
     identity.
     """
-    _require_admin(user)
+    require_admin(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
 
     client_id, client_secret, oauth_block = _app_creds_for(
@@ -895,7 +1035,7 @@ async def pat_save(
     The MCP manifest must declare ``personal_access_token`` in its
     ``flows`` list; otherwise we reject.
     """
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
 
     # Gate: manifest must declare personal_access_token as a valid flow.
@@ -1006,7 +1146,7 @@ async def admin_consent_start(
     pre-gating would prevent OtoDock managers who happen to be Microsoft
     tenant admins from using the flow.
     """
-    _require_dashboard_user(user)
+    require_human(user)
     _validate_provider_for_mcp(body.mcp_name, "microsoft")
 
     client_id, _, _ = _app_creds_for("microsoft", body.mcp_name)

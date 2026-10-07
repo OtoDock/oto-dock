@@ -155,6 +155,29 @@ async def test_config_build_failure_notifies():
 
 
 @pytest.mark.asyncio
+async def test_a_participant_below_the_editor_tier_ends_the_meeting_cleanly(caplog):
+    from core.sandbox.session_config_dir import AgentStateRefused
+    notify = AsyncMock()
+    refusal = AgentStateRefused("This agent is set to Shared only, so its chats and tasks "
+                                "run as the agent itself (this one would run as viewer).")
+    with patch.object(MO.task_store, "get_meeting",
+                      return_value=_pending_meeting_row()), \
+         patch.object(MO.task_store, "get_chat", return_value={}), \
+         patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
+         patch.object(MO, "build_meeting_agent_config",
+                      new=AsyncMock(side_effect=refusal)), \
+         patch.object(MO, "_notify_meeting_failed", new=notify), \
+         caplog.at_level("INFO"):
+        await MO.start_meeting("m1")
+    notify.assert_awaited_once()
+    msg = notify.await_args.args[1]
+    assert msg.startswith("The meeting could not start: ") and "set to Shared only" in msg
+    assert "failed to prepare" not in msg
+    assert not any(r.levelname == "ERROR" for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_usage_limit_block_notifies():
     from services.billing import usage_service
     notify = AsyncMock()

@@ -25,13 +25,15 @@ from pydantic import BaseModel
 from api.apps import catalog
 from auth.providers import (
     UserContext, get_current_user, require_agent_access, require_auth, session_bound_to,
+    require_user,
 )
 from services.checks import documents
 from storage import database as task_store
 from storage.checks import db_checks
 
 logger = logging.getLogger("checks")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 MAX_ATTACHED = 16
 # A session token changes or reads an agent's checks only for the agent it

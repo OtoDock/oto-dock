@@ -48,7 +48,7 @@ async def _stream(monkeypatch, row: dict) -> list[str]:
         raise AssertionError("a terminal row never subscribes to the scheduler")
 
     monkeypatch.setattr(tasks_api.scheduler, "subscribe_run", _never)
-    resp = await tasks_api.stream_run_output(row["id"], SimpleNamespace(), key=None, authorization=None)
+    resp = await tasks_api.stream_run_output(row["id"], SimpleNamespace())
     lines: list[str] = []
     async for chunk in resp.body_iterator:
         lines.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
@@ -164,7 +164,7 @@ async def _live_stream(monkeypatch, run_id: str, *, keepalive: float = 0.5,
     monkeypatch.setattr(tasks_api, "_check_run_access", lambda _run, _user: None)
     monkeypatch.setattr(tasks_api.run_stream, "KEEPALIVE_S", keepalive)
     monkeypatch.setattr(tasks_api.scheduler, "subscribe_run", _subscribe)
-    resp = await tasks_api.stream_run_output(run_id, SimpleNamespace(), key=None, authorization=None)
+    resp = await tasks_api.stream_run_output(run_id, SimpleNamespace())
     lines: list[str] = []
     async for chunk in resp.body_iterator:
         lines.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
@@ -329,7 +329,7 @@ class _Layer:
 
 
 @asynccontextmanager
-async def _instant_slot(session_id, target="", execution_path=None):
+async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
     yield
 
 
@@ -429,6 +429,32 @@ async def test_a_run_left_to_complete_sends_exactly_one_done_after_the_stamp(tem
     assert _registries_clear(run_id, "t-cx2")
 
 
+async def test_the_run_owes_its_report_while_it_runs(temp_db, monkeypatch):
+    """A turn the platform drives into the run's chat or session meanwhile
+    keeps the task producer (lanes.report_pending); the run's end releases
+    the keys it took."""
+    from services.scheduler import lanes
+    run_id, session_id = "run-cx5", "55555555-5555-4555-8555-555555555555"
+    seen: list[bool] = []
+
+    class _Watching(_Layer):
+        async def send_message(self, session_id_, prompt, **kw):
+            seen.append(lanes.report_pending(f"task-{run_id}", "")
+                        and lanes.report_pending("", session_id_))
+            async for event in super().send_message(session_id_, prompt, **kw):
+                yield event
+
+    t, _q = _drive(monkeypatch, _Watching(hold=False), _task("t-cx5"), run_id, session_id)
+    try:
+        await asyncio.wait_for(t, 20)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+        shared._run_event_buffer.pop(run_id, None)
+    assert seen == [True]
+    assert not lanes.report_pending(f"task-{run_id}", session_id)
+
+
 async def test_the_streams_word_waits_for_the_demotion(temp_db, monkeypatch):
     """A run the runner demotes after a clean turn (an engine error recorded
     by the pump) streams ``done failed`` — the producer's early ``completed``
@@ -452,6 +478,34 @@ async def test_the_streams_word_waits_for_the_demotion(temp_db, monkeypatch):
         shared._run_event_buffer.pop(run_id, None)
     assert temp_db.get_run(run_id)["status"] == run_status.FAILED
     assert q.dones() == [({"type": "done", "status": run_status.FAILED}, run_status.FAILED)]
+
+
+async def test_a_turn_the_engine_stopped_fails_the_run_with_its_reason(temp_db, monkeypatch):
+    """A declined turn (or a usage limit) the pump recorded as a typed ending
+    fails the run with the reason first in its error message, and the run's
+    output names it when the turn produced none."""
+    from core.events import stream_pump, turn_ending
+    run_id, session_id = "run-cx4", "44444444-4444-4444-8444-444444444444"
+    layer = _Layer(hold=False)
+    real_start = stream_pump.ChatStreamPump.start
+    ending = turn_ending.TurnEnding(reason=turn_ending.DECLINED, detail="cyber")
+
+    def _start(self):
+        self.last_error = ending.line()
+        self.last_ending = ending
+        return real_start(self)
+
+    monkeypatch.setattr(stream_pump.ChatStreamPump, "start", _start)
+    t, q = _drive(monkeypatch, layer, _task("t-cx4"), run_id, session_id)
+    try:
+        await asyncio.wait_for(t, 20)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+        shared._run_event_buffer.pop(run_id, None)
+    row = temp_db.get_run(run_id)
+    assert row["status"] == run_status.FAILED
+    assert row["error_message"] == "Declined by the model's safety classifier (cyber)."
 
 
 async def test_a_cancel_in_the_pre_slot_window_ends_the_row(temp_db, monkeypatch):

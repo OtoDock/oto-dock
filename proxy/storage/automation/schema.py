@@ -64,6 +64,30 @@ def init_tasks(conn) -> None:
     )
     conn.execute("DROP INDEX IF EXISTS idx_runs_agent")
 
+    # The files a delegated worker attached to its result (PROJECTS.md
+    # "Result files"): one row per file landed in the delegator's tree, named
+    # where it already was (the same tree) or skipped with its reason. A new
+    # table, so CREATE IF NOT EXISTS converges an existing install at boot;
+    # the foreign key cleans the rows with their run.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS delegate_result_files (
+            id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            run_id       TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+            target_agent TEXT NOT NULL,
+            path         TEXT NOT NULL,
+            landed_path  TEXT NOT NULL DEFAULT '',
+            ws_path      TEXT NOT NULL DEFAULT '',
+            bytes        BIGINT NOT NULL DEFAULT 0,
+            status       TEXT NOT NULL CHECK (status IN ('landed', 'named', 'skipped')),
+            reason       TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_result_files_run "
+        "ON delegate_result_files (run_id, id)"
+    )
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS dynamic_tasks (
             id TEXT PRIMARY KEY,

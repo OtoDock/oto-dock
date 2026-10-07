@@ -114,6 +114,49 @@ def warm_routes(app: FastAPI) -> None:
             except Exception:
                 logger.debug("route warm-up skipped %r", route, exc_info=True)
 
+_SWEEP_CONCURRENCY = 4
+_sweeps_running: dict[str, asyncio.Task] = {}
+
+
+async def run_sweep_items(items) -> list[str]:
+    """One tick of the 60 s sweep: every item not still running from the
+    last tick, ``_SWEEP_CONCURRENCY`` at a time, each failure logged on its
+    own. Returns the names that ran once they all ended (the loop does not
+    wait for that: a tick is its own task)."""
+    slot = asyncio.Semaphore(_SWEEP_CONCURRENCY)
+    ran: list[str] = []
+
+    async def _one(name: str, fn) -> None:
+        async with slot:
+            try:
+                await fn()
+            except Exception:
+                logger.exception("%s failed", name)
+
+    tasks = []
+    for name, fn in items:
+        previous = _sweeps_running.get(name)
+        if previous is not None and not previous.done():
+            logger.warning("%s still running from the last tick; skipped", name)
+            continue
+        ran.append(name)
+        task = asyncio.create_task(_one(name, fn))
+        _sweeps_running[name] = task
+        tasks.append(task)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return ran
+
+
+def _purge_mcp_build_outputs() -> None:
+    """The session MCP config build outputs are rebuilt per session; what an
+    earlier release left there carried vendor bearers inline, so the two
+    directories are emptied at every boot (the gateway descriptors beside
+    them are kept: a re-adoption reads them)."""
+    import shutil
+    for name in ("user-mcp-configs", "sse-mcp-configs"):
+        shutil.rmtree(config.SESSIONS_DIR / name, ignore_errors=True)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,6 +171,7 @@ async def lifespan(app: FastAPI):
 
     raise_nofile_limit()
     default_executor = set_default_executor(asyncio.get_running_loop())
+    _purge_mcp_build_outputs()
 
     # Startup — register client adapters
     from adapters import register_adapter
@@ -150,19 +194,16 @@ async def lifespan(app: FastAPI):
     def _queue_on_pump(chat_id: str, text: str, system: bool = False) -> bool:
         pump = _active_pumps.get(chat_id)
         if pump and not pump.is_done:
-            if system:
-                # Only pumps whose producer DRAINS system_queue may accept —
-                # a task/scheduler pump would swallow the prompt forever while
-                # the delivery ladder thinks it succeeded (silent-loss hole
-                # from the 2026-09-02 delegate trace). Refusal makes the
-                # caller fall through to persistent/one-shot/direct delivery.
-                if not getattr(pump, "system_queue_consumer", False):
-                    return False
-                pump.system_queue.append(text)
-            else:
-                from core.events.common_events import TurnInput
-                if pump.queue_message(TurnInput(text)) < 0:
-                    return False  # queue full — don't pretend it was delivered
+            # Only pumps whose producer DRAINS system_queue may accept —
+            # a task/scheduler pump would swallow the prompt forever while
+            # the delivery ladder thinks it succeeded (silent-loss hole
+            # from the 2026-09-02 delegate trace). Refusal makes the
+            # caller fall through to persistent/one-shot/direct delivery.
+            # A person's message never comes this way: the chat owns its
+            # queue (core/events/input_queue.py).
+            if not system or not getattr(pump, "system_queue_consumer", False):
+                return False
+            pump.system_queue.append(text)
             return True
         return False
 
@@ -252,6 +293,8 @@ async def lifespan(app: FastAPI):
     offboarding_sessions.register()
     offboarding_transfer.register()
     offboarding_bindings.register()
+    from ws import dashboard as _dashboard_ws
+    _dashboard_ws.register_offboarding()
     from services.apps import app_lifecycle as _app_lifecycle
     _app_lifecycle.register()
     # Credential-key canary: one loud ERROR when stored secrets can't be
@@ -295,6 +338,9 @@ async def lifespan(app: FastAPI):
     # closed sessions were cleared, so a replayed dead-session JWT stays denied.
     from core.session.session_state import load_session_security
     load_session_security()
+    # The sign-ins a logout revoked survive a restart (auth/session_revocation.py).
+    from auth import session_revocation
+    await asyncio.to_thread(session_revocation.load)
 
     from storage.agents import agent_store
     # Converge pre-1.4 agents on the agent.md persona filename before any
@@ -475,6 +521,13 @@ async def lifespan(app: FastAPI):
     from core.remote.remote_execution import reap_idle_remote_sessions
     _bg_tasks.append(asyncio.create_task(reap_idle_remote_sessions()))
     logger.info("Remote session reaper started")
+    # The credential gateway's push loop: a machine session's vendor tokens
+    # are renewed under their lease and wiped at the session's purge.
+    from core.credentials import mcp_gateway as _mcp_gateway
+    from core.remote import mcp_gateway_push as _mcp_gateway_push
+    _mcp_gateway.add_purge_hook(_mcp_gateway_push.on_purge)
+    _bg_tasks.append(asyncio.create_task(_mcp_gateway_push.run_push_loop()))
+    logger.info("MCP gateway push loop started")
     # Task ("is_task") session-index entries are popped on run completion in
     # scheduler._run_task; this is the backstop for any that leak (pre-launch
     # failure / restart mid-run) so the index can't grow unbounded.
@@ -552,122 +605,130 @@ async def lifespan(app: FastAPI):
     from ws.satellite import push_transfer_event as _push_transfer_event
     _transfer_registry.set_broadcaster(_push_transfer_event)
 
+    # The 60 s sweep's items, each isolated (one that raises is logged and
+    # the next runs) and run concurrently, _SWEEP_CONCURRENCY at a time: a
+    # slow one no longer pushes the rest back, and an item still running
+    # from the last tick is skipped (a hung sweep holds one slot, never
+    # four, and the fingerprint merge never runs twice). Every store touch
+    # goes through run_db (storage/pg.py's event-loop rule): a periodic
+    # DELETE + COMMIT on the loop is exactly what froze the proxy on
+    # 2026-09-03 when the disk went slow; the two file sweeps run in a
+    # worker thread for the same reason.
+    from storage.pg import run_db as _run_db
+
+    async def _sweep_media():
+        from services.media import media_pipeline as _mp
+        from storage import database as _db
+        await asyncio.to_thread(_mp.sweep_host_media_cache)      # TTL satellite-host media
+        await _run_db(_db.sweep_expired_media_tokens)  # reap expired workspace tokens
+
+    async def _sweep_preview_snapshots():
+        # Version-pinned preview snapshots: reap dirs of deleted chats
+        # (internally throttled to hourly).
+        from services.media import preview_snapshots as _psnap
+        await asyncio.to_thread(_psnap.sweep_orphans)
+
+    async def _sweep_recover_bin():
+        # Workspace Recover Bin: reap entries past their 7-day TTL
+        # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
+        from storage.files import recover_bin_store as _rbstore
+        await _run_db(_rbstore.delete_expired)
+
+    async def _sweep_tombstones():
+        # File-sync delete tombstones: reap past their 30-day TTL (an
+        # offline satellite is assumed long-since caught up). Indexed delete.
+        from storage.files import file_tombstones_store as _tstore
+        await _run_db(_tstore.delete_expired)
+
+    async def _sweep_idle_fingerprints():
+        # Fingerprint-gated periodic idle sync — for each connected
+        # satellite whose agent tree changed OUT-OF-TURN (no active session),
+        # run the merge so it (and the dashboard) catches up without waiting
+        # for the next session. No-op for quiet / pre-0.5.32 satellites.
+        from core.session.session_manager import _get_remote_layer as _grl
+        _layer = _grl()
+        if _layer is not None:
+            await _layer.run_idle_fingerprint_sweep()
+
+    async def _sweep_retention():
+        # Session retention + disk cleanup: ages out LOCAL chats' on-disk
+        # session files (admin knob; chats reseed from DB history via
+        # #11), reaps orphaned session files + Codex telemetry junk, and
+        # runs the MCP tarball-cache GC. Internally gated to once/24h.
+        from services.infra import retention as _retention
+        await _retention.maybe_run_daily()
+
+    async def _sweep_quotas():
+        # Storage quotas: measure each agent's shared + per-user buckets
+        # and fire the 90/95/100% warning notifications (with hysteresis).
+        # Cheap when no limit is set (early-returns); uses the kernel quota
+        # report when enforcing, else a throttled tree walk.
+        from services.infra import quota_monitor as _qm
+        await _qm.check_quotas()
+
+    async def _sweep_subscription_health():
+        # OAuth grant health: warn owners before a login grant's
+        # finite lifetime lapses (72h/24h out) and once when a row
+        # flips to expired. Self-throttled to 15 min; dedup stamps
+        # persist inside the credential blob.
+        from services.infra import subscription_health as _sub_health
+        await _sub_health.check_subscription_health()
+
+    async def _sweep_window_alerts():
+        # Provider windows: tell an account's owner when a weekly
+        # window passes 90 % and when it is reached. Self-throttled
+        # to 5 min; dedup rows persist per window instance.
+        from services.infra import subscription_window_alerts as _win_alerts
+        await _win_alerts.check_window_alerts()
+
+    async def _sweep_mcp_autoupdate():
+        # Automatic MCP updates: once a week in a low-traffic window,
+        # apply available community-MCP updates (deferring in-use docker
+        # MCPs). Persisted wall-clock gate; launches the run as its own
+        # task so the multi-hour defer loop never blocks this sweep.
+        from services.mcp import mcp_autoupdate as _mcp_autoupdate
+        await _mcp_autoupdate.maybe_run_weekly()
+
+    async def _sweep_agent_updates():
+        # Community agent templates: once a day, the managers of an
+        # agent whose template has a newer catalog version hear it,
+        # once per version (the update itself is theirs to press).
+        from services.community import community_agent_updater as _agent_updater
+        await _agent_updater.maybe_notify_updates()
+
+    async def _sweep_catalog_installs():
+        from core.credentials import catalog_install_registry as _catalog_install_registry
+        await _catalog_install_registry.sweep_stale()
+
+    sweep_items = [
+        ("warmup_registry sweep", _warmup_registry.sweep_stale),
+        ("install_registry sweep", _install_registry.sweep_stale),
+        ("transfer_registry sweep", _transfer_registry.sweep_stale),
+        ("catalog_install_registry sweep", _sweep_catalog_installs),
+        ("media cache sweep", _sweep_media),
+        ("preview snapshot sweep", _sweep_preview_snapshots),
+        ("recover-bin reap", _sweep_recover_bin),
+        ("tombstone reap", _sweep_tombstones),
+        ("idle fingerprint sweep", _sweep_idle_fingerprints),
+        ("retention sweep", _sweep_retention),
+        ("quota monitor sweep", _sweep_quotas),
+        ("subscription health sweep", _sweep_subscription_health),
+        ("subscription window alert sweep", _sweep_window_alerts),
+        ("mcp auto-update sweep", _sweep_mcp_autoupdate),
+        ("agent template update sweep", _sweep_agent_updates),
+    ]
+
+    ticks: set[asyncio.Task] = set()
+
     async def _registry_sweep_loop():
+        # A tick is started, not awaited: an item that hangs is skipped at
+        # the next tick and holds nothing of it (each tick has its own
+        # slots), instead of holding every later tick back.
         while True:
             await asyncio.sleep(60)
-            try:
-                await _warmup_registry.sweep_stale()
-            except Exception:
-                logger.exception("warmup_registry sweep failed")
-            try:
-                await _install_registry.sweep_stale()
-            except Exception:
-                logger.exception("install_registry sweep failed")
-            try:
-                await _transfer_registry.sweep_stale()
-            except Exception:
-                logger.exception("transfer_registry sweep failed")
-            try:
-                from core.credentials import catalog_install_registry as _catalog_install_registry
-                await _catalog_install_registry.sweep_stale()
-            except Exception:
-                logger.exception("catalog_install_registry sweep failed")
-            # Every store touch in this 60 s loop goes through run_db
-            # (storage/pg.py's event-loop rule): a periodic DELETE + COMMIT
-            # on the loop is exactly what froze the proxy on 2026-09-03 when
-            # the disk went slow.
-            from storage.pg import run_db as _run_db
-            try:
-                from services.media import media_pipeline as _mp
-                from storage import database as _db
-                _mp.sweep_host_media_cache()      # TTL satellite-host media
-                await _run_db(_db.sweep_expired_media_tokens)  # reap expired workspace tokens
-            except Exception:
-                logger.exception("media cache sweep failed")
-            try:
-                # Version-pinned preview snapshots: reap dirs of deleted chats
-                # (internally throttled to hourly).
-                from services.media import preview_snapshots as _psnap
-                _psnap.sweep_orphans()
-            except Exception:
-                logger.exception("preview snapshot sweep failed")
-            try:
-                # Workspace Recover Bin: reap entries past their 7-day TTL
-                # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
-                from storage.files import recover_bin_store as _rbstore
-                await _run_db(_rbstore.delete_expired)
-            except Exception:
-                logger.exception("recover-bin reap failed")
-            try:
-                # File-sync delete tombstones: reap past their 30-day TTL (an
-                # offline satellite is assumed long-since caught up). Indexed delete.
-                from storage.files import file_tombstones_store as _tstore
-                await _run_db(_tstore.delete_expired)
-            except Exception:
-                logger.exception("tombstone reap failed")
-            try:
-                # Fingerprint-gated periodic idle sync — for each connected
-                # satellite whose agent tree changed OUT-OF-TURN (no active session),
-                # run the merge so it (and the dashboard) catches up without waiting
-                # for the next session. No-op for quiet / pre-0.5.32 satellites.
-                from core.session.session_manager import _get_remote_layer as _grl
-                _layer = _grl()
-                if _layer is not None:
-                    await _layer.run_idle_fingerprint_sweep()
-            except Exception:
-                logger.exception("idle fingerprint sweep failed")
-            try:
-                # Session retention + disk cleanup: ages out LOCAL chats' on-disk
-                # session files (admin knob; chats reseed from DB history via
-                # #11), reaps orphaned session files + Codex telemetry junk, and
-                # runs the MCP tarball-cache GC. Internally gated to once/24h.
-                from services.infra import retention as _retention
-                await _retention.maybe_run_daily()
-            except Exception:
-                logger.exception("retention sweep failed")
-            try:
-                # Storage quotas: measure each agent's shared + per-user buckets
-                # and fire the 90/95/100% warning notifications (with hysteresis).
-                # Cheap when no limit is set (early-returns); uses the kernel quota
-                # report when enforcing, else a throttled tree walk.
-                from services.infra import quota_monitor as _qm
-                await _qm.check_quotas()
-            except Exception:
-                logger.exception("quota monitor sweep failed")
-            try:
-                # OAuth grant health: warn owners before a login grant's
-                # finite lifetime lapses (72h/24h out) and once when a row
-                # flips to expired. Self-throttled to 15 min; dedup stamps
-                # persist inside the credential blob.
-                from services.infra import subscription_health as _sub_health
-                await _sub_health.check_subscription_health()
-            except Exception:
-                logger.exception("subscription health sweep failed")
-            try:
-                # Provider windows: tell an account's owner when a weekly
-                # window passes 90 % and when it is reached. Self-throttled
-                # to 5 min; dedup rows persist per window instance.
-                from services.infra import subscription_window_alerts as _win_alerts
-                await _win_alerts.check_window_alerts()
-            except Exception:
-                logger.exception("subscription window alert sweep failed")
-            try:
-                # Automatic MCP updates: once a week in a low-traffic window,
-                # apply available community-MCP updates (deferring in-use docker
-                # MCPs). Persisted wall-clock gate; launches the run as its own
-                # task so the multi-hour defer loop never blocks this sweep.
-                from services.mcp import mcp_autoupdate as _mcp_autoupdate
-                await _mcp_autoupdate.maybe_run_weekly()
-            except Exception:
-                logger.exception("mcp auto-update sweep failed")
-            try:
-                # Community agent templates: once a day, the managers of an
-                # agent whose template has a newer catalog version hear it,
-                # once per version (the update itself is theirs to press).
-                from services.community import community_agent_updater as _agent_updater
-                await _agent_updater.maybe_notify_updates()
-            except Exception:
-                logger.exception("agent template update sweep failed")
+            tick = asyncio.create_task(run_sweep_items(sweep_items))
+            ticks.add(tick)
+            tick.add_done_callback(ticks.discard)
 
     _bg_tasks.append(asyncio.create_task(_registry_sweep_loop()))
     logger.info("Warmup + install registry sweeper started (60s interval)")
@@ -825,10 +886,19 @@ async def _flush_active_pumps(logger) -> None:
     pumps = list(_active_pumps.items())
     if not pumps:
         return
+    from core.events.stream_pump import suppress_recovery_flush
+    from core.session import session_kind
+    from core.session.session_state import mark_recover_pending
     waits = []
     for chat_id, pump in pumps:
         try:
             if run_recovery.is_recovery_eligible(chat_id):
+                # Replayed after the restart whether it is still running or
+                # finished meanwhile: nothing of it is written now. A run is
+                # parked and recovered by its run id instead.
+                suppress_recovery_flush(chat_id)
+                if pump.source_type != session_kind.TASK.source_type:
+                    mark_recover_pending(pump.session_id)
                 continue
             pump.abort()
             task = getattr(pump, "_task", None)
@@ -939,6 +1009,20 @@ async def _shutdown_cleanup(logger) -> None:
     # (flag first, then the tick task — never a fake stall at shutdown).
     from core import loop_watchdog
     loop_watchdog.stop()
+    # The binding writer's queued seat releases land before the pools close,
+    # drained in a worker thread with a bound (30 s: a stalled database drops
+    # what is still queued, which the next boot's counter reset repairs); a
+    # write after this runs inline.
+    from services.engines import subscription_pool as _subscription_pool
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_subscription_pool.close_binding_writes),
+            _subscription_pool._BINDING_DRAIN_TIMEOUT_S + 5,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("Shutdown: the binding writer did not close in time (continuing)")
+    except Exception:
+        logger.exception("Shutdown: binding writer close failed (continuing)")
     pg_pool.shutdown_db_executor()
 
     # From here down nothing may touch the DB.
@@ -972,24 +1056,32 @@ async def _shutdown_sessions(logger):
             except Exception as e:
                 logger.warning(f"Shutdown: {path} {sid[:8]} error: {e}")
 
-    # Remote sessions. A remote CLI session with an in-flight turn is LEFT
-    # OPEN so the satellite keeps its CLI alive for Mode C re-adopt after the
-    # restart — closing it would send close_session → kill the CLI → nothing
-    # to recover. Idle/Codex/direct remote sessions close normally.
-    from core.session.session_manager import _remote_layer, get_layer_capabilities
+    from core.session.session_manager import _remote_layer
     if _remote_layer:
-        for sid in _remote_layer.local_session_ids():
-            _info = _remote_layer._sessions.get(sid)
-            _rc = get_layer_capabilities(getattr(_info, "execution_path", "") or "") if _info else None
-            if (_rc is not None
-                    and _rc.runtime.supports_reattach_after_restart
-                    and getattr(_info, "turn_active", False)):
-                logger.info(
-                    f"Shutdown: leaving in-flight remote CLI {sid[:8]} open "
-                    f"for satellite re-adopt"
-                )
-                continue
-            try:
-                await _remote_layer.close_session(sid)
-            except Exception as e:
-                logger.warning(f"Shutdown: Remote {sid[:8]} error: {e}")
+        await _shutdown_remote_sessions(_remote_layer, logger)
+
+
+async def _shutdown_remote_sessions(remote_layer, logger) -> None:
+    """Remote sessions at shutdown. One whose engine takes a session back
+    after a restart (``readopts_idle_session``: Claude and Codex) is LEFT
+    OPEN, idle or mid-turn, with its security context: the satellite keeps
+    its process and reports it, and the new process re-adopts it (a Claude
+    turn in flight is replayed; a Codex one, with no replay, is closed by
+    that report). Closing it here could not reach the satellite anyway
+    (uvicorn closes the sockets before the lifespan's shutdown) and would
+    only drop the context, so the session came back with every hook refused.
+    Other engines close as before."""
+    from core.session.session_manager import get_layer_capabilities
+    for sid in remote_layer.local_session_ids():
+        info = remote_layer._sessions.get(sid)
+        caps = get_layer_capabilities(getattr(info, "execution_path", "") or "") if info else None
+        if caps is not None and caps.runtime.readopts_idle_session:
+            logger.info(
+                f"Shutdown: leaving remote {sid[:8]} open for re-adoption "
+                f"({'mid-turn' if getattr(info, 'turn_active', False) else 'idle'})"
+            )
+            continue
+        try:
+            await remote_layer.close_session(sid)
+        except Exception as e:
+            logger.warning(f"Shutdown: Remote {sid[:8]} error: {e}")

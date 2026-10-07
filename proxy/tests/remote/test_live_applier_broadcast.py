@@ -41,7 +41,7 @@ async def _run(role, username, path, action="write"):
         "hash": "sha256:abc",
         "content_b64": base64.b64encode(b"x").decode() if action == "write" else "",
     }
-    sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role=role, username=username, agent="my-agent")
+    sec = SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1"), role=role, username=username, agent="my-agent")
     bcast = AsyncMock()
 
     with patch("core.session.session_state.get_session_security", return_value=sec), \

@@ -51,9 +51,17 @@ def test_422_caps_the_number_of_errors(client):
 
 
 def test_422_cuts_long_loc_parts(client):
+    # The integrations router refuses an anonymous body 401 before it is
+    # validated (require_user); the loc shape is what this test is about, so
+    # the router guard is overridden for the call.
+    from auth.providers import require_user
     key = "k" * 60_000  # under the 64 KB cap of an unauthenticated body
-    r = client.put("/v1/users/me/integrations/some-mcp",
-                   json={"credentials": {key: 1}})
+    client.app.dependency_overrides[require_user] = lambda: None
+    try:
+        r = client.put("/v1/users/me/integrations/some-mcp",
+                       json={"credentials": {key: 1}})
+    finally:
+        client.app.dependency_overrides.pop(require_user, None)
     assert r.status_code == 422
     assert len(r.content) < 2048
     locs = [part for err in r.json()["detail"] for part in err["loc"]]
@@ -212,7 +220,7 @@ def test_the_shim_resolves_the_client_and_keeps_the_peer(_bare_metal):
 
 def test_the_server_is_built_with_the_shim_and_two_listeners(_bare_metal, monkeypatch):
     import config
-    from app import _ClientAddressShim, _build_server
+    from app import _BoundedWebSocketProtocol, _ClientAddressShim, _build_server
     monkeypatch.setattr(config, "HOST", "127.0.0.1")
     monkeypatch.setattr(config, "PORT", 0)
     server, sockets = _build_server(_echo_client)
@@ -220,7 +228,7 @@ def test_the_server_is_built_with_the_shim_and_two_listeners(_bare_metal, monkey
         cfg = server.config
         assert cfg.proxy_headers is False and cfg.lifespan == "on" and cfg.interface == "asgi3"
         assert isinstance(cfg.app, _ClientAddressShim)
-        assert cfg.log_config is None and cfg.ws == "websockets-sansio"
+        assert cfg.log_config is None and cfg.ws is _BoundedWebSocketProtocol
         assert cfg.timeout_keep_alive == 2 and cfg.timeout_graceful_shutdown == 10
         assert cfg.http.__name__ == "_HeaderDeadlineProtocol"
         assert len(sockets) == 2 and not any(s.get_inheritable() for s in sockets)

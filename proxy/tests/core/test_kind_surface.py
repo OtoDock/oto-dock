@@ -145,7 +145,7 @@ KNOWN_TS_SITES: dict[str, tuple[str, dict[str, int]]] = {
          "artifact:document_preview": 1, "task:app_action": 1}),
     "dashboard/src/components/chat/artifacts/ArtifactView.tsx": (
         "the PiP renderer per kind", {"artifact:images": 1, "artifact:image_generating": 1,
-                                       "artifact:media_processing": 1, "artifact:document_preview": 1}),
+                                       "artifact:media_processing": 1}),
     "dashboard/src/components/chat/artifacts/ArtifactDock.tsx": (
         "the PiP dock's icon per kind", {"artifact:images": 1, "artifact:image_generating": 1,
                                           "artifact:media_processing": 1}),
@@ -153,21 +153,18 @@ KNOWN_TS_SITES: dict[str, tuple[str, dict[str, int]]] = {
         "the window title per kind (titleFor) and a skeleton's media kind (audio | video); the eviction "
         "and identity rules ask the mirror",
         {"artifact:images": 1, "artifact:image_generating": 1, "artifact:media_processing": 1,
-         "artifact:document_preview": 1, "artifact:video": 1, "artifact:audio": 2, "artifact:url": 1,
-         "artifact:file": 1, "artifact:ui": 1}),
+         "artifact:video": 1, "artifact:audio": 2, "artifact:url": 1, "artifact:file": 1, "artifact:ui": 1}),
     "dashboard/src/hooks/useChatStream.ts": (
         "a transcode skeleton's media kind (audio | video), not an artifact kind", {"artifact:audio": 1}),
     "dashboard/src/lib/messageBlocks.ts": (
-        "the render-time chains of ONE kind each (a preview's live / frozen / chip versions, a ui page's "
-        "supersede-to-chip by path) and a skeleton's media kind",
-        {"artifact:document_preview": 3, "artifact:ui": 2, "artifact:audio": 1}),
+        "ONE kind each: a preview's last push per file in a message, a ui page's supersede-to-chip by "
+        "path, and a skeleton's media kind",
+        {"artifact:document_preview": 2, "artifact:ui": 2, "artifact:audio": 1}),
     "dashboard/src/hooks/useChatMessages.ts": (
-        "the removal of ONE kind's blocks by file (the preview chain's dismiss)",
+        "ONE kind's card per file in the streaming message (a preview's push replaces its card)",
         {"artifact:document_preview": 1}),
-    "dashboard/src/components/chat/ChatMessages.tsx": (
-        "the render-time chains of a preview and a ui page", {"artifact:document_preview": 1}),
     "dashboard/src/components/chat/artifacts/ArtifactWindows.tsx": (
-        "a window size for the iframe-hosting kinds", {"artifact:document_preview": 1, "artifact:ui": 1}),
+        "a window size for the iframe-hosting kind (a ui page)", {"artifact:ui": 1}),
     "dashboard/src/components/apps/AppFrame.tsx": (
         "the app_action WIRE frame (phase 6's axis), not a run's origin", {"task:app_action": 1}),
     "dashboard/src/sharehost/host.ts": (

@@ -38,17 +38,20 @@ import type { WireImage } from '../../hooks/useDashboardWs'
 import TopBar from '../../components/chat/TopBar'
 import AppSettingsModal from '../../components/chat/AppSettingsModal'
 import { SetupBanner } from '../../components/PlatformSetupGuard'
+import { ForwardingBanner } from '../../components/admin/ForwardingBanner'
 import FindBar from '../../components/chat/FindBar'
 import { useChatNotifications } from '../../hooks/useChatNotifications'
 import { useSwipeGesture } from '../../hooks/useSwipeGesture'
 import ChatHistory from '../../components/chat/ChatHistory'
 import ActiveChatsPanel from '../../components/chat/ActiveChatsPanel'
 import { CHAT_PHASE } from '../../lib/status/chat'
+import { sendAgainPrompt } from '../../lib/messageBlocks'
 import ChatComposerBar from './chat/ChatComposerBar'
 import ChatBanners from './chat/ChatBanners'
 import ChatSidePanels from './chat/ChatSidePanels'
 import ResponsiveDrawer from '../../components/ui/ResponsiveDrawer'
 import ChatWorkspaceSlot from './chat/ChatWorkspaceSlot'
+import ChatDocumentPane, { useDocumentChips, useDocumentPaneForm } from './chat/ChatDocumentPane'
 import AppsOverlay from '../../components/apps/AppsOverlay'
 import ProjectsOverlay from '../../components/projects/ProjectsOverlay'
 import { setNativeSwitchBusy } from '../../lib/nativeBridge'
@@ -57,6 +60,7 @@ import { useAgentPrefsStore } from '../../store/agentPrefsStore'
 import { useHydrateUiPrefs } from '../../api/userUiPrefs'
 import { useInteractiveChat, currentDashboardTheme } from '../../hooks/useInteractiveChat'
 import { useArtifactWindows } from '../../hooks/useArtifactWindows'
+import { notePushedDocument, pushedDocumentFromFrame, useDocumentPaneStore } from '../../store/documentPaneStore'
 import { useAgentChatStream } from './chat/useAgentChatStream'
 import { useFindBar } from './chat/useFindBar'
 import { useChatAttachments } from './chat/useChatAttachments'
@@ -67,6 +71,8 @@ import { useChatDuplexVoice, useDuplexWakeArm, duplexVoiceProp } from './chat/us
 import { useOverlayPanels, useAppSendPrompt, usePendingAppAction } from './chat/useOverlayPanels'
 import { useInteractiveHandlers } from './chat/useInteractiveHandlers'
 import { isTaskChatId } from '../../lib/session/kind'
+import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
+import { canEditAgent, isAdmin } from '../../lib/permissions'
 
 // Stable empty-array references for the chatStore selectors below. Zustand
 // uses Object.is to detect selector-result changes — returning a fresh `[]`
@@ -147,6 +153,10 @@ export default function AgentChat() {
   // notification options below.
   const chatNotif = useChatNotifications()
 
+  // The drive gate's sentence for the loaded chat (chat_history), set when
+  // the chat runs as the agent and this person is below the editor tier.
+  const [driveRefusal, setDriveRefusal] = useState<{ chatId: string; text: string } | null>(null)
+
   // Live-PTY flag mirrored into a ref for useDashboardWs's auto-attach gate —
   // the interactive hook is created after useChatStream (it needs `ws`), so
   // callbacks reach the current value through this ref, never the closure.
@@ -194,8 +204,8 @@ export default function AgentChat() {
     setMeetingRound,
     meetingLeftParticipants,
     editText, setEditText,
-    dismissPreview,
-    currentMsgRef, thinkingBufRef, abortedRef, discardingRef, sentWithBubbleRef, meetingSpeakerRef,
+    currentMsgRef, thinkingBufRef, abortedRef, discardingRef, sentWithBubbleRef, erroredRef,
+    meetingSpeakerRef,
     handlePermissionRespond, handleQuestionAnswer, handleQuestionAnswerStructured, handleSendMessage,
     sendArtifactInteraction, sendAppAction,
     handleImplementPlan, handlePlanFetched, resolvePlanReview, finalizeAbortedTurn,
@@ -206,7 +216,7 @@ export default function AgentChat() {
     agents, urlChatId, agentDefaultModel, agentExecutionPath, agentName, navigate, isFavoriteAgent, preWarmPath,
     warmingUp, setWarmingUp, chatNotif, sessionInteractiveRef, duplexActiveRef,
     setChatActiveLayer, setProcessAlive, setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError,
-    pendingFindQuery, setFindInput, setFindQuery, setFindBarOpen,
+    pendingFindQuery, setFindInput, setFindQuery, setFindBarOpen, setDriveRefusal,
   })
 
   // Interactive CLI — per-chat toggle + live-PTY flag
@@ -224,7 +234,15 @@ export default function AgentChat() {
   // Lifted here so the minimized dock can render in the top-left panel stack
   // (below Todo/Workflow) while the open windows float inside TerminalView. The
   // empty chatId when not interactive clears the windows + drops the subscription.
-  const artifacts = useArtifactWindows(ws, interactive.sessionInteractive && chatId ? chatId : '')
+  // A terminal chat's document pushes go to the document pane, not a window.
+  const onTerminalDocument = useCallback((evt: any) => {
+    const doc = pushedDocumentFromFrame(evt)
+    if (doc && chatIdRef.current) notePushedDocument(chatIdRef.current, doc)
+  }, [chatIdRef])
+  const artifacts = useArtifactWindows(ws, interactive.sessionInteractive && chatId ? chatId : '', onTerminalDocument)
+  // Docked as the right half, or a window over the slot (a phone, a narrow
+  // window, a terminal chat).
+  const documentPaneForm = useDocumentPaneForm(interactive.interactiveMode, chatId)
 
   // Compound model value for dropdown matching (layer::model_id)
   const modelCompound = `${chatActiveLayer || selectedLayer || agentExecutionPath}::${model}`
@@ -247,6 +265,16 @@ export default function AgentChat() {
   // live switch (kill+rewarm) is in flight — both would race a second
   // toggle. A live session is switchable (via confirm).
   const interactiveLocked = warmingUp || interactive.switching
+  // A chat that runs as the agent takes the editor tier to change its mode,
+  // model or terminal (the server refuses the pick and echoes the stored
+  // value): the loaded chat's refusal from the server, or, for a new chat
+  // on a Shared-only agent, the same rule read from this person's role.
+  const pickersLockReason = chatId
+    ? (!isTaskChatId(chatId) && driveRefusal && driveRefusal.chatId === chatId ? driveRefusal.text : '')
+    : (currentAgent && agentName && isSharedOnly(modeOfAgent(currentAgent))
+        && !canEditAgent(user, agentName)
+      ? 'This agent is set to Shared only, so its chats run as the agent itself, which takes the editor role or above.'
+      : '')
   usePermissionModeInvariant(mode, permissionModes, setMode)
 
   // A live meeting/voice session would be lost on an install switch — flag the
@@ -405,6 +433,19 @@ export default function AgentChat() {
   } = useOverlayPanels({
     messages, agentName, user, chatId, searchParams, setSearchParams, urlChatId, chats, taskChats, keepAppsOnChatEntryRef,
   })
+  // An overlay filling the chat's slot hides the document pane and its chips.
+  let slotOverlay = workspace.state.open || appsActive
+  slotOverlay = slotOverlay || projectsActive
+  const documentChips = useDocumentChips(chatId, slotOverlay)
+  // The composer's shrink and regrow animate only over the message list:
+  // every row the slot gains or loses during an animation re-lays out what
+  // else fills it (a live terminal resizes its PTY and redraws, an overlay or
+  // a floating Collabora frame re-lays out), so those get an instant change.
+  const floatingPaneShown = useDocumentPaneStore((s) => {
+    const pane = chatId ? s.byChat[chatId] : undefined
+    return !!pane && pane.open && !pane.minimized
+  }) && documentPaneForm === 'floating'
+  const composerAnimates = !interactive.sessionInteractive && !slotOverlay && !floatingPaneShown
 
   // Resume / reset chat state when the URL chat changes. Handles three cases:
   //   - Initial mount with /chat/:agent/:chatId
@@ -488,14 +529,15 @@ export default function AgentChat() {
   const { handleAddFiles, handleRemoveFile, handleRetryFile } = useChatAttachments({ agentName, draftKey })
 
   const handleSend = useCallback(
-    (text: string) => {
+    (text: string, again?: { images?: PendingImage[]; files?: PendingFile[] }) => {
       if (!agentName) return
       // Live conversation: a typed send rides the duplex socket as a
       // SPOKEN-mode turn — the reply comes back as TTS, and none of the
       // overlay-closing below runs (an open app view survives the
       // send). Attachments can't ride the frame — fall through to a
       // normal typed send when any are pending, or if the socket is gone.
-      if (duplexActiveRef.current && pendingImages.length === 0
+      // Send again (the turn-ended card) is a typed turn of its own.
+      if (!again && duplexActiveRef.current && pendingImages.length === 0
           && pendingFiles.length === 0 && duplexVoice.sendTyped(text)) {
         if (draftKey) useChatStore.getState().clearDraft(draftKey)
         return
@@ -507,9 +549,11 @@ export default function AgentChat() {
       }
       abortedRef.current = false  // Reset abort guard on new send
       discardingRef.current = false  // User is sending — accept events
+      erroredRef.current = false  // a new turn: its own done refetches as usual
       // Draft persisted only as long as it's unsent. Clear immediately so a
       // tab crash mid-streaming doesn't leave the just-sent text dangling.
-      if (draftKey) useChatStore.getState().clearDraft(draftKey)
+      // Send again leaves the composer as it is.
+      if (draftKey && !again) useChatStore.getState().clearDraft(draftKey)
       // Drop the workspace/apps overlay when the user sends — they're done
       // browsing and should see the turn. The path/view memory persists so
       // re-opening returns to the same folder/tab.
@@ -519,9 +563,15 @@ export default function AgentChat() {
       // Capture pending images and files before clearing. Files were uploaded eagerly
       // on pick, so each has uploadedPath set by now (the Send button is disabled
       // while any upload is still in-flight).
-      const images = pendingImages.length > 0 ? [...pendingImages] : undefined
-      const files = pendingFiles.length > 0 ? [...pendingFiles] : undefined
-      if (draftKey) {
+      // Send again (the turn-ended card) carries the last prompt's own
+      // attachments by their saved paths and leaves the composer's alone.
+      const images = again
+        ? (again.images?.length ? again.images : undefined)
+        : pendingImages.length > 0 ? [...pendingImages] : undefined
+      const files = again
+        ? (again.files?.length ? again.files : undefined)
+        : pendingFiles.length > 0 ? [...pendingFiles] : undefined
+      if (draftKey && !again) {
         if (images) useChatStore.getState().setPendingImages(draftKey, [])
         if (files) useChatStore.getState().setPendingFiles(draftKey, [])
       }
@@ -544,7 +594,7 @@ export default function AgentChat() {
           blocks.push({
             type: 'image_attachments',
             images: images.map(i => i.base64 ?? i.name),
-            paths: images.every(i => i.path) ? images.map(i => i.path ?? null) : undefined,
+            paths: images.some(i => i.path) ? images.map(i => i.path ?? null) : undefined,
           })
         }
         blocks.push({ type: 'text', content: text })
@@ -676,6 +726,21 @@ export default function AgentChat() {
     ws.warmup(agentName, chatId || undefined, mode, model, chatActiveLayer ?? selectedLayer ?? undefined, { text: held.text, images: held.images, files: held.files }, interactive.chatExecMode || undefined, currentDashboardTheme())
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agents, agentsLoadFailed, interactive.routeSend])
+
+  // A chip is its author's to cancel (an admin's: any); a chip a 1.7.0
+  // proxy minted names no author.
+  const mayCancelQueued = useCallback(
+    (item: QueuedMessage) => !item.authorSub || item.authorSub === user?.sub || isAdmin(user),
+    [user],
+  )
+
+  // The turn-ended card's Send again: the person's messages of the turn
+  // that ended (the one the card is in, an earlier turn's card included)
+  // go out again as one new turn, verbatim (sendAgainPrompt).
+  const handleSendAgain = useCallback((messageId: string) => {
+    const again = sendAgainPrompt(messages, messageId)
+    if (again) handleSend(again.text, { images: again.images, files: again.files })
+  }, [handleSend, messages])
 
   const handleAbort = useCallback(() => {
     if (warmingUp) {
@@ -941,16 +1006,12 @@ export default function AgentChat() {
         onSendMessage={handleSendMessage}
         onArtifactInteraction={sendArtifactInteraction}
         onPlanFetched={handlePlanFetched}
-        onDismissPreview={(fileId, key) => {
-          // Drop the preview blocks from local UI state (ref-safe; `key` scopes
-          // to one frozen instance). The DocumentPreview component already
-          // called the dismiss API before invoking this.
-          dismissPreview(fileId, key)
-        }}
         streaming={viewedStreaming}
         queuedMessages={queuedMessages}
         pendingSteers={pendingSteers}
         onCancelQueued={handleCancelQueued}
+        mayCancelQueued={mayCancelQueued}
+        onSendAgain={handleSendAgain}
         onLoadOlder={loadOlder}
         hasMoreOlder={hasMoreOlder}
         loadingOlder={loadingOlder}
@@ -988,6 +1049,7 @@ export default function AgentChat() {
           banner pushes them down instead of covering them (the z-50 banner
           used to bury the z-20 TopBar and swallow its clicks). */}
       <SetupBanner />
+      <ForwardingBanner />
       {/* min-h-0 is load-bearing: as a COLUMN flex item this div's
           min-height:auto tracks its content, so a long chat blows the
           100dvh root open and the DOCUMENT becomes the scroller (input +
@@ -1012,6 +1074,11 @@ export default function AgentChat() {
           notificationBell={chatNotif.notificationBell}
         />
 
+        {/* The chat column and, docked beside it, the document pane: the
+            column narrows as the pane opens. The TopBar spans both. */}
+        <div className="flex-1 flex min-h-0 min-w-0">
+        <div className="flex-1 flex flex-col min-w-0 min-h-0 relative overflow-clip">
+
         {/* Find bar */}
         {findBarOpen && (
           <FindBar value={findInput} onChange={setFindInput} onClose={closeFindBar} />
@@ -1022,7 +1089,7 @@ export default function AgentChat() {
           sessionPlans={sessionPlans} currentGoal={currentGoal} meetingActive={meetingActive}
           meetingParticipants={meetingParticipants} meetingSpeaker={meetingSpeaker}
           meetingLeftParticipants={meetingLeftParticipants} currentTodos={currentTodos} workflows={workflows}
-          artifacts={artifacts}
+          artifacts={artifacts} documentChips={documentChips}
         />
 
         {/* Agent HOME: the live-sessions strip rides permanently on top —
@@ -1040,7 +1107,10 @@ export default function AgentChat() {
         )}
 
         {/* Main content area — scrollable, with padding for floating bars.
-            The workspace overlay swaps this slot in place when toggled. */}
+            The workspace overlay swaps this slot in place when toggled. The
+            floating document pane sits over this slot only, above the
+            banners and the composer. */}
+        <div className="relative flex-1 min-h-0 flex flex-col">
         {workspace.state.open && agentName ? (
           <ChatWorkspaceSlot
             isTaskChat={isTaskChat} currentAgent={currentAgent} taskRun={taskRun} agentName={agentName}
@@ -1090,6 +1160,10 @@ export default function AgentChat() {
         ) : (
           messageListView
         )}
+        {chatId && documentPaneForm === 'floating' && (
+          <ChatDocumentPane key={chatId} chatId={chatId} placement="floating" hidden={slotOverlay} userSub={user?.sub ?? ''} />
+        )}
+        </div>
 
         <ChatBanners
           sessionExecutionTarget={sessionExecutionTarget} sessionFallbackReason={sessionFallbackReason}
@@ -1112,7 +1186,8 @@ export default function AgentChat() {
           cacheStats={cacheStats} meetingActive={meetingActive} permissionModes={permissionModes}
           agentLayerModels={agentLayerModels} modelGroups={modelGroups}
           interactiveAvailable={interactiveAvailable} interactive={interactive}
-          interactiveLocked={interactiveLocked} handleInteractiveToggle={handleInteractiveToggle}
+          interactiveLocked={interactiveLocked} pickersLockReason={pickersLockReason}
+          handleInteractiveToggle={handleInteractiveToggle}
           handleToggleRichView={handleToggleRichView} isTaskChat={isTaskChat} chatId={chatId} agentName={agentName} ws={ws}
           handleModeChange={handleModeChange} handleModelChange={handleModelChange}
           chatActiveLayer={chatActiveLayer} effectiveLayer={effectiveLayer}
@@ -1128,8 +1203,13 @@ export default function AgentChat() {
           toggleApps={toggleApps} setAppsOpen={setAppsOpen}
           projectsActive={projectsActive} isProjectChat={isProjectChat} dockAvailable={dockAvailable}
           setProjectsOpen={setProjectsOpen}
-          voice={voice}
+          voice={voice} composerAnimates={composerAnimates}
         />
+        </div>
+        {chatId && documentPaneForm === 'docked' && (
+          <ChatDocumentPane key={chatId} chatId={chatId} placement="docked" hidden={slotOverlay} userSub={user?.sub ?? ''} />
+        )}
+        </div>
       </div>
       </div>
       </SearchProvider>

@@ -416,6 +416,94 @@ def test_the_pin_key_names_the_versions_md_row():
         assert row and row == layer.pinned_cli_version(), (path, pin_key, row)
 
 
+def test_the_installer_defaults_mirror_the_pins():
+    # The Docker image installs the CLIs from the installer's own defaults
+    # (proxy/Dockerfile runs scripts/install-baseline-tools.sh before
+    # VERSIONS.md is copied in), so every image's CLI version is the
+    # default baked into the script, not the VERSIONS.md row. Both scripts'
+    # defaults must equal the row of each engine's pin key, or an image
+    # ships one CLI version while the proxy and the satellites pin another.
+    import re
+    from tests._paths import REPO_ROOT
+    sh = (REPO_ROOT / "scripts" / "install-baseline-tools.sh").read_text(encoding="utf-8")
+    ps1 = (REPO_ROOT / "scripts" / "install-baseline-tools.ps1").read_text(encoding="utf-8")
+    ps1_names = {"claude_code": "ClaudeCodeVersion", "codex": "CodexVersion"}
+    for path, layer in get_all_layers().items():
+        pin_key = layer.capabilities.runtime.pin_key
+        if not pin_key:
+            continue
+        key = f"{pin_key.upper()}_VERSION"
+        want = layer.pinned_cli_version()
+        assert want, (path, key)
+        sh_hits = re.findall(rf'^{key}="\$\{{{key}:-([^}}]+)\}}"$', sh, re.MULTILINE)
+        assert sh_hits == [want], (path, key, sh_hits, want)
+        var = ps1_names[pin_key]
+        ps1_hits = re.findall(
+            rf"^\s*\${var}\s*=\s*if \(\$env:{key}\) \{{ \$env:{key} \}} else \{{ '([^']+)' \}}$",
+            ps1, re.MULTILINE,
+        )
+        assert ps1_hits == [want], (path, key, ps1_hits, want)
+
+
+def test_the_installer_toolchain_defaults_mirror_the_pins():
+    # The Docker image runs scripts/install-baseline-tools.sh before
+    # VERSIONS.md is copied in, so uv, pnpm, Bun and sympy in every image are
+    # the script's own defaults, as on any host run without the env
+    # overrides. Only the Node default's major is used (the NodeSource line);
+    # the whole value is held equal so "keep in sync" stays true.
+    import re
+    import config as app_config
+    from tests._paths import REPO_ROOT
+    sh = (REPO_ROOT / "scripts" / "install-baseline-tools.sh").read_text(encoding="utf-8")
+    ps1 = (REPO_ROOT / "scripts" / "install-baseline-tools.ps1").read_text(encoding="utf-8")
+    sh_vars = {"UV_VERSION": "uv_ver", "PNPM_VERSION": "pnpm_ver", "BUN_VERSION": "bun_ver",
+               "SYMPY_VERSION": "sympy_ver", "NODE_VERSION": "node_ver"}
+    for key, var in sh_vars.items():
+        want = app_config._read_pinned_version(key)
+        assert want, key
+        hits = re.findall(rf'^\s*local {var}="\$\{{{key}:-([^}}]+)\}}"', sh, re.MULTILINE)
+        assert hits == [want], (key, hits, want)
+    for key, var in {"UV_VERSION": "UvVersion", "PNPM_VERSION": "PnpmVersion"}.items():
+        want = app_config._read_pinned_version(key)
+        hits = re.findall(
+            rf"^\s*\${var}\s*=\s*if \(\$env:{key}\) \{{ \$env:{key} \}} else \{{ '([^']+)' \}}$",
+            ps1, re.MULTILINE)
+        assert hits == [want], (key, hits, want)
+    sympy = app_config._read_pinned_version("SYMPY_VERSION")
+    assert re.findall(r"sympy==([0-9][0-9.]*)", ps1) == [sympy]
+
+
+def test_the_image_defaults_mirror_the_pins():
+    # A bare `docker build` or `docker compose up` (no scripts/versions.sh in
+    # front) takes the Dockerfile ARG and compose literal defaults, and T1
+    # builds the file-tools sidecar that way, so each default equals its
+    # VERSIONS.md row; so do CI's Postgres service images and dev-setup's
+    # fallbacks. A workflow missing from this checkout is not read.
+    import re
+    import config as app_config
+    from tests._paths import REPO_ROOT
+    python_image = app_config._read_pinned_version("PYTHON_IMAGE")
+    node_image = app_config._read_pinned_version("NODE_IMAGE")
+    postgres_image = app_config._read_pinned_version("POSTGRES_IMAGE")
+    assert python_image and node_image and postgres_image
+    for rel in ("proxy/Dockerfile", "phone/Dockerfile", "mcps/custom/file-tools-mcp/Dockerfile"):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert re.findall(r"^ARG PYTHON_IMAGE=(\S+)$", text, re.MULTILINE) == [python_image], rel
+    proxy = (REPO_ROOT / "proxy" / "Dockerfile").read_text(encoding="utf-8")
+    assert re.findall(r"^ARG NODE_IMAGE=(\S+)$", proxy, re.MULTILINE) == [node_image]
+    setup = (REPO_ROOT / "scripts" / "dev-setup.sh").read_text(encoding="utf-8")
+    literals = {"docker-compose.yml": 2, "docker-compose.t1.yml": 1, "scripts/dev-setup.sh": 1}
+    for rel, count in literals.items():
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert re.findall(r"\$\{POSTGRES_IMAGE:-([^}]+)\}", text) == [postgres_image] * count, rel
+    ci = [tag for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+          for tag in re.findall(r"^\s*image:\s*(postgres:\S+)$", path.read_text(encoding="utf-8"), re.MULTILINE)]
+    assert ci and set(ci) == {postgres_image}, ci
+    for key in ("PYTHON_VERSION", "NODE_VERSION"):
+        hits = re.findall(rf'{key}="\$\{{{key}:-([^}}]+)\}}"', setup)
+        assert hits == [app_config._read_pinned_version(key)], (key, hits)
+
+
 def test_the_agents_column_default_is_the_platform_default():
     # DDL cannot read a constant: the agents.execution_path default is typed
     # in storage/agents/schema.py and pinned here to DEFAULT_EXECUTION_PATH.

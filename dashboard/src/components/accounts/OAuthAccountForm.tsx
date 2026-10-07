@@ -22,6 +22,7 @@ import type {
   Integration,
   OAuthService,
 } from '../../api/credentials'
+import { reconnectReasonText } from '../../api/credentials'
 import {
   useStartOAuth,
   useDisconnectOAuth,
@@ -88,6 +89,12 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
   )
   const [patValue, setPatValue] = useState('')
   const [patLabel, setPatLabel] = useState('')
+  // The MCP server names its own authorization server: the install
+  // registers itself there and the person signs in on the vendor's page;
+  // an optional label keeps a second account of the same person apart.
+  const authServer = integration.oauth_meta?.authorization_server
+  const registeredClient = authServer && authServer.active !== false ? authServer : undefined
+  const [registeredLabel, setRegisteredLabel] = useState('')
 
   // Device-code polling state. Persisted to sessionStorage so
   // a popup close / page refresh resumes the poll instead of losing it.
@@ -255,7 +262,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         provider: providerId,
         mcpName: integration.mcp_name,
         services: selectedServices,
-        accountLabel: account?.account_label || '',
+        accountLabel: account?.account_label || (registeredClient ? registeredLabel.trim() : ''),
         mobile: isNative,
       })
       const { openOAuthWindow, waitForDeepLink } = await import(
@@ -379,6 +386,32 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
             enabled. Click <strong>Reconnect</strong> to grant the
             additional access without redoing the others.
           </div>
+        </div>
+      )}
+
+      {account?.needs_reconnect && (
+        <div className="px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
+          <div className="text-sm text-amber-700 dark:text-amber-300">
+            ⚠️ Reconnect needed: {reconnectReasonText(account.reconnect_reason)}.
+            Agents leave this account out until you click <strong>Reconnect</strong>.
+          </div>
+        </div>
+      )}
+
+      {registeredClient && !account && (
+        <div className="space-y-2">
+          <p className="text-xs text-p-text-secondary">
+            Signs you in at <strong>{registeredClient.resource_host}</strong>.
+            This install registers itself as a client there the first time;
+            there is no OAuth app to create.
+          </p>
+          <input
+            type="text"
+            value={registeredLabel}
+            onChange={(e) => setRegisteredLabel(e.target.value)}
+            placeholder="Account label (optional)"
+            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg focus:ring-2 focus:ring-brand focus:border-transparent"
+          />
         </div>
       )}
 

@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16.14-alpine
+        image: postgres:16.15-alpine
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     services:
       postgres:
-        image: postgres:16.14-alpine
+        image: postgres:16.15-alpine
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -165,8 +165,9 @@ jobs:
       - name: Codex CLI at the VERSIONS.md pin
         # Two session tests start a Codex session for real to check the
         # files it writes, so the daemon must be on PATH, at the version the
-        # platform ships.
-        run: sudo npm install -g "@openai/codex@$(bash scripts/versions.sh CODEX_VERSION)"
+        # platform ships, installed as the installers do (npm 12 skips a
+        # package's install scripts unless --allow-scripts names it).
+        run: sudo npm install -g --allow-scripts=@openai/codex "@openai/codex@$(bash scripts/versions.sh CODEX_VERSION)"
 
       - name: Install satellite dependencies
         run: |
@@ -178,8 +179,8 @@ jobs:
 
   # The same suite at the host floor (VERSIONS.md PYTHON_MIN_VERSION): what an
   # Ubuntu 22.04 host pairs with. A separate job, not a matrix, so the
-  # `satellite` check keeps its name. tomli stands in for the 3.11+ tomllib
-  # in the tests that parse a composed config.toml.
+  # `satellite` check keeps its name. The satellite's own requirements carry
+  # tomli below 3.11 (the daemon validates a composed config.toml with it).
   satellite-floor:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
@@ -197,13 +198,12 @@ jobs:
             proxy/requirements-test.txt
 
       - name: Codex CLI at the VERSIONS.md pin
-        run: sudo npm install -g "@openai/codex@$(bash scripts/versions.sh CODEX_VERSION)"
+        run: sudo npm install -g --allow-scripts=@openai/codex "@openai/codex@$(bash scripts/versions.sh CODEX_VERSION)"
 
       - name: Install satellite dependencies
         run: |
           python -m pip install -U pip
           python -m pip install -r satellite/requirements.txt -r proxy/requirements-test.txt
-          python -m pip install "tomli; python_version < '3.11'"
 
       - name: pytest
         run: python -m pytest satellite/tests -q

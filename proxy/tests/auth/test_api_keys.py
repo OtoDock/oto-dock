@@ -16,6 +16,7 @@ Covers:
 Run: cd proxy && python -m pytest tests/auth/test_api_keys.py -v
 """
 
+import asyncio
 import sys
 from datetime import datetime, timezone
 
@@ -404,3 +405,51 @@ def test_a_webhook_address_carries_the_username_and_the_display_name_still_resol
     assert akm.verify_bearer_for_user(f"Bearer {raw}", username="dev-admin")["user_sub"] == "sub-dev-admin"
     assert akm.verify_bearer_for_user(f"Bearer {raw}", username="Dev Admin")["user_sub"] == "sub-dev-admin"
 
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Routes: the store calls and the bcrypt hash run off the event loop
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _off_loop(fn):
+    """``fn``, refusing to run on a thread with a running event loop (a
+    worker thread has none)."""
+    def guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*a, **kw)
+        raise AssertionError(f"{fn.__name__} ran on the event loop")
+    return guarded
+
+
+def test_user_key_routes_run_off_the_loop(temp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import app
+    from auth.providers import UserContext, get_current_user
+    from services.infra import api_key_manager as akm
+    from storage.identity import api_key_store
+
+    async def _me():
+        return UserContext(sub="user-viewer", email="viewer@test.com",
+                           name="Viewer User", role="member")
+
+    for mod, name in ((akm, "create_user_key"), (akm, "revoke_user_key"),
+                      (api_key_store, "list_user_api_keys"),
+                      (api_key_store, "get_user_api_key")):
+        monkeypatch.setattr(mod, name, _off_loop(getattr(mod, name)))
+    app.dependency_overrides[get_current_user] = _me
+    try:
+        client = TestClient(app)
+        created = client.post("/v1/user-api-keys", json={"name": "Personal"})
+        assert created.status_code == 200, created.text
+        key_id = created.json()["id"]
+        listed = client.get("/v1/user-api-keys")
+        assert [k["id"] for k in listed.json()["keys"]] == [key_id]
+        assert client.delete(f"/v1/user-api-keys/{key_id}").json() == {
+            "status": "revoked", "id": key_id}
+        assert client.delete(f"/v1/user-api-keys/{key_id}").json()["status"] == "already_revoked"
+        assert client.delete("/v1/user-api-keys/no-such-key").status_code == 404
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

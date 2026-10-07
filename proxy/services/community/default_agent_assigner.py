@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 
+from auth import roles
+from services.agents import shared_only_members
 from storage.agents import agent_store
 from storage import database as user_store
 from services.community import community_agent_installer
@@ -52,6 +54,12 @@ def assign_default_agents(user_sub: str) -> dict[str, str]:
             # Defense in depth — list_default_for_new_users_agents already
             # filters this, but if a future caller swaps in a different
             # source, we don't want to attach with an empty role.
+            continue
+        if not roles.allowed_on_shared_only(role) and shared_only_members.is_shared_only_row(agent):
+            # A default stored before the agent turned Shared only (or by a
+            # template): below the editor tier it would open no chat there.
+            logger.warning("default agent %s is Shared only: its %s default is skipped", slug, role)
+            result[slug] = "skipped-shared-only"
             continue
         try:
             inserted = user_store.add_user_agent(

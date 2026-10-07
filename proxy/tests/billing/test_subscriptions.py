@@ -632,6 +632,156 @@ class TestHeadroomRoutingAndFailover:
         assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-a"
         mock_store.latest_window_samples.assert_not_called()
 
+    # -- A usage-limit ending rests the account until its window resets ------
+
+    @staticmethod
+    def _limit(window="five_hour", in_s=7200.0):
+        from datetime import datetime, timedelta, timezone
+        from core.events import turn_ending
+        at = (datetime.now(timezone.utc) + timedelta(seconds=in_s)).isoformat()
+        return turn_ending.TurnEnding(reason=turn_ending.LIMIT, resets_at=at, window=window)
+
+    def _rested(self, mock_store):
+        """Two OAuth accounts with no window samples (the rests act alone),
+        sess-1 bound to sub-a."""
+        sp = self._two_oauth(mock_store, {})
+        sp._throttled_hard.clear(); sp._window_rests.clear(); sp._scoped_rests.clear()
+        sp.bind_session("sess-1", "sub-a", layer="claude-code-cli", user_sub="")
+        return sp
+
+    def _clear(self, sp):
+        sp._session_subscriptions.clear(); sp._session_binding_ctx.clear()
+        sp._throttled_until.clear(); sp._throttled_hard.clear()
+        sp._window_rests.clear(); sp._scoped_rests.clear()
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_an_account_wide_limit_rests_until_its_reset(self, mock_store):
+        sp = self._rested(mock_store)
+        try:
+            sp.rest_after_limit("sess-1", self._limit("five_hour", in_s=7200), "")
+            assert abs(sp._throttled_until["sub-a"] - (time.time() + 7200)) < 5
+            assert "sub-a" in sp._throttled_hard
+            for model in ("claude-fable-5-1", "claude-sonnet-5", ""):
+                assert sp.acquire_subscription(
+                    "claude-code-cli", None, model=model).subscription_id == "sub-b"
+        finally:
+            self._clear(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_the_rest_is_bounded_by_the_windows_declared_length(self, mock_store):
+        sp = self._rested(mock_store)
+        try:
+            sp.rest_after_limit("sess-1", self._limit("five_hour", in_s=30 * 86400), "")
+            assert sp._throttled_until["sub-a"] <= time.time() + 5 * 3600 + 5
+        finally:
+            self._clear(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_a_limit_without_a_window_or_a_future_reset_keeps_the_cooldown(self, mock_store):
+        from core.events import turn_ending
+        sp = self._rested(mock_store)
+        try:
+            for ending in (self._limit("", in_s=7200), self._limit("five_hour", in_s=-60),
+                           self._limit("an_unknown_window", in_s=7200),
+                           turn_ending.TurnEnding(reason=turn_ending.LIMIT, window="five_hour")):
+                sp._throttled_until.clear(); sp._throttled_hard.clear()
+                sp.rest_after_limit("sess-1", ending, "")
+                until = sp._throttled_until["sub-a"]
+                assert abs(until - (time.time() + sp._THROTTLE_COOLDOWN_S)) < 5, ending
+                assert "sub-a" in sp._throttled_hard and "sub-a" not in sp._window_rests
+        finally:
+            self._clear(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_a_model_scoped_limit_rests_only_that_scope(self, mock_store):
+        sp = self._rested(mock_store)
+        try:
+            sp.rest_after_limit("sess-1", self._limit("scoped:fable", in_s=86400), "")
+            assert "sub-a" not in sp._throttled_until
+            assert sp.acquire_subscription(
+                "claude-code-cli", None, model="claude-fable-5-1").subscription_id == "sub-b"
+            mock_store.get_subscription_consumption.side_effect = (
+                lambda sid, since: {"sub-a": 0.0, "sub-b": 9.0}[sid])
+            assert sp.acquire_subscription(
+                "claude-code-cli", None, model="claude-sonnet-5").subscription_id == "sub-a"
+        finally:
+            self._clear(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_every_account_resting_falls_back_to_the_one_that_frees_first(self, mock_store):
+        sp = self._rested(mock_store)
+        try:
+            sp.bind_session("sess-2", "sub-b", layer="claude-code-cli", user_sub="")
+            sp.rest_after_limit("sess-1", self._limit("seven_day", in_s=3 * 86400), "")
+            sp.rest_after_limit("sess-2", self._limit("five_hour", in_s=3600), "")
+            assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-b"
+            # A single account still serves, so the person sees the vendor's
+            # own limit message.
+            mock_store.list_platform_pool.return_value = [self._oauth("sub-a")]
+            assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-a"
+        finally:
+            self._clear(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_other_errors_keep_their_cooldowns_and_never_shorten_a_rest(self, mock_store):
+        sp = self._rested(mock_store)
+        try:
+            sp.rest_after_limit("sess-1", None, "API Error: 529 Overloaded")
+            assert sp._throttled_until["sub-a"] <= time.time() + sp._OVERLOAD_COOLDOWN_S
+            assert "sub-a" not in sp._throttled_hard
+            sp._throttled_until.clear()
+            sp.rest_after_limit("sess-1", None, "Error 429: rate_limit_error")
+            assert abs(sp._throttled_until["sub-a"] - (time.time() + sp._THROTTLE_COOLDOWN_S)) < 5
+            sp._throttled_until.clear()
+            sp.rest_after_limit("sess-1", None, "connection reset by peer")
+            assert "sub-a" not in sp._throttled_until
+            sp.rest_after_limit("sess-1", self._limit("seven_day", in_s=86400), "")
+            sp.rest_after_limit("sess-1", None, "API Error: 529 Overloaded")
+            sp.mark_subscription_throttled("sess-1")
+            assert sp._throttled_until["sub-a"] > time.time() + 86000
+            assert sp._window_rests["sub-a"][0] == "seven_day"
+        finally:
+            self._clear(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_a_fresh_reading_with_headroom_ends_the_rest_early(self, mock_store):
+        from datetime import datetime, timedelta, timezone
+        from services.engines import subscription_windows as sw
+        from core.execution_layer import Scoped, Window
+        sp = self._rested(mock_store)
+        specs = sw.window_specs("claude-code-cli")
+        now = datetime.now(timezone.utc)
+
+        def reading(five, *, fable=None, ago_s=-1.0, reached=""):
+            w = sw.Windows(specs=specs, observed_at=now - timedelta(seconds=ago_s),
+                           reached=reached)
+            w.windows["five_hour"] = Window(five, now + timedelta(hours=2))
+            w.windows["seven_day"] = Window(20.0, now + timedelta(days=3))
+            if fable is not None:
+                w.scoped.append(Scoped("fable", "Fable", fable, now + timedelta(days=3)))
+            return w
+        try:
+            sp.rest_after_limit("sess-1", self._limit("five_hour", in_s=7200), "")
+            sp.rest_after_limit("sess-1", self._limit("scoped:fable", in_s=86400), "")
+            # Still full, reached, or read before the limit landed: the rest holds.
+            for w in (reading(100.0), reading(20.0, reached="five_hour"),
+                      reading(20.0, ago_s=60.0)):
+                sp.clear_rests_with_headroom("sub-a", w)
+                assert sp._is_throttled("sub-a")
+            sp.clear_rests_with_headroom("sub-a", reading(20.0))
+            assert not sp._is_throttled("sub-a") and "sub-a" not in sp._throttled_hard
+            assert ("sub-a", "fable") in sp._scoped_rests  # no reading of it yet
+            sp.clear_rests_with_headroom("sub-a", reading(20.0, fable=99.0))
+            assert ("sub-a", "fable") in sp._scoped_rests
+            sp.clear_rests_with_headroom("sub-a", reading(20.0, fable=40.0))
+            assert ("sub-a", "fable") not in sp._scoped_rests
+            # A plain cooldown is no window's rest: a reading never ends it.
+            sp.mark_subscription_throttled("sess-1")
+            sp.clear_rests_with_headroom("sub-a", reading(20.0))
+            assert sp._is_throttled("sub-a")
+        finally:
+            self._clear(sp)
+
 
 # ---------------------------------------------------------------------------
 # Scope-sticky selection + persisted bindings
@@ -865,6 +1015,9 @@ class TestScopeStickyAndPersistedBindings:
         assert sp._OVERLOAD_COOLDOWN_S <= 60 < sp._THROTTLE_COOLDOWN_S
         assert sp.throttle_cooldown_for("Error 429: rate_limit_error") == sp._THROTTLE_COOLDOWN_S
         assert sp.throttle_cooldown_for("You have hit your usage limit") == sp._THROTTLE_COOLDOWN_S
+        # Claude Code's usage-credits wording of the limit notice (in the 2.1.281
+        # binary too; first met live on 2026-10-04 and unknown to the regex until then).
+        assert sp.throttle_cooldown_for("You're out of usage credits. Switch to another model") == sp._THROTTLE_COOLDOWN_S
         assert sp.throttle_cooldown_for("connection reset by peer") is None
         assert sp.throttle_cooldown_for("") is None
 
@@ -2400,6 +2553,25 @@ class TestStickyYieldsToExhaustion:
         assert h.subscription_id == "sub-b"
         reb.assert_called_once_with("sticky account exhausted")
         assert sp._scope_recent["local:/agents/dev/.claude"][0] == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=False)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_a_pin_resting_for_the_model_yields(self, mock_store, _off):
+        sp = self._pool(mock_store, {})
+        sp._scoped_rests.clear()
+        sp._scoped_rests[("sub-a", "fable")] = (time.time() + 86400, time.time())
+        try:
+            with patch.object(sp, "schedule_rebalance") as reb:
+                h = sp.acquire_subscription("claude-code-cli", None, model="claude-fable-5-1",
+                                            sticky_scope="local:/agents/dev/.claude")
+            assert h.subscription_id == "sub-b"
+            reb.assert_called_once_with("sticky account exhausted")
+            sp._scope_recent.clear()
+            h = sp.acquire_subscription("claude-code-cli", None, model="claude-sonnet-5",
+                                        sticky_scope="local:/agents/dev/.claude")
+            assert h.subscription_id == "sub-a"
+        finally:
+            sp._scoped_rests.clear()
 
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch("services.engines.subscription_pool.subscription_store")

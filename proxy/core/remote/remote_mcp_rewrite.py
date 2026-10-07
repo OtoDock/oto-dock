@@ -12,6 +12,7 @@ must be monkeypatched HERE (core.remote.remote_mcp_rewrite), not on remote_execu
 import json
 import re
 from core import host_os
+from core.credentials.mcp_gateway import GATEWAY_PATH_PREFIX, gateway_key_of
 
 # ---------------------------------------------------------------------------
 # MCP config rewriting for remote execution
@@ -91,10 +92,39 @@ def _resolve_satellite_mcp_path_info(slug: str):
     return sat_category, sat_name, platform_dir, manifest
 
 
+def _gateway_json_entry(
+    server: dict, name: str, facts: dict, sat_port: int, session_id: str, gateway_mode: bool,
+) -> dict:
+    """A credential-gateway entry (``mcp_gateway.entry_url``) as the
+    satellite config carries it: a sidecar keeps the tunnel's
+    ``/mcp/<name>/`` shape with the session id (the tunnel's forward adds
+    the credential there); a vendor entry dials the machine's own loopback
+    gateway when the machine runs one, and otherwise keeps the inline shape
+    (the vendor URL and the header's value) until the machine updates. The
+    Authorization sentinel stays where the session token belongs and is
+    removed where it does not: no vendor ever receives a session token."""
+    path = facts.get("path") or "/"
+    headers = dict(server.get("headers") or {})
+    if facts.get("proxy_local"):
+        sess = f"?session_id={session_id}" if session_id else ""
+        server["url"] = f"http://127.0.0.1:{sat_port}/mcp/{name}{path}{sess}"
+    elif gateway_mode:
+        server["url"] = f"http://127.0.0.1:{sat_port}{GATEWAY_PATH_PREFIX}/{name}{path}"
+    else:
+        server["url"] = f"{facts.get('upstream', '')}{path}"
+        headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+        if facts.get("value"):
+            headers[str(facts.get("header") or "Authorization")] = str(facts["value"])
+        server["headers"] = headers
+        if not headers:
+            server.pop("headers", None)
+    return server
+
+
 def _rewrite_mcp_json_for_remote(
     mcp_config: dict, sat_port: int, *, target_os: str = "linux",
     session_id: str = "", secret_bundle_keys: set = frozenset(),
-    bearer_swap_keys: set = frozenset(), proxy_api_key: str = "",
+    proxy_api_key: str = "", gateway: dict | None = None, gateway_mode: bool = False,
 ) -> dict:
     """Rewrite JSON MCP config (CLI format) for remote execution.
 
@@ -106,6 +136,7 @@ def _rewrite_mcp_json_for_remote(
     - SSE/HTTP MCPs (Docker on platform): URL rewritten to
       ``http://127.0.0.1:{sat_port}/mcp/{name}/...`` so the satellite's
       local tunnel server forwards over WS to the platform-side dispatcher.
+    - credential-gateway entries (``gateway``, by key): ``_gateway_json_entry``.
     - env: ``PROXY_URL`` rewritten to ``http://127.0.0.1:{sat_port}``.
     """
     servers = mcp_config.get("mcpServers", {})
@@ -114,10 +145,13 @@ def _rewrite_mcp_json_for_remote(
     for name, server in servers.items():
         server = dict(server)
 
+        facts = (gateway or {}).get(name) if "url" in server else None
+        if facts is not None and gateway_key_of(server["url"]) == name:
+            server = _gateway_json_entry(server, name, facts, sat_port, session_id, gateway_mode)
         # Rewrite SSE/HTTP URLs to point at the satellite's local tunnel.
         # `name` here is the mcpServers key — that's the same slug used
         # in the tunnel allowlist `/mcp/<slug>/...`.
-        if "url" in server and sat_port:
+        elif "url" in server and sat_port:
             from urllib.parse import urlparse
             from services.mcp import mcp_registry
             from core.config import deployment
@@ -201,25 +235,12 @@ def _rewrite_mcp_json_for_remote(
         if "env" in server and sat_port:
             server["env"] = _rewrite_env_for_remote(server["env"], sat_port)
 
-        # HTTP bearer-swap: a proxy-terminable HTTP MCP (github/m365 — its
-        # localhost URL was tunnel-rewritten above) ships the per-session JWT as
-        # its Authorization bearer. The tunnel `_dispatch` decodes the JWT → sid
-        # and swaps it for the real upstream token from the in-memory store, so
-        # the real bearer never lands on the satellite. The shared build file
-        # carried only a sentinel; we overwrite it with the JWT here. `name` ∈
-        # bearer_swap_keys ⇒ localhost (set IFF http_bearer in build), so vendor
-        # (external) HTTP MCPs keep their inline bearer untouched.
-        if name in bearer_swap_keys and proxy_api_key:
-            headers = dict(server.get("headers") or {})
-            headers["Authorization"] = f"Bearer {proxy_api_key}"
-            server["headers"] = headers
-
         # Per-session JWT for Docker MCPs that call back to the proxy hooks
-        # (file-tools, server.proxy_callbacks). The shared build config carries
-        # the sentinel bearer; overwrite it with the real session JWT
-        # (proxy_api_key already IS one, minted per-session above). The tunnel
-        # `_dispatch` forwards it unchanged (file-tools ∉ bearer_swap_keys → no
-        # upstream swap); the proxy hook validates it via verify_session_match.
+        # (file-tools, server.proxy_callbacks) and for every gateway entry
+        # that keeps the sentinel. The shared build config carries the
+        # sentinel bearer; overwrite it with the real session JWT
+        # (proxy_api_key already IS one, minted per-session above). The
+        # tunnel forwards it unchanged and the proxy judges it.
         if proxy_api_key:
             from auth.session_token import SESSION_JWT_SENTINEL_BEARER
             headers = dict(server.get("headers") or {})
@@ -253,7 +274,7 @@ def _rewrite_mcp_toml_for_remote(
     toml_content: str, sat_port: int, *, target_os: str = "linux",
     session_id: str = "", proxy_api_key: str = "",
     secret_bundle_keys: set = frozenset(),
-    bearer_swap_keys: set = frozenset(),
+    gateway: dict | None = None, gateway_mode: bool = False,
 ) -> str:
     """Rewrite TOML MCP config (Codex format) for remote execution.
 
@@ -270,7 +291,9 @@ def _rewrite_mcp_toml_for_remote(
       resolved via the manifest.)
     - ``url = "http://localhost:<port>/<path>"`` → satellite tunnel URL
       (loopback Docker MCPs only; slug comes from the ``[mcp_servers.<slug>]``
-      header so the tunnel path matches the allowlist regex).
+      header so the tunnel path matches the allowlist regex); a
+      credential-gateway entry (``gateway``, by slug) takes the shape
+      ``_gateway_json_entry`` gives the JSON twin, its header line too.
     - Each stdio MCP's ``env`` inline table gets ``PROXY_URL`` (satellite tunnel)
       + ``PROXY_API_KEY`` (per-session JWT) appended. Codex — unlike Claude CLI —
       does NOT propagate the daemon's process env to MCP subprocesses, so every
@@ -306,6 +329,14 @@ def _rewrite_mcp_toml_for_remote(
     def _esc(v: str) -> str:
         return v.replace("\\", "\\\\").replace('"', '\\"')
 
+    # The inline shape's header line per slug: a vendor entry on a machine
+    # below the gateway version.
+    inline_headers: dict[str, tuple[str, str]] = {
+        slug: (str(f.get("header") or "Authorization"), str(f.get("value") or ""))
+        for slug, f in (gateway or {}).items()
+        if not f.get("proxy_local") and not gateway_mode
+    }
+
     out_lines: list[str] = []
     current_slug: str | None = None
     for line in toml_content.splitlines(keepends=True):
@@ -338,8 +369,17 @@ def _rewrite_mcp_toml_for_remote(
             out_lines.append(f"{sm2.group(1)}{value}{sm2.group(3)}{nl}")
             continue
 
-        # url → satellite loopback tunnel (proxy-local Docker MCPs only).
+        # url → satellite loopback tunnel (proxy-local Docker MCPs only),
+        # or the credential gateway's shape for a gateway entry.
         um = url_re.match(body)
+        facts = (gateway or {}).get(current_slug) if (um and current_slug) else None
+        if um and facts is not None and gateway_key_of(
+                f"{um.group(2)}{um.group(3)}{um.group(4) or ''}{um.group(5) or ''}") == current_slug:
+            entry = _gateway_json_entry(
+                {"url": "", "headers": {}}, current_slug, facts, sat_port, session_id, gateway_mode,
+            )
+            out_lines.append(f'{um.group(1)}{_esc(entry["url"])}{um.group(6)}{nl}')
+            continue
         if um and current_slug and sat_port:
             _host = um.group(3)
             _manifest = mcp_registry.get_manifest_by_config_key(current_slug)
@@ -438,23 +478,23 @@ def _rewrite_mcp_toml_for_remote(
             out_lines.append(f'{head}{inner.rstrip()}{sep}{adds} }}{trail}{nl}')
             continue
 
-        # HTTP bearer-swap: swap the sentinel Authorization bearer in a
-        # proxy-terminable github/m365 http_headers sub-table for the per-session
-        # JWT. The tunnel `_dispatch` then swaps the JWT for the real upstream
-        # token, so it never lands on the satellite. Vendor HTTP MCPs (slug ∉
-        # bearer_swap_keys) keep their inline bearer untouched.
+        # The inline shape: a vendor entry below the gateway version carries
+        # its header's value where the sentinel stood; an empty value drops
+        # the line (the vendor answers the MCP), and no session token ever
+        # reaches a vendor.
         am2 = auth_re.match(body)
-        if am2 and current_slug in bearer_swap_keys and proxy_api_key:
-            out_lines.append(
-                f'{am2.group(1)}"Authorization" = "Bearer {_esc(proxy_api_key)}"'
-                f'{am2.group(2)}{nl}'
-            )
+        if am2 and current_slug in inline_headers:
+            header, value = inline_headers[current_slug]
+            if value:
+                out_lines.append(
+                    f'{am2.group(1)}"{_esc(header)}" = "{_esc(value)}"{am2.group(2)}{nl}'
+                )
             continue
 
         # Per-session JWT for Docker MCPs that call back to the proxy hooks
-        # (file-tools, server.proxy_callbacks; slug ∉ bearer_swap_keys). Swap the
-        # session-JWT sentinel for the real session JWT; the tunnel `_dispatch`
-        # forwards it unchanged and the proxy hook validates it.
+        # (file-tools, server.proxy_callbacks) and for every gateway entry
+        # that keeps the sentinel: swap it for the real session JWT; the
+        # tunnel forwards it unchanged and the proxy judges it.
         if am2 and proxy_api_key and SESSION_JWT_SENTINEL_BEARER in body:
             out_lines.append(
                 f'{am2.group(1)}"Authorization" = "Bearer {_esc(proxy_api_key)}"'

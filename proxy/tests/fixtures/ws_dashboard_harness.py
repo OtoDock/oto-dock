@@ -72,6 +72,12 @@ class FakeDashboardWebSocket:
         # client, which every test before the rule was written stands for.
         self.headers = Headers(headers=headers or {})
         self.url = URL("ws://testserver/ws/dashboard")
+        # The origin rule derives the scheme from the handshake's scope the
+        # way a real socket's does (a trusted hop's X-Forwarded-Proto, else
+        # the socket's own): a test server's handshake, no hop in front.
+        self.scope = {"type": "websocket", "scheme": "ws",
+                      "client": ("testclient", 50000), "server": ("testserver", 80),
+                      "headers": self.headers.raw}
         self.accepted = False
         self.closed: tuple[int, str] | None = None
         self.sent: list[dict] = []
@@ -99,6 +105,14 @@ class FakeDashboardWebSocket:
         # A real socket's send awaits network I/O; concurrent tasks (the pump)
         # get scheduled across sends. Without this yield the handler runs
         # send-to-send synchronously — orderings no real deployment has.
+        await asyncio.sleep(0)
+
+    async def send_text(self, text: str) -> None:
+        # A frame the handler encoded itself (the history, off the loop):
+        # decoded here so the tests see one frame shape either way.
+        frame = json.loads(text)
+        self.sent.append(frame)
+        self._outbound.put_nowait(frame)
         await asyncio.sleep(0)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
@@ -171,6 +185,13 @@ class FakeExecutionLayer:
         self.queued_interrupts: list[str] = []
         self.interrupt_for_queued_accepts = False
         self.on_interrupt_for_queued = None
+        # Reconnect-grace scripting: sid -> seconds until its machine is back
+        # (None = it stays away through the wait); the real default is
+        # "no machine", so no wait.
+        self.reconnecting: dict[str, float | None] = {}
+        self.reconnect_waits: list[str] = []
+        # Sessions whose machine's reconnect grace still holds them.
+        self.grace_held: set[str] = set()
 
     async def start_session(self, sid: str, agent_cfg) -> None:
         if self.start_gate is not None:
@@ -285,6 +306,22 @@ class FakeExecutionLayer:
 
     def remote_stream_severed(self, sid: str) -> bool:
         return sid in self.severed
+
+    async def wait_session_reconnect(self, sid: str, *, timeout: float = 10.0) -> bool:
+        self.reconnect_waits.append(sid)
+        if sid not in self.reconnecting:
+            return False
+        back_in = self.reconnecting.pop(sid)
+        if back_in is None or back_in > timeout:
+            await asyncio.sleep(min(timeout, 0.05))
+            return False
+        await asyncio.sleep(back_in)
+        self.alive.add(sid)
+        self.dead_processes.discard(sid)
+        return True
+
+    def is_session_grace_held(self, sid: str) -> bool:
+        return sid in self.grace_held
 
     def session_idle_seconds(self, sid: str) -> float | None:
         return self.idle_seconds.get(sid)

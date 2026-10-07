@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch, fetchAuthConfig } from '../../api/auth'
+import { apiFetch, fetchAuthConfig, signOutEverywhere } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
-import { ROLE, roleBadge, roleLabel } from '../../lib/permissions'
+import { ROLE, allowedOnSharedOnly, roleBadge, roleLabel } from '../../lib/permissions'
+import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { useSetPlatformAuth } from '../../api/executionLayers'
 
 interface UserRecord {
@@ -41,7 +42,9 @@ function useAgentList() {
       const res = await apiFetch('/v1/agents?all=true')
       if (!res.ok) throw new Error('Failed to fetch agents')
       const data = await res.json()
-      return (data.agents as { name: string }[]).map((a) => a.name)
+      // A Shared-only agent takes editor or manager assignments only.
+      return (data.agents as { name: string; collaborative?: boolean; default_scope?: 'user' | 'agent' }[])
+        .map((a) => ({ name: a.name, sharedOnly: isSharedOnly(modeOfAgent(a)) }))
     },
   })
 }
@@ -289,6 +292,11 @@ export default function UsersPage() {
     onError: (e: Error) => setError(e.message),
   })
 
+  const signOutUserEverywhere = useMutation({
+    mutationFn: (sub: string) => signOutEverywhere(sub),
+    onError: (e: Error) => setError(e.message),
+  })
+
   const resetUserPassword = useMutation({
     mutationFn: async (sub: string) => {
       const res = await apiFetch(`/v1/admin/users/${sub}/reset-password`, { method: 'POST' })
@@ -332,10 +340,13 @@ export default function UsersPage() {
       editAgents.length !== current.agents.length ||
       editAgents.some((a) => !current.agents.includes(a))
     const rolesChanged = editAgents.some(
-      (a) => (editAgentRoles[a] || ROLE.VIEWER) !== (current.agent_roles?.[a] || ROLE.VIEWER)
+      (a) => (editAgentRoles[a] || startingRole(a)) !== (current.agent_roles?.[a] || ROLE.VIEWER)
     )
     if (agentsChanged || rolesChanged) {
-      await updateAgents.mutateAsync({ sub: editingSub, agents: editAgents, agent_roles: editAgentRoles })
+      // Every ticked agent carries its role explicitly (a Shared-only agent
+      // starts at editor, never the store's viewer default).
+      const agentRoles = Object.fromEntries(editAgents.map((a) => [a, editAgentRoles[a] || startingRole(a)]))
+      await updateAgents.mutateAsync({ sub: editingSub, agents: editAgents, agent_roles: agentRoles })
       // Editing YOUR OWN assignments must also refresh the auth snapshot —
       // `user.agent_roles` is otherwise only fetched at app load, and it
       // drives the Remote Machines settings tab and per-agent role gates.
@@ -344,7 +355,15 @@ export default function UsersPage() {
     setEditingSub(null)
   }
 
+  const sharedOnly = new Set((allAgents || []).filter((a) => a.sharedOnly).map((a) => a.name))
+  // The role a newly ticked agent starts with: viewer, or editor on a
+  // Shared-only agent (its chats run as the agent, which takes editor).
+  const startingRole = (agent: string) => (sharedOnly.has(agent) ? ROLE.EDITOR : ROLE.VIEWER)
+
   const toggleAgent = (agent: string) => {
+    if (!editAgents.includes(agent) && !editAgentRoles[agent] && sharedOnly.has(agent)) {
+      setEditAgentRoles((prev) => ({ ...prev, [agent]: ROLE.EDITOR }))
+    }
     setEditAgents((prev) =>
       prev.includes(agent) ? prev.filter((a) => a !== agent) : [...prev, agent],
     )
@@ -356,32 +375,51 @@ export default function UsersPage() {
   const renderAgentEditor = () => (
     <div className="space-y-2">
       <div className="flex flex-col gap-1.5">
-        {allAgents?.map((agent) => (
-          <label key={agent} className="flex items-center gap-2 min-w-0 text-xs text-p-text">
-            <input
-              type="checkbox"
-              checked={editAgents.includes(agent)}
-              onChange={() => toggleAgent(agent)}
-              className="rounded-sm border-p-border-light shrink-0"
-            />
-            <span className="min-w-[120px]">{agent}</span>
-            {/* The role select shrinks to what the row has left (its
-                longest option is wider than a phone) and clips its closed
-                text; the native picker still shows every option in full. */}
-            {editAgents.includes(agent) && (
-              <select
-                value={editAgentRoles[agent] || 'viewer'}
-                onChange={(e) => setEditAgentRoles((prev) => ({ ...prev, [agent]: e.target.value }))}
-                className={`${SELECT_XS_CLS} min-w-0 truncate`}
-              >
-                <option value="viewer">viewer — reads and chats</option>
-                <option value="contributor">contributor — also writes the shared workspace</option>
-                <option value="editor">editor — also automates as the agent</option>
-                <option value="manager">manager — configures the agent</option>
-              </select>
-            )}
-          </label>
-        ))}
+        {allAgents?.map(({ name: agent, sharedOnly: agentSharedOnly }) => {
+          const role = editAgentRoles[agent] || startingRole(agent)
+          // A Shared-only agent offers editor and manager only; a lower row an
+          // older install holds shows, marked, and cannot be picked again.
+          const legacy = agentSharedOnly && !allowedOnSharedOnly(role)
+          return (
+            <label key={agent} className="flex items-center gap-2 min-w-0 text-xs text-p-text">
+              <input
+                type="checkbox"
+                checked={editAgents.includes(agent)}
+                onChange={() => toggleAgent(agent)}
+                className="rounded-sm border-p-border-light shrink-0"
+              />
+              <span className="min-w-[120px]">
+                {agent}
+                {agentSharedOnly && <span className="ml-1 text-[10px] text-p-text-light">(Shared only)</span>}
+              </span>
+              {/* The role select shrinks to what the row has left (its
+                  longest option is wider than a phone) and clips its closed
+                  text; the native picker still shows every option in full. */}
+              {editAgents.includes(agent) && (
+                <select
+                  value={role}
+                  onChange={(e) => setEditAgentRoles((prev) => ({ ...prev, [agent]: e.target.value }))}
+                  aria-label={`Role on ${agent}`}
+                  className={`${SELECT_XS_CLS} min-w-0 truncate ${legacy ? 'border-amber-500' : ''}`}
+                  title={legacy ? 'Shared only takes the editor role or above: this assignment opens no chat. Raise it or untick the agent.' : undefined}
+                >
+                  {(!agentSharedOnly || role === ROLE.VIEWER) && (
+                    <option value={ROLE.VIEWER} disabled={agentSharedOnly}>
+                      {agentSharedOnly ? 'viewer — needs editor on Shared only' : 'viewer — reads and chats'}
+                    </option>
+                  )}
+                  {(!agentSharedOnly || role === ROLE.CONTRIBUTOR) && (
+                    <option value={ROLE.CONTRIBUTOR} disabled={agentSharedOnly}>
+                      {agentSharedOnly ? 'contributor — needs editor on Shared only' : 'contributor — also writes the shared workspace'}
+                    </option>
+                  )}
+                  <option value={ROLE.EDITOR}>editor — also automates as the agent</option>
+                  <option value={ROLE.MANAGER}>manager — configures the agent</option>
+                </select>
+              )}
+            </label>
+          )
+        })}
       </div>
       <p className="text-[11px] text-p-text-secondary">
         Per-agent roles are independent of the platform role — the platform role only
@@ -436,6 +474,12 @@ export default function UsersPage() {
                 <button onClick={() => { if (window.confirm(`Reset password for ${u.email}?`)) resetUserPassword.mutate(u.sub) }}
                   className="text-xs px-3 py-1.5 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors">
                   Reset Password
+                </button>
+              )}
+              {!Number(u.is_owner) && (
+                <button onClick={() => { if (window.confirm(`Sign ${u.email} out of every device? Their open chats restart at their next message.`)) signOutUserEverywhere.mutate(u.sub) }}
+                  className="text-xs px-3 py-1.5 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors">
+                  Sign Out Everywhere
                 </button>
               )}
               {!Number(u.is_owner) && (

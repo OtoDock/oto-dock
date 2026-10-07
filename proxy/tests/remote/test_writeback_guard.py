@@ -178,7 +178,7 @@ class TestApplierGuard:
             "session_id": "sess-1",
             "content_b64": base64.b64encode(b"x").decode() if action == "write" else "",
         }
-        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role=role, username=username,
+        sec = SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1"), role=role, username=username,
                               agent="my-agent")
         if mount_username is not None:
             sec.mount_username = mount_username
@@ -273,7 +273,7 @@ class TestDenialLogLevel:
 
     @pytest.mark.asyncio
     async def test_engine_machinery_denial_is_debug(self, caplog):
-        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="admin", username="alice",
+        sec = SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1"), role="admin", username="alice",
                               agent="my-agent")
         records = await self._run_capturing(
             caplog, "users/alice/.codex/models_cache.json", sec)
@@ -281,7 +281,7 @@ class TestDenialLogLevel:
 
     @pytest.mark.asyncio
     async def test_role_denial_stays_warning(self, caplog):
-        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="viewer", username="alice",
+        sec = SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1"), role="viewer", username="alice",
                               agent="my-agent")
         records = await self._run_capturing(caplog, "knowledge/x.md", sec)
         assert records and all(lvl == "WARNING" for lvl, _ in records)
@@ -332,7 +332,7 @@ class TestAdmissionOrder:
         from core.remote.satellite_connection import SatelliteConnectionManager
         sft.LAST_FILE_CHANGED.clear()
         cm = SatelliteConnectionManager()
-        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="manager",
+        sec = SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-1"), role="manager",
                               username="alice", agent="other-agent")
         msg = {"agent_slug": "my-agent", "path": "workspace/x.md", "action": "write",
                "session_id": "sess-1", "content_b64": base64.b64encode(b"x").decode()}

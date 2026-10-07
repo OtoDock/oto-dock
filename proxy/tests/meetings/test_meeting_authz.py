@@ -47,6 +47,8 @@ def test_viewer_cannot_include_shared_only_agent(temp_db):
         _create(u, ["ops", "caller"], scope="user", x_agent_name="ops")
     assert ei.value.status_code == 403
     assert "caller" in ei.value.detail
+    # Worded by what the participant runs as: the agent, Shared only.
+    assert "set to Shared only" in ei.value.detail and "run as viewer" in ei.value.detail
 
 
 def test_editor_can_include_shared_only_agent(temp_db):
@@ -277,3 +279,199 @@ def test_a_paused_resume_never_overwrites_an_end(temp_db):
     assert task_store.remove_active_participant(mid, "beta", meeting_status.LEAVABLE) is None
     task_store.update_meeting(mid, status=meeting_status.CONCLUDED)
     assert task_store.remove_active_participant(mid, "head", meeting_status.LEAVABLE) is None
+
+
+# ---------------------------------------------------------------------------
+# A leave through the route reaches the round loop: the loop re-reads the
+# row's active list each round and writes its own departures through the
+# row's lock.
+# ---------------------------------------------------------------------------
+
+def _leave_office(monkeypatch):
+    import json
+    from services.meetings import meeting_orchestrator as MO
+    _office()
+    agent_store.create_agent("gamma", "Gamma", default_scope="agent", collaborative=True)
+    ceo = _user({a: "manager" for a in ("head", "alpha", "beta", "gamma")}, sub="ceo-1")
+    mid = task_store.create_meeting(
+        "mtg-leave", "t", json.dumps(["head", "alpha", "beta", "gamma"]), "head",
+        "directed", 30, "chat-leave", None, None, "agent", "ceo-1")["id"]
+    task_store.update_meeting(mid, status=meeting_status.ACTIVE)
+    sessions = {a: f"s-{a}" for a in ("head", "alpha", "beta", "gamma")}
+    closed: list[str] = []
+
+    class _Layer:
+        async def close_session(self, sid):
+            closed.append(sid)
+    for sid in sessions.values():
+        monkeypatch.setitem(MO._meeting_session_layers, sid, _Layer())
+    return ceo, mid, sessions, closed
+
+
+def _run_rounds(monkeypatch, mid, sessions, turn):
+    """meeting_produce on the real row, each turn scripted by ``turn(agent)``;
+    returns the rounds run and the SYSTEM events emitted."""
+    from types import SimpleNamespace
+    from core.events.common_events import SYSTEM
+    from services.meetings import meeting_orchestrator as MO
+    rounds: list[list[str]] = []
+
+    async def fake_live(agent, agent_sessions, meeting, transcript, pending, q, meeting_id):
+        rounds.append([agent])
+        return await turn(agent)
+
+    async def fake_batch(ready, agent_sessions, meeting, transcript, pending, q, meeting_id):
+        rounds.append(list(ready))
+        return [await turn(a) for a in ready]
+    monkeypatch.setattr(MO, "_run_live_turn", fake_live)
+    monkeypatch.setattr(MO, "_run_parallel_batch", fake_batch)
+
+    async def _go():
+        q: asyncio.Queue = asyncio.Queue()
+        await MO.meeting_produce(mid, sessions, q,
+                                 SimpleNamespace(chat_id="chat-mtg", system_queue=[]))
+        events = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev.type == SYSTEM:
+                events.append(ev.data)
+        return events
+    return rounds, asyncio.run(_go())
+
+
+def _said(agent, *, directed=(), called=()):
+    from services.meetings import meeting_orchestrator as MO
+    text = f"{agent} reports its findings in full. " * 3
+    return MO.TurnResult(agent=agent, events=[], content=text, directed_to=list(directed),
+                         tools_called=set(called), tail_text=len(text))
+
+
+def test_a_rest_leave_during_a_round_keeps_the_agent_out(temp_db, monkeypatch):
+    """The creator takes beta out while alpha's turn runs and alpha then
+    addresses beta: beta gets no further turn, its session is closed and the
+    dashboard is told it left."""
+    import json
+    from ws import wire_events as wire
+    ceo, mid, sessions, closed = _leave_office(monkeypatch)
+    spoken: list[str] = []
+
+    async def turn(agent):
+        spoken.append(agent)
+        if agent == "head":
+            return (_said("head", directed=["alpha"]) if spoken.count("head") == 1
+                    else _said("head", called=("end_meeting",)))
+        if agent == "alpha":
+            await leave_meeting_endpoint(mid, user=ceo, x_agent_name="beta")
+            return _said("alpha", directed=["beta", "gamma"])
+        return _said(agent)
+
+    rounds, events = _run_rounds(monkeypatch, mid, sessions, turn)
+    # gamma answers alone, then the moderator wraps up.
+    assert rounds == [["head"], ["alpha"], ["gamma"], ["head"]]
+    assert closed == ["s-beta"]
+    assert [e["agent"] for e in events
+            if e.get("subtype") == wire.SUBTYPE_MEETING_AGENT_LEFT] == ["beta"]
+    assert json.loads(task_store.get_meeting(mid)["active_participants"]) == ["head", "alpha", "gamma"]
+
+
+def test_work_queued_for_a_removed_agent_is_dropped(temp_db, monkeypatch):
+    """The moderator addresses only beta while the creator takes beta out:
+    the work is dropped, nobody else is ready and the moderator spoke last,
+    so the meeting concludes."""
+    ceo, mid, sessions, closed = _leave_office(monkeypatch)
+
+    async def turn(agent):
+        await leave_meeting_endpoint(mid, user=ceo, x_agent_name="beta")
+        return _said("head", directed=["beta"])
+
+    rounds, events = _run_rounds(monkeypatch, mid, sessions, turn)
+    assert rounds == [["head"]]
+    assert closed == ["s-beta"]
+    ends = [e for e in events if e.get("subtype") == "meeting_concluded"]
+    assert ends and "error" not in ends[-1]
+
+
+def test_a_rest_leave_of_the_moderator_ends_the_meeting(temp_db, monkeypatch):
+    """The creator takes the moderator out while alpha's turn runs: the
+    meeting ends after that round, as when the moderator fails, and beta,
+    whom alpha addressed, never runs."""
+    from ws import wire_events as wire
+    ceo, mid, sessions, closed = _leave_office(monkeypatch)
+    spoken: list[str] = []
+
+    async def turn(agent):
+        spoken.append(agent)
+        if agent == "head":
+            return _said("head", directed=["alpha"])
+        await leave_meeting_endpoint(mid, user=ceo, x_agent_name="head")
+        return _said("alpha", directed=["beta"])
+
+    rounds, events = _run_rounds(monkeypatch, mid, sessions, turn)
+    assert rounds == [["head"], ["alpha"]]
+    assert closed == ["s-head"]
+    assert [e["agent"] for e in events
+            if e.get("subtype") == wire.SUBTYPE_MEETING_AGENT_LEFT] == ["head"]
+    ends = [e for e in events if e.get("subtype") == "meeting_concluded"]
+    assert ends and "error" not in ends[-1]
+
+
+@pytest.mark.parametrize("gamma_ends", ["leaves", "fails"])
+def test_the_round_loop_never_writes_a_removed_agent_back(temp_db, monkeypatch, gamma_ends):
+    """The creator takes beta out while gamma's turn runs, and gamma then
+    leaves (its own leave_meeting) or fails: the loop's own departure is
+    written through the row's lock and beta stays out of the row."""
+    import json
+    ceo, mid, sessions, closed = _leave_office(monkeypatch)
+    spoken: list[str] = []
+
+    async def turn(agent):
+        spoken.append(agent)
+        if agent == "head":
+            return (_said("head", directed=["gamma"]) if spoken.count("head") == 1
+                    else _said("head", called=("end_meeting",)))
+        if agent == "gamma":
+            await leave_meeting_endpoint(mid, user=ceo, x_agent_name="beta")
+            if gamma_ends == "leaves":
+                await leave_meeting_endpoint(mid, user=_nouser_on("gamma", "s-gamma"))
+                return _said("gamma", called=("leave_meeting",))
+            return _said("gamma", called=("_failed",))
+        return _said(agent)
+
+    rounds, _ = _run_rounds(monkeypatch, mid, sessions, turn)
+    assert "beta" not in spoken
+    assert json.loads(task_store.get_meeting(mid)["active_participants"]) == ["head", "alpha"]
+    # Every departure's session is closed when it leaves (the failed one by
+    # the failure path, which closes it the same way).
+    assert sorted(closed) == ["s-beta", "s-gamma"]
+
+
+def test_thinking_goes_to_an_admin_or_the_creator_only(temp_db):
+    """The operator's choice (2026-10-02): a turn's thinking is hidden from
+    the other agents and from every reader but a person at the dashboard
+    who is an admin or the meeting's creator."""
+    _office()
+    ceo = _user({"head": "manager", "alpha": "manager", "beta": "manager"}, sub="ceo-1")
+    mid = _create(ceo, ["head", "alpha", "beta"], scope="agent", x_agent_name="head")["meeting_id"]
+    _turns(mid)
+    head_turn = lambda u: next(t for t in asyncio.run(  # noqa: E731
+        get_transcript_endpoint(mid, user=u))["turns"] if t["agent"] == "head")
+    assert head_turn(ceo)["thinking"] == "x" * 400                       # the creator
+    admin = UserContext(sub="root-1", email="r@x", name="r", role="admin", agents=[])
+    assert head_turn(admin)["thinking"] == "x" * 400                     # an admin
+    reader = _user({"head": "manager", "alpha": "manager", "beta": "manager"}, sub="cfo-1")
+    assert "thinking" not in head_turn(reader)                           # another reader
+    token = UserContext(sub="ceo-1", email="c@x", name="c", role="admin", agents=[],
+                        is_api_key=True, session_id="s9", agent="head")
+    assert "thinking" not in head_turn(token)                            # never a token
+
+
+def test_the_participants_prompt_carries_no_thinking(temp_db):
+    import json
+    from services.meetings import meeting_context
+    _office()
+    meeting = {"id": "m1", "topic": "margins", "participants": json.dumps(["head", "beta"]),
+               "moderator": "head", "scope": "agent"}
+    transcript = [{"agent": "head", "role": "assistant", "content": "HEAD says hi",
+                   "thinking": "SECRET-REASONING", "tools": []}]
+    prompt = meeting_context.build_turn_prompt(meeting, "beta", transcript)
+    assert "HEAD says hi" in prompt and "SECRET-REASONING" not in prompt

@@ -194,8 +194,15 @@ def test_protected_denial_allows_repo_config():
 # ---------------------------------------------------------------------------
 
 
+def test_dev_mods_are_readable():
+    for p in ("/users/alice/.claude/dev-mods/abc/hooks/register.js", "/workspace/.claude/dev-mods/x.js"):
+        assert path_roles.is_protected_agent_config_path(p) is False, p
+
+
 def test_command_backstop_matches_scope_root_config():
     for cmd in [
+        "echo x > /users/alice/.claude/dev-mods/abc/hooks/register.js",
+        "mkdir -p /workspace/.claude/dev-mods/abc",
         "cat /users/alice/.claude/personal-assistant-abc.json",
         "grep Bearer /workspace/.codex/config.toml",
         "cat ~/.oto-dock/agents/pa/users/alice/.codex/auth.json",
@@ -206,6 +213,7 @@ def test_command_backstop_matches_scope_root_config():
 def test_command_backstop_skips_repo_and_unrelated():
     for cmd in [
         "cat /users/alice/workspace/repo/.claude/settings.json",  # repo nested
+        "echo x > /users/alice/workspace/repo/.claude/dev-mods/a.js",  # repo nested
         "cat /workspace/proj/.codex/config.toml",                 # repo nested
         "cp x /users/alice/workspace/repo/.claude/permission_gate.py",
         "ls /workspace",
@@ -238,6 +246,14 @@ WRITE_PROTECTED = [
     "/tmp/.codex/config.toml",
     "/tmp/.claude/permission_gate.py",
     "/tmp/.codex/hooks.json",
+    # Claude Code 2.1.287+ writes a mod Claude authors under
+    # <config dir>/dev-mods/<session>/ and loads it after a hot-reload
+    # prompt; a mod's hooks run ahead of the platform's gate. The write is
+    # refused before the prompt can exist.
+    "/users/alice/.claude/dev-mods/abc/my-mod/hooks/register.js",
+    "/workspace/.claude/dev-mods/abc/plugin.json",
+    "/tmp/.claude/dev-mods/abc/index.ts",
+    "/home/frank/.oto-dock/agents/pa/users/alice/.claude/dev-mods/x/a.js",
 ]
 
 # Readable (no secret in them), write-protected (the gate runs from them).
@@ -249,6 +265,7 @@ SCRIPTS = [
 
 NOT_WRITE_PROTECTED = [
     "/users/alice/workspace/repo/.claude/permission_gate.py",  # a repo's own
+    "/users/alice/workspace/repo/.claude/dev-mods/x/a.js",       # a repo's own mods
     "/users/alice/.claude/todos/x.json",                        # not at the dir
     "/users/alice/.claude/plans/p.md",
     "/users/alice/.codex/sessions/2026/x.jsonl",

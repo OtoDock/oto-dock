@@ -322,6 +322,7 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         app_handler=row.get("app_handler") or None,
         checks=_checks_of(row.get("checks")),
         transferred_from=row.get("transferred_from") or "",
+        transferred_at=row.get("transferred_at") or "",
     )
 
 

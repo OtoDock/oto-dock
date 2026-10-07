@@ -16,6 +16,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useChatStream } from '@/hooks/useChatStream'
+import { useChatStore } from '@/store/chatStore'
 
 const wsMock = vi.hoisted(() => ({
   streaming: true,
@@ -213,6 +214,20 @@ describe('queued attachments', () => {
     expect(restoreAttachments).toHaveBeenCalledWith([], files)
   })
 
+  it('a returned message goes after the draft the person is typing', () => {
+    useChatStore.getState().setDraftInput('chat-1', 'half typed')
+    const { result } = renderHook(() =>
+      useChatStream({
+        agents: [],
+        initialChatId: 'chat-1',
+        queue: { addQueued, clearQueued: vi.fn(), restoreAttachments: vi.fn() },
+      }),
+    )
+    act(() => captured.cb.onQueueEditReturn({ index: 0, text: 'came back' }))
+    expect(result.current.editText).toBe('half typed\n\ncame back')
+    useChatStore.getState().setDraftInput('chat-1', '')
+  })
+
   it('an attachment-only message comes back without touching the draft', () => {
     const restoreAttachments = vi.fn()
     const { result } = renderHook(() =>
@@ -273,5 +288,58 @@ describe('post-abort stragglers', () => {
     expect(result.current.messages).toHaveLength(2)
     expect(result.current.messages[1].blocks)
       .toEqual([{ type: 'text', content: 'fresh turn' }])
+  })
+})
+
+describe('steered frame naming its row', () => {
+  it('splits the streaming answer at once, the bubble keyed by its row', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onText('Working on the first part'))
+    act(() => captured.cb.onSteered({ text: 'switch to the second', message_id: 42, queue_id: 'q' }))
+    act(() => captured.cb.onText('On it.'))
+    const msgs = result.current.messages
+    expect(msgs.map((m: any) => m.role)).toEqual(['assistant', 'user', 'assistant'])
+    expect(msgs[0].blocks).toEqual([{ type: 'text', content: 'Working on the first part' }])
+    expect(msgs[1].id).toBe('db-42')
+    expect(msgs[2].blocks).toEqual([{ type: 'text', content: 'On it.' }])
+    expect(result.current.pendingSteers).toEqual([])
+  })
+
+  it('a frame with no row (a 1.7.0 proxy) still waits for the block boundary', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onText('Working'))
+    act(() => captured.cb.onSteered({ text: 'later' }))
+    expect(result.current.messages.map((m: any) => m.role)).toEqual(['assistant'])
+    expect(result.current.pendingSteers).toEqual([{ text: 'later' }])
+  })
+})
+
+describe('the queue frames that carry their ids', () => {
+  it('a send the proxy queued instead of starting turns its bubble into the chip', () => {
+    const { result } = renderStream()
+    act(() => {
+      result.current.sentWithBubbleRef.current = 'meanwhile'
+      result.current.setMessages([
+        { id: 'user-1', role: 'user', blocks: [{ type: 'text', content: 'meanwhile' }], createdAt: '' },
+        { id: 'stream-1', role: 'assistant', blocks: [], createdAt: '' },
+      ])
+    })
+    act(() => captured.cb.onQueued({ index: 0, queue_id: 'q', text: 'meanwhile', author_sub: 'u' }))
+    expect(result.current.messages).toEqual([])
+    expect(addQueued).not.toHaveBeenCalled()  // the socket hook filed the chip
+  })
+
+  it('a fresh send that took waiting messages shows them first', () => {
+    const { result } = renderStream()
+    act(() => {
+      result.current.sentWithBubbleRef.current = 'fresh'
+      result.current.setMessages([
+        { id: 'user-1', role: 'user', blocks: [{ type: 'text', content: 'fresh' }], createdAt: '' },
+        { id: 'stream-1', role: 'assistant', blocks: [], createdAt: '' },
+      ])
+    })
+    act(() => captured.cb.onQueueSent({ queue_ids: ['q'], message_ids: [5], text: 'waiting' }))
+    const texts = result.current.messages.map((m: any) => m.blocks[0]?.content ?? '')
+    expect(texts).toEqual(['waiting', 'fresh', ''])
   })
 })

@@ -22,6 +22,7 @@ import threading
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
+from services.apps import app_supervisor
 from storage import database as task_store
 from core import placement
 from core.session import session_kind
@@ -127,9 +128,36 @@ METHODS: dict[str, dict] = {
         "min_role": "viewer",
         "args": {"scope": "string"},
     },
+    # Who uses the app (SHARING.md): read by the app itself, and by an
+    # editor or manager of its own agent, a personal app's owner or an
+    # admin (audience_reader_ok; the floor is clamped to editor at validation).
+    "app.audience": {
+        "description": "who uses this app: its members, the agents it is placed in with their "
+                       "members, and the people it is shared with, each with their role",
+        "min_role": "editor",
+        "args": {},
+    },
+    # A single-file app's document per viewer, each viewer's page its own
+    # (a folder app keeps per-viewer data in its database).
+    "viewer.data.read": {
+        "description": "your own saved data in this app",
+        "min_role": "viewer",
+        "args": {},
+    },
+    "viewer.data.write": {
+        "description": "save your own data in this app: doc replaces it, patch merges into it",
+        "min_role": "viewer",
+        "args": {"doc": "object", "patch": "object"},
+    },
 }
 FILE_METHODS = frozenset({"files.list", "files.read", "files.write"})
 SETUP_METHODS = frozenset({"setup.status", "setup.complete"})
+AUDIENCE_METHOD = "app.audience"
+VIEWER_DATA_METHODS = frozenset({"viewer.data.read", "viewer.data.write"})
+# A person's own page only: the page's claim, direct or forwarded by the
+# server; never a bearer, the app identity, a wake, an inbound event or
+# the render.
+PERSON_METHODS = SETUP_METHODS | VIEWER_DATA_METHODS
 FILE_MAX_BYTES = 2 * 1024 * 1024
 FILE_LIST_MAX = 500
 
@@ -201,7 +229,7 @@ class AppSubscription:
     """One server socket's feeds and queue: the socket holds it from open
     to close, and only the socket that registered it may take it down."""
 
-    def __init__(self, app_id: str, agent: str, instance: str = "live") -> None:
+    def __init__(self, app_id: str, agent: str, instance: str = app_supervisor.LIVE) -> None:
         from services.notifications.notification_manager import LiveQueue
         self.app_id = app_id
         self.agent = agent
@@ -219,7 +247,7 @@ _app_subs: dict[tuple[str, str], AppSubscription] = {}
 APP_FEEDS_MAX = 16
 
 
-def open_app_subscription(app_id: str, agent: str, instance: str = "live") -> AppSubscription:
+def open_app_subscription(app_id: str, agent: str, instance: str = app_supervisor.LIVE) -> AppSubscription:
     sub = AppSubscription(app_id, agent, instance)
     _app_subs[(app_id, instance)] = sub
     return sub
@@ -242,7 +270,7 @@ def app_subscribe(sub: AppSubscription, feed: str, on: bool) -> bool:
     return True
 
 
-def app_subscription(app_id: str, instance: str = "live") -> AppSubscription | None:
+def app_subscription(app_id: str, instance: str = app_supervisor.LIVE) -> AppSubscription | None:
     return _app_subs.get((app_id, instance))
 
 
@@ -351,7 +379,7 @@ def _members_and_admins(agent: str) -> list[str]:
     """The agent's members and every admin, from the notification manager's
     audience cache (no store read per emit)."""
     from services.notifications.notification_manager import agent_audience
-    return sorted(set(agent_audience(agent)))
+    return sorted(set(agent_audience(agent, fan_out=True)))
 
 
 def _chat_targets(chat: dict) -> list[str]:
@@ -710,9 +738,13 @@ def provider_status(agent: str, row: dict, user) -> list[dict]:
     return out
 
 
-def run_method(method: str, agent: str, row: dict, user, args) -> dict:
+def run_method(method: str, agent: str, row: dict, user, args, *,
+               role: str | None = None) -> dict:
     """Answer one platform method; raises ValueError with a user-facing
-    reason for a bad request, PermissionError when the viewer may not."""
+    reason for a bad request, PermissionError when the viewer may not.
+    ``role`` is the role the caller's floors were judged at (SHARING.md: a
+    person a share admits holds the share's role), so ``viewer.me`` never
+    disagrees with the floors; without it the per-agent acting role."""
     args = args if isinstance(args, dict) else {}
     if method == "viewer.me":
         u = task_store.get_user(user.sub) or {}
@@ -720,7 +752,7 @@ def run_method(method: str, agent: str, row: dict, user, args) -> dict:
             "sub": user.sub,
             "name": u.get("display_name") or u.get("name") or user.name,
             "username": u.get("username") or "",
-            "role": user.acting_role(agent),
+            "role": role or user.acting_role(agent),
             "external": False,
         }
     if method == "integrations.status":
@@ -759,7 +791,69 @@ def run_method(method: str, agent: str, row: dict, user, args) -> dict:
         return _run_file_method(method, agent, row, user, args)
     if method in SETUP_METHODS:
         return _run_setup_method(method, agent, row, user, args)
+    if method == AUDIENCE_METHOD:
+        return _run_audience(row, user, role)
+    if method in VIEWER_DATA_METHODS:
+        return _run_viewer_data(method, row, user, args)
     raise KeyError(method)
+
+
+def is_app_identity(row: dict, user) -> bool:
+    """Whether ``user`` is ``app_principal(row)``: the app's own server (its
+    launch token alone), a handler's wake or a step."""
+    from auth.providers import SESSION_SUB_PREFIX
+    return (getattr(user, "sub", "") or "") == f"{SESSION_SUB_PREFIX}app:{row['id']}"
+
+
+def audience_reader_ok(row: dict, user) -> bool:
+    """Whether a PERSON may read the app's audience page-side (SHARING.md
+    "Agents use a placed app"): a platform admin, the owner of a personal
+    app, or an editor or manager of the app's OWN agent; a person a share
+    admits, a placed editor included, reads it through the app's server
+    alone. The app identity is judged before this."""
+    from auth import roles
+    if user.is_admin:
+        return True
+    if row.get("username"):
+        return (row.get("owner_sub") or "") == user.sub
+    return roles.can_edit(user.effective_role(row.get("agent") or ""))
+
+
+def _run_audience(row: dict, user, role: str | None) -> dict:
+    """``app.audience``: the app itself reads it; a person reads it when
+    ``audience_reader_ok`` admits them. Names and usernames are blank for
+    every reader but a platform admin while the directory is closed to
+    members (SHARING.md "The user directory"), so a page matches viewers by
+    ``sub``; ``role`` is the one the floors judged, so an admin's agent
+    session, judged at its row, reads blank names like any session."""
+    from api.sharing.shares import SETTING_DIRECTORY
+    from auth import roles
+    from services.apps import audience as _audience
+    if is_app_identity(row, user):
+        is_admin = False
+    elif getattr(user, "is_api_key", False) or getattr(user, "render_app", ""):
+        raise PermissionError("the audience is read by the app itself or on a person's own page")
+    elif not audience_reader_ok(row, user):
+        raise PermissionError("the audience is for the app's own editors and managers")
+    else:
+        is_admin = roles.is_admin(role) if role else bool(user.is_admin)
+    names = is_admin or task_store.get_platform_setting(SETTING_DIRECTORY) != "0"
+    return _audience.describe_audience(row, names=names)
+
+
+def _run_viewer_data(method: str, row: dict, user, args: dict) -> dict:
+    """``viewer.data.read`` / ``viewer.data.write``: the viewer's own
+    document in a single-file app, on a person's own page (never a bearer
+    or the render; the platform route requires the page's claim)."""
+    from services.apps import viewer_data
+    if getattr(user, "is_api_key", False) or getattr(user, "render_app", ""):
+        raise PermissionError("your saved data is read on your own page")
+    from storage import db_apps
+    if db_apps.app_kind_of(row).serves_tree:
+        raise PermissionError("a folder app keeps per-viewer data in its own database")
+    if method == "viewer.data.read":
+        return viewer_data.read(row, user.sub)
+    return viewer_data.write(row, user.sub, doc=args.get("doc"), patch=args.get("patch"))
 
 
 def mcp_status(agent: str, row: dict, user) -> dict[str, dict]:

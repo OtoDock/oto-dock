@@ -579,6 +579,45 @@ def test_the_argv_rule_and_the_scrub():
     assert app_steps.scrub("token=abcdefghij tail short", ["abcdefghij", "short"]) == "token=[redacted] tail short"
 
 
+def test_a_local_step_mounts_only_its_signed_script(agent_tree, monkeypatch):
+    """The approval signs the step's script alone, so a local run sees that
+    script and nothing else of the release (a paired machine already runs
+    only the verified bytes): the bytes are staged into the run's scratch
+    directory and mounted at ``/app`` in place of the live release."""
+    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
+    row = _deploy_approved(agent_tree, "staged", STEP_MANIFEST,
+                           {"scripts/sync.sh": SCRIPT, "scripts/lib.sh": "echo sibling\n"})
+    plan = app_steps.plan_for(row, {"id": "d-staged-1", "handler": "sync", "event": "trigger:t", "payload": {}})
+    spec = app_steps._spec_for(plan, "claim")
+    try:
+        live = releases.live_release_dir(row)
+        assert spec.script_dir is not None and spec.mount_at == "/app"
+        assert spec.script_dir != live and not spec.script_dir.is_relative_to(live)
+        staged = sorted(p.relative_to(spec.script_dir).as_posix()
+                        for p in spec.script_dir.rglob("*") if p.is_file())
+        assert staged == ["scripts/sync.sh"]
+        assert (spec.script_dir / "scripts" / "sync.sh").read_bytes() == SCRIPT.encode()
+        assert spec.script_dir.is_relative_to(spec.scratch_root / "d-staged-1")
+        argv, _env, _step_dir = app_steps._build_local(plan, "claim")
+        assert argv[-1] == "/app/scripts/sync.sh"
+    finally:
+        shutil.rmtree(spec.scratch_root / "d-staged-1", ignore_errors=True)
+
+
+def test_a_failed_local_start_leaves_no_staged_script(agent_tree, monkeypatch):
+    from services.scripts import runner as _runner
+    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
+    row = _deploy_approved(agent_tree, "staged2", STEP_MANIFEST, {"scripts/sync.sh": SCRIPT})
+    plan = app_steps.plan_for(row, {"id": "d-staged-2", "handler": "sync", "event": "trigger:t", "payload": {}})
+
+    def _broken(spec):
+        raise _runner.ScriptRefused("the sandbox could not be built")
+    monkeypatch.setattr(_runner, "build_local", _broken)
+    with pytest.raises(app_steps.StepRefused):
+        asyncio.run(app_steps.run_local(plan, "claim"))
+    assert not (releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME / "d-staged-2").exists()
+
+
 # ── the real thing ──────────────────────────────────────────────────────────
 
 REAL_SCRIPT = """#!/bin/sh
@@ -615,6 +654,26 @@ def test_a_step_really_runs_in_the_sandbox_with_the_identitys_mounts(agent_tree,
         # The step's scratch directory is gone with the run.
         assert not (releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME).exists() \
             or not any((releases.app_release_dir(row) / app_steps.STEPS_DIR_NAME).iterdir())
+
+    asyncio.run(go())
+
+
+@_needs_runtime
+def test_a_local_step_cannot_source_a_sibling_the_approval_never_signed(agent_tree, monkeypatch):
+    """A sibling the script sources is not in the step's sandbox, as on a
+    machine: a redeploy that changes only that file changes nothing a step
+    runs."""
+    monkeypatch.setattr(app_sandbox, "bun_binary", lambda: "")
+    script = "#!/bin/sh\n. /app/scripts/lib.sh\necho after-source\n"
+    row = _deploy_approved(agent_tree, "sibling", STEP_MANIFEST,
+                           {"scripts/sync.sh": script,
+                            "scripts/lib.sh": "echo SIBLING-RAN\n"})
+
+    async def go():
+        got = await _run_step(row, "sync")
+        assert got["status"] == "dead", got
+        assert "SIBLING-RAN" not in (got["output"] or "")
+        assert "lib.sh" in (got["output"] or "")
 
     asyncio.run(go())
 

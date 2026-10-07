@@ -55,9 +55,8 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 # ── pinned versions — read straight from VERSIONS.md (single source of truth) ─
 # shellcheck source=versions.sh
 source "$PLATFORM_ROOT/scripts/versions.sh"
-PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.14}"
-PYVER_MINOR="${PYTHON_VERSION%.*}"                              # 3.13
-NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-24.18.0}"
+PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.16}"
+NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-24.21.0}"
 NODE_MAJOR="${NODE_VERSION%%.*}"                               # 24
 UV_VERSION="$(otodock_version_get UV_VERSION)";       export UV_VERSION   # honored by install-baseline-tools.sh
 PNPM_VERSION="$(otodock_version_get PNPM_VERSION)";   export PNPM_VERSION
@@ -66,10 +65,27 @@ echo
 info "Pinned toolchain (from VERSIONS.md): python ${PYTHON_VERSION} · node ${NODE_VERSION} · uv ${UV_VERSION:-?} · pnpm ${PNPM_VERSION:-?}"
 echo
 
+# ── 0. A running server ───────────────────────────────────────────────────
+# A run rebuilds proxy/venv (phone/venv with --phone) when its Python is not
+# the pin, reinstalls their packages and recreates the Postgres container on
+# a new image: none of that may happen under a running unit, so stop before
+# the first step. Hosts without systemctl skip the check; a proxy run in the
+# foreground is not seen and is the caller's to stop.
+refuse_running_units() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl is-active --quiet otodock-proxy; then
+        die "otodock-proxy is running: stop the proxy first (sudo systemctl stop otodock-proxy), then re-run"
+    fi
+    if [ "$WITH_PHONE" = 1 ] && systemctl is-active --quiet otodock-phone; then
+        die "otodock-phone is running: stop the phone daemon first (sudo systemctl stop otodock-phone), then re-run"
+    fi
+}
+
 # ── 1. Node (pinned major, via NodeSource) ────────────────────────────────
-# install-baseline-tools.sh does NOT install Node, and the distro's node is the
-# wrong major — so put the pinned major under /usr FIRST (the sandbox mounts
-# /usr, not $HOME, so a version-manager node in ~/ is invisible to agents).
+# install-baseline-tools.sh adds Node only when npm is absent, so a distro
+# node of the wrong major would stay — put the pinned major under /usr FIRST
+# (the sandbox mounts /usr, not $HOME, so a version-manager node in ~/ is
+# invisible to agents).
 install_node() {
     local cur=""
     command -v node >/dev/null 2>&1 && cur="$(node -v 2>/dev/null | sed 's/^v//;s/\..*//')"
@@ -91,6 +107,13 @@ install_baseline() {
     info "Running install-baseline-tools.sh (git/gh/uv/pnpm/bubblewrap/passt/CLIs)..."
     bash "$PLATFORM_ROOT/scripts/install-baseline-tools.sh"
     command -v uv >/dev/null 2>&1 || die "uv not on PATH after baseline install"
+    # The installer moves /usr/local/bin/uv; an older copy earlier on this PATH
+    # (pipx's or a standalone uv in ~/.local/bin) would fail the Python install
+    # below.
+    local uv_now; uv_now="$(uv --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    if [ -n "${UV_VERSION:-}" ] && [ "$(printf '%s\n%s\n' "${uv_now:-0}" "$UV_VERSION" | sort -V | head -1)" != "$UV_VERSION" ]; then
+        die "uv at $(command -v uv) reports ${uv_now:-no version}, older than the pin ${UV_VERSION}: update that copy in place ('pipx install --force uv==${UV_VERSION}' for a pipx one, 'uv self update ${UV_VERSION}' for a standalone one) or remove it, then re-run"
+    fi
     ok "Baseline toolchain installed"
 }
 
@@ -111,7 +134,8 @@ install_docker() {
 # ── 4. Pinned Python + proxy venv ─────────────────────────────────────────
 # uv fetches the EXACT pinned CPython (distro-independent); the venv is built on
 # it, then proxy/setup.sh reuses that venv (it skips creation when venv/ exists)
-# to install deps + generate config.env — one source of truth for both.
+# to install deps + generate config.env — one source of truth for both. A venv
+# on any other Python, a patch release included, is rebuilt on the pin.
 setup_proxy() {
     info "Provisioning Python ${PYTHON_VERSION} via uv..."
     uv python install "$PYTHON_VERSION"
@@ -119,7 +143,7 @@ setup_proxy() {
     local venv="$PLATFORM_ROOT/proxy/venv" have=""
     [ -x "$venv/bin/python" ] && have="$("$venv/bin/python" -V 2>&1 | awk '{print $2}')"
     case "$have" in
-        "$PYVER_MINOR".*)
+        "$PYTHON_VERSION")
             if [ -x "$venv/bin/pip" ]; then
                 ok "proxy/venv already on Python $have"
             else
@@ -132,7 +156,7 @@ setup_proxy() {
             fi
             ;;
         *)
-            [ -n "$have" ] && info "Rebuilding proxy/venv ($have → ${PYVER_MINOR}.x)"
+            [ -n "$have" ] && info "Rebuilding proxy/venv ($have → ${PYTHON_VERSION})"
             rm -rf "$venv"
             uv venv "$venv" --python "$PYTHON_VERSION" --seed   # --seed → pip in the venv, so setup.sh's `venv/bin/pip` works
             ;;
@@ -147,7 +171,7 @@ setup_proxy() {
 start_postgres() {
     [ -f "$PLATFORM_ROOT/config.env" ] || die "config.env missing — proxy/setup.sh should have created it"
     local DC="docker"; docker info >/dev/null 2>&1 || DC="sudo docker"
-    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.14-alpine}) in Docker..."
+    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine}) in Docker..."
     $DC compose --env-file "$PLATFORM_ROOT/config.env" -f "$PLATFORM_ROOT/docker-compose.t1.yml" up -d postgres
     ok "Postgres up on 127.0.0.1:5432 (container otodock-postgres)"
 }
@@ -169,7 +193,7 @@ setup_phone() {
     local venv="$PLATFORM_ROOT/phone/venv" have=""
     [ -x "$venv/bin/python" ] && have="$("$venv/bin/python" -V 2>&1 | awk '{print $2}')"
     case "$have" in
-        "$PYVER_MINOR".*)
+        "$PYTHON_VERSION")
             if [ -x "$venv/bin/pip" ]; then
                 ok "phone/venv already on Python $have"
             else
@@ -179,7 +203,7 @@ setup_phone() {
             fi
             ;;
         *)
-            [ -n "$have" ] && info "Rebuilding phone/venv ($have → ${PYVER_MINOR}.x)"
+            [ -n "$have" ] && info "Rebuilding phone/venv ($have → ${PYTHON_VERSION})"
             rm -rf "$venv"
             uv venv "$venv" --python "$PYTHON_VERSION" --seed
             ;;
@@ -256,6 +280,7 @@ EOF
     fi
 }
 
+refuse_running_units
 install_node
 install_baseline
 install_docker

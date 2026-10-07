@@ -67,9 +67,18 @@ def test_safe_mkdirs_and_cleanup_partials(tmp_path, victim):
     target = tmp_path / "report.pdf"
     (tmp_path / ".report.pdf.0123456789ab.partial").write_bytes(b"x")
     (tmp_path / ".other.pdf.0123456789ab.partial").write_bytes(b"x")
+    (tmp_path / ".report.pdf.bak.0123456789ab.partial").write_bytes(b"x")
     shared.cleanup_partials(str(target))
     assert not (tmp_path / ".report.pdf.0123456789ab.partial").exists()
     assert (tmp_path / ".other.pdf.0123456789ab.partial").exists()
+    assert (tmp_path / ".report.pdf.bak.0123456789ab.partial").exists()
+    # A name over 200 bytes: the temp carries the name cut to 200 bytes,
+    # inside a multibyte character too.
+    for name in ("x" * 240, "文" * 80):
+        partial = b"." + name.encode()[:200] + b".0123456789ab.partial"
+        os.close(os.open(os.path.join(os.fsencode(tmp_path), partial), os.O_CREAT | os.O_WRONLY))
+        shared.cleanup_partials(str(tmp_path / name))
+        assert not os.path.lexists(os.path.join(os.fsencode(tmp_path), partial))
 
 
 def _bypass(monkeypatch, *mods):
@@ -213,9 +222,102 @@ def test_convert_document_lands_the_result_through_the_helper(tmp_path, victim, 
     assert not out.is_symlink() and out.read_bytes() == b"%PDF-FAKE"
 
 
+def _sandbox_rig(tmp_path, monkeypatch):
+    """A mount at ``tmp_path/agents`` holding ``pa/users/u/workspace/docs``,
+    a faked LibreOffice, and a resolver that answers a read as given and a
+    write in sandbox form only (``/users/...``), as the proxy does: a
+    container path reaches it in its agents-relative form, which it
+    resolves for reads only. Returns ``(pdf module, docs dir, writes)``."""
+    import fitz
+    from PIL import Image
+
+    import pdf as pdf_mod
+    mount = tmp_path / "agents"
+    docs = mount / "pa/users/u/workspace/docs"
+    docs.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "green").save(docs / "photo.png")
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "page")
+    doc.save(str(docs / "doc.pdf"))
+    doc.close()
+    (docs / "sheet.docx").write_bytes(b"docx")
+    writes = []
+
+    async def _resolve(p, writing=False, **kw):
+        if not writing:
+            return p
+        writes.append(p)
+        if not Path(p).is_relative_to("/users/u/workspace"):
+            raise ValueError(f"Cannot open '{p}': proxy resolve-path 403")
+        return str(mount / "pa") + p
+
+    async def _fake_convert(input_path, output_format, output_dir=None):
+        produced = Path(output_dir) / (Path(input_path).stem + "." + output_format)
+        produced.write_bytes(b"%PDF-FAKE")
+        return str(produced)
+
+    _bypass(monkeypatch, pdf_mod)
+    monkeypatch.setattr(pdf_mod, "_resolve_path", _resolve)
+    monkeypatch.setattr(shared, "_resolve_path", _resolve)
+    monkeypatch.setattr(pdf_mod, "_to_agents_relative", lambda p: p)
+    monkeypatch.setattr(pdf_mod, "_libreoffice_convert", _fake_convert)
+    monkeypatch.setattr(pdf_mod, "MOUNT_AGENTS_DIR", str(mount))
+    return pdf_mod, docs, writes
+
+
+@pytest.mark.parametrize("name, fmt, landed", [
+    ("photo.png", "pdf", "photo.pdf"),
+    ("doc.pdf", "png", "doc/page_001.png"),
+    ("sheet.docx", "pdf", "sheet.pdf"),
+])
+def test_a_default_conversion_output_resolves_as_a_sandbox_write(tmp_path, monkeypatch, name, fmt, landed):
+    pdf_mod, docs, writes = _sandbox_rig(tmp_path, monkeypatch)
+    msg = asyncio.run(pdf_mod.handle_convert_document(
+        {"input_path": str(docs / name), "output_format": fmt},
+    ))
+    assert msg.startswith("Converted"), msg
+    assert writes == ["/users/u/workspace/docs/" + landed.split("/")[0]]
+    assert (docs / landed).exists()
+
+
+@pytest.mark.parametrize("name, fmt, output_path, landed", [
+    ("photo.png", "pdf", "/users/u/workspace/out/final.pdf", "out/final.pdf"),
+    ("doc.pdf", "png", "/users/u/workspace/out/pages", "out/pages/page_001.png"),
+    ("sheet.docx", "pdf", "/users/u/workspace/out/s.pdf", "out/s.pdf"),
+])
+def test_a_conversion_lands_at_output_path_by_its_own_name(
+        tmp_path, monkeypatch, name, fmt, output_path, landed):
+    pdf_mod, docs, writes = _sandbox_rig(tmp_path, monkeypatch)
+    msg = asyncio.run(pdf_mod.handle_convert_document(
+        {"input_path": str(docs / name), "output_format": fmt, "output_path": output_path},
+    ))
+    assert msg.startswith("Converted"), msg
+    assert writes == [output_path]
+    assert (docs.parent / landed).exists()
+
+
+def test_pdf_to_images_default_folder_resolves_as_a_sandbox_write(tmp_path, monkeypatch):
+    pdf_mod, docs, writes = _sandbox_rig(tmp_path, monkeypatch)
+    asyncio.run(pdf_mod.handle_pdf_to_images({"path": str(docs / "doc.pdf")}))
+    assert writes == ["/users/u/workspace/docs/doc_pages"]
+    assert (docs / "doc_pages" / "page_001.png").exists()
+
+
 def test_libreoffice_runs_under_the_pinned_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(shared, "_LO_PROFILE_DIR", str(tmp_path / "lo-profile"))
     seen = {}
+    real_profile = shared._libreoffice_profile
+    on_loop = []
+
+    def _profile():
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return real_profile()
+
+    monkeypatch.setattr(shared, "_libreoffice_profile", _profile)
 
     class _Proc:
         returncode = 0
@@ -232,16 +334,24 @@ def test_libreoffice_runs_under_the_pinned_profile(tmp_path, monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
     (tmp_path / "in.docx").write_bytes(b"x")
+    # A profile that drifted (an older pin set, a user's change) is rewritten.
+    xcu_path = tmp_path / "lo-profile" / "user" / "registrymodifications.xcu"
+    xcu_path.parent.mkdir(parents=True)
+    xcu_path.write_text(shared._LO_REGISTRY.replace("BlockUntrustedRefererLinks", "Other"))
     out = asyncio.run(shared._libreoffice_convert(str(tmp_path / "in.docx"), "pdf", str(tmp_path)))
     assert out.endswith("in.pdf")
     argv = seen["argv"]
     assert argv[0] == "libreoffice" and argv[1] == f"-env:UserInstallation=file://{tmp_path / 'lo-profile'}"
-    xcu = (tmp_path / "lo-profile" / "user" / "registrymodifications.xcu").read_text()
+    xcu = xcu_path.read_text()
     for needle in ('name="ODFRecalcMode"', 'name="OOXMLRecalcMode"',
                    'Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1',
                    'Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0',
                    'name="DisableMacrosExecution" oor:op="fuse"><value>true',
-                   'name="MacroSecurityLevel" oor:op="fuse"><value>3'):
+                   'name="MacroSecurityLevel" oor:op="fuse"><value>3',
+                   'Office.Common/Security/Scripting"><prop oor:name="BlockUntrustedRefererLinks"'
+                   ' oor:op="fuse"><value>true'):
         assert needle in xcu, needle
+    assert xcu == shared._LO_REGISTRY and xcu.rstrip().endswith("</oor:items>")
+    assert on_loop == [False]  # the profile's reads and writes run off the loop
     with contextlib.suppress(OSError):
         os.unlink(tmp_path / "in.pdf")

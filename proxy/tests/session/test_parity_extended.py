@@ -409,7 +409,96 @@ def test_codex_translator_turn_failed_to_error():
         "turn": {"status": "failed", "error": {"message": "boom"}},
     }))
     assert [e.type for e in out] == ["error", "done"]
-    assert out[0].data["message"] == "boom"
+    from core.events import turn_ending
+    ending = turn_ending.from_dict(out[0].data["ending"])
+    assert ending.reason == turn_ending.ERROR and ending.detail == "boom"
+    assert out[0].data["message"] == ending.line()
+
+
+def test_codex_usage_limit_and_policy_declines_are_typed_endings():
+    """``codexErrorInfo`` names the reason (app-server 0.156.1): a usage limit
+    ends with its reset from the last rate-limit snapshot's reached window,
+    a cyber or misalignment policy block ends as a decline; any other failure
+    stays a plain error."""
+    from core.events import turn_ending
+    from core.layers.codex import CodexEventTranslator, CodexEvent
+
+    t = CodexEventTranslator()
+    t.translate(CodexEvent(type="account/rateLimits/updated", data={"rateLimits": {
+        "primary": {"usedPercent": 100, "windowDurationMins": 300, "resetsAt": 1790000000},
+        "secondary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1790500000},
+    }}))
+    out = t.translate(CodexEvent(type="turn/completed", data={"turn": {
+        "status": "failed", "error": {"message": "You've hit your usage limit.",
+                                      "codexErrorInfo": "usageLimitExceeded"}}}))
+    assert [e.type for e in out] == ["error", "done"]
+    ending = turn_ending.from_dict(out[0].data["ending"])
+    assert ending.reason == turn_ending.LIMIT
+    assert ending.resets_at == turn_ending.epoch_to_iso(1790000000)
+    assert ending.detail == "You've hit your usage limit."
+    assert ending.window == "five_hour"  # both Codex windows are account-wide
+    assert out[0].data["message"] == ending.line()
+
+    # Both windows reached: the account frees when the later one resets, the
+    # weekly window here; a window of no declared length names none.
+    for primary, secondary, window, at in (
+            ({"usedPercent": 100, "windowDurationMins": 300, "resetsAt": 1790000000},
+             {"usedPercent": 100, "windowDurationMins": 10080, "resetsAt": 1790500000},
+             "seven_day", 1790500000),
+            ({"usedPercent": 100, "resetsAt": 1790000000},
+             {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1790500000},
+             "", 1790000000)):
+        t = CodexEventTranslator()
+        t.translate(CodexEvent(type="account/rateLimits/updated", data={"rateLimits": {
+            "primary": primary, "secondary": secondary}}))
+        out = t.translate(CodexEvent(type="turn/completed", data={"turn": {
+            "status": "failed", "error": {"message": "You've hit your usage limit.",
+                                          "codexErrorInfo": "usageLimitExceeded"}}}))
+        ending = turn_ending.from_dict(out[0].data["ending"])
+        assert (ending.window, ending.resets_at) == (window, turn_ending.epoch_to_iso(at))
+
+    for info, detail in (("cyberPolicy", "cyber"), ("misalignmentPolicyViolation", "policy"),
+                         ("tooManyDenials", turn_ending.DENIALS)):
+        out = CodexEventTranslator().translate(CodexEvent(type="error", data={
+            "error": {"message": "blocked", "codexErrorInfo": info},
+            "threadId": "t", "turnId": "u", "willRetry": False}))
+        ending = turn_ending.from_dict(out[0].data["ending"])
+        assert (ending.reason, ending.detail) == (turn_ending.DECLINED, detail)
+    # Codex 0.160's Guardian circuit breaker: not the model's classifier, so
+    # the ending says what happened and does not offer a model change.
+    denials = turn_ending.TurnEnding(reason=turn_ending.DECLINED, detail=turn_ending.DENIALS)
+    assert denials.line().startswith("⚠ Codex stopped this turn after too many of its actions were denied")
+    assert "classifier" not in denials.line() and "another model" not in denials.line()
+    assert denials.summary() == "Stopped after too many of its actions were denied."
+    assert "permission mode" in denials.callback_note("w") and "classifier" not in denials.callback_note("w")
+    # flexUnavailable (0.158) is no named reason: the ``error`` ending, the
+    # daemon warm, Codex's words as the detail.
+    out = CodexEventTranslator().translate(CodexEvent(type="turn/completed", data={"turn": {
+        "status": "failed", "error": {"message": "flex", "codexErrorInfo": "flexUnavailable"}}}))
+    flex = turn_ending.from_dict(out[0].data["ending"])
+    assert (flex.reason, flex.detail) == (turn_ending.ERROR, "flex")
+
+    out = CodexEventTranslator().translate(CodexEvent(type="turn/completed", data={"turn": {
+        "status": "failed", "error": {"message": "boom", "codexErrorInfo": "internalServerError"}}}))
+    assert turn_ending.from_dict(out[0].data["ending"]).reason == turn_ending.ERROR
+
+
+def test_codex_error_codex_retries_does_not_end_the_turn():
+    """``willRetry`` sits at the params' top level (0.156.1); a retried error
+    is not the turn's end. An older satellite ends its own turn on it, so the
+    remote adapter keeps the ERROR there."""
+    from core.layers.codex import CodexEventTranslator, CodexEvent
+
+    retried = {"error": {"message": "stream disconnected"}, "threadId": "t", "turnId": "u",
+               "willRetry": True}
+    assert CodexEventTranslator().translate(CodexEvent(type="error", data=retried)) == []
+    nested = {"error": {"message": "stream disconnected", "willRetry": True}}
+    assert CodexEventTranslator().translate(CodexEvent(type="error", data=nested)) == []
+    old_satellite = CodexEventTranslator()
+    old_satellite.retried_errors_end_turn = True
+    assert [e.type for e in old_satellite.translate(CodexEvent(type="error", data=retried))] == ["error"]
+    final = {**retried, "willRetry": False}
+    assert [e.type for e in CodexEventTranslator().translate(CodexEvent(type="error", data=final))] == ["error"]
 
 
 # ---------------------------------------------------------------------------

@@ -91,6 +91,24 @@ def test_the_two_trees_walk_with_identical_blocks():
     assert not proxy_fs._is_codex_runtime_state("workspace/models.json")
 
 
+def test_the_per_session_mcp_config_copies_are_host_local_in_both_trees():
+    # A session's MCP config copy carries its own session token and broker
+    # fetch tokens: the satellite's ``mcp-config-<sid12>.json`` (0.5.132+),
+    # the proxy's ``<agent>-<sha256(sub)[:12]>-<sid12>.json``
+    # (``session_config_dir._session_copy_path``) and the shared names an
+    # earlier release wrote never sync, either direction.
+    for name in ("mcp-config.json", "mcp-config-1a2b3c4d-5e6.json",
+                 "personal-assistant-0123456789ab-1a2b3c4d-5e6.json",
+                 "personal-assistant-0123456789ab.json"):
+        assert proxy_fs._is_claude_runtime_state(f"users/u/.claude/{name}"), name
+        assert proxy_fs._is_claude_runtime_state(f"workspace/.claude/{name}"), name
+    for name in ("notes.json", "settings.local.json", "mcp-config.txt"):
+        assert not proxy_fs._is_claude_runtime_state(f"users/u/.claude/{name}"), name
+    assert not proxy_fs._is_claude_runtime_state(
+        "users/u/.claude/projects/h/mcp-config-1a2b3c4d-5e6.json")
+    assert _satellite_constant("_CLAUDE_HOST_LOCAL_RE") == proxy_fs._CLAUDE_HOST_LOCAL_RE.pattern
+
+
 def test_the_runtime_helpers_key_on_the_one_whitelist():
     # The cruft-dir and cruft-file helpers answer for every synced engine dir
     # (they used to spell the pair themselves).

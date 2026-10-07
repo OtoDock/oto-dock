@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import config
 from storage import database as task_store
 from services.scheduler import delivery, shared
+from services.scheduler.delivery_identity import _shared_chat_person, _standing_of, _wake_refused
 from auth import roles
 from ws import wire_events as wire
 
@@ -248,12 +249,12 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     from storage.pg import run_db
     # A Shared-only chat is woken as the person who scheduled the wake; a
     # personal chat's wake is its owner's (``scope == "user"``).
-    shared_person = await run_db(delivery._shared_chat_person, chat, task.created_by)
+    shared_person = await run_db(_shared_chat_person, chat, task.created_by)
     person = shared_person or (task.created_by if task.scope == "user" else "")
     standing = row = ""
     if person:
-        standing, row = await run_db(delivery._standing_of, person, task.agent)
-    if person and delivery._wake_refused(standing, shared=bool(shared_person)):
+        standing, row = await run_db(_standing_of, person, task.agent)
+    if person and _wake_refused(standing, shared=bool(shared_person)):
         # The delegate rung's rule, before any rung is tried: a person who
         # no longer holds the agent (on a Shared-only chat: the editor tier)
         # wakes nothing and stores nothing. The fire still counts, so the
@@ -283,6 +284,7 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
 
     # Same identity resolution as delegate delivery: the chat owner's remote
     # pins / role must be honored on the persistent/one-shot rungs.
+    creator = ""
     if person:
         deliver_user_sub: str | None = person
         # On a Shared-only chat the person's effective role, the one their
@@ -297,6 +299,11 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
         deliver_role = ((roles.row_role(await run_db(task_store.get_user_agent_roles, creator),
                                         task.agent)
                          or roles.VIEWER) if creator else roles.MANAGER)
+    # A wake that runs as nobody below the editor tier would run from the
+    # agent's own state, which the start floor refuses: it rides a live
+    # process (the call it was scheduled from) and starts none, and an
+    # undelivered one is not kept.
+    spawns = deliver_user_sub is not None or roles.can_edit(deliver_role)
 
     async def _save_echo(outcome) -> None:
         # Every rung refused (a reservation that timed out on a full box, or
@@ -304,14 +311,21 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
         # chat's next turn, unless the person who scheduled it no longer
         # holds the agent (the delegate rung's rule).
         if outcome.path == "none" and chat_id:
-            if deliver_user_sub and delivery._wake_refused(
-                    (await run_db(delivery._standing_of, deliver_user_sub, task.agent))[0],
+            if deliver_user_sub and _wake_refused(
+                    (await run_db(_standing_of, deliver_user_sub, task.agent))[0],
                     shared=bool(shared_person)):
                 logger.info(
                     f"Continuation {task.id} wake not stored: {deliver_user_sub[:8]} "
                     f"no longer holds agent '{task.agent}': chat={chat_id[:8]}"
                 )
-            elif await delivery._store_undelivered_wakes(chat_id, [wake_prompt]):
+            elif not spawns:
+                logger.info(
+                    f"Continuation {task.id} wake not stored: no live process took it "
+                    f"and none may start at {deliver_role}: chat={chat_id[:8]}"
+                )
+            elif await delivery._store_undelivered_wakes(
+                    chat_id, [wake_prompt], person=deliver_user_sub or "", role=deliver_role,
+                    by=creator):
                 logger.info(
                     f"Continuation {task.id} wake undeliverable: stored for the "
                     f"chat's next turn: chat={chat_id[:8]}"
@@ -349,7 +363,7 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
             },
             persist_event=_persist_wake,
             persistent_fn=delivery._deliver_via_persistent,
-            oneshot_fn=delivery._deliver_via_oneshot,
+            oneshot_fn=delivery._deliver_via_oneshot if spawns else None,
             on_outcome=_save_echo,
         )
         logger.info(f"Continuation {task.id} fired via {outcome.path}: chat={chat_id[:8]}")

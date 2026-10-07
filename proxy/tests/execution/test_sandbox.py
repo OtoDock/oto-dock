@@ -695,9 +695,34 @@ class TestDisallowedBuiltinsConstant:
         """Platform is the only skill source: with the Skill tool allowed,
         plugin skills must not activate outside install/approval — the
         always-rewritten settings.json keeps every plugin off."""
-        from core.layers.cli.config_dir import build_settings
+        from core.layers.cli.config_dir import DISABLED_BUILTIN_PLUGINS, build_settings
         settings = build_settings("/users/test/.claude")
-        assert settings["enabledPlugins"] == {}
+        # Claude Code 2.1.287 ships built-in mods that an empty map leaves ON
+        # (verified on 2.1.289: plugin-authoring loaded and its skill reached
+        # the session): every built-in but the four the platform keeps is
+        # switched off by name; 2.1.281 ignores the ids it does not know.
+        assert settings["enabledPlugins"] == {p: False for p in DISABLED_BUILTIN_PLUGINS}
+        for off in ("cc-plugin-plugin-authoring@builtin", "cc-plugin-you-should-know@builtin",
+                    "cc-plugin-claude-test@builtin", "cc-plugin-mods-guide@builtin"):
+            assert off in DISABLED_BUILTIN_PLUGINS
+        # The four the platform keeps on are never in the disable map.
+        for keep in ("cc-plugin-agents-md", "cc-plugin-diff", "cc-plugin-telemetry", "cc-plugin-sec-default"):
+            assert not any(p.startswith(keep) for p in DISABLED_BUILTIN_PLUGINS)
+        assert set(settings["permissions"]["deny"]) >= {"Artifact", "ArtifactComments", "ArtifactData", "ArtifactCheck"}
+
+    def test_the_satellite_switches_off_the_same_builtins(self):
+        """The satellite writes settings.json itself (cli_session._write_cli_hooks):
+        its list of built-ins is the proxy's, read from the file as a literal."""
+        import ast
+        from tests._paths import REPO_ROOT
+        from core.layers.cli.config_dir import DISABLED_BUILTIN_PLUGINS
+        tree = ast.parse((REPO_ROOT / "satellite" / "sessions" / "cli_session.py").read_text(encoding="utf-8"))
+        twin = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "DISABLED_BUILTIN_PLUGINS" for t in node.targets):
+                twin = ast.literal_eval(node.value)
+        assert twin == tuple(DISABLED_BUILTIN_PLUGINS)
 
 
 # ---------------------------------------------------------------------------
@@ -1349,6 +1374,35 @@ class TestNetnsIntegration:
         # Metadata IP is unrouteable (ip route get returns non-zero).
         assert "meta_rc=0" not in stdout, (stdout, out.stderr)
 
+    def test_ipv6_loopback_fails_at_once_so_localhost_falls_back(self, tmp_agents):
+        """A forward reaches a host service on IPv4 loopback only (every
+        platform publish is 127.0.0.1). pasta's splice also listens on ::1 and
+        resets a connection it cannot complete host-side, which a client
+        that dials ::1 first for "localhost" never recovers from. The
+        namespace has no IPv6 loopback, so that dial fails at once and the
+        client moves on to 127.0.0.1."""
+        agents_dir, mcps_dir = tmp_agents
+        port = _free_port()
+        _accept_once(port, b"REACHED")
+        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[str(port)])
+        probe = (
+            "import socket,sys,time\n"
+            "t=time.monotonic()\n"
+            "s=socket.socket(socket.AF_INET6); s.settimeout(5)\n"
+            "try:\n"
+            f"  s.connect(('::1',{port})); r='connected'\n"
+            "except OSError as e: r='refused'\n"
+            "sys.stdout.write('v6='+r+' %.2f\\n' % (time.monotonic()-t))\n"
+            "s=socket.socket(); s.settimeout(5)\n"
+            f"s.connect(('127.0.0.1',{port})); sys.stdout.write('v4='+s.recv(16).decode()+'\\n')\n"
+        )
+        cmd = SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe])
+        out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert "v4=REACHED" in out.stdout, (out.stdout, out.stderr)
+        v6 = next(ln for ln in out.stdout.splitlines() if ln.startswith("v6="))
+        verdict, took = v6[3:].split()
+        assert verdict == "refused" and float(took) < 1.0, (out.stdout, out.stderr)
+
 
 # ---------------------------------------------------------------------------
 # cli_install_ro_binds — CLI binaries installed outside the system mounts
@@ -1533,6 +1587,27 @@ class TestAgentStateMasked:
         assert not (state / "json.py").exists()
 
 
+class TestRefusalWording:
+    """The refusal names what the session runs as: a Shared-only agent's
+    chats, or an agent-scope chat on any other agent."""
+
+    def test_shared_only_is_the_default_sentence(self):
+        from core.sandbox.session_config_dir import AgentStateRefused, refuse_agent_state_below_editor
+        with pytest.raises(AgentStateRefused, match="set to Shared only") as e:
+            refuse_agent_state_below_editor("agent", "viewer")
+        assert "run as viewer" in str(e.value) and "turn on personal chats" in str(e.value)
+
+    def test_an_agent_scope_chat_elsewhere_says_what_it_runs_as(self):
+        from core.sandbox.session_config_dir import AgentStateRefused, refuse_agent_state_below_editor
+        with pytest.raises(AgentStateRefused) as e:
+            refuse_agent_state_below_editor("agent", "contributor", shared_only=False)
+        msg = str(e.value)
+        assert msg.startswith("This chat runs as the agent itself")
+        assert "Shared only" not in msg and "personal chats" not in msg
+        assert "editor role" in msg and "run as contributor" in msg
+        refuse_agent_state_below_editor("agent", "editor", shared_only=False)
+
+
 class TestEnginesRefuseTheAgentStateBelowEditor:
     """The start-time floor: no engine runs a CLI from the agent's own state
     for a person below the editor tier (its sandbox masks that dir, so the
@@ -1569,6 +1644,16 @@ class TestEnginesRefuseTheAgentStateBelowEditor:
         with pytest.raises(AgentStateRefused):
             await get_layer_by_path(path)._start_session_impl("sess-x", cfg)
 
+    def test_the_start_time_refusal_names_what_the_session_runs_as(self, temp_db):
+        from core.sandbox.session_config_dir import AgentStateRefused, refuse_session_on_agent_state
+        from storage.agents import agent_store
+        agent_store.create_agent("personal-assistant", "PA", collaborative=True, default_scope="user")
+        with pytest.raises(AgentStateRefused, match="runs as the agent itself"):
+            refuse_session_on_agent_state(self._ctx("contributor"))
+        agent_store.update_agent("personal-assistant", collaborative=False, default_scope="agent")
+        with pytest.raises(AgentStateRefused, match="set to Shared only"):
+            refuse_session_on_agent_state(self._ctx("contributor"))
+
     @pytest.mark.asyncio
     async def test_a_machine_refuses_before_any_frame(self):
         from unittest.mock import MagicMock
@@ -1581,3 +1666,298 @@ class TestEnginesRefuseTheAgentStateBelowEditor:
         with pytest.raises(AgentStateRefused):
             await layer.start_session("sess-x", cfg)
         layer._cm.is_connected.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Held bind sources (F68): every bind source under the agents root reaches
+# bwrap as a descriptor the launcher's shim opened with no link followed,
+# and the proxy's own mkdirs of those sources never follow a link either.
+# ---------------------------------------------------------------------------
+
+import dataclasses as _dataclasses
+import stat
+
+from core.sandbox.sandbox import Mount as _Mount
+
+
+def _launcher_module():
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("oto_sandbox_net_held", str(_sandbox_mod._NETNS_LAUNCHER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _shim_held_binds(beneath):
+    """The shim's own held-bind code, run without its network setup."""
+    ns: dict = {}
+    exec(_launcher_module()._HELD_BINDS, ns)
+    ns["_BENEATH"] = list(beneath)
+    return ns["_held_binds"]
+
+
+def _close_fds(argv):
+    for flag, fd in zip(argv, argv[1:]):
+        if flag in ("--bind-fd", "--ro-bind-fd"):
+            os.close(int(fd))
+
+
+def _bwrap_argv(cmd):
+    return cmd[cmd.index("--") + 1:]
+
+
+class TestHeldBindSources:
+    def test_an_agent_session_names_its_resolved_folder_to_the_launcher(self, tmp_agents):
+        agents_dir, mcps_dir = tmp_agents
+        for username in ("alice", ""):
+            cfg = _make_config(agents_dir, mcps_dir, username=username)
+            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            launcher = cmd[:cmd.index("--")]
+            root = str((agents_dir / "personal-assistant").resolve())
+            assert launcher[launcher.index("--beneath") + 1] == root
+
+    def test_an_agent_folder_that_is_a_link_keeps_starting(self, tmp_agents, tmp_path):
+        """An operator may move an agent's folder to another disk and leave
+        a link: every source is spelled from the resolved folder, the
+        launcher holds them beneath it, and the mkdirs follow no link below
+        it."""
+        agents_dir, mcps_dir = tmp_agents
+        moved = tmp_path / "other-disk" / "moved-agent"
+        for sub in ("workspace", "config", "users/alice/workspace"):
+            (moved / sub).mkdir(parents=True)
+        (agents_dir / "moved-agent").symlink_to(moved)
+        for username in ("alice", ""):
+            cfg = _make_config(agents_dir, mcps_dir, username=username, agent="moved-agent")
+            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            launcher = cmd[:cmd.index("--")]
+            real = str(moved.resolve())
+            assert launcher[launcher.index("--beneath") + 1] == real
+            bwrap = _bwrap_argv(cmd)
+            assert not [a for a in bwrap if a.startswith(str(agents_dir / "moved-agent") + "/")]
+            out = _shim_held_binds([real])(bwrap)
+            try:
+                assert out.count("--bind-fd") + out.count("--ro-bind-fd") >= 2
+            finally:
+                _close_fds(out[:out.index("--")])
+
+    def test_every_option_the_builder_emits_is_known_to_the_shim(self, tmp_agents, tmp_path):
+        """The shim steps over each bwrap option with its values; one it
+        does not know refuses the launch, so every shape the builder emits
+        must walk cleanly and every agent-tree source must be held."""
+        from core.sandbox.session_config_dir import HOOK_SCRIPTS
+        agents_dir, mcps_dir = tmp_agents
+        pa = agents_dir / "personal-assistant"
+        (pa / "knowledge" / "shared" / "lib").mkdir(parents=True)
+        for state in (pa / "users" / "alice" / ".claude", pa / "workspace" / ".codex"):
+            state.mkdir(parents=True, exist_ok=True)
+            for name in HOOK_SCRIPTS:
+                (state / name).write_text("# hook\n")
+        home = pa / "externals" / "caller-1"
+        home.mkdir(parents=True)
+        shapes = [
+            _make_config(agents_dir, mcps_dir, role="editor"),
+            _make_config(agents_dir, mcps_dir, role="manager", username=""),
+            _dataclasses.replace(_make_config(agents_dir, mcps_dir, role="manager"),
+                                 knowledge_libraries=[("lib", "", False)], read_only=True),
+            _dataclasses.replace(_make_config(agents_dir, mcps_dir, role="viewer", username=""),
+                                 external=True, external_home=str(home.resolve())),
+        ]
+        root = str(pa.resolve())
+        for cfg in shapes:
+            bwrap = _bwrap_argv(SandboxBuilder(cfg).build_command_prefix(["claude", "--", "x"]))
+            out = _shim_held_binds([root])(bwrap)
+            try:
+                head = out[:out.index("--")]
+                assert not [s for f, s in zip(head, head[1:])
+                            if f in ("--bind", "--ro-bind") and s.startswith(root + "/")]
+            finally:
+                _close_fds(out[:out.index("--")])
+
+    def test_an_app_table_names_no_root(self, tmp_agents, tmp_path):
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _dataclasses.replace(
+            _make_config(agents_dir, mcps_dir, username=""),
+            app_mounts=[_Mount(str(tmp_path), "/app", False)], app_cwd="/app")
+        cmd = SandboxBuilder(cfg).build_command_prefix(["bun"])
+        assert "--beneath" not in cmd[:cmd.index("--")]
+
+    def test_the_launcher_takes_the_root_before_its_own_flags(self):
+        mod = _launcher_module()
+        roots, rest = mod._take_beneath(
+            ["--beneath", "/srv/agents", "--forward", "8400", "--", "bwrap", "--beneath", "x"])
+        assert roots == ["/srv/agents"]
+        assert rest == ["--forward", "8400", "--", "bwrap", "--beneath", "x"]
+        assert "_BENEATH = ['/srv/agents']" in mod._build_pyshim(
+            ["8400"], [], "", True, False, beneath=["/srv/agents"])
+        assert "_BENEATH = []" in mod._build_pyshim(["8400"], [], "", True, False)
+
+    def test_the_shim_hands_bwrap_a_held_handle_for_each_source_below_the_root(self, tmp_path):
+        root = tmp_path / "agent"
+        ws = root / "workspace"
+        state = root / "users" / "u" / "state"
+        ws.mkdir(parents=True)
+        state.mkdir(parents=True)
+        hook = state / "permission_gate.py"
+        hook.write_text("x")
+        argv = ["bwrap", "--ro-bind", "/usr", "/usr",
+                "--bind", str(ws), "/workspace",
+                "--bind", str(state), "/users/u/state",
+                "--ro-bind", str(hook), "/users/u/state/permission_gate.py",
+                "--chdir", "/workspace", "--", "tool", "--bind", str(ws), "x"]
+        out = _shim_held_binds([str(root)])(argv)
+        try:
+            assert out[:4] == ["bwrap", "--ro-bind", "/usr", "/usr"]
+            for flag, src, dest in (("--bind-fd", ws, "/workspace"),
+                                    ("--bind-fd", state, "/users/u/state"),
+                                    ("--ro-bind-fd", hook, "/users/u/state/permission_gate.py")):
+                at = out.index(dest)
+                assert out[at - 2] == flag
+                fd = int(out[at - 1])
+                assert os.readlink(f"/proc/self/fd/{fd}") == str(src)
+                assert os.get_inheritable(fd)
+            # A FILE source (the hook script) is held as itself, not its dir.
+            at = out.index("/users/u/state/permission_gate.py")
+            assert stat.S_ISREG(os.fstat(int(out[at - 1])).st_mode)
+            # The session's own argv after bwrap's separator is never touched.
+            assert out[out.index("--"):] == argv[argv.index("--"):]
+        finally:
+            _close_fds(out[:out.index("--")])
+
+    def test_the_shim_holds_any_source_but_a_link(self, tmp_path):
+        """A socket or FIFO an MCP manifest names inside the agent's tree is
+        bound today and stays bound: only a link is refused."""
+        import socket
+        root = tmp_path / "agent"
+        root.mkdir()
+        fifo = root / "pipe"
+        os.mkfifo(fifo)
+        sock_path = root / "sock"
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(str(sock_path))
+        try:
+            out = _shim_held_binds([str(root)])(
+                ["bwrap", "--bind", str(fifo), "/p", "--bind", str(sock_path), "/s", "--", "true"])
+            try:
+                assert out[1] == "--bind-fd" and out[4] == "--bind-fd"
+                assert stat.S_ISFIFO(os.fstat(int(out[2])).st_mode)
+                assert stat.S_ISSOCK(os.fstat(int(out[5])).st_mode)
+            finally:
+                _close_fds(out[:out.index("--")])
+        finally:
+            sock.close()
+
+    def test_the_shim_steps_over_option_values(self, tmp_path):
+        """A value that reads like an option (``--``, ``--bind``) is a value:
+        it neither ends the walk nor becomes a bind."""
+        root = tmp_path / "agent"
+        (root / "workspace").mkdir(parents=True)
+        src = str(root / "workspace")
+        argv = ["bwrap", "--setenv", "X", "--bind", "--chdir", "--", "--size", "10",
+                "--bind", src, "/workspace", "--", "true"]
+        out = _shim_held_binds([str(root)])(argv)
+        try:
+            assert out[:8] == argv[:8]
+            assert out[8] == "--bind-fd" and out[10] == "/workspace"
+            assert out[11:] == ["--", "true"]
+        finally:
+            _close_fds(out[:out.index("--", 8)])
+
+    def test_the_shim_refuses_an_option_it_does_not_know(self, tmp_path):
+        with pytest.raises(OSError):
+            _shim_held_binds([str(tmp_path)])(["bwrap", "--brand-new", "v", "--", "true"])
+
+    @pytest.mark.parametrize("where", ["component", "leaf", "root"])
+    def test_the_shim_refuses_a_source_reached_through_a_link(self, tmp_path, where):
+        root = tmp_path / "agent"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        (outside / "sub").mkdir(parents=True)
+        (outside / "f.py").write_text("x")
+        held_root = str(root)
+        if where == "component":
+            (root / "k").symlink_to(outside)
+            src = root / "k" / "sub"
+        elif where == "leaf":
+            src = root / "hook.py"
+            src.symlink_to(outside / "f.py")
+        else:
+            # The root the proxy resolved became a link before the spawn.
+            held_root = str(tmp_path / "agent-link")
+            (tmp_path / "agent-link").symlink_to(outside)
+            src = tmp_path / "agent-link" / "sub"
+        with pytest.raises(OSError):
+            _shim_held_binds([held_root])(["bwrap", "--ro-bind", str(src), "/x", "--", "true"])
+
+    def test_the_mirror_mkdir_never_creates_through_a_link_swapped_in_after_the_check(
+            self, tmp_agents, tmp_path, monkeypatch):
+        agents_dir, mcps_dir = tmp_agents
+        shared = agents_dir / "personal-assistant" / "knowledge" / "shared"
+        shared.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (shared / "src").symlink_to(outside)
+        # The swap lands after the early realpath refusal: let that check pass.
+        monkeypatch.setattr(_sandbox_mod, "_verified_literal_path",
+                            lambda root, *parts: root.joinpath(*parts))
+        cfg = _dataclasses.replace(_make_config(agents_dir, mcps_dir, role="manager"),
+                                   knowledge_libraries=[("src", "sub", False)])
+        with pytest.raises(RuntimeError):
+            SandboxBuilder(cfg).workspace_mount_table()
+        assert not (outside / "sub").exists()
+
+    def test_a_session_dir_is_never_made_through_a_link_swapped_in_after_the_check(
+            self, tmp_agents, tmp_path, monkeypatch):
+        from core.sandbox import session_config_dir as scd
+        agents_dir, _mcps_dir = tmp_agents
+        monkeypatch.setattr(_app_config, "AGENTS_DIR", agents_dir)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (agents_dir / "personal-assistant" / "users" / "carol").symlink_to(outside)
+        # The swap lands after the early realpath refusal: let that check pass.
+        real = os.path.realpath
+        monkeypatch.setattr(scd.os.path, "realpath",
+                            lambda p, *a, **k: str(p) if "carol" in str(p) else real(p, *a, **k))
+        with pytest.raises(RuntimeError):
+            scd._verified_session_dir("personal-assistant", "users", "carol", ".claude")
+        assert not (outside / ".claude").exists()
+
+    @_needs_netns
+    def test_a_mirror_source_swapped_for_a_link_after_the_build_never_mounts_its_target(
+            self, tmp_agents, tmp_path):
+        """The decisive end-to-end case: a Personal-only library mirror has no
+        parent /knowledge bind, so its destination is a fresh mountpoint that
+        does not traverse the swapped tree. A component of the source swapped
+        for a link to an out-of-tree directory, between the build and the
+        spawn, must refuse the start — never bind the link's target."""
+        agents_dir, mcps_dir = tmp_agents
+        shared = agents_dir / "personal-assistant" / "knowledge" / "shared"
+        (shared / "src" / "sub").mkdir(parents=True)
+        (shared / "src" / "sub" / "in-tree.txt").write_text("INTREE")
+        cfg = _dataclasses.replace(
+            _make_config(agents_dir, mcps_dir, role="manager"),
+            mount_shared=False, knowledge_libraries=[("src", "sub", False)])
+        cmd = SandboxBuilder(cfg).build_command_prefix(["ls", "/knowledge/shared/src/sub"])
+        outside = tmp_path / "outside"
+        (outside / "sub").mkdir(parents=True)
+        (outside / "sub" / "host-only.txt").write_text("x")
+        (shared / "src").rename(shared / "src.real")
+        (shared / "src").symlink_to(outside)
+        out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert "host-only.txt" not in out.stdout, (out.stdout, out.stderr)
+        assert out.returncode != 0
+
+    @_needs_netns
+    def test_held_sources_bind_and_no_descriptor_reaches_the_session(self, tmp_agents):
+        agents_dir, mcps_dir = tmp_agents
+        (agents_dir / "personal-assistant" / "users" / "alice" / "workspace" / "w.txt").write_text("SEEN")
+        probe = ("import os\n"
+                 "fds = sorted(int(f) for f in os.listdir('/proc/self/fd'))\n"
+                 "print('extra=' + ','.join(str(f) for f in fds if f > 3))\n"
+                 "print('w=' + open('/users/alice/workspace/w.txt').read())\n")
+        cfg = _make_config(agents_dir, mcps_dir, role="editor")
+        cmd = SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe])
+        out = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        assert "w=SEEN" in out.stdout, (out.stdout, out.stderr)
+        assert "extra=\n" in out.stdout, (out.stdout, out.stderr)

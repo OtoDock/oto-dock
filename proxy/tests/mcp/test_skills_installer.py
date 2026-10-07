@@ -132,6 +132,55 @@ async def test_install_lands_scrubbed_in_skills_dir(temp_db, tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_failed_install_over_a_leftover_folder_restores_it(temp_db, tmp_path, monkeypatch):
+    """The shared file step strips an existing folder to its preserved items:
+    a leftover skill folder is backed up first and restored when the install
+    fails after the strip."""
+    import config as app_config
+    monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
+    leftover = tmp_path / "mcps" / "skills" / "pdf-skills"
+    (leftover / "skills").mkdir(parents=True)
+    (leftover / "notes.md").write_text("old")
+    (leftover / "skills" / "old.md").write_text("old skill")
+    root = _pkg(tmp_path / "upload")
+    with patch.object(mcp_registry, "get_manifest", return_value=None), \
+         patch.object(mcp_registry, "scan_manifests", side_effect=[RuntimeError("scan"), None]):
+        with pytest.raises(RuntimeError):
+            await si.install_skill_package_from_extracted(root)
+    assert (leftover / "notes.md").read_text() == "old"
+    assert (leftover / "skills" / "old.md").read_text() == "old skill"
+    assert not (leftover / "manifest.json").exists()
+    assert not leftover.with_suffix(".bak").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_inside_the_file_step_restores_the_folder(temp_db, tmp_path, monkeypatch):
+    """A copy that fails after the strip leaves no half-stripped folder: the
+    backup comes back whole and no ``.bak`` is left."""
+    import config as app_config
+    from services.community import community_installer as ci
+    monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
+    leftover = tmp_path / "mcps" / "skills" / "pdf-skills"
+    (leftover / "skills").mkdir(parents=True)
+    (leftover / "notes.md").write_text("old")
+    (leftover / "skills" / "old.md").write_text("old skill")
+    root = _pkg(tmp_path / "upload")
+
+    def _copy_fails(src, dst, *a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ci.shutil, "copy2", _copy_fails)
+    with patch.object(mcp_registry, "get_manifest", return_value=None), \
+         patch.object(mcp_registry, "scan_manifests"):
+        with pytest.raises(OSError):
+            await si.install_skill_package_from_extracted(root)
+    assert (leftover / "notes.md").read_text() == "old"
+    assert (leftover / "skills" / "old.md").read_text() == "old skill"
+    assert not (leftover / "manifest.json").exists()
+    assert not leftover.with_suffix(".bak").exists()
+
+
+@pytest.mark.asyncio
 async def test_install_rejects_name_collision_with_mcp(temp_db, tmp_path, monkeypatch):
     from fastapi import HTTPException
     import config as app_config

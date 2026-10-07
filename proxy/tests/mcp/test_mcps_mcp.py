@@ -69,6 +69,7 @@ class TestPermissionMatrix:
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
             "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
+            "OTO_CAN_EDIT_AGENT": "true",
         })
         assert m.ENABLED_TOOLS == {
             "list_enabled_mcps",
@@ -81,7 +82,26 @@ class TestPermissionMatrix:
             "disable_mcp_for_agent",
             "get_request_status",
             "cancel_my_request",
+            "validate_mcp_package",
         }
+
+    def test_editor_gets_the_authoring_check_tool_only(self):
+        """The editor tier authors packages (the mcp-authoring skill's
+        audience) and hands them to an admin; it manages no MCP."""
+        m = _load_server({
+            "OTO_AGENT_NAME": "pa",
+            "OTO_SCOPE": "user",
+            "OTO_ROLE": "editor", "OTO_CAN_EDIT_AGENT": "true",
+        })
+        assert m.ENABLED_TOOLS == {"validate_mcp_package"}
+
+    def test_contributor_has_no_tools(self):
+        m = _load_server({
+            "OTO_AGENT_NAME": "pa",
+            "OTO_SCOPE": "user",
+            "OTO_ROLE": "contributor", "OTO_CAN_WRITE_WORKSPACE": "true",
+        })
+        assert m.ENABLED_TOOLS == set()
 
     def test_admin_sees_same_set_as_manager(self):
         """Admin power operations (platform-wide install without an agent
@@ -92,11 +112,13 @@ class TestPermissionMatrix:
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
             "OTO_ROLE": "admin", "OTO_CAN_MANAGE_AGENT": "true",
+            "OTO_CAN_EDIT_AGENT": "true",
         })
         manager = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
             "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
+            "OTO_CAN_EDIT_AGENT": "true",
         })
         assert admin.ENABLED_TOOLS == manager.ENABLED_TOOLS
         # Explicit assertion the removed tools are gone.
@@ -116,11 +138,12 @@ class TestPermissionMatrix:
 
     def test_agent_scope_is_read_only(self):
         """Tasks / phone / triggers / Shared-only agents — no user in the
-        session, so requests can't be created on anyone's behalf."""
+        session, so requests can't be created on anyone's behalf, and the
+        check route needs a signed-in person."""
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "agent",
-            "OTO_ROLE": "",
+            "OTO_ROLE": "", "OTO_CAN_EDIT_AGENT": "true",
         })
         assert m.ENABLED_TOOLS == {
             "list_enabled_mcps",
@@ -128,6 +151,41 @@ class TestPermissionMatrix:
             "list_community_mcps",
             "list_community_skills",
         }
+
+    def test_validate_package_renders_the_verdict(self, monkeypatch):
+        m = _load_server({
+            "OTO_AGENT_NAME": "pa", "OTO_SCOPE": "user",
+            "OTO_ROLE": "editor", "OTO_CAN_EDIT_AGENT": "true",
+            "PROXY_URL": "http://test", "PROXY_API_KEY": "k",
+        })
+        seen = {}
+
+        async def fake_request(self, method, url, **kw):
+            seen["method"], seen["url"], seen["json"] = method, url, kw.get("json")
+            return _mock_response({
+                "ok": False,
+                "errors": ["lib/.env: a .env file is refused at install"],
+                "warnings": ["README.md is missing"],
+                "summary": {"name": "weather-tools"},
+            })
+        monkeypatch.setattr(httpx.AsyncClient, "request", fake_request)
+        text = asyncio.run(m.call_tool("validate_mcp_package", {"path": "/workspace/weather-tools"}))[0].text
+        assert seen["method"] == "POST" and seen["url"].endswith("/v1/mcps/local-package/validate")
+        assert seen["json"] == {"path": "/workspace/weather-tools"}
+        assert text.startswith("❌ Package is not valid yet")
+        assert "lib/.env" in text and "README.md is missing" in text
+
+        async def fake_ok(self, method, url, **kw):
+            return _mock_response({
+                "ok": True, "errors": [], "warnings": [],
+                "summary": {"name": "weather-tools", "runtime": "node", "source": "npm:weather",
+                            "skills": ["weather-usage"]},
+            })
+        monkeypatch.setattr(httpx.AsyncClient, "request", fake_ok)
+        text = asyncio.run(m.call_tool("validate_mcp_package", {"path": "/workspace/weather-tools"}))[0].text
+        assert text.startswith("✅ Package `weather-tools` is valid (node, npm:weather)")
+        assert "weather-usage" in text and "Admin → MCP Servers → Install" in text
+        assert "path is required" in asyncio.run(m.call_tool("validate_mcp_package", {}))[0].text
 
     def test_list_tools_filters_to_enabled(self):
         m = _load_server({

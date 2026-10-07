@@ -181,10 +181,12 @@ class CommonEvent:
         {"message": str}
 
     QUEUE_TURN:
-        {"text": str, "event_data": dict}
-        text = the raw user text of the drained batch (the user row);
-        event_data = the row's attachment meta ({"images": [{name, path}],
-        "files": [{path, name}]}), empty when the batch carried none.
+        {"inputs": [QueuedInput], "accepted": Future}
+        inputs = the drained messages (core/events/input_queue.py), one
+        user row each, and accepted resolves to their message ids once
+        the pump's lane job wrote the rows (a meeting round puts none).
+        The task producer's nudge still sends the older
+        {"text": str} (an "event_data" is read when present).
 
     ARTIFACT_TURN:
         {"interactions": [{"token": str, "title": str, "payload": Any,
@@ -213,8 +215,13 @@ class TurnInput:
     the attachments back to the composer on a cancel.
 
     The shape is what the idle send builds, what a steer writes into the
-    live turn, and what the pump's message queue holds — so a message sent
+    live turn, and what the chat's queue holds
+    (``core/events/input_queue.QueuedInput.item``) — so a message sent
     while the agent works loses nothing an idle send would carry.
+
+    ``chat_id`` is set on a message the connection itself holds (the
+    implement-plan message, ``implement_queue``): the chat it was meant
+    for, drained as that chat's next turn.
     """
 
     text: str
@@ -222,6 +229,7 @@ class TurnInput:
     images: list[dict] = field(default_factory=list)
     image_meta: list[dict] = field(default_factory=list)
     files: list[dict] = field(default_factory=list)
+    chat_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.cli_text:

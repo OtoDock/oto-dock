@@ -695,6 +695,63 @@ def test_pull_folder_brings_the_satellite_tree_within_the_caps(agent_tree, monke
         asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board"))
 
 
+@pytest.mark.parametrize("listing", [
+    [],
+    # Only what a pull never takes: the folder has no app file on the machine.
+    ["users/alice/workspace/apps/board/data/app.db",
+     "users/alice/workspace/apps/board/.env"],
+])
+def test_pull_folder_refuses_a_missing_or_empty_folder_and_keeps_the_copy(
+        agent_tree, monkeypatch, listing):
+    from core.remote import remote_file_flow as rff
+
+    async def fake_list(sid, prefix):
+        return listing
+
+    async def fake_pull(sid, rel):
+        raise AssertionError("nothing is pulled from an empty folder")
+
+    class Info:
+        agent_name = AGENT
+
+    monkeypatch.setattr(rff, "list_remote_files", fake_list)
+    monkeypatch.setattr(rff, "pull_through", fake_pull)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    root = agent_tree / "users/alice/workspace/apps/board"
+    _write(root, {"app.json": '{"title": "Board"}', "client/index.html": "<p>v1</p>"})
+    with pytest.raises(app_deploy.DeployError, match="missing or empty on your machine"):
+        asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board"))
+    assert (root / "app.json").is_file() and (root / "client" / "index.html").is_file()
+
+
+def test_pull_folder_never_drops_data_dotfiles_or_node_modules(agent_tree, monkeypatch):
+    from core.remote import remote_file_flow as rff
+    listing = ["users/alice/workspace/apps/board/app.json"]
+
+    async def fake_list(sid, prefix):
+        return listing
+
+    async def fake_pull(sid, rel):
+        p = agent_tree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}")
+        return p
+
+    class Info:
+        agent_name = AGENT
+
+    monkeypatch.setattr(rff, "list_remote_files", fake_list)
+    monkeypatch.setattr(rff, "pull_through", fake_pull)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    root = agent_tree / "users/alice/workspace/apps/board"
+    kept = {"data/app.db": "db", "server/data/cache.json": "{}", ".env": "K=v",
+            "server/node_modules/x.js": "x"}
+    _write(root, kept)
+    assert asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board")) == 1
+    for rel in kept:
+        assert (root / rel).is_file(), rel
+
+
 @_needs_runtime
 def test_a_broken_server_leaves_the_previous_release_running(agent_tree):
     """The pipeline itself, on one loop (a child process belongs to the loop
@@ -777,22 +834,22 @@ def test_the_deploy_hooks_refuse_a_token_whose_holder_is_gone(agent_tree, op):
     """D1-to-verifier-owners: the folder-app hooks judge the session token's
     holder like the session routes: a person who no longer exists is refused
     before the hook runs, a living person's token reaches it."""
-    from api.sessions import sessions
-    from auth.session_token import create_session_token
+    from auth import token_holder
+    from tests.conftest import live_session_token
     _folder(agent_tree)
-    sessions._holder_answers.clear()
+    token_holder.reset_for_tests()
     try:
-        ghost = create_session_token(SID, AGENT, "ghost-sub")
+        ghost = live_session_token(SID, AGENT, "ghost-sub")
         r = client.post(f"/v1/hooks/apps/{op}", json={"session_id": SID, "slug": "board"},
                         headers={"Authorization": f"Bearer {ghost}"})
         assert r.status_code == 401, r.text
-        alive = create_session_token(SID, AGENT, "alice-sub")
+        alive = live_session_token(SID, AGENT, "alice-sub")
         with patch("api.hooks.pins.verify_session_match_async"):
             r = client.post(f"/v1/hooks/apps/{op}", json={"session_id": SID, "slug": "board"},
                             headers={"Authorization": f"Bearer {alive}"})
         assert r.status_code != 401, r.text
     finally:
-        sessions._holder_answers.clear()
+        token_holder.reset_for_tests()
 
 
 def test_a_deploy_never_turns_the_approval_switch_off(agent_tree, monkeypatch):
@@ -913,20 +970,129 @@ def test_a_link_in_a_registered_working_tree_is_a_refusal_on_render(agent_tree, 
 
 def test_the_check_smoke_starts_a_copy_of_the_working_tree(agent_tree, monkeypatch):
     """A check that smoke-starts a server runs a copy of the working tree,
-    never the folder a session can still change, and removes the copy."""
+    never the folder a session can still change, and removes the copy, its
+    stub's release root and what the registry kept for the stub's id."""
+    from services.apps import app_tokens
     seen: list = []
 
     async def fake_smoke(row, tree_dir):
-        seen.append((tree_dir, (tree_dir / "server" / "index.ts").is_file()))
+        seen.append((row["id"], tree_dir, (tree_dir / "server" / "index.ts").is_file()))
+        # What a start keeps per id: its lock and its derived key.
+        app_supervisor._lock((row["id"], app_supervisor.CHECK))
+        app_tokens.public_key_b64(row["id"])
         return {"ok": True, "server": "up"}
 
     monkeypatch.setattr(app_supervisor, "smoke", fake_smoke)
     src = _folder(agent_tree, "smoky", server=SERVER_OK)
     body = _hook("check", {"slug": "smoky"}).json()
     assert body["status"] == "ok", body
-    assert len(seen) == 1 and seen[0][1] is True
-    tree = seen[0][0]
+    assert len(seen) == 1 and seen[0][2] is True
+    stub_id, tree = seen[0][0], seen[0][1]
     assert tree.resolve() != src.resolve() and not tree.exists()
+    assert tree.parent.name == stub_id and not tree.parent.exists()
+    assert not any(key[0] == stub_id for key in app_supervisor._locks)
+    assert stub_id not in app_tokens._keys
+
+
+def test_two_checks_of_one_undeployed_slug_keep_their_own_copies(agent_tree, monkeypatch):
+    """Each check of a slug with no row runs on its own stub (its own
+    release root and supervisor key): the one that ends first removes its
+    own copy and leaves the other's server tree in place."""
+    from api.hooks import app_deploy as hook
+    _folder(agent_tree, "smoky", server=SERVER_OK)
+    started: list = []
+    first_running = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_smoke(row, tree_dir):
+        started.append((row["id"], tree_dir))
+        if len(started) == 1:
+            first_running.set()
+            await release_first.wait()
+        return {"ok": tree_dir.is_dir() and (tree_dir / "server" / "index.ts").is_file(), "server": "up"}
+
+    monkeypatch.setattr(app_supervisor, "smoke", fake_smoke)
+
+    async def main():
+        req = hook.HookAppDeployRequest(session_id=SID, slug="smoky")
+        first = asyncio.create_task(hook.hook_app_check(req, authorization="Bearer dummy"))
+        await first_running.wait()
+        second = await hook.hook_app_check(req, authorization="Bearer dummy")
+        alive = started[0][1].is_dir()
+        release_first.set()
+        return await first, second, alive
+
+    with patch("api.hooks.app_deploy.verify_session_match_async"):
+        first, second, alive = asyncio.run(main())
+    assert first["status"] == "ok" and second["status"] == "ok", (first, second)
+    (id1, tree1), (id2, tree2) = started
+    assert id1 != id2 and id1.startswith("check-smoky-") and id2.startswith("check-smoky-")
+    assert len(id1) == len("check-smoky-") + 8
+    assert alive and tree1.parent != tree2.parent
+    assert not tree1.parent.exists() and not tree2.parent.exists()
+
+
+def test_the_deploys_render_and_the_preview_take_live_data_only_when_unreviewed_code_would_go_live(
+        agent_tree, monkeypatch):
+    """The copy a deploy renders before it goes live, and the preview of the
+    working tree, run on a copy of the live database only when the release
+    would go live without a person (the manifest approved, the approval
+    switch off); else on empty data."""
+    from services.apps import app_render
+    seeds: list = []
+
+    async def recording(row, tree_dir, *, approved, seed):
+        seeds.append(seed)
+        return app_render.RenderReport()
+
+    monkeypatch.setattr(app_render, "render_tree", recording)
+    _folder(agent_tree, "board")
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "ok", body
+    row = task_store.get_app(body["app_id"])
+    data = releases.app_data_dir(row)
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "app.db")
+    con.execute("CREATE TABLE t (x)")
+    con.commit()
+    con.close()
+    assert _hook("deploy", {"slug": "board"}).json()["status"] == "ok"
+    assert asyncio.run(app_deploy.cut_preview(row, agent_tree / row["rel_path"]))
+    assert (releases.preview_dir(row) / "data" / "app.db").is_file()
+    switched = task_store.set_deploy_state(row["id"], requires_approval=True)
+    assert _hook("deploy", {"slug": "board"}).json()["status"] == app_deploy.RESULT_PENDING_APPROVAL
+    asyncio.run(app_deploy.cut_preview(switched, agent_tree / row["rel_path"]))
+    assert not (releases.preview_dir(row) / "data" / "app.db").exists()
+    assert seeds == [True, True, False], seeds
+
+
+def test_a_preview_of_a_tree_a_deploy_would_hold_for_a_person_runs_on_empty_data(agent_tree):
+    """The preview runs the working tree's code: a copy whose own app.json
+    adds an action nobody approved, or turns the approval switch on, or
+    would not deploy at all, gets no copy of the live database."""
+    _folder(agent_tree, "board")
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "ok", body
+    row = task_store.get_app(body["app_id"])
+    data = releases.app_data_dir(row)
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "app.db")
+    con.execute("CREATE TABLE t (x)")
+    con.commit()
+    con.close()
+    src = agent_tree / row["rel_path"]
+    seeded = releases.preview_dir(row) / "data" / "app.db"
+    asyncio.run(app_deploy.cut_preview(row, src))
+    assert seeded.is_file()
+    me = {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}
+    for doc in ({"title": "Board", "actions": [me]}, {"title": "Board", "deploy_requires_approval": True},
+                {"title": "Board", "unknown_key": 1}):
+        (src / "app.json").write_text(json.dumps(doc))
+        asyncio.run(app_deploy.cut_preview(row, src))
+        assert not seeded.exists(), doc
+    (src / "app.json").write_text(json.dumps({"title": "Board"}))
+    asyncio.run(app_deploy.cut_preview(row, src))
+    assert seeded.is_file()
 
 
 def test_the_restore_validates_off_the_loop(agent_tree, monkeypatch):

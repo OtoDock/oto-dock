@@ -22,6 +22,7 @@ Credential schemas are read from MCP manifests via mcp_registry.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,41 @@ class AccountRef:
 
     label: str
     owner_sub: str
+
+
+class AccountNeedsReconnect(Exception):
+    """The bound account's token file can no longer serve a session; the
+    message is the reason (``expired``, ``revoked``, ``mechanism_changed``,
+    ``registration_unavailable`` or ``issuer_changed``)."""
+
+
+def account_unusable_reason(raw: dict, manifest) -> str:
+    """Why a token file cannot serve a session on this manifest, or ``""``:
+    the file's own verdict (``oauth_account_store.token_dead_reason``) and
+    the token-origin invariant of a manifest that names its own
+    authorization server (``mcp_authorization.token_origin_problem``)."""
+    from services.oauth import mcp_authorization, oauth_account_store
+    return (
+        oauth_account_store.token_dead_reason(raw)
+        or mcp_authorization.token_origin_problem(raw, manifest)
+    )
+
+
+_RECONNECT_WORDING = {
+    "expired": "the account's access expired and the vendor issued no refresh token",
+    "revoked": "the vendor ended the account's grant",
+    "mechanism_changed": "this MCP now signs in through the vendor's own authorization server",
+    "registration_unavailable": "the install's client registration at the vendor is gone",
+    "issuer_changed": "the vendor's authorization server moved",
+}
+
+
+def reconnect_wording(reason: str) -> str:
+    """The sentence a session reads for an account that needs a reconnect."""
+    return (
+        _RECONNECT_WORDING.get(reason, "the account can no longer be refreshed")
+        + "; reconnect it in Settings > Integrations"
+    )
 
 
 def pick_account(
@@ -187,10 +223,17 @@ def resolve_credentials(
             # OAuth-based MCPs: check token file instead of DB credentials
             if cred_schema.get("oauth"):
                 label = cred_schema.get("label", mcp_name)
-                oauth_env = _resolve_oauth_mcp(
-                    mcp_name, cred_schema, user_sub, task_scope,
-                    agent_name=agent_name,
-                )
+                try:
+                    oauth_env = _resolve_oauth_mcp(
+                        mcp_name, cred_schema, user_sub, task_scope,
+                        agent_name=agent_name,
+                    )
+                except AccountNeedsReconnect as needs:
+                    result.excluded_mcps.add(mcp_name)
+                    result.exclusion_reasons[mcp_name] = (
+                        f"{label}: {reconnect_wording(str(needs))}."
+                    )
+                    continue
                 if oauth_env is not None:
                     result.env_vars.update(oauth_env)
                     result.env_by_mcp[mcp_name] = oauth_env
@@ -396,6 +439,19 @@ def _resolve_oauth_mcp(
             mcp_name, account_label, source_file,
         )
         return None
+    # A grant the vendor ended, an expired token nobody can refresh, or a
+    # file the manifest's way of issuing tokens no longer covers: the MCP
+    # is left out with the reason instead of failing on every call.
+    dead = account_unusable_reason(
+        oauth_account_store.read_account_token(source_dir, account_label) or {},
+        manifest,
+    )
+    if dead:
+        logger.warning(
+            "oauth resolve %s: bound account '%s' needs a reconnect (%s)",
+            mcp_name, account_label, dead,
+        )
+        raise AccountNeedsReconnect(dead)
 
     # `env_injection` (manifest opt-in): expose the bound account's
     # canonical access_token via the declared env var names so CLIs
@@ -466,11 +522,11 @@ def _resolve_oauth_mcp(
             env_injection_vars["GIT_CONFIG_VALUE_1"] = str(git_cred_helper["helper"])
 
     # Bearer-injected MCPs (slack, github, linear, notion) have no
-    # `credentials_dir` path_env — their token reaches the MCP via the
-    # Authorization header injected by `maybe_inject_bearer_header` at
-    # config-build time. The token-file-exists check above is enough to
-    # call them "connected"; we still emit any declared env_injection so
-    # bash CLIs can use the token.
+    # `credentials_dir` path_env — their token reaches the MCP through the
+    # credential gateway (`mcp_registry.gateway_entry` at config build; the
+    # gateway adds the header per request). The token-file-exists check
+    # above is enough to call them "connected"; we still emit any declared
+    # env_injection so bash CLIs can use the token.
     if manifest.credentials.oauth.get("bearer_required", False):
         return {**env_injection_vars, **mcp_env_vars}
 
@@ -598,15 +654,19 @@ def _bound_token_source(
     return source_dir, ref.label, username
 
 
-def collect_oauth_token_files(
+def collect_oauth_token_files_by_manifest(
     agent_name: str,
     *,
     user_sub: str | None = None,
     session_scope: str = "user",
-) -> dict[str, bytes]:
-    """Per-session OAuth token FILES for a remote session, keyed by the
-    sandbox-virtual ``credentials_dir`` path the MCP subprocess reads them
-    from (e.g. ``/users/alice/.credentials/google-tokens/a@gmail.com.json``).
+) -> dict[str, dict[str, bytes]]:
+    """Per-session OAuth token FILES of the agent's stdio OAuth MCPs,
+    ``{manifest name: {virtual path: bytes}}``: each file under the manifest
+    whose binding it was collected for, keyed by the sandbox-virtual
+    ``credentials_dir`` path the MCP subprocess reads it from (e.g.
+    ``/users/alice/.credentials/google-tokens/a@gmail.com.json``). The local
+    broker delivers each MCP only its own entry; the remote channel takes
+    the flat form (``collect_oauth_token_files``).
 
     ``.credentials`` is NOT part of the persistent satellite file sync —
     token files are delivered per-session over the session-file broker
@@ -614,14 +674,15 @@ def collect_oauth_token_files(
     long-lived refresh tokens. This collector mirrors
     ``_resolve_oauth_mcp``'s account pick + source resolution but reads the
     bytes straight from the CENTRAL store (always fresh — the proxy-side
-    refresh worker is authoritative). Skips bearer-injected MCPs (token
+    refresh worker is authoritative), and like it skips a file that needs a
+    reconnect (``account_unusable_reason``). Skips bearer-injected MCPs (token
     travels via the tunnel bearer swap, no file) and docker/none-runtime
     MCPs (never spawned on a satellite).
     """
     from services.mcp import mcp_registry
     from services import path_roles
 
-    out: dict[str, bytes] = {}
+    by_manifest: dict[str, dict[str, bytes]] = {}
     for manifest in mcp_registry.get_agent_mcps(agent_name):
         oauth = manifest.credentials.oauth
         if not oauth or oauth.get("bearer_required", False):
@@ -647,12 +708,45 @@ def collect_oauth_token_files(
             content = source_file.read_bytes()
         except OSError:
             continue
+        # A file that needs a reconnect is not delivered: the resolver
+        # leaves its MCP out of the session (``AccountNeedsReconnect``).
+        try:
+            parsed = json.loads(content)
+        except ValueError:
+            parsed = {}
+        dead = account_unusable_reason(parsed if isinstance(parsed, dict) else {}, manifest)
+        if dead:
+            logger.info(
+                "token file of %s/%s not delivered: the account needs a reconnect (%s)",
+                manifest.name, account_label, dead,
+            )
+            continue
         # Same destination rule as _resolve_oauth_mcp: user dir only for
         # user-scope sessions; agent-scope copies live under knowledge/.
         dest_username = username if session_scope == "user" else ""
+        files = by_manifest.setdefault(manifest.name, {})
         for _env_var, subpath in cred_entries:
             virtual_dir = path_roles.resolve_role(
                 "credentials_dir", username=dest_username, subpath=subpath,
             )
-            out[f"{virtual_dir}/{source_file.name}"] = content
-    return out
+            files[f"{virtual_dir}/{source_file.name}"] = content
+    return by_manifest
+
+
+def collect_oauth_token_files(
+    agent_name: str,
+    *,
+    user_sub: str | None = None,
+    session_scope: str = "user",
+) -> dict[str, bytes]:
+    """The remote session's token files: every manifest's files of
+    ``collect_oauth_token_files_by_manifest`` in one map keyed by virtual
+    path. A satellite lands them at those paths, one directory per
+    ``credentials_dir`` subpath, so two MCPs that declare the same subpath
+    read one directory there."""
+    flat: dict[str, bytes] = {}
+    for files in collect_oauth_token_files_by_manifest(
+        agent_name, user_sub=user_sub, session_scope=session_scope,
+    ).values():
+        flat.update(files)
+    return flat

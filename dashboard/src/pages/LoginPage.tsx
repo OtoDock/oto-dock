@@ -55,10 +55,6 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
   const { setUser } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
-  // A signed-out page has no dashboard socket: it learns about a new build
-  // on its own, so a login page left open across an upgrade reloads onto
-  // the bundle that matches the server.
-  useBuildWatch(true)
   // The login page renders IN PLACE of the page the visitor asked for
   // (RequireAuth), so a signed-in visitor lands where they were going — a
   // full-screen app link, a settings tab — never a `next` parameter.
@@ -79,6 +75,14 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
   const [totpToken, setTotpToken] = useState('')
   const [totpCode, setTotpCode] = useState('')
   const [secondFactors, setSecondFactors] = useState<string[]>(['totp'])
+
+  // A signed-out page has no dashboard socket: it learns about a new build
+  // on its own, so a login page left open across an upgrade reloads onto
+  // the bundle that matches the server. The watch rests while a reload
+  // would lose what the person is doing: a typed password, a sign-in
+  // request or passkey ceremony in flight, the second-factor step (its
+  // token lives only in this component).
+  useBuildWatch(!needs2FA && !loading && password === '')
 
   // Forgot password
   const [showForgot, setShowForgot] = useState(false)

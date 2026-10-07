@@ -11,6 +11,7 @@ EXISTS so re-runs are safe (the startup path is idempotent).
 """
 
 import contextlib
+import json
 import logging
 import re
 
@@ -38,7 +39,12 @@ from storage.mcp.schema import init_community_requests, init_mcp, init_mcp_autou
 from storage.phone.schema import init_audio_telephony, init_phone_call_log
 from storage.schema_base import _drop_invalid_indexes
 from storage.schema_base import _index_exists  # noqa: F401  (offered to migrations, DATABASE-SCHEMA.md)
-from storage.sharing.schema import init_shares
+from storage.sharing.schema import (
+    DECISION_CHECK,
+    GRANTEE_CHECK,
+    GRANTEE_KIND_CHECK,
+    init_shares,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,20 @@ _ROLE_CHECKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("user_agents", "user_agents_agent_role_check", "agent_role", roles.AGENT_ROLES),
     ("agents", "agents_default_for_new_users_role_check", "default_for_new_users_role",
      ("",) + tuple(reversed(roles.AGENT_ROLES))),
+    ("shares", "shares_role_cap_check", "role_cap", roles.AGENT_ROLES),
+)
+
+# The named CHECKs of ``shares`` (SHARING.md) ``run_migrations`` keeps current
+# the same way: (name, definition, the quoted words the catalog renders). The
+# 1.7.0 table carried an auto-named scope CHECK over ``grantee_sub`` alone;
+# the grantee rewrite drops it, found by its definition.
+_SHARE_CHECKS: tuple[tuple[str, str, frozenset[str]], ...] = tuple(
+    (name, definition, frozenset(re.findall(r"'([^']*)'", definition)))
+    for name, definition in (
+        ("shares_grantee_check", GRANTEE_CHECK),
+        ("shares_grantee_kind_check", GRANTEE_KIND_CHECK),
+        ("shares_decision_check", DECISION_CHECK),
+    )
 )
 
 
@@ -181,6 +201,9 @@ def init_remote_machines(conn) -> None:
             -- store key). NULL = every session asks the user to click Allow.
             -- Never leaves the store: listed in remote_store._SECRET_COLUMNS.
             browser_extension_token_enc TEXT,
+            -- Whether an unattended session (a task, a call, a meeting) gets
+            -- that token too; off, only a session a person drives does.
+            browser_unattended BOOLEAN NOT NULL DEFAULT FALSE,
             -- Whether admins currently hold an outstanding "offline" alert
             -- for this machine. Set TRUE when the sustained-outage evaluator
             -- (core/remote/satellite_connection.py) fires the offline notification;
@@ -621,6 +644,18 @@ def run_migrations(conn) -> None:
         "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
         "browser_extension_token_enc TEXT"
     )
+    # Unattended runs and a saved own-browser token: added once, and set
+    # where a token is already stored, since unattended runs used it until
+    # the flag existed (a later choice of the owner is never reset).
+    if not _column_exists(conn, "remote_machines", "browser_unattended"):
+        conn.execute(
+            "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
+            "browser_unattended BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        conn.execute(
+            "UPDATE remote_machines SET browser_unattended = TRUE "
+            "WHERE browser_extension_token_enc IS NOT NULL"
+        )
     # 2026-07-11: chat/project-scoped pins (the Dock). The one-per-scope
     # partial unique indexes live HERE, not in init_pinned_apps: on a
     # pre-existing install the CREATE-IF-NOT-EXISTS no-ops before these
@@ -654,6 +689,29 @@ def run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_chats_pending_wake ON chats (id) "
         "WHERE pending_delegate_wake <> ''"
     )
+    # A stored wake names the person it runs as since 1.7.1 (a JSON array of
+    # {"prompt", "person", "role", "by"}); 1.7.0 stored plain strings. Each
+    # such value is rewritten with no person; a converted value starts with
+    # '[{', so the pass is idempotent and needs no flag. A value that is not
+    # JSON is cleared (the reader would drop it anyway).
+    conn.execute("SAVEPOINT pending_wake_records")
+    try:
+        from storage.chat.db_chats import wake_records
+        rows = conn.execute(
+            "SELECT id, pending_delegate_wake FROM chats "
+            "WHERE pending_delegate_wake <> '' AND pending_delegate_wake NOT LIKE '[{%%'"
+        ).fetchall()
+        for r in rows:
+            wakes = wake_records(r["pending_delegate_wake"])
+            if not wakes and r["pending_delegate_wake"].strip() != "[]":
+                logger.warning("pending wake migration: chat %s held no readable wake; cleared",
+                               r["id"])
+            conn.execute("UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
+                         (json.dumps(wakes) if wakes else "", r["id"]))
+        conn.execute("RELEASE SAVEPOINT pending_wake_records")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT pending_wake_records")
+        logger.exception("pending wake migration failed; it retries at the next startup")
     # The engine-reported running cost total at the last recorded turn and
     # the engine session it belongs to. Claude Code ≥ 2.1.277 resumes
     # a session from its saved total, and the pump's per-turn delta needs the
@@ -716,6 +774,10 @@ def run_migrations(conn) -> None:
     # at startup before the pool serves a request — the "never ALTER ADD
     # CONSTRAINT" note on init_schema is about DDL on a busy pool.
     for table, name, column, words in _ROLE_CHECKS:
+        # A column a later block adds (shares.role_cap, with its CHECK inline)
+        # is rewritten from its next boot on.
+        if not _column_exists(conn, table, column):
+            continue
         present = _check_constraint_words(conn, table, name)
         if present is not None and present >= set(words):
             continue
@@ -886,6 +948,132 @@ def run_migrations(conn) -> None:
             "ADD COLUMN IF NOT EXISTS transferred_at TEXT NOT NULL DEFAULT ''"
         )
 
+    # The per-person token epoch (1.7.1, auth/providers.py): NULL on every
+    # pre-existing row = never bumped, so nothing signed in before the
+    # upgrade is refused.
+    conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS token_epoch_at TEXT")
+
+    # The single-column agent index on chats (1.7.1): idx_chats_agent_updated
+    # covers it by its prefix, and every chats UPDATE rewrote it for nothing.
+    # Guarded by the catalog so a database that never had it, or already
+    # lost it, does nothing here.
+    if _index_exists(conn, "idx_chats_agent"):
+        conn.execute("SAVEPOINT drop_idx_chats_agent")
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_chats_agent")
+            conn.execute("RELEASE SAVEPOINT drop_idx_chats_agent")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT drop_idx_chats_agent")
+            logger.exception("dropping idx_chats_agent failed; the next boot retries")
+
+    # 1.7.1: shares to an agent or a department, a role cap, a decision and a
+    # placement (SHARING.md). The 1.7.0 table knew one grantee kind, so the
+    # columns reach an existing install here; their defaults are what a
+    # 1.7.0 INSERT leaves after a downgrade (``person``, ``pending``,
+    # ``viewer``), which every CHECK below accepts. The role-cap CHECK rides
+    # the column add, so the role loop above finds it from the next boot.
+    conn.execute(
+        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_kind TEXT NOT NULL DEFAULT 'person'"
+    )
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_agent TEXT")
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS grantee_department TEXT")
+    conn.execute(
+        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS role_cap TEXT NOT NULL DEFAULT 'viewer' "
+        "CONSTRAINT shares_role_cap_check CHECK (role_cap IN ("
+        + ", ".join(f"'{w}'" for w in roles.AGENT_ROLES) + "))"
+    )
+    conn.execute(
+        "ALTER TABLE shares ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'"
+    )
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS decided_by TEXT")
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS decided_at TEXT")
+    conn.execute("ALTER TABLE shares ADD COLUMN IF NOT EXISTS placed_agent TEXT")
+    # The backfill runs at every boot and never writes ``pending``, so a
+    # decision is never flipped back and a row 1.7.0 wrote with the defaults
+    # after a downgrade is repaired: a link has no kind and no decision; a
+    # chat share needs no decision.
+    conn.execute(
+        "UPDATE shares SET grantee_kind = '', decision = '' "
+        "WHERE scope = 'external' AND (grantee_kind <> '' OR decision <> '')"
+    )
+    conn.execute(
+        "UPDATE shares SET decision = 'accepted' "
+        "WHERE scope = 'internal' AND target_kind = 'chat' AND decision = 'pending'"
+    )
+    _rewrite_share_checks(conn)
+    # The 1.7.0 unique index keyed every unrevoked internal row and would
+    # refuse a re-share after a decline; the three per-kind indexes replace
+    # it. Here, never in init_shares: the CREATE no-ops on an existing table
+    # and an index on a column this block adds would fail the boot.
+    if _index_exists(conn, "idx_shares_internal_grant"):
+        conn.execute("SAVEPOINT drop_idx_shares_internal_grant")
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_shares_internal_grant")
+            conn.execute("RELEASE SAVEPOINT drop_idx_shares_internal_grant")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT drop_idx_shares_internal_grant")
+            logger.exception("dropping idx_shares_internal_grant failed; the next boot retries")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_person_grant "
+        "ON shares (target_kind, COALESCE(app_id, chat_id), grantee_sub) "
+        "WHERE scope = 'internal' AND grantee_kind = 'person' AND revoked_at IS NULL "
+        "AND decision <> 'declined'"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_agent_grant "
+        "ON shares (app_id, grantee_agent) "
+        "WHERE grantee_kind = 'agent' AND revoked_at IS NULL AND decision <> 'declined'"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_department_grant "
+        "ON shares (app_id, grantee_department) "
+        "WHERE grantee_kind = 'department' AND revoked_at IS NULL AND decision <> 'declined'"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shares_grantee_agent ON shares (grantee_agent)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shares_grantee_department ON shares (grantee_department)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shares_placed_agent ON shares (placed_agent)"
+    )
+
+
+def _rewrite_share_checks(conn) -> None:
+    """Keep the named ``shares`` CHECKs at the code's words on an existing
+    install: a constraint that is absent or lacks a word is dropped and added
+    again inside a SAVEPOINT (a no-op once the words are in, logged and
+    retried next boot on a failure). The grantee rewrite also drops the 1.7.0
+    scope CHECK, auto-named by Postgres, found by its definition: it reads
+    ``grantee_sub`` and not ``grantee_kind``."""
+    for name, definition, words in _SHARE_CHECKS:
+        present = _check_constraint_words(conn, "shares", name)
+        if present is not None and present >= words:
+            continue
+        conn.execute(f"SAVEPOINT {name}")
+        try:
+            if name == "shares_grantee_check":
+                old = conn.execute(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE t.relname = 'shares' AND n.nspname = current_schema() "
+                    "AND c.contype = 'c' "
+                    "AND pg_get_constraintdef(c.oid) LIKE '%%grantee_sub%%' "
+                    "AND pg_get_constraintdef(c.oid) NOT LIKE '%%grantee_kind%%'"
+                ).fetchall()
+                for row in old:
+                    quoted = '"' + row["conname"].replace('"', '""') + '"'
+                    conn.execute(f"ALTER TABLE shares DROP CONSTRAINT IF EXISTS {quoted}")
+            conn.execute(f"ALTER TABLE shares DROP CONSTRAINT IF EXISTS {name}")
+            conn.execute(f"ALTER TABLE shares ADD CONSTRAINT {name} CHECK ({definition})")
+            conn.execute(f"RELEASE SAVEPOINT {name}")
+            logger.info("shares CHECK %s rewritten", name)
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            logger.exception("shares CHECK %s could not be rewritten; the next boot retries", name)
+
 
 # ---------------------------------------------------------------------------
 # Schema-drift guard (log-only)
@@ -938,7 +1126,9 @@ def check_schema_drift(conn) -> list[tuple[str, str]]:
         drift = [(r["t"], r["c"]) for r in rows]
         # The role CHECKs run_migrations rewrites: the probe's words are the
         # code's, the live words the install's.
-        for table, name, _column, _words in _ROLE_CHECKS:
+        checks = [(table, name) for table, name, _c, _w in _ROLE_CHECKS]
+        checks += [("shares", name) for name, _d, _w in _SHARE_CHECKS]
+        for table, name in checks:
             expected = _check_constraint_words(conn, table, name)
             live = _check_constraint_words(conn, table, name, live_schema)
             if expected is not None and live != expected:
@@ -961,9 +1151,9 @@ def check_schema_drift(conn) -> list[tuple[str, str]]:
         )
     if stale:
         logger.error(
-            "SCHEMA DRIFT: %d role CHECK constraint(s) on the live database "
+            "SCHEMA DRIFT: %d CHECK constraint(s) on the live database "
             "differ from the code's: %s. run_migrations() rewrites them at "
-            "startup; a row with the newer role word is refused until it has.",
+            "startup; a row with a newer word is refused until it has.",
             len(stale),
             ", ".join(f"{t}.{c}" for t, c in stale),
         )

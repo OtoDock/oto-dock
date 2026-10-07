@@ -17,6 +17,24 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class OAuthTokenError(RuntimeError):
+    """A token endpoint refused a request. ``code`` is the vendor's OAuth
+    error code (``invalid_grant``, ``invalid_client``, ...), or
+    ``http_<status>`` when the answer carried none, or ``unreachable`` when
+    no answer came; the refresh worker reads it to tell a permanent failure
+    from a passing one. The message never carries a response body."""
+
+    def __init__(self, provider_id: str, action: str, code: str,
+                 description: str = "", status: int = 0):
+        self.provider_id = provider_id
+        self.action = action
+        self.code = code or ""
+        self.description = description or ""
+        self.status = status
+        detail = self.code + (f": {self.description}" if self.description else "")
+        super().__init__(f"{provider_id} token {action} failed: {detail}")
+
+
 @dataclass
 class TokenSet:
     """Vendor-neutral token bundle returned by ``exchange_code`` / ``refresh``.

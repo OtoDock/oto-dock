@@ -3,9 +3,11 @@ import { render, screen, fireEvent } from '@testing-library/react'
 
 const modeMutate = vi.fn()
 const tokenMutate = vi.fn()
+const unattendedMutate = vi.fn()
 vi.mock('@/api/remoteMachines', () => ({
   useSetBrowserMode: () => ({ mutate: modeMutate, isPending: false, error: null }),
   useSetBrowserToken: () => ({ mutate: tokenMutate, isPending: false, error: null }),
+  useSetBrowserUnattended: () => ({ mutate: unattendedMutate, isPending: false, error: null }),
 }))
 
 import {
@@ -23,6 +25,7 @@ function machine(over: Partial<RemoteMachine> = {}): RemoteMachine {
 beforeEach(() => {
   modeMutate.mockReset()
   tokenMutate.mockReset()
+  unattendedMutate.mockReset()
 })
 
 // The mode selector lives in the Browser-control row; the token field shows
@@ -44,12 +47,11 @@ describe('BrowserModeSelect', () => {
     confirm.mockReturnValue(true)
     fireEvent.change(screen.getByLabelText('Browser mode'), { target: { value: 'own' } })
     expect(modeMutate).toHaveBeenCalledWith({ machineId: 'm1', mode: 'own' })
-    // The disclosure: unattended use with the saved token.
+    // The disclosure: unattended use needs its own consent (F47).
     expect(confirm.mock.calls[0][0]).toContain(
-      'your logins, cookies and open tabs are reachable to them. With the extension token saved, '
-      + 'scheduled tasks, triggers, calls and meetings on this machine use this browser with nobody '
-      + 'watching, and browser actions are not asked about; only the tools the browser MCP marks '
-      + 'high-risk still need a person.\n\n')
+      'your logins, cookies and open tabs are reachable to them. If you also let unattended runs '
+      + 'use the saved token, scheduled tasks, triggers, calls and meetings on this machine use '
+      + 'this browser with nobody watching, and browser actions are not asked about.\n\n')
     confirm.mockRestore()
   })
 
@@ -71,8 +73,10 @@ describe('BrowserTokenField', () => {
     expect(link.getAttribute('target')).toBe('_blank')
     expect(screen.getByText(/paste it here/)).toBeInTheDocument()
     expect(screen.getByText(
-      'Saving it lets scheduled tasks, triggers, calls and meetings use this browser unattended.',
+      'Saving it lets the sessions you drive connect without a click.',
     )).toBeInTheDocument()
+    // No token, no unattended box.
+    expect(screen.queryByRole('checkbox')).toBeNull()
     expect(screen.queryByText(/No token/)).toBeNull()
     expect(screen.queryByText('Token saved')).toBeNull()
     const save = screen.getByRole('button', { name: 'Save token' })
@@ -97,5 +101,30 @@ describe('BrowserTokenField', () => {
     expect(screen.getByText('Token saved')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Clear' }))
     expect(tokenMutate).toHaveBeenCalledWith({ machineId: 'm1', token: null })
+  })
+})
+
+
+describe('unattended use of the saved token (F47)', () => {
+  it('asks before letting unattended runs use the browser, and turns off at once', () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const { rerender } = render(<BrowserTokenField
+      machine={machine({ browser_mode: 'own', browser_extension_token_set: true })} scope="me" />)
+    const box = screen.getByRole('checkbox')
+    expect(box).not.toBeChecked()
+    fireEvent.click(box)
+    expect(unattendedMutate).not.toHaveBeenCalled()
+    confirm.mockReturnValue(true)
+    fireEvent.click(screen.getByRole('checkbox'))
+    expect(unattendedMutate).toHaveBeenCalledWith({ machineId: 'm1', enabled: true })
+    expect(confirm.mock.calls[0][0]).toContain('Let unattended runs use your browser on laptop?')
+    confirm.mockClear()
+    rerender(<BrowserTokenField machine={machine({
+      browser_mode: 'own', browser_extension_token_set: true, browser_unattended: true,
+    })} scope="me" />)
+    fireEvent.click(screen.getByRole('checkbox'))
+    expect(confirm).not.toHaveBeenCalled()
+    expect(unattendedMutate).toHaveBeenLastCalledWith({ machineId: 'm1', enabled: false })
+    confirm.mockRestore()
   })
 })

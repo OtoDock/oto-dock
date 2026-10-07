@@ -3,12 +3,13 @@ import { onFileUpdate, type FileUpdate } from '../lib/fileUpdates'
 
 interface Args {
   // Identity of the document this iframe renders — used to match incoming
-  // `file_updated` events. Provide whichever the host has: the chat inline
-  // preview has `fileId`; the workspace preview has `agentSlug` + `relPath`.
+  // `file_updated` events. Provide whichever the host has: the chat's
+  // document pane (`DocumentFrame`) has `fileId`; the workspace preview has
+  // `agentSlug` + `relPath`.
   fileId?: string
   agentSlug?: string
   relPath?: string
-  // Actually reload the iframe (bump its cache-busting timestamp).
+  // Actually reload the frame (a new load of the editor).
   reload: () => void
 }
 
@@ -21,17 +22,17 @@ interface Args {
  *   If no status ever arrives (handshake unavailable), `modified` stays false →
  *   we auto-reload (the default, least-surprising behaviour for a view).
  * - On a `file_updated` event matching THIS document:
- *     · source === "collabora": a peer saved via Collabora. Two Collabora
- *       sessions on the same path-keyed file_id share ONE live document, so the
- *       change is already merged here — do nothing.
+ *     · source === "collabora": a peer saved via Collabora. The views of one
+ *       WOPI id share ONE live document, so the change is already merged
+ *       here — do nothing.
  *     · source === "disk" (agent / file-tools / dashboard write): Collabora's
  *       in-memory copy is now stale. Reload when the doc is clean; when it has
  *       unsaved edits, surface a manual "Reload" affordance instead of clobbering.
  *
  * Returns an `iframeRef` to attach to the <iframe>, a `reloadAvailable` flag for
  * the manual affordance, `doReload` for its button, and `modifiedRef` — the
- * doc's live dirty state, which DocumentPreview reads to flush unsaved edits
- * (Action_Save) before swapping a superseded block to its frozen snapshot.
+ * doc's live dirty state, which the document pane reads to save unsaved
+ * edits (Action_Save) before it leaves a document.
  */
 export function useCollaboraLiveReload({ fileId, agentSlug, relPath, reload }: Args) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null)

@@ -93,14 +93,13 @@ async def test_close_drops_the_registration(kind):
     assert sid not in session_state._session_modes
 
 
-def test_is_session_registered_reads_the_layer_registries():
+def test_session_is_live_reads_the_layer_registries():
     from core.layers.direct.session import _direct_sessions
-    from core.session.session_manager import is_session_registered
     sid = str(uuid.uuid4())
-    assert not is_session_registered(sid)
-    assert not is_session_registered("")
+    assert not session_state.session_is_live(sid)
+    assert not session_state.session_is_live("")
     _direct_sessions[sid] = object()
     try:
-        assert is_session_registered(sid)
+        assert session_state.session_is_live(sid)
     finally:
         _direct_sessions.pop(sid, None)

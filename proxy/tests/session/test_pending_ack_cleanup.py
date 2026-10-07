@@ -17,9 +17,9 @@ async def test_deregister_cancels_pending_acks_for_machine():
     fut_a1 = loop.create_future()
     fut_a2 = loop.create_future()
     fut_b = loop.create_future()
-    cm._pending_acks["cmd-a1"] = ("machine-a", fut_a1)
-    cm._pending_acks["cmd-a2"] = ("machine-a", fut_a2)
-    cm._pending_acks["cmd-b"] = ("machine-b", fut_b)
+    cm._pending_acks["cmd-a1"] = ("machine-a", fut_a1, None)
+    cm._pending_acks["cmd-a2"] = ("machine-a", fut_a2, None)
+    cm._pending_acks["cmd-b"] = ("machine-b", fut_b, None)
 
     # Pretend machine-a was connected (deregister needs to find it)
     cm._connections["machine-a"] = type("FakeConn", (), {

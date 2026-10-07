@@ -38,9 +38,12 @@ the writer then holds the handler lock and a flush would block forever.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import logging.handlers
+import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -52,6 +55,19 @@ _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 # One line per HTTP request — stderr only, never the file: at ~10 MB/day
 # it would cut the file's 120 MB window from months to under two weeks.
 _ACCESS_LOGGER = "uvicorn.access"
+# A token a URL carries: the WOPI ``access_token`` (in Collabora's socket path
+# it is URL-encoded), a share or download ``token`` / ``t``, a ``key``, and
+# the usual names of keys, signatures, codes and passwords. The value goes,
+# the name stays, so a line still says what was asked for.
+_URL_SECRET = re.compile(
+    r"((?:[?&]|%3F|%26)(?:access_token|token|key|t|api_?key|sig|signature|"
+    r"x-amz-signature|x-goog-signature|code|password|secret)(?:=|%3D))(?:(?!%26)[^&\s\"'#])+",
+    re.IGNORECASE,
+)
+# A share link's token is a path segment (``/s/<token>``, its socket too).
+_SHARE_PATH = re.compile(r"(/s/)[A-Za-z0-9_-]{8,}")
+# The HTTP clients log every request's full URL at INFO.
+_QUIET_LOGGERS = ("httpx", "httpcore")
 
 _active: LogQueue | None = None
 
@@ -93,6 +109,27 @@ class _DroppingQueueHandler(logging.handlers.QueueHandler):
         return n
 
 
+def redact(text: str) -> str:
+    """``text`` with the value of every URL token parameter replaced by
+    ``[redacted]``."""
+    if "/s/" in text:
+        text = _SHARE_PATH.sub(r"\1[redacted]", text)
+    if "=" not in text and "%3D" not in text and "%3d" not in text:
+        return text
+    return _URL_SECRET.sub(r"\1[redacted]", text)
+
+
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """The rotating file, created 0600 (every rotation too): it holds
+    request paths, addresses and account names."""
+
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with contextlib.suppress(OSError):  # a file owned by another uid keeps its mode
+            os.fchmod(fd, 0o600)
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+
 class _Listener(logging.handlers.QueueListener):
     """The single consumer: the overflow line precedes the record that
     carries the count."""
@@ -106,7 +143,17 @@ class _Listener(logging.handlers.QueueListener):
         n = getattr(record, _DROPPED_ATTR, 0)
         if n:
             super().handle(self._overflow_record(n))
-        super().handle(record)
+        super().handle(self._redacted(record))
+
+    @staticmethod
+    def _redacted(record: logging.LogRecord) -> logging.LogRecord:
+        """Off the loop: ``prepare`` already merged the args (and any
+        traceback) into ``msg``; a record built here still has its args."""
+        text = record.getMessage()
+        clean = redact(text)
+        if clean is not text and clean != text:
+            record.msg, record.args = clean, None
+        return record
 
     @staticmethod
     def _overflow_record(n: int) -> logging.LogRecord:
@@ -191,13 +238,17 @@ def configure(
     the writer thread. Returns None — and installs nothing — when the logger
     already has handlers (see the module docstring)."""
     global _active
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     target = logger if logger is not None else logging.getLogger()
     if target.handlers:
         return None
     fmt = logging.Formatter(_FORMAT)
     stream = logging.StreamHandler()
     stream.setFormatter(fmt)
-    file_handler = logging.handlers.RotatingFileHandler(
+    with contextlib.suppress(OSError):  # an existing file from before the floor
+        os.chmod(log_path, 0o600)
+    file_handler = _PrivateRotatingFileHandler(
         str(log_path), maxBytes=max_bytes, backupCount=backup_count,
     )
     file_handler.setFormatter(fmt)

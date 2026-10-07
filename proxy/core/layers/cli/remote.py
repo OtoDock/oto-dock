@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
 
 import config as app_config
+from core.events import turn_ending, turn_life
 from core.events.common_events import CommonEvent, DONE, ERROR
 from core.execution_layer import (
     AgentConfig, RemoteEngineAdapter, RemoteStartContext, RemoteStartPlan,
@@ -126,7 +127,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             env["CLAUDE_CODE_OAUTH_401_WAIT_MS"] = str(REMOTE_401_WAIT_MS)
         # Ship the built-in-tool deny list so the satellite's settings.json
         # carries the SAME permissions.deny the local sandbox applies (the
-        # claude.ai Cron/Trigger/Push/integration tools — one source of
+        # claude.ai Cron/Trigger/Push/Artifact/integration tools — one source of
         # truth, core/layers/cli/config_dir.py). Never the session's own
         # denials: the satellite writes this list into the scope's shared
         # settings.json, which the CLI reloads live, so a judge's write tools
@@ -144,8 +145,8 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                         json.loads(mcp_path.read_text()), ctx.sat_port,
                         target_os=ctx.target_os, session_id=ctx.session_id,
                         secret_bundle_keys=ctx.secret_bundle_keys,
-                        bearer_swap_keys=ctx.bearer_swap_keys,
                         proxy_api_key=ctx.proxy_api_key,
+                        gateway=ctx.gateway, gateway_mode=ctx.gateway_mode,
                     )
             except Exception:
                 logger.exception("Claude MCP JSON build failed")
@@ -177,7 +178,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         # nothing lives across turns for this engine.
         info.engine_state = None
 
-    def adopt_state(self, info: "RemoteSessionInfo") -> None:
+    def adopt_state(self, info: "RemoteSessionInfo", cm=None) -> None:
         """Mode C: the replayed turn streams through a fresh translator and an
         interactive settle (the buffered turn's sentinel / turn_ended closes
         it)."""
@@ -205,8 +206,19 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
         The satellite is a dumb pipe: it forwards every NDJSON line as a
         session_event. This owns the turn-end decision and sends ``stop_turn``
-        to the satellite when the turn is over.
+        to the satellite when the turn is over — also when the consumer
+        stops early (an ERROR it ended on, a cancel), so the satellite's
+        per-turn reader never outlives the turn.
         """
+        turn = {"closed": False}
+        try:
+            async for event in self._stream_turn(info, cm, turn):
+                yield event
+        finally:
+            if not turn["closed"]:
+                _stop_turn_in_background(cm, info)
+
+    async def _stream_turn(self, info: "RemoteSessionInfo", cm, turn: dict) -> AsyncIterator[CommonEvent]:
         from core.events import wake_capture
         from core.session.session_state import (
             reconcile_background_snapshot, resolve_bg_command_frame,
@@ -244,17 +256,43 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                         info.session_id[:8], FOREIGN_SKIP_SILENCE_S,
                     )
                     await send_stop_turn(cm, info)
+                    turn["closed"] = True
                     await drain_until_turn_ended(
                         info, timeout=2.0, expected_command_id=expected_cmd_id,
                     )
                     yield CommonEvent(type=DONE)
                     return
                 if not settle.settling:
-                    # Pre-settle: long silence, keep waiting.
-                    continue
+                    # Pre-settle silence: the turn keeps its life (an open
+                    # tool, a prompt on a person, background work, a recent
+                    # hook) or ends typed past the ceiling, the twin of the
+                    # local drive loop. The satellite's reader is stopped
+                    # here and the remote turn's kill branch ends the CLI
+                    # (``silent`` is in ``KILLS_PROCESS``), so the next
+                    # message resumes the session. During the reconnect
+                    # grace the turn may still arrive: the grace's own
+                    # expiry closes it.
+                    silent_for = time.monotonic() - info.last_event_at
+                    if (cm.is_session_in_grace(info.machine_id, info.session_id)
+                            or not _silence_ends(info, translator)):
+                        continue
+                    logger.warning(
+                        "Remote session %s: no events for %.0fs with nothing running — "
+                        "ending the turn", info.session_id[:8], silent_for,
+                    )
+                    await send_stop_turn(cm, info)
+                    turn["closed"] = True
+                    ending = turn_ending.TurnEnding(
+                        reason=turn_ending.SILENT, detail=f"no output for {int(silent_for)} s",
+                    )
+                    yield CommonEvent(type=ERROR, data={"message": ending.line(),
+                                                        "ending": ending.as_dict()})
+                    yield CommonEvent(type=DONE)
+                    return
                 settle.maybe_log_heartbeat(proc_alive=True)
                 if settle.should_exit_on_silence(timeout):
                     await send_stop_turn(cm, info)
+                    turn["closed"] = True
                     # Wait briefly for satellite to drain + ack turn_ended
                     await drain_until_turn_ended(
                         info, timeout=2.0, expected_command_id=expected_cmd_id,
@@ -264,8 +302,18 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 continue
 
             if raw is None:
-                # Session ended on satellite (process exit) — terminal.
-                yield CommonEvent(type=DONE)
+                # Session ended on satellite (process exit) — terminal. After
+                # the proxy's own kill (a Stop, the watchdog) that is the
+                # kill, not a lost machine.
+                turn["closed"] = True
+                if info.proxy_killed:
+                    yield CommonEvent(type=DONE)
+                    return
+                # The CLI is gone: the next send resumes it instead of
+                # meeting the dead process first.
+                info.cli_dead = True
+                for event in _lost_events("the machine ended the session mid-turn"):
+                    yield event
                 return
 
             # An event arrived — slide the post-skip valve (never disarm:
@@ -290,8 +338,11 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 )
                 continue
             if rtype == "error":
-                yield CommonEvent(type=ERROR, data=raw)
-                yield CommonEvent(type=DONE)
+                # The satellite's own send failed (no reader is open), or the
+                # reconnect grace expired on a severed stream.
+                turn["closed"] = True
+                for event in _satellite_error_events(raw):
+                    yield event
                 return
             if rtype == "_turn_ended":
                 # Filter stale turn_ended from a previous turn whose
@@ -308,6 +359,14 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                         info.session_id[:8], expected_cmd_id[:8], ended_cmd_id[:8],
                     )
                     continue
+                turn["closed"] = True
+                if not state.result_seen and not settle.settling and not info.proxy_killed:
+                    # The satellite closed the turn before the CLI's result:
+                    # its process went, and what it ran may not be on disk.
+                    info.cli_dead = True
+                    for event in _lost_events("the machine ended the turn before its result"):
+                        yield event
+                    return
                 yield CommonEvent(type=DONE)
                 return
 
@@ -317,7 +376,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             # bypass the stale filter above, and a dying prior process's
             # junk text must not flip the next zero-content result to
             # "real" and close the turn on it.
-            info.last_activity = time.monotonic()
+            info.last_activity = info.last_event_at = time.monotonic()
             # An init DURING settle = the CLI's self-wake review turn running
             # INLINE through this stream (its content joins the task output)
             # — note it so the producer/monitors skip the redundant nudge.
@@ -373,6 +432,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                             reconcile_background_snapshot(info.session_id, nxt)
                     # Interactive chat: no settle — tell satellite to stop.
                     await send_stop_turn(cm, info)
+                    turn["closed"] = True
                     await drain_until_turn_ended(
                         info, timeout=2.0, expected_command_id=expected_cmd_id,
                     )
@@ -466,6 +526,10 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         a frame is written."""
         state: ClaudeRemoteState | None = info.engine_state
         if not text or state is None or state.result_seen:
+            return False
+        if _silence_ends(info, state.translator):
+            # The turn is about to end silent: the frame would be lost with
+            # the process, so the caller queues it for the next turn.
             return False
         if not cm.satellite_supports_steer_turn(info.machine_id):
             logger.info(
@@ -561,6 +625,20 @@ async def _peek_after_result(info: "RemoteSessionInfo", expected_command_id: str
         return raw
 
 
+_stop_turn_tasks: set[asyncio.Task] = set()
+
+
+def _stop_turn_in_background(cm, info: "RemoteSessionInfo") -> None:
+    """``send_stop_turn`` from a turn generator's close: a closing generator
+    must not await, so the frame goes out on its own task."""
+    try:
+        task = asyncio.get_running_loop().create_task(send_stop_turn(cm, info))
+    except RuntimeError:
+        return
+    _stop_turn_tasks.add(task)
+    task.add_done_callback(_stop_turn_tasks.discard)
+
+
 async def send_stop_turn(cm, info: "RemoteSessionInfo") -> None:
     """Tell the satellite to exit its stdout read loop for this turn. If
     background work is still pending, ask the satellite to keep draining
@@ -586,6 +664,36 @@ async def send_stop_turn(cm, info: "RemoteSessionInfo") -> None:
         logger.warning(
             "Remote stop_turn send failed for session %s: %s", info.session_id[:8], e,
         )
+
+
+def _silence_ends(info: "RemoteSessionInfo", translator) -> bool:
+    """Whether the remote turn's silence (since its own last stream event)
+    ends it now, with the translator's open tool calls as its life."""
+    return turn_life.ends(
+        info.session_id, tools_open=bool(translator.open_tools),
+        silent_for=time.monotonic() - info.last_event_at, task=info.task_turn,
+    )
+
+
+def _lost_events(detail: str) -> list[CommonEvent]:
+    """The ``lost`` ending (the machine's stream or process gone mid-turn)
+    and the turn's end."""
+    ending = turn_ending.TurnEnding(reason=turn_ending.LOST, detail=detail)
+    return [CommonEvent(type=ERROR, data={"message": ending.line(), "ending": ending.as_dict()}),
+            CommonEvent(type=DONE)]
+
+
+def _satellite_error_events(raw: dict) -> list[CommonEvent]:
+    """A satellite ``error`` frame as the turn's typed end: the reconnect
+    grace's expiry (``durable_marker``, the stream severed) is ``lost``, a
+    refused send is ``error`` with the satellite's words."""
+    message = str(raw.get("message") or "the machine reported an error")
+    if raw.get("durable_marker"):
+        return _lost_events(message)
+    ending = turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=message)
+    data = {k: v for k, v in raw.items() if k != "type"}
+    data.update({"message": ending.line(), "ending": ending.as_dict()})
+    return [CommonEvent(type=ERROR, data=data), CommonEvent(type=DONE)]
 
 
 async def drain_until_turn_ended(

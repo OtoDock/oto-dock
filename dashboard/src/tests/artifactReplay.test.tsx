@@ -80,7 +80,7 @@ describe('replayableDisplayEvents', () => {
     expect(replayableDisplayEvents(messages, new Set()).map((r) => r.dbId)).toEqual([5])
   })
 
-  it('dedupes document_preview by file_id and ui by path — latest wins', () => {
+  it('skips documents (the document pane opens them) and dedupes ui by path — latest wins', () => {
     const prev = (id: number, wopi: string) =>
       row(id, 'event', 'document_preview',
         { type: 'document_preview', wopi_url: wopi, filename: 'f.docx', file_id: 'fid', download_url: '/d' })
@@ -90,9 +90,8 @@ describe('replayableDisplayEvents', () => {
       [row(1, 'user'), prev(2, 'w1'), ui(3, 'a'), prev(4, 'w2'), ui(5, 'b')],
       new Set(),
     )
-    expect(out.map((r) => r.dbId)).toEqual([4, 5])
-    expect((out[0].block as any).wopiUrl).toBe('w2')
-    expect((out[1].block as any).token).toBe('b')
+    expect(out.map((r) => r.dbId)).toEqual([5])
+    expect((out[0].block as any).token).toBe('b')
   })
 
   it('drops locally dismissed ids and caps at the newest MAX_REPLAY_WINDOWS', () => {
@@ -217,3 +216,17 @@ describe('useArtifactWindows replay-on-open', () => {
     expect(result.current.windows).toHaveLength(1)
   })
 })
+
+describe('useArtifactWindows: a document push goes to the document pane', () => {
+  it('hands the frame to onDocument and opens no window', async () => {
+    fetchPageMock.mockResolvedValue({ messages: [], has_more: false })
+    const { ws, emit } = makeWs()
+    const onDocument = vi.fn()
+    const { result } = renderHook(() => useArtifactWindows(ws, 'c1', onDocument))
+    const doc = { type: 'document_preview', wopi_url: 'w', filename: 'f.docx', file_id: 'fid', download_url: '/d', generation: 5 }
+    act(() => { emit(doc) })
+    expect(onDocument).toHaveBeenCalledWith(doc)
+    expect(result.current.windows).toHaveLength(0)
+  })
+})
+

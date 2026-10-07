@@ -141,8 +141,28 @@ class TestDelegateDelivery:
             assert payload["session_id"] == "sess-z"   # routes to the right session
             assert payload["chat_id"] == "chat-z"        # routes to the right chat
             assert payload["result_prompt"] == "echo prompt"
+            assert "reason" not in payload
         finally:
             _dashboard_notify_queues.pop("sess-z", None)
+
+    def test_notify_queue_payload_carries_the_typed_ending(self, temp_db, monkeypatch):
+        from core.events import turn_ending
+        from core.session.session_state import _dashboard_notify_queues
+        _owner()
+        task_store.create_chat("chat-te", "user-1", "pa")
+        q: asyncio.Queue = asyncio.Queue()
+        _dashboard_notify_queues["sess-te"] = q
+        try:
+            with _alive_cli_session("sess-te"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-te", "pa", "echo prompt", _task(),
+                    chat_id="chat-te", output_text="half", status="failed",
+                    ending=turn_ending.TurnEnding(turn_ending.DECLINED, detail="cyber"),
+                ))
+            payload = q.get_nowait()
+            assert (payload["reason"], payload["resets_at"]) == ("declined", "")
+        finally:
+            _dashboard_notify_queues.pop("sess-te", None)
 
     def test_successful_delivery_persists_result_and_echo(self, temp_db, monkeypatch):
         _owner()
@@ -447,7 +467,6 @@ class TestLaneQuiescence:
 
         class _FakePump:
             is_done = False
-            message_queue: list = []
 
         pump = _FakePump()
         _active_pumps["lane-q"] = pump
@@ -470,12 +489,38 @@ class TestLaneQuiescence:
         elapsed = _time.monotonic() - t0
         assert 1.2 <= elapsed < 8.0  # waited for the pump, then settled
 
+    def test_a_message_waiting_in_the_chats_queue_keeps_the_lane_busy(self, temp_db):
+        """A turn that ended with a message still waiting in the chat's
+        queue: it goes out as the lane's next turn, so the lane waits."""
+        from core.events import input_queue
+        from core.events.common_events import TurnInput
+
+        q = input_queue.get("lane-l")
+        q.items.append(input_queue.QueuedInput(
+            queue_id="q-1", chat_id="lane-l", author_sub="user-admin",
+            item=TurnInput("typed as the turn ended")))
+
+        async def _run():
+            async def _delivered():
+                await asyncio.sleep(1.2)
+                q.items.clear()
+            asyncio.get_running_loop().create_task(_delivered())
+            await scheduler._await_lane_quiescence("lane-l", settle_seconds=0.5,
+                                                   ceiling_seconds=10.0)
+
+        import time as _time
+        t0 = _time.monotonic()
+        try:
+            asyncio.run(_run())
+        finally:
+            input_queue._registry.pop("lane-l", None)
+        assert _time.monotonic() - t0 >= 1.2
+
     def test_ceiling_bounds_a_stuck_lane(self, temp_db):
         from core.events.stream_pump import _active_pumps
 
         class _StuckPump:
             is_done = False
-            message_queue: list = []
 
         _active_pumps["lane-c"] = _StuckPump()
         try:
@@ -544,6 +589,21 @@ class TestLaneFinalization:
         assert got["status"] == "user_interrupted"
         assert got["output_text"] == "partial"
         assert "s=user_interrupted" in got["result_prompt"]
+
+    def test_a_run_the_engine_ended_stays_failed(self, temp_db, monkeypatch):
+        # A typed ending (exited, silent, lost) stamps the abort flag for the
+        # next turn's context; the run it failed is delivered failed, not
+        # as stopped by a person.
+        task_store.create_chat("lane-f3", "user-1", "pa")
+        task_store.update_chat("lane-f3", last_turn_aborted=True)
+        task_store.add_chat_message("lane-f3", "assistant", "partial")
+
+        got = self._deliver(
+            monkeypatch, self._lane_task("lane-f3"), "failed", "",
+            worker_chat_id="lane-f3",
+        )
+        assert got["status"] == "failed"
+        assert "s=failed" in got["result_prompt"]
 
     def test_a_failed_run_carries_only_its_own_check_verdict(self, temp_db, monkeypatch):
         # A reused worker chat: an earlier run's failing verdict must not
@@ -690,6 +750,15 @@ class TestTaskStallWatchdog:
             self._task = task
             self.producer = producer
             self.aborted = False
+            self.has_viewers = False
+            self.event_queue = asyncio.Queue()
+
+        def lost_ending(self):
+            """The ``lost`` ending the reap put ahead of its abort, or None."""
+            from core.events import turn_ending
+            if self.event_queue.empty():
+                return None
+            return turn_ending.from_dict(self.event_queue.get_nowait().data.get("ending"))
 
         def abort(self):
             self.aborted = True
@@ -716,6 +785,35 @@ class TestTaskStallWatchdog:
 
     def _run(self, coro):
         return asyncio.run(coro)
+
+    def test_a_prompt_parked_with_nobody_viewing_is_told_once(self, monkeypatch):
+        """A woken turn whose next step waits on a person while nobody views
+        the chat calls ``on_parked`` once; a viewer on the pump spares it."""
+        from core.session import session_state
+        monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.02)
+        monkeypatch.setattr(session_state, "has_pending_prompt", lambda sid: True)
+
+        async def _go(viewers):
+            hang = asyncio.get_event_loop().create_future()
+            producer = asyncio.get_event_loop().create_future()
+            pump = self._FakePump(asyncio.ensure_future(hang), producer)
+            pump.has_viewers = viewers
+            told: list[str] = []
+
+            async def _parked():
+                told.append("told")
+
+            async def _finish():
+                await asyncio.sleep(0.12)
+                hang.set_result(None)
+            asyncio.ensure_future(_finish())
+            await scheduler._watch_task_pump(
+                self._FakeLayer(idle=1.0), pump, "run-p", "chat-p", "s" * 8,
+                on_parked=_parked)
+            return told
+
+        assert self._run(_go(False)) == ["told"]
+        assert self._run(_go(True)) == []
 
     def test_healthy_completion_passes_through(self, monkeypatch):
         monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.05)
@@ -772,7 +870,35 @@ class TestTaskStallWatchdog:
             else:
                 raise AssertionError("expected _TaskTurnStalled")
             assert pump.aborted
+            assert pump.lost_ending().reason == "lost"
             assert layer.prepared
+
+        self._run(_go())
+
+    def test_a_turn_waiting_on_a_person_outlives_the_ceiling(self, monkeypatch):
+        """A permission card or a question parked on the run: silence by
+        design, bounded by the prompt's own wait, never the turn ceiling."""
+        monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.02)
+        import config as _config
+        from core.session import session_state
+        monkeypatch.setattr(_config, "CLAUDE_TIMEOUT", 5)
+        monkeypatch.setattr(session_state, "has_pending_prompt", lambda sid: True)
+
+        async def _go():
+            hang = asyncio.get_event_loop().create_future()
+            producer = asyncio.get_event_loop().create_future()
+            pump = self._FakePump(asyncio.ensure_future(hang), producer)
+            layer = self._FakeLayer(idle=99.0, dead=False)
+
+            async def _finish():
+                await asyncio.sleep(0.07)
+                hang.set_result(None)
+
+            fin = asyncio.create_task(_finish())
+            await scheduler._watch_task_pump(
+                layer, pump, "run-w5", "task-run-w5", "s" * 8)
+            await fin
+            assert not pump.aborted
 
         self._run(_go())
 
@@ -793,6 +919,7 @@ class TestTaskStallWatchdog:
             else:
                 raise AssertionError("expected _TaskTurnStalled")
             assert pump.aborted
+            assert pump.lost_ending().reason == "lost"
 
         self._run(_go())
 
@@ -815,7 +942,6 @@ class TestInterruptDeferral:
 
         class _FakePump:
             is_done = False
-            message_queue: list = []
 
         pump = _FakePump()
         _active_pumps["lane-i"] = pump
@@ -881,6 +1007,46 @@ class TestInterruptDeferral:
         assert "[User interjected]: actually do X instead" in captured["output_text"]
         assert "did X" in captured["output_text"]
         assert "s=user_interrupted" in captured["result_prompt"]
+
+    @pytest.mark.parametrize("quiescence_raises", [False, True])
+    def test_the_worker_chat_owes_its_report_until_the_collection(
+            self, temp_db, monkeypatch, quiescence_raises):
+        """From the delivery's start until the lane's output is collected, a
+        turn the platform drives into the worker chat keeps the task producer
+        (its background work's review must land in the report); the hold is
+        gone before the callback is delivered, a failed finalization too."""
+        task_store.create_chat("lane-h", "user-1", "pa")
+        seen: dict = {}
+
+        async def _fake_quiescence(chat_id, **kw):
+            seen["during"] = lanes.report_pending(chat_id, "")
+            if quiescence_raises:
+                raise RuntimeError("quiescence failed")
+
+        monkeypatch.setattr(lanes, "_await_lane_quiescence", _fake_quiescence)
+        done = asyncio.Event()
+
+        async def _fake_do_deliver(session_id, agent, result_prompt, t, **kw):
+            seen["at_delivery"] = lanes.report_pending("lane-h", "")
+            done.set()
+
+        monkeypatch.setattr(delivery, "_do_deliver", _fake_do_deliver)
+        task = TaskDefinition(
+            id="dyn-h", name="lane", agent="pa", prompt="p", scope="agent",
+            target_chat_id="lane-h", on_complete_agent="pa",
+            on_complete_prompt="s={{status}} out={{output}}",
+            on_complete_session_id="sess-h",
+        )
+
+        async def _run():
+            await scheduler._deliver_task_result(
+                task, "completed", "the report", worker_chat_id="lane-h")
+            seen["after_schedule"] = lanes.report_pending("lane-h", "")
+            await asyncio.wait_for(done.wait(), timeout=5)
+
+        asyncio.run(_run())
+        assert seen == {"after_schedule": True, "during": True, "at_delivery": False}
+        assert "lane-h" not in lanes._report_holds
 
 
 def test_touch_chat_bumps_sidebar_recency(temp_db):
@@ -972,6 +1138,30 @@ class TestPumpedEchoTurn:
         # The pump deregistered itself.
         assert _active_pumps.get("chat-pump") is None
 
+    def test_a_parked_echo_turn_tells_its_person(self, temp_db, monkeypatch):
+        """The echo turn on a live process runs in the chat's own mode: when
+        its next step parks a prompt nobody sees, the delivery's person (else
+        the chat's owner) is notified once, linked to the chat."""
+        from services.notifications import notification_manager
+        task_store.create_chat("chat-park", "user-1", "pa")
+        fired: list[dict] = []
+
+        async def _fire(title, body, **kw):
+            fired.append({"title": title, **kw})
+            return []
+        monkeypatch.setattr(notification_manager, "fire_notification", _fire)
+
+        async def _watch(layer, pump, run_id, chat_id, session_id, *, on_parked=None):
+            await on_parked()
+            await pump._task
+        monkeypatch.setattr(lanes, "_watch_task_pump", _watch)
+        asyncio.run(scheduler._run_echo_turn_pumped(
+            _FakeEchoLayer(), "sess-park", "chat-park", "pa", "review", person="user-2"))
+        asyncio.run(scheduler._run_echo_turn_pumped(
+            _FakeEchoLayer(), "sess-park", "chat-park", "pa", "review"))
+        assert [(f["target"], f["chat_id"], f["scope"]) for f in fired] == [
+            ("user-2", "chat-park", "user"), ("user-1", "chat-park", "user")]
+
     def test_refuses_when_chat_already_pumping(self, temp_db):
         from core.events.stream_pump import _active_pumps
 
@@ -1020,3 +1210,402 @@ class TestPumpedEchoTurn:
         ))
         assert len(_delegate_events("chat-e")) == 1
         assert _assistant_msgs("chat-e") == []  # no duplicate echo row
+
+
+class _RecordingEchoLayer(_FakeEchoLayer):
+    """An echo layer that records each send's keyword arguments, and can
+    register a background subagent as the turn's generator closes (where the
+    Codex session hands a still-running sub-agent to its supervisor)."""
+
+    def __init__(self, *, subagent_at_close: str = ""):
+        super().__init__()
+        self.sends: list[dict] = []
+        self._subagent_at_close = subagent_at_close
+
+    async def send_message(self, sid, prompt, **kwargs):
+        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.session.session_state import get_subagent_registry
+        self.sends.append(kwargs)
+        try:
+            yield CommonEvent(type=TEXT, data={"content": "woken answer"})
+            yield CommonEvent(type=DONE, data={})
+        finally:
+            if self._subagent_at_close:
+                get_subagent_registry(sid).register_spawn(self._subagent_at_close, "tu-sub")
+
+
+def _bound_chat(chat_id: str, sid: str, *, owner: str = "user-1", **kw) -> None:
+    task_store.create_chat(chat_id, owner, "pa", **kw)
+    task_store.update_chat(chat_id, session_id=sid)
+
+
+class TestWokenTurnContract:
+    """A turn the platform drives into a chat (a scheduled wake, a delegate
+    result, a stored-wake replay) ends at the engine's result, as the chat's
+    own turns do: background work an earlier turn left running stays with the
+    chat's monitors. Inside a run's report window (a worker reports only after
+    its background work) and in phone chats it keeps the task producer."""
+
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        """Record the monitors the turn arms and any hold of the task
+        producer's monitor guard, and clean the per-session state up."""
+        from core.events import pump_bg_monitors, task_producer
+        armed: list[tuple[str, str, str]] = []
+        holds: list[str] = []
+
+        async def _cmd(layer, sid, cid, count):
+            armed.append(("commands", sid, cid))
+
+        async def _agents(layer, sid, cid, count):
+            armed.append(("agents", sid, cid))
+
+        real_hold = task_producer.hold_bg_monitors
+
+        def _hold(sid):
+            holds.append(sid)
+            return real_hold(sid)
+
+        monkeypatch.setattr(pump_bg_monitors, "_bg_command_monitor", _cmd)
+        monkeypatch.setattr(pump_bg_monitors, "_bg_agent_monitor", _agents)
+        monkeypatch.setattr(task_producer, "hold_bg_monitors", _hold)
+        sids: list[str] = []
+        yield SimpleNamespace(armed=armed, holds=holds, sids=sids)
+        from core.events.bg_command_state import _bg_command_registries
+        from core.session.session_state import _subagent_registries
+        for sid in sids:
+            _bg_command_registries.pop(sid, None)
+            _subagent_registries.pop(sid, None)
+            pump_bg_monitors._bg_command_monitors_running.discard(sid)
+            pump_bg_monitors._bg_monitors_running.discard(sid)
+
+    @staticmethod
+    def _wake(layer, sid, chat_id):
+        async def _run():
+            out = await asyncio.wait_for(scheduler._run_echo_turn_pumped(
+                layer, sid, chat_id, "pa", "check back"), timeout=5)
+            await asyncio.sleep(0)  # let the post-turn arming run
+            return out
+        return asyncio.run(_run())
+
+    def test_a_woken_turn_ends_at_its_answer_beside_an_earlier_turns_job(
+            self, temp_db, recorded):
+        from core.events import pump_bg_monitors
+        from core.events.bg_command_state import get_bg_command_registry
+        from core.events.stream_pump import _active_pumps
+        sid = "sess-wk1"
+        recorded.sids.append(sid)
+        _bound_chat("chat-wk1", sid)
+        # An earlier turn left a never-ending command, and its monitor runs.
+        get_bg_command_registry(sid).register_spawn("bWK1", "tuWK1", label="bWK1: watch")
+        pump_bg_monitors._bg_command_monitors_running.add(sid)
+        layer = _RecordingEchoLayer()
+
+        assert self._wake(layer, sid, "chat-wk1") == ""
+
+        assert [s.get("settle_after_result", 0) for s in layer.sends] == [0]
+        assert recorded.holds == []
+        assert sid in pump_bg_monitors._bg_command_monitors_running
+        assert recorded.armed == []          # the running monitor keeps the job
+        assert _active_pumps.get("chat-wk1") is None
+        assert [m["content"] for m in _assistant_msgs("chat-wk1")] == ["woken answer"]
+
+    def test_the_chats_monitor_is_armed_after_the_turn(self, temp_db, recorded):
+        from core.events.bg_command_state import get_bg_command_registry
+        sid = "sess-wk2"
+        recorded.sids.append(sid)
+        _bound_chat("chat-wk2", sid)
+        get_bg_command_registry(sid).register_spawn("bWK2", "tuWK2", label="bWK2: build")
+
+        self._wake(_RecordingEchoLayer(), sid, "chat-wk2")
+
+        assert recorded.armed == [("commands", sid, "chat-wk2")]
+
+    def test_a_subagent_handed_off_at_the_turns_close_is_watched(self, temp_db, recorded):
+        sid = "sess-wk3"
+        recorded.sids.append(sid)
+        _bound_chat("chat-wk3", sid)
+
+        self._wake(_RecordingEchoLayer(subagent_at_close="sub-wk3"), sid, "chat-wk3")
+
+        assert recorded.armed == [("agents", sid, "chat-wk3")]
+
+    @pytest.mark.parametrize("chat_id, kw", [
+        ("chat-wk-worker", {"delegate_role": "worker"}),
+        ("chat-wk-task", {"source_type": "task"}),
+        ("task-wk-legacy", {}),
+    ])
+    def test_worker_and_task_chats_end_at_the_answer_outside_a_report(
+            self, temp_db, recorded, chat_id, kw):
+        from core.events.bg_command_state import get_bg_command_registry
+        sid = "sess-" + chat_id
+        recorded.sids.append(sid)
+        _bound_chat(chat_id, sid, **kw)
+        get_bg_command_registry(sid).register_spawn("bOut", "tuOut", label="bOut: watch")
+        layer = _RecordingEchoLayer()
+
+        self._wake(layer, sid, chat_id)
+
+        assert [s.get("settle_after_result", 0) for s in layer.sends] == [0]
+        assert recorded.holds == []
+        assert recorded.armed == [("commands", sid, chat_id)]
+
+    @pytest.mark.parametrize("hold_key", ["chat", "session"])
+    def test_a_woken_turn_inside_a_report_window_waits_for_its_jobs(
+            self, temp_db, recorded, hold_key):
+        sid = "sess-wk-window"
+        recorded.sids.append(sid)
+        _bound_chat("chat-wk-window", sid, delegate_role="worker")
+        layer = _RecordingEchoLayer()
+        key = "chat-wk-window" if hold_key == "chat" else sid
+        lanes.hold_report(key)
+        try:
+            self._wake(layer, sid, "chat-wk-window")
+        finally:
+            lanes.release_report(key)
+
+        assert [s.get("settle_after_result") for s in layer.sends] == [30.0]
+        assert recorded.armed == []
+
+    @pytest.mark.parametrize("chat_id, kw, sid_on_row", [
+        ("chat-wk-phone", {"source_type": "phone", "owner": "phone"}, True),
+        ("chat-wk-moved", {}, False),
+    ])
+    def test_phone_chats_and_a_moved_session_keep_the_task_producer(
+            self, temp_db, recorded, chat_id, kw, sid_on_row):
+        sid = "sess-" + chat_id
+        recorded.sids.append(sid)
+        owner = kw.pop("owner", "user-1")
+        _bound_chat(chat_id, sid if sid_on_row else "sess-another", owner=owner, **kw)
+        layer = _RecordingEchoLayer()
+
+        self._wake(layer, sid, chat_id)
+
+        assert [s.get("settle_after_result") for s in layer.sends] == [30.0]
+        assert recorded.armed == []
+
+    def test_the_parked_notice_names_a_finished_background_job(self, temp_db, monkeypatch):
+        from services.notifications import notification_manager
+        task_store.create_chat("chat-wk-park", "user-1", "pa")
+        bodies: list[str] = []
+
+        async def _fire(title, body, **kw):
+            bodies.append(body)
+            return []
+        monkeypatch.setattr(notification_manager, "fire_notification", _fire)
+
+        async def _watch(layer, pump, run_id, chat_id, session_id, *, on_parked=None):
+            await on_parked()
+            await pump._task
+        monkeypatch.setattr(lanes, "_watch_task_pump", _watch)
+        asyncio.run(scheduler._run_echo_turn_pumped(
+            _FakeEchoLayer(), "sess-wk-park", "chat-wk-park", "pa", "review"))
+        assert "a finished background job" in bodies[0]
+
+
+class TestTakesChatContract:
+    @pytest.mark.parametrize("row, sid, expected", [
+        ({"id": "c1", "source_type": "chat", "user_sub": "u", "session_id": "s"}, "s", True),
+        ({"id": "c1", "source_type": "chat", "user_sub": "agent::pa", "session_id": "s"}, "s", True),
+        ({"id": "c1", "source_type": "chat", "user_sub": "u", "session_id": "s"}, "t", False),
+        ({"id": "c1", "source_type": "chat", "user_sub": "u", "session_id": "s",
+          "delegate_role": "worker"}, "s", True),
+        ({"id": "c1", "source_type": "chat", "user_sub": "u", "session_id": "s",
+          "delegate_role": "orchestrator"}, "s", True),
+        ({"id": "c1", "source_type": "task", "user_sub": "u", "session_id": "s"}, "s", True),
+        ({"id": "task-c1", "source_type": "chat", "user_sub": "u", "session_id": "s"}, "s", True),
+        ({"id": "c1", "source_type": "chat", "user_sub": "task::pa", "session_id": "s"}, "s", True),
+        ({"id": "c1", "source_type": "phone", "user_sub": "phone", "session_id": "s"}, "s", False),
+        ({"id": "c1", "source_type": "chat", "user_sub": "phone", "session_id": "s"}, "s", False),
+        (None, "s", False),
+    ])
+    def test_a_chat_driving_its_own_session_outside_a_report(self, row, sid, expected):
+        assert lanes.takes_chat_contract(row, sid) is expected
+
+    @pytest.mark.parametrize("key", ["c1", "s"])
+    def test_a_report_window_on_the_chat_or_its_session(self, key):
+        row = {"id": "c1", "source_type": "chat", "user_sub": "u", "session_id": "s",
+               "delegate_role": "worker"}
+        lanes.hold_report(key)
+        try:
+            assert lanes.takes_chat_contract(row, "s") is False
+            assert lanes.report_pending("c1", "s") is True
+        finally:
+            lanes.release_report(key)
+        assert lanes.takes_chat_contract(row, "s") is True
+
+    def test_holds_count_and_never_go_negative(self):
+        lanes.hold_report("c2", "s2")
+        lanes.hold_report("c2")
+        lanes.release_report("c2", "s2")
+        assert lanes.report_pending("c2", "") is True
+        assert lanes.report_pending("", "s2") is False
+        lanes.release_report("c2")
+        lanes.release_report("c2")
+        assert lanes.report_pending("c2", "s2") is False
+        lanes.hold_report("c2")
+        assert lanes.report_pending("c2", "") is True
+        lanes.release_report("c2")
+        assert "c2" not in lanes._report_holds
+
+
+class TestTypedEnding:
+    def test_the_callback_names_the_ending_and_the_next_step(self, monkeypatch):
+        """A worker whose turn the engine stopped: the callback appends the
+        reason and how to continue (also for task rows stored with an older
+        template), and the delegate_result event carries the typed fields."""
+        from core.events import turn_ending
+        captured: dict = {}
+
+        async def fake_do_deliver(session_id, agent, result_prompt, task, **kw):
+            captured.update(prompt=result_prompt, **kw)
+
+        monkeypatch.setattr(delivery, "_do_deliver", fake_do_deliver)
+        monkeypatch.setattr(delivery.task_store, "get_dynamic_task", lambda tid: {
+            "on_complete_agent": "pa", "on_complete_session_id": "sess-1",
+            "on_complete_chat_id": None,
+            "on_complete_prompt": "Worker finished with status={{status}}. Output:\n{{output}}"})
+        ending = turn_ending.TurnEnding(reason=turn_ending.LIMIT,
+                                        resets_at="2026-10-01T15:00:00+00:00")
+
+        async def run():
+            await delivery._deliver_task_result(_task(), "failed", "half the report",
+                                                ending=ending)
+            for _ in range(100):
+                if captured:
+                    return
+                await asyncio.sleep(0.01)
+
+        asyncio.run(run())
+        assert captured["prompt"].startswith("Worker finished with status=failed. Output:\nhalf the report")
+        assert captured["prompt"].endswith(f"[{ending.callback_note('')}]")
+        assert "resets 2026-10-01 15:00 UTC" in captured["prompt"]
+        assert captured["ending"] is ending
+        assert delivery._ending_fields(ending) == {
+            "reason": "limit", "resets_at": "2026-10-01T15:00:00+00:00"}
+        assert delivery._ending_fields(None) == {}
+
+
+class TestResultFiles:
+    """The files a worker attached ride the result: the callback's bracketed
+    note (after the template, like the ending note), the delegate_result
+    event, the notify payload; a store error names none and strands nothing."""
+
+    def _rows(self, run_id: str) -> None:
+        from storage.automation import db_result_files, run_status as _rs
+        task_store.create_run(run_id, "task-1", "pa", "manual", "pa", "p",
+                              task_type="delegate", scope="user", created_by="user-1")
+        task_store.update_run(run_id, status=_rs.COMPLETED)
+        db_result_files.record(run_id, "pa", [
+            {"path": "report.md", "landed_path": "users/u/workspace/inbox/w/report.md",
+             "ws_path": "inbox/w/report.md", "bytes": 12600, "status": "landed"},
+            {"path": "notes/x.md", "status": "skipped", "reason": "symlink"},
+        ])
+
+    def _deliver(self, monkeypatch, run_id: str) -> dict:
+        captured: dict = {}
+
+        async def fake_do_deliver(session_id, agent, result_prompt, task, **kw):
+            captured.update(prompt=result_prompt, **kw)
+
+        monkeypatch.setattr(delivery, "_do_deliver", fake_do_deliver)
+        monkeypatch.setattr(delivery.task_store, "get_dynamic_task", lambda tid: {
+            "on_complete_agent": "pa", "on_complete_session_id": "sess-1",
+            "on_complete_chat_id": None, "on_complete_prompt": "s={{status}} out={{output}}"})
+
+        async def run():
+            await delivery._deliver_task_result(_task(), "completed", "done", run_id=run_id)
+            for _ in range(200):
+                if captured:
+                    return
+                await asyncio.sleep(0.01)
+
+        asyncio.run(run())
+        return captured
+
+    def test_the_callback_names_the_files_after_the_template(self, temp_db, monkeypatch):
+        self._rows("run-rf-d1")
+        got = self._deliver(monkeypatch, "run-rf-d1")
+        assert got["prompt"] == (
+            "s=completed out=done\n\n"
+            "[Files the worker attached, relative to your workspace: inbox/w/report.md (12.3 KB). "
+            "Not attached: notes/x.md (symlink).]")
+        assert got["files"] == [{"path": "users/u/workspace/inbox/w/report.md", "bytes": 12600}]
+        assert got["files_skipped"] == [{"path": "notes/x.md", "reason": "symlink"}]
+
+    def test_no_rows_or_no_run_id_names_nothing(self, temp_db, monkeypatch):
+        got = self._deliver(monkeypatch, "")
+        assert got["prompt"] == "s=completed out=done"
+        assert got["files"] == [] and got["files_skipped"] == []
+
+    def test_a_store_error_strands_nothing(self, temp_db, monkeypatch):
+        from services.delegation import result_files
+
+        def boom(run_id):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(result_files, "delivery_lists", boom)
+        got = self._deliver(monkeypatch, "run-rf-d3")
+        assert got["prompt"] == "s=completed out=done"
+        assert got["files"] == []
+
+    def test_the_event_row_and_the_notify_payload_carry_the_files(self, temp_db, monkeypatch):
+        from core.session.session_state import _dashboard_notify_queues
+        _owner()
+        task_store.create_chat("chat-rf", "user-1", "pa")
+        files = [{"path": "users/u/workspace/inbox/w/report.md", "bytes": 3}]
+        skipped = [{"path": "x", "reason": "symlink"}]
+        verdict = {"check": "answer", "round": 1, "summary": "no"}
+        q: asyncio.Queue = asyncio.Queue()
+        _dashboard_notify_queues["sess-rf"] = q
+        try:
+            with _alive_cli_session("sess-rf"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-rf", "pa", "echo prompt", _task(),
+                    chat_id="chat-rf", output_text="OUT", status="failed",
+                    verdict=verdict, files=files, files_skipped=skipped,
+                ))
+            payload = q.get_nowait()
+            assert payload["files"] == files and payload["files_skipped"] == skipped
+            assert payload["verdict"] == verdict
+        finally:
+            _dashboard_notify_queues.pop("sess-rf", None)
+
+    def test_a_result_without_files_keeps_its_shape(self, temp_db, monkeypatch):
+        _owner()
+        task_store.create_chat("chat-rf2", "user-1", "pa")
+
+        async def _fail(*a, **k):
+            return None
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
+        asyncio.run(scheduler._do_deliver(
+            "sess-rf2", "pa", "echo prompt", _task(), chat_id="chat-rf2", output_text="R"))
+        data = json.loads(_delegate_events("chat-rf2")[0]["event_data"])
+        assert "files" not in data and "files_skipped" not in data and "verdict" not in data
+        asyncio.run(scheduler._do_deliver(
+            "sess-rf2", "pa", "echo prompt", _task(), chat_id="chat-rf2", output_text="R2",
+            files_skipped=[{"path": "a", "reason": "symlink"}]))
+        data = json.loads(_delegate_events("chat-rf2")[1]["event_data"])
+        assert data["files"] == [] and data["files_skipped"] == [{"path": "a", "reason": "symlink"}]
+
+    def test_a_refused_person_keeps_the_files_on_the_event_row(self, temp_db):
+        """The standing gate refuses the person (they hold no agent row): the
+        result is written as an event only, with the files on it."""
+        from storage.agents import agent_store
+        agent_store.create_agent("pa", "PA", collaborative=True, default_scope="user")
+        task_store.create_chat("chat-rf3", "user-gone", "pa")
+        files = [{"path": "users/g/workspace/inbox/w/r.md", "bytes": 2}]
+        asyncio.run(scheduler._do_deliver(
+            "sess-rf3", "pa", "echo prompt", _task(), chat_id="chat-rf3", output_text="R",
+            files=files, files_skipped=[]))
+        data = json.loads(_delegate_events("chat-rf3")[0]["event_data"])
+        assert data["files"] == files and data["files_skipped"] == []
+        assert task_store.claim_pending_delegate_wake("chat-rf3") == []
+
+    def test_a_second_delivery_names_the_same_rows(self, temp_db, monkeypatch):
+        self._rows("run-rf-d5")
+        first = self._deliver(monkeypatch, "run-rf-d5")
+        second = self._deliver(monkeypatch, "run-rf-d5")
+        assert first["files"] == second["files"] and first["prompt"] == second["prompt"]
+        from storage.automation import db_result_files
+        assert len(db_result_files.list_for_run("run-rf-d5")) == 2

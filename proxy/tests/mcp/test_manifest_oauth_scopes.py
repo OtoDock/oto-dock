@@ -458,3 +458,143 @@ class TestOptionalFields:
                 },
                 "x",
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# credentials.oauth.authorization_server — the MCP server names its own
+# authorization server; the install registers itself there.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _server_block(url="https://mcp.notion.com/mcp", transport="streamable_http"):
+    return {"transport": transport, "url_template": url, "source": "remote:mcp.notion.com"}
+
+
+def _as_block(**over):
+    raw = {
+        "provider_id": "notion-hosted",
+        "flows": ["authorization_code_pkce"],
+        "authorization_server": {"registration": "dynamic", "confidential": False},
+        "bearer_required": True,
+        "proposed_hosts": ["mcp.notion.com"],
+    }
+    raw.update(over)
+    return raw
+
+
+class TestAuthorizationServerBlock:
+    def test_minimal_block_accepted_without_services(self):
+        """A server that names its own scopes needs no services list."""
+        _strict_validate(_as_block(), "notion-hosted-mcp", _server_block())
+
+    def test_block_accepted_with_services_and_identity(self):
+        raw = _as_block(
+            authorization_server={
+                "registration": "dynamic", "confidential": True,
+                "issuer": "https://mcp.notion.com", "client_name": "OtoDock",
+                "scopes": ["default"],
+                "identity": {"label_field": "workspace_id", "display_field": "email_domain"},
+            },
+            services=[{"key": "default", "label": "Workspace", "description": "d",
+                       "scopes": ["default"]}],
+        )
+        _strict_validate(raw, "notion-hosted-mcp", _server_block())
+
+    def test_block_must_be_object(self):
+        with pytest.raises(ValueError, match="must be an object"):
+            _strict_validate(_as_block(authorization_server="dynamic"), "m", _server_block())
+
+    @pytest.mark.parametrize("field", ["confidential", "accepts_app_tokens"])
+    def test_the_boolean_fields(self, field):
+        _strict_validate(_as_block(authorization_server={field: True}), "m", _server_block())
+        with pytest.raises(ValueError, match=f"{field} must be a boolean"):
+            _strict_validate(_as_block(authorization_server={field: "yes"}), "m", _server_block())
+
+    @pytest.mark.parametrize("flows", [["authorization_code"], ["authorization_code_pkce", "personal_access_token"]])
+    def test_flows_must_be_exactly_pkce(self, flows):
+        with pytest.raises(ValueError, match="authorization_code_pkce"):
+            _strict_validate(_as_block(flows=flows), "m", _server_block())
+
+    def test_app_flow_urls_may_stay_beside_the_block(self):
+        """An admin's own app keeps today's flow; the registered client
+        discovers its endpoints and ignores these."""
+        _strict_validate(_as_block(authorization_url="https://x/auth", token_url="https://x/token",
+                                   revoke_url="https://x/revoke", app_credential="x-app"),
+                         "m", _server_block())
+
+    @pytest.mark.parametrize("key,value", [
+        ("device_authorization_url", "https://x/d"),
+        ("app_credential_variants", {"device_code": "x"}), ("authorize_params", {"owner": "user"}),
+        ("env_injection", ["TOKEN"]), ("mcp_env_injection", ["TOKEN"]),
+        ("git_credential_helper", {"host": "h", "helper": "x"}),
+    ])
+    def test_excluded_keys_refused(self, key, value):
+        with pytest.raises(ValueError, match=f"credentials.oauth.{key} cannot be declared beside"):
+            _strict_validate(_as_block(**{key: value}), "m", _server_block())
+
+    def test_registration_mode_must_be_dynamic(self):
+        with pytest.raises(ValueError, match="registration='metadata_document' is not supported"):
+            _strict_validate(_as_block(authorization_server={"registration": "metadata_document"}), "m", _server_block())
+
+    def test_confidential_is_a_boolean(self):
+        with pytest.raises(ValueError, match="confidential must be a boolean"):
+            _strict_validate(_as_block(authorization_server={"confidential": "yes"}), "m", _server_block())
+
+    @pytest.mark.parametrize("issuer", ["http://mcp.notion.com", "https://mcp.notion.com/?x=1",
+                                        "https://mcp.notion.com/#f", "mcp.notion.com"])
+    def test_issuer_must_be_clean_https(self, issuer):
+        with pytest.raises(ValueError, match="issuer must be an https URL"):
+            _strict_validate(_as_block(authorization_server={"issuer": issuer}), "m", _server_block())
+
+    def test_scopes_and_identity_shapes(self):
+        with pytest.raises(ValueError, match="scopes must be a list of"):
+            _strict_validate(_as_block(authorization_server={"scopes": ["read", ""]}), "m", _server_block())
+        with pytest.raises(ValueError, match="identity must be a non-empty object"):
+            _strict_validate(_as_block(authorization_server={"identity": {}}), "m", _server_block())
+        with pytest.raises(ValueError, match="identity.email is not a known field"):
+            _strict_validate(_as_block(authorization_server={"identity": {"email": "e"}}), "m", _server_block())
+        with pytest.raises(ValueError, match="identity.label_field must be a non-empty string"):
+            _strict_validate(_as_block(authorization_server={"identity": {"label_field": ""}}), "m", _server_block())
+
+    @pytest.mark.parametrize("pid", ["google", "slack", "microsoft", "zoom", "facebook"])
+    def test_hardcoded_provider_cannot_carry_the_block(self, pid):
+        with pytest.raises(ValueError, match="own Python class"):
+            _strict_validate(_as_block(provider_id=pid), "m", _server_block())
+
+    def test_bearer_required_is_required(self):
+        raw = _as_block()
+        raw.pop("bearer_required")
+        raw.pop("proposed_hosts")
+        with pytest.raises(ValueError, match="requires bearer_required=true"):
+            _strict_validate(raw, "m", _server_block())
+
+    def test_url_template_must_be_https_with_a_literal_host(self):
+        with pytest.raises(ValueError, match="https server.url_template with a literal host"):
+            _strict_validate(_as_block(), "m", _server_block(url="http://mcp.notion.com/mcp"))
+        with pytest.raises(ValueError, match="https server.url_template with a literal host"):
+            _strict_validate(_as_block(proposed_hosts=["localhost"]), "m",
+                             _server_block(url="https://${docker_mcp_host}:8935/mcp"))
+
+    def test_url_template_host_must_match_proposed_hosts(self):
+        with pytest.raises(ValueError, match="proposed_hosts must match the server.url_template host 'mcp.linear.app'"):
+            _strict_validate(_as_block(), "m", _server_block(url="https://mcp.linear.app/mcp"))
+        # a wildcard pattern and a case difference both match
+        _strict_validate(_as_block(proposed_hosts=["*.linear.app"]), "m",
+                         _server_block(url="https://MCP.linear.app/mcp"))
+
+    def test_userinfo_url_must_be_https_beside_the_block(self):
+        with pytest.raises(ValueError, match="userinfo_url must be an https URL"):
+            _strict_validate(_as_block(userinfo_url="http://mcp.notion.com/me"), "m", _server_block())
+        _strict_validate(_as_block(userinfo_url="https://mcp.notion.com/me"), "m", _server_block())
+
+    def test_transport_must_be_http_class(self):
+        with pytest.raises(ValueError, match="HTTP-class"):
+            _strict_validate(_as_block(), "m", _server_block(transport="stdio"))
+
+    def test_manifests_without_the_block_keep_their_rules(self):
+        """github-mcp's templated host with proposed_hosts localhost stays valid."""
+        _raw_validate(
+            {"provider_id": "github", "bearer_required": True, "proposed_hosts": ["localhost"]},
+            "github-mcp",
+            {"transport": "streamable_http", "url_template": "http://${docker_mcp_host}:8935/mcp"},
+        )

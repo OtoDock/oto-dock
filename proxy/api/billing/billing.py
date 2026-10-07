@@ -15,10 +15,11 @@ import logging
 
 from fastapi import APIRouter, Depends
 
-from auth.providers import get_current_user, require_auth, UserContext
+from auth.providers import get_current_user, require_auth, UserContext, require_user
 
 logger = logging.getLogger("claude-proxy.billing")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 _ZERO_BALANCE = {
     "balance_usd": 0.0,

@@ -181,11 +181,18 @@ APP_TOOLS: list[Tool] = [
                         "'active_chats', 'project_lanes', 'sessions', 'tasks', 'notifications', "
                         "'trigger_fires', 'file_changes'), method? (platform — a request the page "
                         "makes via otodock.platform: 'viewer.me', 'integrations.status', "
-                        "'tasks.run_result', 'notifications.create'), min_role? ('editor'|'manager' "
+                        "'tasks.run_result', 'notifications.create', 'app.audience' (who uses the "
+                        "app: its members, the agents it is placed in and the people it is shared "
+                        "with; on a page, editors and up of this agent, the owner of a personal "
+                        "app or an admin), "
+                        "'viewer.data.read' / 'viewer.data.write' (a small document per viewer, "
+                        "each page its own; single-file apps only)), min_role? "
+                        "('contributor'|'editor'|'manager' "
                         "— the lowest agent role that may use the action; everyone otherwise), "
                         "args_schema? (fire_task/mcp_tool/platform — flat JSON-Schema object of "
                         "scalar props gating page-supplied args; strings need maxLength or enum; "
-                        "see the skill). Every viewer reads their own slice of a feed or method. "
+                        "see the skill; 'viewer.data.write' takes its doc or patch object with "
+                        "none). Every viewer reads their own slice of a feed or method. "
                         "Omit to keep the current manifest; [] clears it. Changing it requires "
                         "user re-approval."
                     ),
@@ -252,7 +259,11 @@ APP_TOOLS: list[Tool] = [
         description=(
             "List the pinned apps in your scope (shared + the "
             "session user's personal ones) with slug, title, path, "
-            "declared actions, and approval state. Entries marked "
+            "declared actions, and approval state, plus the apps a share "
+            "placed in this agent (another agent's, named by their home "
+            "agent and slug with their id, the role you act at and their "
+            "exported methods: call those with your session token by id; "
+            "never re-pin them). Entries marked "
             "'unpinned' were removed from the user's dashboard — "
             "pin_app(slug) restores one with approval intact. Check "
             "before pin_app so slugs are reused deliberately."
@@ -323,16 +334,25 @@ APP_TOOLS: list[Tool] = [
             "at this\" moment after you built or changed it. In the chat "
             "the user is in, the app opens right away (the overlay, or "
             "the Dock for a chat-scoped one); on another page they get a "
-            "notice with an Open button. Only for a session with a human, "
-            "only on a screen they are using, a few times a minute. The "
-            "result says opened, no_screen, hidden (they parked the app "
-            "off their strip) or off (they turned this off in settings): "
-            "say so instead of retrying."
+            "notice with an Open button. An app a share placed in this "
+            "agent opens too (pass agent, its home agent, when one of "
+            "this agent's own apps or another placed app shares the slug): it arrives as the "
+            "notice with Open, never in this agent's overlay. Only for a "
+            "session with a human, only on a screen they are using, a few "
+            "times a minute. The result says opened, no_screen, hidden "
+            "(they parked the app off their strip; for a placed app, off "
+            "this agent's strip) or off (they turned this off in "
+            "settings): say so instead of retrying."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "The app's slug."},
+                "agent": {
+                    "type": "string",
+                    "description": "The home agent of an app a share placed in this agent "
+                                   "(as list_apps names it); omit for this agent's own apps.",
+                },
                 "visibility": _VISIBILITY_ARG,
             },
             "required": ["slug"],
@@ -444,11 +464,18 @@ APP_TOOLS: list[Tool] = [
             "its exported methods, snapshots and events with their descriptions "
             "and role floors, so you can build against it without reading its "
             "code. Reachable: this agent's own apps, the apps of agents this "
-            "agent delegates to, and the apps of agents the current user is a "
-            "member of; anything else is 'no app to bind to'. To use one, "
-            "declare it in your app.json: \"bindings\": [{\"name\": \"crm\", "
-            "\"agent\": \"<agent>\", \"app\": \"<slug>\"}] — the user approves "
-            "the binding on your card, the target's editor approved its exports."
+            "agent delegates to, the apps of agents the current user is a "
+            "member of, and the apps a share placed in this agent (list_apps "
+            "names them); anything else is 'no app to bind to'. To use one "
+            "from your server, declare it in your app.json: \"bindings\": "
+            "[{\"name\": \"crm\", \"agent\": \"<agent>\", \"app\": \"<slug>\"}] "
+            "— the user approves the binding on your card, the target's editor "
+            "approved its exports. An app placed here you may also call from "
+            "this session: POST $PROXY_URL/v1/apps/<app_id>/api/<method> with "
+            "your session token, at your role here as the share gives it; its "
+            "other routes stay out of reach, and a placement opens no binding: "
+            "your server reaches it only over the usual edge (this agent's "
+            "delegation for a shared app, your membership for your personal app)."
         ),
         inputSchema={
             "type": "object",
@@ -840,6 +867,8 @@ async def _handle_live_hook(op: str, arguments: dict) -> list[TextContent]:
     payload: dict = {"session_id": SESSION_ID, "slug": (arguments.get("slug") or "").strip()}
     if arguments.get("visibility"):
         payload["visibility"] = arguments["visibility"].strip().lower()
+    if op == "open" and arguments.get("agent"):
+        payload["agent"] = str(arguments["agent"]).strip().lower()
     if op == "push":
         payload["payload"] = arguments.get("payload")
     elif op == "state":
@@ -903,7 +932,8 @@ async def _handle_app_hook(op: str, arguments: dict) -> list[TextContent]:
                   f"({data.get('screens', 0)} open screen(s) reloaded). {tail}"),
         )]
     apps = data.get("apps", [])
-    if not apps:
+    placed = data.get("placed", [])
+    if not apps and not placed:
         return [TextContent(type="text", text="No pinned apps in your scope.")]
     lines = []
     for a in apps:
@@ -913,16 +943,53 @@ async def _handle_app_hook(op: str, arguments: dict) -> list[TextContent]:
         approved = "approved" if a.get("actions_approved") else "PENDING APPROVAL"
         pin_scope = a.get("pin_scope", "standing")
         scope_tag = (f", {pin_scope}-scoped" if pin_scope != "standing" else "")
-        kind_tag = ", server app" if a.get("kind") == "folder" else ""
         lines.append(
-            f"- {a.get('slug')} [{a.get('scope')}{scope_tag}{kind_tag}] \"{a.get('title')}\" — "
+            f"- {a.get('slug')} [{a.get('scope')}{scope_tag}{_kind_tag(a)}] \"{a.get('title')}\" — "
             f"id {a.get('id')}, path {a.get('path')}, actions: {acts}"
             + ("" if acts == "none" else f" ({approved})")
             + (f" — waiting: {a['waiting']}" if a.get("waiting") else "")
             + (" — UNPINNED by the user; pin_app(slug) restores it"
                if a.get("unpinned") else "")
         )
-    return [TextContent(type="text", text="Pinned apps:\n" + "\n".join(lines))]
+    text = ("Pinned apps:\n" + "\n".join(lines)) if lines else "No pinned apps of this agent's own."
+    if placed:
+        text += ("\nPlaced here by a share (another agent's apps: call their exported methods "
+                 "by id with your session token, never re-pin them):\n"
+                 + "\n".join(_placed_line(p) for p in placed))
+    return [TextContent(type="text", text=text)]
+
+
+def _kind_tag(a: dict) -> str:
+    return ", server app" if a.get("kind") == "folder" else ""
+
+
+_SHARE_WORDS = {"agent": "an agent share", "department": "a department share",
+                "person": "your own accepted share"}
+
+
+def _placed_line(p: dict) -> str:
+    """One line of ``list_apps`` for an app a share placed in this agent
+    (SHARING.md "Agents use a placed app"): the home pair and the id, how it
+    got here, the role this session acts at, and the calls it answers."""
+    pl = p.get("placement") or {}
+    methods = (p.get("exports") or {}).get("methods") or {}
+    calls = ", ".join(
+        f"{name}" + (f" ({spec.get('min_role')} and up)" if spec.get("min_role") else "")
+        for name, spec in methods.items()
+    )
+    role = p.get("role") or ""
+    acting = (f"as {role}" if role and role != "agent"
+              else "with no person behind this session (methods without a role floor only)")
+    return (
+        f"- {p.get('slug')} of agent {p.get('agent')} [placed by "
+        f"{_SHARE_WORDS.get(pl.get('kind'), 'a share')} at {pl.get('role_cap')}, {acting}"
+        f"{_kind_tag(p)}] \"{p.get('title')}\" — id {p.get('id')}; "
+        + (f"calls: {calls} → POST $PROXY_URL/v1/apps/{p.get('id')}/api/<method>" if calls
+           else "exports no method (nothing for a session to call)")
+        + ("" if p.get("actions_approved") else
+           " — its manifest waits for approval on its home agent; calls answer 404 until then")
+        + (" — hidden by the user in this agent" if p.get("hidden_for_me") else "")
+    )
 
 
 def _deploy_reply(slug: str, data: dict, again: str) -> list[TextContent | ImageContent]:
@@ -1109,9 +1176,16 @@ async def _handle_describe(arguments: dict) -> list[TextContent]:
     if data is None:
         return [TextContent(type="text", text=f"Error (describe): {err}")]
     ex = data.get("exports") or {}
+    b = data.get("binding") or {}
+    placement = data.get("placement") or {}
     lines = [f"'{data.get('slug')}' of agent {data.get('agent')} ({data.get('title')}, app_id "
              f"{data.get('app_id')}) offers:"]
-    words = {"methods": "live calls (GET/POST …/bindings/<name>/<method>[/…])",
+    calls = "live calls ("
+    if b:
+        calls += "GET/POST …/bindings/<name>/<method>[/…] from your server"
+    if placement:
+        calls += ("; " if b else "") + f"from this session: {data.get('call')}"
+    words = {"methods": calls + ")",
              "snapshots": "snapshots (GET …/bindings/<name>/snapshot/<snapshot>, served without waking it)",
              "events": "events (declare handlers.on_event: [\"app:<name>:<event>\"] to be woken)"}
     for kind in ("methods", "snapshots", "events"):
@@ -1120,14 +1194,31 @@ async def _handle_describe(arguments: dict) -> list[TextContent]:
             continue
         lines.append(f"  {words[kind]}:")
         for name, spec in entries.items():
-            floor = f" [{spec.get('min_role')} and up on {data.get('agent')}]" if spec.get("min_role") else ""
+            floor = ""
+            if spec.get("min_role"):
+                judged = ("judged at your role here as the share gives it" if placement and kind == "methods"
+                          else f"on {data.get('agent')}")
+                floor = f" [{spec.get('min_role')} and up, {judged}]"
             lines.append(f"    - {name}: {spec.get('description', '')}{floor}")
     if len(lines) == 1:
         lines.append("  nothing yet — its app.json has no exports block.")
-    b = data.get("binding") or {}
-    lines.append(f"Bind with: \"bindings\": [{{\"name\": \"<your name for it>\", \"agent\": "
-                 f"\"{b.get('agent')}\", \"app\": \"{b.get('app')}\"}}] in your app.json, then "
-                 "deploy_app — the user approves the binding on your card.")
+    if placement:
+        role = placement.get("role") or ""
+        acting = (f"as {role}" if role and role != "agent"
+                  else "with no person behind this session, so only methods without a role floor")
+        lines.append(f"Placed in this agent by {_SHARE_WORDS.get(placement.get('kind'), 'a share')} "
+                     f"at {placement.get('role_cap')}: this session calls its exported methods "
+                     f"{acting} ({data.get('call')}); its snapshots, events, other routes, push, "
+                     "state and platform methods stay out of a session's reach.")
+    if b:
+        lines.append(f"Bind with: \"bindings\": [{{\"name\": \"<your name for it>\", \"agent\": "
+                     f"\"{b.get('agent')}\", \"app\": \"{b.get('app')}\"}}] in your app.json, then "
+                     "deploy_app — the user approves the binding on your card.")
+    else:
+        lines.append("No binding reaches it from here: it was found through the placement alone "
+                     "(its home agent is outside this agent's reach, or it is a personal app, "
+                     "never a binding target), so your server cannot call it over a binding; "
+                     "your sessions call its exported methods as above.")
     return [TextContent(type="text", text="\n".join(lines))]
 
 

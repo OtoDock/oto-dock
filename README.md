@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-Apache-2.0" src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.7.0-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.7.1-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
@@ -191,7 +191,9 @@ when it needs one, run its own server and database.
   <img src=".github/media/story-apps.jpg" alt="A team board with the team's avatars, its own database, platform tools, schedules and notifications, beside a booking page shared by link and opened on a customer's phone" />
 </p>
 
-You can share an app or a chat with a teammate, or with anyone by a link.
+You can share an app or a chat with a teammate, place an app in another
+agent's or a whole department's apps, where that agent's chats and tasks
+call what the app offers, or share either with anyone by a link.
 
 ## Give an agent a phone number
 

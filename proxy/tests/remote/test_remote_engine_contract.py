@@ -28,6 +28,7 @@ def _layer(cm=None) -> RemoteExecutionLayer:
     layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
     layer._cm = cm if cm is not None else MagicMock()
     layer._sessions = {}
+    layer._spawning = set()
     return layer
 
 
@@ -195,7 +196,7 @@ class TestResumeHandle:
                 translator=CodexEventTranslator(model="m", supervised_bg=True))
         info.engine_state.default_consumer = asyncio.Queue()
         info.engine_state.default_consumer.put_nowait(
-            {"type": "_turn_ended", "command_id": "cmd-1"})
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
         return get_layer_by_path("codex-cli").remote_adapter().stream_turn(info, MagicMock())
 
     @pytest.mark.asyncio
@@ -203,19 +204,24 @@ class TestResumeHandle:
         from core.events.common_events import DONE, METADATA
         info = _info("s-1", "codex-cli")
         first = [ev async for ev in self._codex_turn(info, "thread-9")]
-        assert [ev.type for ev in first] == [METADATA, DONE]
+        # The handle's frozen key rides the first turn's first event; the
+        # daemon's own usage metadata and the DONE follow it.
+        assert first[0].type == METADATA and first[-1].type == DONE
         assert first[0].data == {"codex_thread_id": "thread-9"}   # what the pump persists
         second = [ev async for ev in self._codex_turn(info, "thread-9")]
-        assert [ev.type for ev in second] == [DONE]
+        assert second[-1].type == DONE
+        assert not [ev for ev in second if "codex_thread_id" in ev.data]
 
     @pytest.mark.asyncio
     async def test_a_turn_before_the_frame_leaves_the_emit_for_the_next_one(self):
         from core.events.common_events import DONE, METADATA
         info = _info("s-1", "codex-cli")
         early = [ev async for ev in self._codex_turn(info, "")]
-        assert [ev.type for ev in early] == [DONE]
+        assert early[-1].type == DONE
+        assert not [ev for ev in early if "codex_thread_id" in ev.data]
         later = [ev async for ev in self._codex_turn(info, "thread-9")]
-        assert [ev.type for ev in later] == [METADATA, DONE]
+        assert later[0].type == METADATA and later[0].data == {"codex_thread_id": "thread-9"}
+        assert later[-1].type == DONE
 
 
 # --- the old-satellite contract: the start payload, byte for byte -------------

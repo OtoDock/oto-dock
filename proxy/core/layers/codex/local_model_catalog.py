@@ -8,7 +8,7 @@ entry has ``supports_search_tool``; an unknown slug gets the built-in fallback
 local model receives every MCP server as a ``namespace`` tool on every request
 (T1 capture 2026-09-07: 25 tools, 98 functions, 200 KB; the desktop: 47k-113k
 prompt tokens a turn). ``model_catalog_json = "<abs path>"`` in config.toml
-(0.149.1 and 0.153.4 alike) replaces the bundled catalog with the file's
+(0.149.1 through 0.160.0 alike) replaces the bundled catalog with the file's
 entries (longest slug-prefix match); with an entry for the session's model
 Codex sends its built-ins, ``tool_search`` (searched client-side in Codex) and
 ``web_search`` — 12 tools, 35 KB — and Ollama 0.34+ returns the model's
@@ -23,7 +23,7 @@ EMPTY instructions for an entry without a template, and the legacy top-level
 ``codex_base_instructions.md`` next to this module: the verbatim
 ``codex-rs/models-manager/prompt.md`` of the pinned Codex, which is exactly what
 the fallback sends (T1 capture on 0.149.1: 20,751 chars; the file is identical
-at rust-v0.149.1 and rust-v0.153.4). Refresh it on every Codex bump against the
+from rust-v0.149.1 to rust-v0.160.0). Refresh it on every Codex bump against the
 file at the new tag (VERSIONS.md "To bump a CLI version"; attribution in
 ``codex_base_instructions.NOTICE``).
 
@@ -85,7 +85,7 @@ def catalog_provider_supported(provider: str) -> bool:
 
 def local_model_catalog_entry(model: str, context_window: int = 0) -> dict:
     """The ``ModelInfo`` for ``model``: Codex's fallback entry
-    (``model_info_from_slug``, same shape on 0.149.1 and the pinned 0.153.4) with ``supports_search_tool``
+    (``model_info_from_slug``, same shape from 0.149.1 to the pinned 0.160.0) with ``supports_search_tool``
     on, ``tool_mode`` direct, the model LISTED (an unavailable requested model
     is replaced by the first listed one when the app-server allows a provider
     fallback — an unlisted catalog would resolve to no model at all) and the

@@ -520,3 +520,89 @@ async def test_update_now_online_push_registers_the_target(monkeypatch):
         assert sat_ws._pending_pushed_updates.get("m-now") == "9.9.9"
     finally:
         sat_ws._pending_pushed_updates.pop("m-now", None)
+
+
+def _plaintext_update_now_stubs(monkeypatch, *, connected: bool, conn_caps: dict | None):
+    """'Update now' against a machine on a plaintext link: what was sent,
+    broadcast and queued, for the two branches of _do_trigger_update_now."""
+    from api.remote import remote_machines as rm
+    from ws import satellite as sat_ws
+    import core.remote.satellite_connection as sc
+
+    seen = {"sent": [], "broadcast": [], "pending": []}
+
+    class _Conn:
+        capabilities = conn_caps or {}
+
+        async def enqueue_send(self, msg, *, bulk=False):
+            seen["sent"].append(msg)
+
+    class _CM:
+        def is_connected(self, mid):
+            return connected
+
+        def get_connection(self, mid):
+            return _Conn() if connected else None
+
+    async def _broadcast(*a, **k):
+        seen["broadcast"].append(a)
+
+    async def _run_db(fn, *args, **kwargs):
+        if fn is rm.remote_store.set_pending_update:
+            seen["pending"].append(args)
+            return None
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(sc, "get_connection_manager", _CM)
+    monkeypatch.setattr(rm, "_require_satellite_source", lambda: None)
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "sha"))
+    monkeypatch.setattr(rm, "run_db", _run_db)
+    monkeypatch.setattr(sat_ws, "_broadcast_satellite_updating", _broadcast)
+    monkeypatch.setattr(sat_ws, "SATELLITE_VERSION_LATEST", "9.9.9")
+    return rm, sat_ws, seen
+
+
+@pytest.mark.asyncio
+async def test_update_now_refuses_a_connected_satellite_on_a_plaintext_link(monkeypatch):
+    """A satellite on a plaintext link it opted into refuses update_required
+    (satellite/transport/ws_client.py), and the auth path never pushes to it
+    (ws/satellite.py): 'Update now' answers 409 naming the installer re-run,
+    sends nothing, announces nothing and arms no rollback detection."""
+    from fastapi import HTTPException
+
+    rm, sat_ws, seen = _plaintext_update_now_stubs(
+        monkeypatch, connected=True, conn_caps={"insecure_transport": True})
+    sat_ws._pending_pushed_updates.pop("m-plain", None)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await rm._do_trigger_update_now("m-plain", {"satellite_version": "0.9.0"})
+        assert exc.value.status_code == 409
+        assert "re-run the installer" in exc.value.detail
+        assert seen == {"sent": [], "broadcast": [], "pending": []}
+        assert "m-plain" not in sat_ws._pending_pushed_updates
+    finally:
+        sat_ws._pending_pushed_updates.pop("m-plain", None)
+
+
+@pytest.mark.asyncio
+async def test_update_now_refuses_an_offline_satellite_last_seen_on_a_plaintext_link(monkeypatch):
+    """Offline, the capabilities the machine last reported decide: no
+    pending_update is queued for a push its next connect would withhold."""
+    from fastapi import HTTPException
+
+    rm, sat_ws, seen = _plaintext_update_now_stubs(monkeypatch, connected=False, conn_caps=None)
+    machine = {"satellite_version": "0.9.0", "capabilities": '{"insecure_transport": true}'}
+    with pytest.raises(HTTPException) as exc:
+        await rm._do_trigger_update_now("m-plain-off", machine)
+    assert exc.value.status_code == 409
+    assert "re-run the installer" in exc.value.detail
+    assert seen == {"sent": [], "broadcast": [], "pending": []}
+
+
+@pytest.mark.asyncio
+async def test_update_now_still_queues_an_offline_satellite_on_a_secure_link(monkeypatch):
+    rm, _sat_ws, seen = _plaintext_update_now_stubs(monkeypatch, connected=False, conn_caps=None)
+    out = await rm._do_trigger_update_now(
+        "m-tls-off", {"satellite_version": "0.9.0", "capabilities": '{"os": "linux"}'})
+    assert out == {"ok": True, "queued": True, "pushed_now": False}
+    assert seen["pending"] == [("m-tls-off", True)]

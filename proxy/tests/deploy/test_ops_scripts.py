@@ -3,14 +3,18 @@
 backup.sh and restore.sh pick the platform's own Postgres and proxy
 containers (compose labels, else the bare-metal container_name matched
 whole) and refuse to guess between two; a community MCP container whose free
-name merely contains the text is never chosen. backup.sh's apps copy opens
-every app database read-only whatever its file name. install.sh and
-compose.sh create the secrets file private from its first byte.
+name merely contains the text is never chosen. restore.sh refuses while the
+platform answers on the port and address .env publishes it on. backup.sh's
+apps copy opens every app database read-only whatever its file name.
+install.sh and compose.sh create the secrets file private from its first
+byte. dev-setup.sh stops before its first step while the otodock-proxy unit
+is active (otodock-phone too with --phone).
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -79,12 +83,21 @@ EVIL_PROXY = {"id": "evil-proxy", "name": "otodock-abcd1234-mcp-otodock-proxy-x"
                          "com.docker.compose.service": "otodock-proxy"}}
 
 
+# A stand-in for curl: logs the URL it was given and answers only the one
+# FAKE_CURL_UP names (a refused connection otherwise).
+FAKE_CURL = r'''#!/bin/sh
+for a; do url="$a"; done
+echo "$url" >> "$FAKE_CURL_LOG"
+[ "$url" = "${FAKE_CURL_UP:-}" ] || exit 7
+'''
+
+
 @pytest.fixture
 def fakebin(tmp_path):
     b = tmp_path / "bin"
     b.mkdir()
     for name, body in (("docker", FAKE_DOCKER),
-                       ("curl", "#!/bin/sh\nexit 7\n")):
+                       ("curl", FAKE_CURL)):
         p = b / name
         p.write_text(body)
         p.chmod(0o755)
@@ -93,11 +106,12 @@ def fakebin(tmp_path):
 
 def _env(tmp_path, fakebin, containers, **extra):
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("POSTGRES_", "OTODOCK_", "PLATFORM_"))}
+           if not k.startswith(("POSTGRES_", "OTODOCK_", "PLATFORM_", "PROXY_"))}
     env.update({
         "PATH": f"{fakebin}:{env.get('PATH', '/usr/bin:/bin')}",
         "FAKE_CONTAINERS": json.dumps(containers),
         "FAKE_LOG": str(tmp_path / "docker.log"),
+        "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
         "OTODOCK_BACKUP_DIR": str(tmp_path / "backups"),
         "PORT": "1",
     })
@@ -181,6 +195,120 @@ def test_restore_refuses_a_lookalike_or_two(tmp_path, fakebin):
         assert _exec_ids(tmp_path) == []
 
 
+# ── restore.sh refuses while the platform answers ──────────────────────
+
+def _put(folder: Path, files: dict) -> None:
+    """Write ``{name: text}`` into ``folder``; a text of ``...`` makes a directory."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        if text is ...:
+            (folder / name).mkdir()
+        else:
+            (folder / name).write_text(text)
+
+
+def _restore_against(tmp_path, fakebin, up_url, cwd_files=None, install_files=None, **shell):
+    """Run a copy of restore.sh from an install folder, in a separate working
+    folder, with curl answering only ``up_url``; returns the run, the URLs
+    probed and whether the dump was fed to psql. ``PORT`` is empty unless
+    ``shell`` sets it (the harness sets it to 1)."""
+    install, work = tmp_path / "install", tmp_path / "work"
+    (install / "scripts").mkdir(parents=True)
+    shutil.copy2(SCRIPTS / "restore.sh", install / "scripts" / "restore.sh")
+    _put(install, install_files or {})
+    _put(work, cwd_files or {})
+    dump = tmp_path / "d.sql"
+    dump.write_text("SELECT 1;\n")
+    r = subprocess.run(
+        ["bash", str(install / "scripts" / "restore.sh"), str(dump)], cwd=work, input="yes\n",
+        env=_env(tmp_path, fakebin, [PG_T2], FAKE_CURL_UP=up_url, **{"PORT": "", **shell}),
+        capture_output=True, text=True, timeout=60,
+    )
+    log = tmp_path / "curl.log"
+    probed = log.read_text().split() if log.exists() else []
+    docker_log = tmp_path / "docker.log"
+    fed = docker_log.exists() and "psql -v" in docker_log.read_text()
+    return r, probed, fed
+
+
+@pytest.mark.parametrize("cwd_files, install_files, port", [
+    ({".env": "PROXY_PORT=8410\n"}, {}, "8410"),
+    ({".env": 'PROXY_PORT="8411"  # moved\n'}, {}, "8411"),
+    ({".env": "PROXY_PORT=8400\nexport PROXY_PORT='8412'\n"}, {}, "8412"),
+    ({".env": "# PROXY_PORT=8413\nPOSTGRES_DB=otodock\n"}, {}, "8400"),
+    ({".env": ...}, {}, "8400"),
+    ({}, {".env": "PROXY_PORT=8414\n"}, "8414"),
+    ({".env": "PROXY_PORT=8415\n"}, {".env": "PROXY_PORT=8416\n"}, "8416"),
+    ({".env": ...}, {".env": "PROXY_PORT=8417\n"}, "8417"),
+    ({"config.env": "PROXY_PORT=8418\n"}, {}, "8418"),
+    ({".env": "POSTGRES_DB=otodock\n"}, {"config.env": "PROXY_PORT=8419\n"}, "8419"),
+    ({".env": "PROXY_PORT=8422\n"}, {"config.env": "PROXY_PORT=8423\n"}, "8423"),
+    ({"config.env": "PROXY_PORT=8424\n"}, {".env": "POSTGRES_DB=otodock\n"}, "8424"),
+])
+def test_restore_probes_the_port_the_env_files_publish(
+        tmp_path, fakebin, cwd_files, install_files, port):
+    url = f"http://127.0.0.1:{port}/health"
+    r, probed, fed = _restore_against(tmp_path, fakebin, url, cwd_files, install_files)
+    assert r.returncode == 1, r.stderr
+    assert "stop the proxy first" in r.stderr and port in r.stderr
+    assert probed == [url]
+    assert not fed
+
+
+@pytest.mark.parametrize("shell, port", [
+    ({"PROXY_PORT": "8420", "PORT": "8421"}, "8420"),
+    ({"PORT": "8421"}, "8421"),
+])
+def test_restore_prefers_the_shell_port_to_the_env_files(tmp_path, fakebin, shell, port):
+    url = f"http://127.0.0.1:{port}/health"
+    r, probed, fed = _restore_against(
+        tmp_path, fakebin, url, {".env": "PROXY_PORT=8410\n"}, **shell)
+    assert r.returncode == 1, r.stderr
+    assert probed == [url]
+    assert not fed
+
+
+@pytest.mark.parametrize("env_file, shell, hosts", [
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=192.0.2.5\n", {}, ["127.0.0.1", "192.0.2.5"]),
+    ("PROXY_PORT=8410\n", {"PROXY_BIND_IP": "192.0.2.6"}, ["127.0.0.1", "192.0.2.6"]),
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=fd00::5\n", {}, ["127.0.0.1", "[fd00::5]"]),
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=[fd00::6]\n", {}, ["127.0.0.1", "[fd00::6]"]),
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=::\n", {}, ["127.0.0.1", "[::1]"]),
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=127.0.0.1\n", {}, ["127.0.0.1"]),
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=0.0.0.0\n", {}, ["127.0.0.1"]),
+])
+def test_restore_probes_the_bind_address_too(tmp_path, fakebin, env_file, shell, hosts):
+    urls = ([f"http://{hosts[0]}:8410/health", "http://127.0.0.1:8400/health"]
+            + [f"http://{h}:8410/health" for h in hosts[1:]])
+    r, probed, fed = _restore_against(tmp_path, fakebin, urls[-1], {".env": env_file}, **shell)
+    assert r.returncode == 1, r.stderr
+    assert probed == urls
+    assert not fed
+
+
+def test_restore_probes_8400_besides_the_configured_port(tmp_path, fakebin):
+    # A compose .env without PROXY_PORT publishes 8400 whatever config.env says.
+    r, probed, fed = _restore_against(
+        tmp_path, fakebin, "http://127.0.0.1:8400/health", {},
+        {".env": "POSTGRES_DB=otodock\n", "config.env": "PROXY_PORT=8410\n"})
+    assert r.returncode == 1, r.stderr
+    assert "port 8400" in r.stderr
+    assert probed == ["http://127.0.0.1:8410/health", "http://127.0.0.1:8400/health"]
+    assert not fed
+
+
+@pytest.mark.parametrize("env_file, probes", [
+    ("PROXY_PORT=8410\nPROXY_BIND_IP=192.0.2.5\n",
+     ["127.0.0.1:8410", "127.0.0.1:8400", "192.0.2.5:8410"]),
+    ("PROXY_PORT=8400\n", ["127.0.0.1:8400"]),
+])
+def test_restore_runs_when_nothing_answers(tmp_path, fakebin, env_file, probes):
+    r, probed, fed = _restore_against(tmp_path, fakebin, "", {".env": env_file})
+    assert r.returncode == 0, r.stderr
+    assert probed == [f"http://{p}/health" for p in probes]
+    assert fed
+
+
 # ── the apps copy opens every database read-only ───────────────────────
 
 @pytest.mark.skipif(shutil.which("python3") is None, reason="python3 not on PATH")
@@ -243,6 +371,35 @@ def test_install_writes_env_private(tmp_path, fakebin):
     assert "POSTGRES_PASSWORD=" in (inst / ".env").read_text()
 
 
+def _install_function(name: str) -> str:
+    text = (SCRIPTS / "install.sh").read_text()
+    m = re.search(rf"^{name}\(\) \{{.*?^\}}\n", text, re.S | re.M)
+    assert m, name
+    return m.group(0)
+
+
+@pytest.mark.parametrize("env_lines,shell,hinted", [
+    ("DASHBOARD_PUBLIC_URL=https://otodock.example.com\n", {}, True),
+    ('DASHBOARD_PUBLIC_URL="https://otodock.example.com"\nTRUSTED_PROXY=\n', {}, True),
+    ("DASHBOARD_PUBLIC_URL=https://otodock.example.com\nTRUSTED_PROXY=10.200.0.1\n", {}, False),
+    ("DASHBOARD_PUBLIC_URL=http://192.168.1.10:8400\n", {}, False),
+    ("#DASHBOARD_PUBLIC_URL=https://x\n", {}, False),
+    ("", {"DASHBOARD_PUBLIC_URL": "https://otodock.example.com"}, True),
+    ("DASHBOARD_PUBLIC_URL=https://otodock.example.com\n", {"TRUSTED_PROXY": "10.0.0.2"}, False),
+])
+def test_install_names_trusted_proxy_for_an_https_url(tmp_path, env_lines, shell, hinted):
+    (tmp_path / ".env").write_text(env_lines)
+    script = ('say() { echo "$*"; }\n' + _install_function("env_value")
+              + _install_function("trusted_proxy_hint") + "trusted_proxy_hint\n")
+    env = {"PATH": os.environ["PATH"], **shell}
+    r = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert ("TRUSTED_PROXY is empty" in r.stdout) is hinted
+    if hinted:
+        assert "PROXY_BIND_IP=127.0.0.1" in r.stdout and "set TRUSTED_PROXY=" not in r.stdout
+
+
 def test_compose_hint_creates_config_env_private(tmp_path, fakebin):
     root = tmp_path / "root"
     (root / "scripts").mkdir(parents=True)
@@ -259,3 +416,87 @@ def test_compose_hint_creates_config_env_private(tmp_path, fakebin):
                    env=_env(tmp_path, fakebin, []), timeout=60)
     assert stat.S_IMODE((work / "config.env").stat().st_mode) == 0o600
     assert (work / "config.env").read_text().startswith("POSTGRES_PASSWORD=")
+
+
+# ── dev-setup.sh stops while the platform's units run ──────────────────
+
+# A stand-in for systemctl: `is-active --quiet <unit>` answers 0 for a unit
+# FAKE_ACTIVE names and 3 (inactive) otherwise; every call is logged.
+FAKE_SYSTEMCTL = r'''#!/bin/sh
+echo "systemctl $*" >> "$FAKE_CALLS"
+[ "$1" = is-active ] || exit 1
+for unit; do :; done
+case " ${FAKE_ACTIVE:-} " in *" $unit "*) exit 0 ;; esac
+exit 3
+'''
+
+
+def _dev_setup(tmp_path, *flags, active="", systemctl=True):
+    """Run a copy of dev-setup.sh from a scratch platform root whose
+    installer is a stub that logs and exits 7, so a run past the guard stops
+    at its second step. PATH holds only logging fakes of node (answering the
+    pinned major), uv and docker, systemctl unless ``systemctl`` is False,
+    and the system tools the script runs before that step. Returns the run
+    and the calls logged, systemctl's apart."""
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    for name in ("dev-setup.sh", "versions.sh"):
+        shutil.copy2(SCRIPTS / name, root / "scripts" / name)
+    shutil.copy2(REPO / "VERSIONS.md", root / "VERSIONS.md")
+    (root / "scripts" / "install-baseline-tools.sh").write_text(
+        'echo installer >> "$FAKE_CALLS"\nexit 7\n')
+    node = re.search(r"^NODE_VERSION=(\S+)", (REPO / "VERSIONS.md").read_text(), re.M)
+    assert node, "VERSIONS.md has no NODE_VERSION"
+    bodies = {name: f'#!/bin/sh\necho "{name} $*" >> "$FAKE_CALLS"\n' for name in ("uv", "docker")}
+    bodies["node"] = f'#!/bin/sh\necho "node $*" >> "$FAKE_CALLS"\necho v{node.group(1)}\n'
+    if systemctl:
+        bodies["systemctl"] = FAKE_SYSTEMCTL
+    fakes, tools, home = tmp_path / "devbin", tmp_path / "tools", tmp_path / "home"
+    for d in (fakes, tools, home):
+        d.mkdir()
+    for name, body in bodies.items():
+        (fakes / name).write_text(body)
+        (fakes / name).chmod(0o755)
+    # No /usr/bin on PATH: the host's own systemctl, node or sudo is never run.
+    for name in ("bash", "dirname", "head", "id", "sed"):
+        (tools / name).symlink_to(shutil.which(name))
+    calls = tmp_path / "calls.log"
+    calls.touch()
+    r = subprocess.run(
+        [str(tools / "bash"), str(root / "scripts" / "dev-setup.sh"), *flags],
+        cwd=tmp_path, stdin=subprocess.DEVNULL,
+        env={"PATH": f"{fakes}:{tools}", "HOME": str(home), "USER": "tester",
+             "FAKE_CALLS": str(calls), "FAKE_ACTIVE": active},
+        capture_output=True, text=True, timeout=60,
+    )
+    lines = calls.read_text().splitlines()
+    return (r, [c for c in lines if c.startswith("systemctl ")],
+            [c for c in lines if not c.startswith("systemctl ")])
+
+
+@pytest.mark.parametrize("flags, active, unit", [
+    ((), "otodock-proxy", "otodock-proxy"),
+    (("--phone",), "otodock-phone", "otodock-phone"),
+    (("--phone",), "otodock-proxy otodock-phone", "otodock-proxy"),
+])
+def test_dev_setup_stops_while_a_unit_runs(tmp_path, flags, active, unit):
+    r, asked, calls = _dev_setup(tmp_path, *flags, active=active)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"{unit} is running" in r.stderr
+    assert f"sudo systemctl stop {unit}" in r.stderr
+    assert f"systemctl is-active --quiet {unit}" in asked
+    assert calls == []  # no node, uv, docker or installer
+
+
+@pytest.mark.parametrize("active, systemctl", [
+    ("otodock-phone", True),  # the phone unit counts only with --phone
+    ("", True),
+    ("", False),              # a host without systemd skips the check
+])
+def test_dev_setup_goes_on_past_the_guard(tmp_path, active, systemctl):
+    r, asked, calls = _dev_setup(tmp_path, active=active, systemctl=systemctl)
+    assert r.returncode == 7, r.stdout + r.stderr
+    assert "is running" not in r.stderr
+    assert asked == (["systemctl is-active --quiet otodock-proxy"] if systemctl else [])
+    # The Node step ran, then the stub installer ended the run.
+    assert calls[-1] == "installer" and calls[:-1] and set(calls[:-1]) == {"node -v"}

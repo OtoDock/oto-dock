@@ -304,9 +304,9 @@ class TestValidators:
         route = _make_route(agent)
         body = {"identity_mode": "user", "identity_user_sub": member}
         # A malformed or empty PIN is refused before anything changes.
-        for bad in ("12", "", "12345678", "abcd"):
+        for bad in ("12", "1234", "", "12345678", "abcd"):
             r = self._put(client, route["id"], {**body, "pin": bad})
-            assert r.status_code == 400 and "4 to 6 digits" in r.json()["detail"], bad
+            assert r.status_code == 400 and "6 digits" in r.json()["detail"], bad
         assert phone_route_store.get_route(route["id"])["identity_mode"] == "caller"
         assert phone_route_store.get_route_pin(route["id"]) == ""
         r = self._put(client, route["id"], {**body, "pin": "907162"})
@@ -324,15 +324,15 @@ class TestValidators:
     def test_a_pin_needs_an_inbound_post_save_direction(self, client):
         agent = _make_agent()
         route = _make_route(agent)
-        r = self._put(client, route["id"], {"direction": "outbound", "pin": "1234"})
+        r = self._put(client, route["id"], {"direction": "outbound", "pin": "123456"})
         assert r.status_code == 400 and "inbound" in r.json()["detail"]
         assert phone_route_store.get_route(route["id"])["direction"] == "inbound"
         # With a stored PIN the direction check still answers before the 409.
         phone_route_store.set_route_pin(route["id"], "1234")
-        r = self._put(client, route["id"], {"direction": "outbound", "pin": "1234"})
+        r = self._put(client, route["id"], {"direction": "outbound", "pin": "123456"})
         assert r.status_code == 400 and "inbound" in r.json()["detail"]
         outbound = _make_route(agent, "outbound")
-        assert self._put(client, outbound["id"], {"pin": "1234"}).status_code == 400
+        assert self._put(client, outbound["id"], {"pin": "123456"}).status_code == 400
 
     def test_direction_is_an_enum(self, client):
         agent = _make_agent()
@@ -398,7 +398,7 @@ class TestValidators:
         agent = _make_agent()
         member = _make_user(agents=(agent,))
         route = _make_route(agent)
-        body = {"identity_mode": "user", "identity_user_sub": member, "pin": "4711"}
+        body = {"identity_mode": "user", "identity_user_sub": member, "pin": "471125"}
 
         real_set, real_update = phone_route_store.set_route_pin, phone_route_store.update_route
 
@@ -407,7 +407,7 @@ class TestValidators:
         # The credential store fails: 500, nothing changed.
         monkeypatch.setattr(phone_route_store, "set_route_pin", _boom)
         r = self._put(client, route["id"], body)
-        assert r.status_code == 500 and "4711" not in r.text
+        assert r.status_code == 500 and "471125" not in r.text
         assert phone_route_store.get_route(route["id"])["identity_mode"] == "caller"
         assert phone_route_store.get_route_pin(route["id"]) == ""
         monkeypatch.setattr(phone_route_store, "set_route_pin", real_set)
@@ -430,7 +430,7 @@ class TestValidators:
         listed = {r["id"]: r for r in client.get("/v1/admin/phone/routes").json()["routes"]}
         assert any("no PIN" in w for w in listed[inbound["id"]]["warnings"])
         # Setting a PIN clears the advisory; removing it brings it back.
-        client.put(f"/v1/admin/phone/routes/{inbound['id']}/pin", json={"value": "4711"})
+        client.put(f"/v1/admin/phone/routes/{inbound['id']}/pin", json={"value": "471125"})
         listed = {r["id"]: r for r in client.get("/v1/admin/phone/routes").json()["routes"]}
         assert listed[inbound["id"]]["warnings"] == []
         r = client.delete(f"/v1/admin/phone/routes/{inbound['id']}/pin",

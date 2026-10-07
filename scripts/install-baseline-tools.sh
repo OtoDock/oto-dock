@@ -6,6 +6,7 @@
 #
 #   - `satellite/install.sh`     (satellite hosts — calls this before pairing)
 #   - the platform `Dockerfile`  (Docker deployments — baked into the image via RUN)
+#   - `scripts/dev-setup.sh`     (the bare-metal dev bootstrap)
 #
 # (A bare-metal platform `setup.sh` install path is planned but not yet wired.)
 #
@@ -14,15 +15,23 @@
 #
 # Tier 1 — coding essentials:  git, gh, python+pipx+uv, node+npm+pnpm,
 #                              curl, wget, jq, ripgrep, tree, make, gcc,
-#                              build-essential, ca-certificates, gnupg
+#                              build-essential, ca-certificates, gnupg,
+#                              openssh-client, bubblewrap, Bun (Linux)
 # Tier 2 — document inspection: poppler-utils, sqlite3
+# Required (Linux):            passt (pasta) + iproute2 (network isolation)
+# Optional (Linux):            xfsprogs, hard storage quotas
+# Every OS:                    sympy in the agents' python
 # CLIs:                        claude (Anthropic), codex (OpenAI) — via npm
 # Git credential helper:       /usr/local/bin/oto-git-credential-helper +
 #                              `/etc/gitconfig` wiring so sandboxed `git`
 #                              consults `GH_TOKEN` (from manifest
 #                              `env_injection`) for github.com URLs.
 #
-# Idempotent — re-running is a no-op for already-installed tools.
+# Idempotent — re-running installs what is missing, upgrades an older uv or pnpm
+# (a newer one stays), moves Bun and the two CLIs to their exact pins, and lets
+# apt bring its packages to the distro's current version; Node and sympy are
+# left once present. On macOS `brew install` brings each formula to brew's
+# current version.
 # Auto-detects EUID: if root, runs apt/cmds directly; else prefixes with sudo.
 #
 # Usage:
@@ -101,6 +110,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CREDENTIAL_HELPER_SRC="$SCRIPT_DIR/oto-git-credential-helper"
 CREDENTIAL_HELPER_DST="/usr/local/bin/oto-git-credential-helper"
 
+# True when version $1 is older than $2 (an equal version is not older).
+_older() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+# A version for a message: "0" marks a copy whose --version said nothing.
+_shown() { if [ "$1" = 0 ]; then echo "(no version)"; else echo "$1"; fi; }
+
 # ──────────────────────────────────────────────────────────────────────
 # Linux (Debian/Ubuntu) — apt path
 # ──────────────────────────────────────────────────────────────────────
@@ -144,7 +158,7 @@ install_linux_tier_1() {
     # (pnpm + the claude/codex CLI installs) falls over with "npm not
     # present" — first hit on a fresh dev-VM satellite pairing. Same keyring
     # pattern as the gh repo above; idempotent.
-    local node_ver="${NODE_VERSION:-24.18.0}"
+    local node_ver="${NODE_VERSION:-24.21.0}"
     local node_major="${node_ver%%.*}"
     if ! command -v npm &>/dev/null; then
         info "Adding NodeSource apt repo (node ${node_major}.x)..."
@@ -164,36 +178,89 @@ install_linux_tier_1() {
     # installs/images non-reproducible). Keep UV_VERSION in sync with VERSIONS.md;
     # the Docker build runs this BEFORE VERSIONS.md is copied in, so the default
     # is carried here (same as the claude/codex pins below).
-    local uv_ver="${UV_VERSION:-0.11.24}"
-    if ! command -v uv &>/dev/null; then
-        info "Installing uv ${uv_ver} to /usr/local/bin..."
-        # `pipx install --global` (drops binaries straight into /usr/local/bin)
-        # needs pipx >= 1.5; Debian/Ubuntu ship an older pipx, so fall back to a
-        # plain pipx install and COPY the resolved binaries into /usr/local/bin.
-        # A copy — NOT a symlink into $HOME — because the runtime user routinely
-        # differs from the installing user (the Docker image builds as root but
-        # runs as uid 1000; the bwrap sandbox mounts /usr but not $HOME), and
-        # $HOME (/root) is mode 0700, so a $HOME-bound symlink is unreachable to
-        # both. uv/uvx are self-contained static binaries → a copy runs anywhere.
-        if ! $SUDO pipx install --global "uv==${uv_ver}" 2>/dev/null; then
-            pipx install "uv==${uv_ver}"
+    # An installed uv older than the pin is upgraded (as the CLIs are below); a
+    # newer one is left alone. The version that decides is /usr/local/bin/uv's,
+    # the copy this script owns and the sandboxes see, else the one on PATH,
+    # which is then copied in when it is at or above the pin: the sandboxes
+    # mount /usr and never $HOME, so /usr/local/bin/uv must exist either way.
+    # A copy that does not run without $HOME is removed and the pin installed.
+    # The install itself also replaces the installing user's ~/.local/bin/uv:
+    # pipx --force takes that path whatever sits there.
+    local uv_ver="${UV_VERSION:-0.12.23}" uv_have="" uv_bin="/usr/local/bin/uv"
+    local uv_install=true uv_clean=""
+    [ -x "$uv_bin" ] || uv_bin="$(command -v uv 2>/dev/null || true)"
+    if [ -n "$uv_bin" ]; then uv_have="$(_cli_ver "$uv_bin")"; uv_have="${uv_have:-0}"; fi
+    if [ -n "$uv_have" ] && ! _older "$uv_have" "$uv_ver"; then
+        uv_install=false
+        [ "$uv_have" = "$uv_ver" ] || warn "uv ${uv_have} is newer than the pin ${uv_ver} — left as it is"
+        if [ "$uv_bin" != /usr/local/bin/uv ]; then
+            # A real file, as below; uvx is taken from beside the PATH uv.
+            info "Copying uv ${uv_have} from ${uv_bin} to /usr/local/bin..."
             for _b in uv uvx; do
-                src="$(command -v "$_b" 2>/dev/null || echo "$HOME/.local/bin/$_b")"
-                if [ -e "$src" ] && [ ! -e "/usr/local/bin/$_b" ]; then
-                    $SUDO cp -Lf "$src" "/usr/local/bin/$_b"
-                fi
+                src="${uv_bin%/*}/$_b"
+                [ -e "$src" ] || continue
+                $SUDO install -m 0755 "$(readlink -f "$src")" "/usr/local/bin/$_b" \
+                    || warn "could not copy $_b into /usr/local/bin"
             done
+            # The copy must run as a sandbox runs it, with no $HOME and a
+            # system PATH. A version manager's shim (mise's resolves to the
+            # mise binary, asdf's is a script that needs ASDF_DIR) passes the
+            # check above on the host and fails here; it is removed so that a
+            # re-run judges the PATH uv again, and the pin goes in instead.
+            uv_clean="$({ env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent \
+                /usr/local/bin/uv --version </dev/null 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; } || true)"
+            if [ "$uv_clean" != "$uv_have" ]; then
+                warn "uv copied from ${uv_bin} does not run without \$HOME (a version manager's shim?) — installing the pin instead"
+                $SUDO rm -f /usr/local/bin/uv /usr/local/bin/uvx
+                uv_have=""; uv_install=true
+            fi
+        fi
+    fi
+    if [ "$uv_install" = true ]; then
+        info "Installing uv ${uv_ver}${uv_have:+ over $(_shown "$uv_have")} to /usr/local/bin..."
+        # A plain pipx install, then a COPY of the binaries into /usr/local/bin
+        # — never a link: the runtime user routinely differs from the
+        # installing one (the Docker image builds as root but runs as uid 1000;
+        # the bwrap sandbox mounts /usr but not $HOME or /opt), so a link into
+        # $HOME or into `pipx --global`'s /opt/pipx is unreachable to agents.
+        # uv/uvx are self-contained static binaries → a copy runs anywhere.
+        # `install` replaces the destination, where `cp` would write through a
+        # link left there by an earlier `pipx --global`.
+        if pipx install --force "uv==${uv_ver}"; then
+            for _b in uv uvx; do
+                src="${PIPX_BIN_DIR:-$HOME/.local/bin}/$_b"
+                [ -e "$src" ] || continue
+                $SUDO install -m 0755 "$(readlink -f "$src")" "/usr/local/bin/$_b" \
+                    || warn "could not copy $_b into /usr/local/bin"
+            done
+            hash -r
+            _verify_resolved_cli "uv" "uv" "$uv_ver"
+        elif [ -n "$uv_have" ]; then
+            warn "uv ${uv_ver} did not install — $(_shown "$uv_have") stays"
+        else
+            err "uv ${uv_ver} did not install"; exit 1
         fi
     fi
 
     # pnpm — needs npm to bootstrap. PINNED to an exact version (keep
-    # PNPM_VERSION in sync with VERSIONS.md; v11 is the current major).
-    local pnpm_ver="${PNPM_VERSION:-11.9.0}"
-    if command -v npm &>/dev/null && ! command -v pnpm &>/dev/null; then
+    # PNPM_VERSION in sync with VERSIONS.md; a new major is a deliberate bump),
+    # with the uv rule above: absent or older is installed, newer is left alone.
+    local pnpm_ver="${PNPM_VERSION:-11.28.2}" pnpm_have=""
+    if command -v pnpm &>/dev/null; then pnpm_have="$(_cli_ver pnpm)"; pnpm_have="${pnpm_have:-0}"; fi
+    if ! command -v npm &>/dev/null; then
+        warn "npm not present — install Node ${node_major} LTS first, then re-run for pnpm."
+    elif [ -n "$pnpm_have" ] && ! _older "$pnpm_have" "$pnpm_ver"; then
+        [ "$pnpm_have" = "$pnpm_ver" ] || warn "pnpm ${pnpm_have} is newer than the pin ${pnpm_ver} — left as it is"
+    elif [ -z "$pnpm_have" ]; then
         info "Installing pnpm ${pnpm_ver} via npm..."
         $SUDO npm install -g "pnpm@${pnpm_ver}"
-    elif ! command -v npm &>/dev/null; then
-        warn "npm not present — install Node 24 LTS first, then re-run for pnpm."
+    elif info "Upgrading pnpm $(_shown "$pnpm_have") → ${pnpm_ver} via npm..." \
+            && $SUDO npm install -g "pnpm@${pnpm_ver}"; then
+        hash -r
+        _verify_resolved_cli "pnpm" "pnpm" "$pnpm_ver"
+    else
+        warn "pnpm ${pnpm_ver} did not install — $(_shown "$pnpm_have") stays"
     fi
 
     ok "Tier 1 installed"
@@ -250,11 +317,11 @@ install_netns_tools() {
     # REQUIRED — sandbox network isolation is always on. `passt` provides
     # `pasta`, which wraps every local agent sandbox in an isolated network
     # namespace; `iproute2` provides `ip` for the in-netns route blackholes.
-    # The proxy's startup preflight (core/sandbox.netns_preflight) hard-fails
-    # if either is missing, so a missing tool here would only defer the failure
-    # to first boot — install it now (auto-fetching the upstream static pasta
-    # on distros without it, e.g. Ubuntu 22.04/jammy). See VERSIONS.md
-    # (PASST_VERSION) + docs/architecture/SANDBOX.md.
+    # The proxy's startup preflight (core/sandbox/sandbox.py::netns_preflight)
+    # hard-fails if either is missing, so a missing tool here would only defer
+    # the failure to first boot — install it now (auto-fetching the upstream
+    # static pasta on distros without it, e.g. Ubuntu 22.04/jammy). See
+    # VERSIONS.md (PASST_VERSION) + docs/architecture/SANDBOX.md.
     info "Required — network-isolation tools (passt + iproute2)..."
     $SUDO apt-get install -y --no-install-recommends iproute2 || {
         err "iproute2 (ip) is required for sandbox network isolation."; exit 1; }
@@ -388,19 +455,25 @@ install_sympy() {
 
 # Pinned CLI versions — keep in sync with VERSIONS.md (CLAUDE_CODE_VERSION /
 # CODEX_VERSION). We pin exact versions because the platform runs against a
-# verified CLI (auto-update is disabled in-app). These defaults are overridable
-# via the matching env vars (compose.sh passes the VERSIONS.md values in);
+# verified CLI (auto-update is disabled in-app). These defaults are what every
+# Docker image installs: the proxy image runs this script before VERSIONS.md is
+# copied in, and nothing passes the VERSIONS.md values down (a pairing or a
+# bare-metal run may override them through the matching env vars);
+# proxy/tests/execution/test_engine_descriptor.py holds them equal to the rows.
 # _install_pinned_cli upgrades an existing install to the exact pin rather than
 # skipping it.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.281}"
-CODEX_VERSION="${CODEX_VERSION:-0.156.1}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.289}"
+CODEX_VERSION="${CODEX_VERSION:-0.160.0}"
 
 # Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
 # "codex-cli 0.139.0").
-_cli_ver() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+# Never fails (a tool whose --version breaks reads as empty under set -e) and
+# never waits on stdin (a corepack shim may ask before downloading).
+_cli_ver() { { "$1" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; } || true; }
 
-# After an install/upgrade, verify what the shell NOW resolves. npm places
-# the pinned copy in its global prefix, but PATH may still resolve another
+# After an install/upgrade, verify what the shell NOW resolves. The install
+# places the pinned copy in its own location (npm's global prefix,
+# /usr/local/bin for uv), but PATH may still resolve another
 # install (e.g. the vendor's standalone installer under ~/.local/bin) — the
 # upgrade then silently changes nothing for anything that spawns "$bin".
 # Warn with every resolvable copy and its version so the shadow is obvious.
@@ -413,10 +486,10 @@ _verify_resolved_cli() {
     fi
     warn "${label}: '${bin}' still resolves ${now:-nothing} — want ${want}."
     warn "Another install shadows the pinned copy on PATH:"
-    local p
+    local p v
     while read -r p; do
         [ -n "$p" ] || continue
-        warn "  ${p} ($("$p" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1))"
+        v="$(_cli_ver "$p")"; warn "  ${p} ($(_shown "${v:-0}"))"
     done < <(type -aP "$bin" 2>/dev/null | awk '!seen[$0]++')
     warn "Remove or upgrade the shadowing copy so '${bin}' resolves ${want}."
     return 0
@@ -427,7 +500,9 @@ _verify_resolved_cli() {
 # install is upgraded — not skipped. This is what keeps the version the proxy
 # actually spawns (resolved from PATH) in lockstep with VERSIONS.md; a plain
 # "already installed → skip" let the system /usr install drift stale while a
-# newer user-prefix copy sat unused.
+# newer user-prefix copy sat unused. --allow-scripts lets the CLI's own install
+# step run under npm 12, which blocks it by default (Claude Code's puts its
+# native binary in place; without it `claude` is a stub that exits 1).
 _install_pinned_cli() {
     local label="$1" pkg="$2" bin="$3" want="$4"
     if command -v "$bin" &>/dev/null; then
@@ -438,14 +513,14 @@ _install_pinned_cli() {
         fi
         if command -v npm &>/dev/null; then
             info "Upgrading ${label} ${have:-unknown} → ${want}..."
-            $SUDO npm install -g "${pkg}@${want}"
+            $SUDO npm install -g --allow-scripts="${pkg}" "${pkg}@${want}"
             _verify_resolved_cli "$label" "$bin" "$want"
         else
             warn "${label} is ${have:-unknown}, want ${want}, but npm not present to upgrade."
         fi
     elif command -v npm &>/dev/null; then
         info "Installing ${label} ${want}..."
-        $SUDO npm install -g "${pkg}@${want}"
+        $SUDO npm install -g --allow-scripts="${pkg}" "${pkg}@${want}"
         _verify_resolved_cli "$label" "$bin" "$want"
     else
         warn "Cannot install ${label}: npm not present."
@@ -545,8 +620,11 @@ main() {
                     warn "Failed to restart $svc — check: systemctl status $svc"
             fi
         done
+    # Only a unit that is running needs the restart: dev-setup.sh runs this
+    # script with otodock-proxy stopped (it refuses while the unit is
+    # active), so keying on is-enabled would call a stopped unit running.
     elif command -v systemctl &>/dev/null && \
-         systemctl is-enabled otodock-proxy >/dev/null 2>&1; then
+         systemctl is-active --quiet otodock-proxy; then
         echo ""
         warn "Platform services are running. Restart them so bwrap remounts pick"
         warn "up new tools and /etc/gitconfig:"

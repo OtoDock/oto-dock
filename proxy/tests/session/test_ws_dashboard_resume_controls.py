@@ -89,7 +89,8 @@ class TestResumeValidation:
         Shared-only agent an assigned editor opens the ``agent::`` pool, not
         a colleague's per-user chat from before the switch, and not a phone
         call (the conversations list is managers-only); a manager opens
-        the call. The agent's mode itself decides nothing."""
+        the call, read-only (its history, no session bind). The agent's
+        mode itself decides nothing."""
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         from core.session import session_kind
         from core.session.visibility import PHONE_CHAT_OWNER, shared_chat_owner
@@ -125,7 +126,11 @@ class TestResumeValidation:
                                      name="Manager User", role="creator")
             async with dashboard_connection(manager) as ws:
                 await drain_startup(ws)
-                await _opens(ws, call)
+                ws.client_send({"type": "resume_chat", "chat_id": call})
+                frame = await ws.next_frame()
+                assert (frame["type"], frame["chat_id"]) == ("chat_history", call), frame
+                await asyncio.sleep(0.2)
+                ws.no_more_frames()
                 ws.client_send({"type": "resume_chat", "chat_id": pre_switch})
                 await ws.expect({"type": "error", "message": "Access denied"})
         run_ws_scenario(scenario)
@@ -145,7 +150,7 @@ async def _frames_until_pong(ws) -> list[dict]:
 
 class TestByIdFramesFollowTheOpenRule:
     """Every frame that names a chat the socket is not bound to passes the
-    rule ``resume_chat`` binds by (``can_open_chat``): on a Shared-only
+    rule ``resume_chat`` binds by (``can_access_chat``): on a Shared-only
     agent an assigned editor reaches the ``agent::`` pool, never a
     colleague's per-user chat from before the switch — not its mode, model
     or execution mode, not its live session, not its history, not a turn
@@ -222,8 +227,24 @@ class TestByIdFramesFollowTheOpenRule:
         contributor = session_cookie(sub="user-viewer", email="viewer@test.com",
                                      name="Viewer User", role="member")
 
+        stored = task_store.get_chat(pool)
+
         def _refused(frame: dict) -> bool:
             return frame.get("type") == "error" and "editor role" in frame.get("message", "")
+
+        # A refused pick answers with the chat's stored value (the picker
+        # takes it back), never an error frame: the sentence reaches the
+        # person as the locked pickers' tooltip (drive_refusal below).
+        echoes = {
+            "mode_change": {"type": "mode_changed", "chat_id": pool,
+                            "mode": stored["permission_mode"]},
+            "model_change": {"type": "model_changed", "chat_id": pool,
+                             "model": stored.get("model", "")},
+            "execution_mode_change": {"type": "execution_mode_changed", "chat_id": pool,
+                                      "execution_mode": stored.get("execution_mode") or ""},
+            "execution_mode_switch": {"type": "execution_mode_changed", "chat_id": pool,
+                                      "execution_mode": stored.get("execution_mode") or ""},
+        }
 
         async def scenario():
             async with dashboard_connection(contributor) as ws:
@@ -238,19 +259,21 @@ class TestByIdFramesFollowTheOpenRule:
                      "chat_id": pool},
                 ):
                     ws.client_send(frame)
-                    assert _refused(await ws.next_frame()), frame
-                # Reading the shared history stays open, and binds the socket.
+                    assert await ws.next_frame() == echoes[frame["type"]], frame
+                # Reading the shared history stays open, binds the socket and
+                # carries the drive gate's sentence for the locked pickers.
                 ws.client_send({"type": "resume_chat", "chat_id": pool})
                 hist = await ws.next_frame()
                 assert hist["type"] == "chat_history", hist
+                assert "editor role" in hist["drive_refusal"], hist
                 ready = await ws.next_frame()
                 assert ready["type"] == "warmup_ready" and ready["session_id"] == live_sid, ready
                 await ws.expect({"type": "queue_snapshot", "chat_id": pool, "messages": []})
                 # Bound: the live session is a colleague's.
                 ws.client_send({"type": "mode_change", "mode": "dontAsk", "chat_id": pool})
-                assert _refused(await ws.next_frame())
+                assert await ws.next_frame() == echoes["mode_change"]
                 ws.client_send({"type": "model_change", "model": TEST_MODEL, "chat_id": pool})
-                assert _refused(await ws.next_frame())
+                assert await ws.next_frame() == echoes["model_change"]
                 ws.client_send({"type": "chat", "text": "PM INJECTED", "chat_id": pool})
                 assert _refused(await ws.next_frame())
                 await ws.expect({"type": "done", "chat_id": pool})
@@ -263,6 +286,44 @@ class TestByIdFramesFollowTheOpenRule:
         assert layer.mode_changes == [] and layer.model_changes == []
         assert layer.closed_sessions == [] and layer.messages == []
         assert live_sid in layer.alive
+
+    def test_a_chat_that_may_not_be_opened_is_refused_without_its_settings(
+            self, temp_db, monkeypatch):
+        """A pick naming a chat this person may not open answers "Access
+        denied" and nothing else: no echo carries that chat's stored mode,
+        model or execution mode. An editor on the pool may drive it: the
+        history frame carries no drive_refusal key."""
+        from core.session.visibility import shared_chat_owner
+        from storage import database as task_store
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent(collaborative=True, default_scope="user")
+        task_store.add_user_agent("user-viewer", slug, "editor", "test")
+        private = _make_chat(slug, user_sub="user-other")
+        pool_agent = make_test_agent(collaborative=False, default_scope="agent")
+        task_store.add_user_agent("user-viewer", pool_agent, "editor", "test")
+        pool = _make_chat(pool_agent, user_sub=shared_chat_owner(pool_agent))
+        editor = session_cookie(sub="user-viewer", email="viewer@test.com",
+                                name="Viewer User", role="member")
+
+        async def scenario():
+            async with dashboard_connection(editor) as ws:
+                await drain_startup(ws)
+                for frame in (
+                    {"type": "mode_change", "mode": "dontAsk", "chat_id": private},
+                    {"type": "model_change", "model": TEST_MODEL, "chat_id": private},
+                    {"type": "execution_mode_change", "execution_mode": "interactive",
+                     "chat_id": private},
+                    {"type": "execution_mode_switch", "execution_mode": "interactive",
+                     "chat_id": private},
+                ):
+                    ws.client_send(frame)
+                    assert await ws.next_frame() == {"type": "error", "message": "Access denied"}
+                ws.client_send({"type": "resume_chat", "chat_id": pool})
+                hist = await ws.next_frame()
+                assert hist["type"] == "chat_history" and "drive_refusal" not in hist, hist
+        run_ws_scenario(scenario)
+        assert task_store.get_chat(private)["permission_mode"] == "default"
 
     def test_a_read_only_viewer_is_never_the_sink_the_zone_or_the_location(
             self, temp_db, monkeypatch):
@@ -399,6 +460,9 @@ class TestByIdFramesFollowTheOpenRule:
 
         denied, sent = asyncio.run(scenario("user-viewer"))
         assert denied and any("editor role" in f.get("message", "") for f in sent)
+        # Worded by what the chat runs as: the agent is not Shared-only.
+        assert denied.startswith("This chat runs as the agent itself")
+        assert "Shared only" not in denied and "run as contributor" in denied
         denied, sent = asyncio.run(scenario("user-viewer2"))
         assert not denied and sent == []
         # A per-user chat on the same agent is its owner's: nothing to gate.
@@ -611,10 +675,12 @@ class TestBoundTaskChatFramesPassTheContinueGate:
         sent = asyncio.run(scenario())
         assert get_session_mode("sid-pool") == "default"
         # The viewer holds no role row on the Shared-only agent, so the drive
-        # gate refuses first; a below-editor viewer WITH a row on the agent's
-        # terminal gets the terminal's own read_only answer. Either refusal
-        # leaves the colleague's mode alone.
-        assert any(f.get("state") == "read_only" or "editor role" in f.get("message", "")
+        # gate refuses first and the picker gets the stored mode back; a
+        # below-editor viewer WITH a row on the agent's terminal gets the
+        # terminal's own read_only answer. Either refusal leaves the
+        # colleague's mode alone.
+        assert any(f.get("state") == "read_only"
+                   or f == {"type": "mode_changed", "chat_id": pool, "mode": "default"}
                    for f in sent), sent
         assert layer.mode_changes == []
 
@@ -1107,21 +1173,27 @@ class TestStreamingTurnControls:
                 # queue two messages while streaming, cancel the first
                 from core.session import session_events
                 t0 = time.monotonic()
-                ws.client_send({"type": "chat", "text": "queued A"})
-                await ws.expect({"type": "queued", "index": 0,
-                                 "text": "queued A", "chat_id": chat_id})
+                ws.client_send({"type": "chat", "text": "queued A", "queue_id": "qa"})
+                await ws.expect({"type": "queued", "index": 0, "queue_id": "qa",
+                                 "text": "queued A", "author_sub": "user-admin",
+                                 "chat_id": chat_id})
                 # A queued message cuts the turn: no check judges or
                 # continues it (CHECKS.md).
                 assert session_events.user_message_since(sid, t0)
-                ws.client_send({"type": "chat", "text": "queued B"})
-                await ws.expect({"type": "queued", "index": 1,
-                                 "text": "queued B", "chat_id": chat_id})
-                ws.client_send({"type": "cancel_queued", "index": 0})
-                await ws.expect({"type": "queue_removed", "index": 0,
-                                 "text": "queued A", "chat_id": chat_id})
+                ws.client_send({"type": "chat", "text": "queued B", "queue_id": "qb"})
+                await ws.expect({"type": "queued", "index": 1, "queue_id": "qb",
+                                 "text": "queued B", "author_sub": "user-admin",
+                                 "chat_id": chat_id})
+                # By its id (a 1.7.0 client's index is the fallback): the
+                # author's composer gets the text back.
+                ws.client_send({"type": "cancel_queued", "queue_id": "qa", "index": 0})
+                await ws.expect({"type": "queue_removed", "queue_id": "qa", "index": 0,
+                                 "returned": True, "text": "queued A",
+                                 "chat_id": chat_id})
 
                 hold.set()  # first turn completes; queue drains as turn 2
-                await ws.expect({"type": "queue_sent", "text": "queued B",
+                await ws.expect({"type": "queue_sent", "queue_ids": ["qb"],
+                                 "message_ids": ANY, "text": "queued B",
                                  "chat_id": chat_id})
                 await ws.expect({"type": "text", "content": "drained",
                                  "chat_id": chat_id})
@@ -1225,7 +1297,7 @@ class TestStreamingTurnControls:
                 })
                 steered = await ws.expect({
                     "type": "steered", "text": "see these", "chat_id": chat_id,
-                    "images": ANY,
+                    "queue_id": ANY, "message_id": ANY, "images": ANY,
                     "files": [{"path": rel_file, "name": "notes.txt"}],
                 })
                 assert steered["images"][0]["name"] == "dot.png"
@@ -1243,13 +1315,15 @@ class TestStreamingTurnControls:
                     "images": [{"data": _PNG_DATA_URL, "name": "only.png"}],
                 })
                 queued = await ws.expect({
-                    "type": "queued", "index": 0, "text": "",
-                    "chat_id": chat_id, "images": ANY,
+                    "type": "queued", "index": 0, "text": "", "queue_id": ANY,
+                    "author_sub": "user-admin", "chat_id": chat_id, "images": ANY,
                 })
                 assert queued["images"][0]["name"] == "only.png"
 
                 hold.set()
                 sent = await ws.expect({"type": "queue_sent", "text": "",
+                                        "queue_ids": [queued["queue_id"]],
+                                        "message_ids": ANY,
                                         "chat_id": chat_id, "images": ANY})
                 assert sent["images"][0]["name"] == "only.png"
                 await ws.expect({"type": "text", "content": "drained",
@@ -1262,14 +1336,17 @@ class TestStreamingTurnControls:
                                  "body": "Response ready"})
 
                 msgs = temp_db.get_chat_messages(chat_id)
+                # The steer's row lands where the engine read it: after the
+                # text the turn produced before it.
                 assert [(m["role"], m["content"]) for m in msgs] == [
                     ("user", "long job"),
-                    ("user", "see these"),
                     ("assistant", "working…"),
+                    ("user", "see these"),
                     ("user", ""),
                     ("assistant", "drained"),
                 ]
-                steered_meta = json.loads(msgs[1]["event_data"])
+                assert steered["message_id"] == msgs[2]["id"]
+                steered_meta = json.loads(msgs[2]["event_data"])
                 assert steered_meta["files"] == [{"path": rel_file, "name": "notes.txt"}]
                 assert steered_meta["images"][0]["path"] == saved
                 drained_meta = json.loads(msgs[3]["event_data"])
@@ -1299,14 +1376,15 @@ class TestStreamingTurnControls:
                 ws.client_send({"type": "chat", "text": "later",
                                 "files": [{"path": rel_file, "name": "notes.txt"}]})
                 await ws.expect({
-                    "type": "queued", "index": 0, "text": "later",
-                    "chat_id": chat_id,
+                    "type": "queued", "index": 0, "text": "later", "queue_id": ANY,
+                    "author_sub": "user-admin", "chat_id": chat_id,
                     "files": [{"path": rel_file, "name": "notes.txt"}],
                 })
+                # A 1.7.0 client cancels by index.
                 ws.client_send({"type": "cancel_queued", "index": 0})
                 await ws.expect({
-                    "type": "queue_removed", "index": 0, "text": "later",
-                    "chat_id": chat_id,
+                    "type": "queue_removed", "index": 0, "queue_id": ANY,
+                    "returned": True, "text": "later", "chat_id": chat_id,
                     "files": [{"path": rel_file, "name": "notes.txt"}],
                 })
                 hold.set()
@@ -1345,10 +1423,11 @@ class TestStreamingTurnControls:
                 ws.client_send({"type": "chat", "text": "look",
                                 "images": [{"data": _PNG_DATA_URL, "name": "dot.png"}]})
                 await ws.expect({"type": "queued", "index": 0, "text": "look",
+                                 "queue_id": ANY, "author_sub": "user-admin",
                                  "chat_id": chat_id, "images": ANY})
                 hold.set()
-                await ws.expect({"type": "queue_sent", "text": "look",
-                                 "chat_id": chat_id, "images": ANY})
+                await ws.expect({"type": "queue_sent", "text": "look", "queue_ids": ANY,
+                                 "message_ids": ANY, "chat_id": chat_id, "images": ANY})
                 await ws.expect({"type": "text", "content": "drained",
                                  "chat_id": chat_id})
                 await ws.expect({"type": "done", "chat_id": chat_id})
@@ -1367,8 +1446,9 @@ class TestStreamingTurnControls:
 
     def test_steer_accepted_mid_stream(self, temp_db, monkeypatch):
         # A steer-capable engine (Codex) takes the mid-turn message INTO the
-        # running turn: `steered` frame (no queue entry), user row persisted
-        # immediately, and the queue drain never runs it as a second turn.
+        # running turn: `steered` frame (no queue entry) with its row's id,
+        # the row recorded in stream order, and the queue drain never runs
+        # it as a second turn.
         from core.events.common_events import CommonEvent, TEXT, DONE
 
         layer = FakeExecutionLayer()
@@ -1412,9 +1492,11 @@ class TestStreamingTurnControls:
 
                 from core.session import session_events
                 t0 = time.monotonic()
-                ws.client_send({"type": "chat", "text": "also check logs"})
-                await ws.expect({"type": "steered", "text": "also check logs",
-                                 "chat_id": chat_id})
+                ws.client_send({"type": "chat", "text": "also check logs",
+                                "queue_id": "q-steer"})
+                steered = await ws.expect({"type": "steered", "text": "also check logs",
+                                           "chat_id": chat_id, "queue_id": "q-steer",
+                                           "message_id": ANY})
                 assert layer.steered == [(sid, "also check logs")]
                 # A steered message is part of the running turn: the
                 # turn is still judged.
@@ -1431,11 +1513,14 @@ class TestStreamingTurnControls:
                                  "body": "Response ready"})
 
                 msgs = temp_db.get_chat_messages(chat_id)
+                # The steer's row sorts after the text the turn produced
+                # before the engine took it, where the live frame put it.
                 assert [(m["role"], m["content"]) for m in msgs] == [
                     ("user", "long job"),
-                    ("user", "also check logs"),   # persisted at steer time
                     ("assistant", "working…"),
+                    ("user", "also check logs"),
                 ]
+                assert steered["message_id"] == msgs[2]["id"]
                 # The steered message never became a second turn.
                 assert [p for _s, p, _k in layer.messages] == ["long job"]
                 ws.client_send({"type": "close"})
@@ -2065,6 +2150,37 @@ class TestTaskChatModeRestore:
         run_ws_scenario(scenario)
 
 
+    def test_a_delegate_workers_task_chat_is_never_locked_as_a_pool_chat(
+            self, temp_db, monkeypatch):
+        """A worker's task chat is owned by the synthetic ``agent::`` owner
+        too, but it keeps the task gate: no drive_refusal rides its history
+        (the pickers lock only for a chat that runs as the agent)."""
+        import uuid as _uuid
+        from core.session.visibility import shared_chat_owner
+        from storage import database as task_store
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        task_store.add_user_agent("user-viewer", slug, "contributor", "test")
+        cid = f"task-run-{_uuid.uuid4().hex[:12]}"
+        task_store.create_chat(cid, shared_chat_owner(slug), slug, "auto",
+                               model=TEST_MODEL, execution_path="claude-code-cli",
+                               source_type="task")
+        viewer = session_cookie(sub="user-viewer", email="viewer@test.com",
+                                name="Viewer User", role="member")
+
+        async def scenario():
+            async with dashboard_connection(viewer) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                history = await ws.next_frame()
+                assert history["type"] == "chat_history" and history["chat_id"] == cid
+                assert "drive_refusal" not in history, history
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+
+
 # ---------------------------------------------------------------------------
 # Self-heal on a bare `chat` frame: a WS that lost its state (reconnect
 # before resume_chat) re-attaches to the chat's still-running pump.
@@ -2152,3 +2268,94 @@ class TestReattachToRunningPump:
             "chat_id": "chat-1", "mode": "auto", "model": TEST_MODEL,
             "execution_path": "codex-cli",
         }]
+
+
+# ---------------------------------------------------------------------------
+# A phone call's conversation is read-only on the dashboard.
+# ---------------------------------------------------------------------------
+
+class TestPhoneChatReadOnly:
+    """A call's session runs as the person its route is tied to (or as the
+    caller), with their accounts, memory and folder. The agent's managers
+    may open the conversation and drive nothing into it: not between the
+    caller's turns, and not as a message queued during one."""
+
+    def _call(self, monkeypatch):
+        from auth.path_policy import SecurityContext
+        from core.events import input_queue
+        from core.session import session_kind
+        from core.session.session_state import set_session_security
+        from core.session.visibility import PHONE_CHAT_OWNER
+        from services.scheduler import shared
+        from storage.identity import db_users
+        input_queue._registry.clear()
+        monkeypatch.setattr(shared, "_shutting_down", False)
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-manager", "mgr")
+        db_users.set_user_agents("user-manager", [slug], "user-admin",
+                                 agent_roles={slug: "manager"})
+        sid = f"phone-sess-{uuid.uuid4().hex[:8]}"
+        cid = _make_chat(slug, session_id=sid, user_sub=PHONE_CHAT_OWNER,
+                         source_type=session_kind.PHONE.source_type)
+        set_session_security(sid, SecurityContext(role="manager", username="admin", agent=slug,
+                                                  is_admin_agent=False))
+        layer.alive.add(sid)
+        return layer, cid, sid
+
+    def test_a_manager_opens_the_call_and_cannot_send_between_its_turns(
+            self, temp_db, monkeypatch):
+        from ws.dashboard_chat_support import PHONE_CHAT_READ_ONLY
+        layer, cid, sid = self._call(monkeypatch)
+
+        async def scenario():
+            cookie = session_cookie(sub="user-manager", email="manager@test.com",
+                                    name="Manager User", role="creator")
+            async with dashboard_connection(cookie) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                frame = await ws.next_frame()
+                assert (frame["type"], frame["chat_id"]) == ("chat_history", cid), frame
+                # The history and nothing else: no warmup_ready binds this
+                # socket to the call's live session.
+                await asyncio.sleep(0.2)
+                ws.no_more_frames()
+                ws.client_send({"type": "chat", "text": "manager typed this", "chat_id": cid})
+                await ws.expect({"type": "error", "message": PHONE_CHAT_READ_ONLY})
+                await asyncio.sleep(0.2)
+                assert layer.messages == []
+        run_ws_scenario(scenario)
+
+    def test_a_message_during_a_call_turn_is_refused_not_queued(self, temp_db, monkeypatch):
+        from core.events import input_queue, stream_pump
+        from core.events.common_events import CommonEvent, PRODUCER_DONE, TEXT
+        from core.session import session_kind
+        from ws.dashboard_chat_support import PHONE_CHAT_READ_ONLY
+        layer, cid, sid = self._call(monkeypatch)
+
+        async def scenario():
+            events: asyncio.Queue = asyncio.Queue()
+            producer = asyncio.get_running_loop().create_task(asyncio.sleep(3600))
+            pump = stream_pump.ChatStreamPump(
+                chat_id=cid, session_id=sid, producer=producer, event_queue=events,
+                perm_queue=None, scope="agent", source_type=session_kind.PHONE.source_type)
+            stream_pump._active_pumps[cid] = pump
+            pump.start()
+            cookie = session_cookie(sub="user-manager", email="manager@test.com",
+                                    name="Manager User", role="creator")
+            try:
+                async with dashboard_connection(cookie) as ws:
+                    await drain_startup(ws)
+                    ws.client_send({"type": "chat", "text": "queued by the manager", "chat_id": cid})
+                    await ws.expect({"type": "error", "message": PHONE_CHAT_READ_ONLY})
+                    assert not input_queue.peek(cid)
+                    # The caller's turn ends: nothing waits to go into the call.
+                    await events.put(CommonEvent(type=TEXT, data={"content": "call reply"}))
+                    await events.put(CommonEvent(type=PRODUCER_DONE, data={}))
+                    await asyncio.sleep(0.5)
+                    assert layer.messages == []
+            finally:
+                producer.cancel()
+                stream_pump._active_pumps.pop(cid, None)
+        run_ws_scenario(scenario, timeout=20)

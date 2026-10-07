@@ -18,14 +18,15 @@ import uuid
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_auth
-from core.session.visibility import SCOPE_USER, nouser_read_targets
+from auth.providers import UserContext, get_current_user, require_auth, require_user
+from core.session.visibility import SCOPE_AGENT, SCOPE_USER, nouser_read_targets
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.chat import meeting_status
 from storage.pg import run_db
 
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # The routes' own answer words beside the meeting statuses they echo:
 # ``starting`` (the orchestrator was kicked) and ``left`` (a participant
@@ -186,9 +187,19 @@ def _check_participants(u: UserContext, req: CreateMeetingRequest) -> None:
             continue
         if u.is_service:
             continue
-        runs_agent_scope = req.scope == "agent" or is_shared_only(slug)
+        shared_only = is_shared_only(slug)
+        runs_agent_scope = req.scope == "agent" or shared_only
         if runs_agent_scope and u.acting_sub is not None:
             if not u.can_edit_agent(slug):
+                if shared_only:
+                    # The sentence the participant's session would be refused with.
+                    from core.sandbox.session_config_dir import (
+                        AgentStateRefused, refuse_agent_state_below_editor,
+                    )
+                    try:
+                        refuse_agent_state_below_editor(SCOPE_AGENT, u.acting_role(slug))
+                    except AgentStateRefused as e:
+                        raise HTTPException(403, f"'{slug}': {e}") from None
                 raise HTTPException(
                     403,
                     f"Agent-scoped participation in '{slug}' requires editor, "
@@ -476,10 +487,15 @@ async def get_transcript_endpoint(
     meeting_id: str,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Get meeting transcript, for a reader of every participant."""
+    """Get meeting transcript, for a reader of every participant. Each
+    turn's ``thinking`` goes to a person at the dashboard (no token) who
+    is an admin or the meeting's creator, and to no one else: the other
+    agents never see a speaker's thinking (the operator, 2026-10-02)."""
     u = require_auth(user)
     meeting, _, can_read = await _meeting_for(meeting_id, u)
     if not can_read:
         raise HTTPException(404, "Meeting not found")
     turns = await run_db(task_store.get_meeting_turns, meeting_id)
+    if u.is_api_key or not (u.is_admin or _is_creator(meeting, u)):
+        turns = [{k: v for k, v in t.items() if k != "thinking"} for t in turns]
     return {"meeting_id": meeting_id, "turns": turns}

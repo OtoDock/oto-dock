@@ -24,6 +24,60 @@ logger = logging.getLogger("claude-proxy")
 # user leaning on a key would otherwise flood the socket with one frame per
 # byte.
 _READ_ONLY_NOTICE_GAP_S = 2.0
+# What a viewer's outbox may hold while its socket is paused (a reader slower
+# than the terminal): past it the backlog is dropped and the scrollback is
+# replayed once the reader catches up, the same re-render a satellite blip
+# gets. Larger than the PTY's scrollback ring, so a reader that keeps up
+# never sees a replay.
+_PTY_OUTBOX_MAX_BYTES = 1024 * 1024
+
+
+class _PtyOutbox:
+    """One viewer's PTY output, bounded. ``push`` is synchronous (the
+    session's output path calls it per chunk) and starts the one drain task
+    when none runs; ``drain`` sends the chunks in order through ``send``,
+    and after an overflow sends ``replay()`` instead of what was dropped."""
+
+    def __init__(self, send, replay, *, limit: int = _PTY_OUTBOX_MAX_BYTES) -> None:
+        self._send = send
+        self._replay = replay
+        self._limit = limit
+        self._chunks: list[bytes] = []
+        self._bytes = 0
+        self.overflowed = False
+        self.replays = 0
+        self.task: asyncio.Task | None = None
+
+    def push(self, data: bytes) -> None:
+        if self.overflowed or self._bytes + len(data) > self._limit:
+            self.overflowed = True
+            self._chunks.clear()
+            self._bytes = 0
+        else:
+            self._chunks.append(data)
+            self._bytes += len(data)
+        if self.task is None or self.task.done():
+            self.task = asyncio.get_running_loop().create_task(self._drain())
+
+    def cancel(self) -> None:
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+        self._chunks.clear()
+        self._bytes = 0
+
+    async def _drain(self) -> None:
+        while self._chunks or self.overflowed:
+            if self.overflowed:
+                self.overflowed = False
+                self._chunks.clear()
+                self._bytes = 0
+                self.replays += 1
+                await self._replay()
+                continue
+            data = self._chunks.pop(0)
+            self._bytes -= len(data)
+            await self._send(data)
+
 
 
 class PtyViewerController:
@@ -115,11 +169,35 @@ class PtyViewerController:
         if vcid and can_drive:
             notification_manager.set_chat_turn_origin(self.user_sub, vcid, self.notify_connection_id)
 
-        async def _on_pty_output(data: bytes) -> None:
+        async def _send_output(data: bytes) -> None:
             await self._send({
                 "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
                 "data": base64.b64encode(data).decode("ascii"),
             })
+
+        async def _replay_screen() -> None:
+            # The reader fell a full outbox behind: the same re-render a
+            # satellite blip gets (a reset with the scrollback, then the
+            # status that re-syncs the size).
+            if sess.pty is None:
+                return
+            from core.terminal_queries import strip_clipboard_writes
+            await self._send({
+                "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
+                "data": base64.b64encode(
+                    strip_clipboard_writes(sess.pty.scrollback())
+                ).decode("ascii"),
+                "replay": True, "reset": True,
+            })
+            await self._send({
+                "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
+                "state": "reconnected",
+            })
+
+        outbox = _PtyOutbox(_send_output, _replay_screen)
+
+        async def _on_pty_output(data: bytes) -> None:
+            outbox.push(data)
 
         async def _on_pty_perm(item: dict) -> None:
             # The drainer forwards the session's permission queue here (there is
@@ -238,6 +316,7 @@ class PtyViewerController:
             scrollback = sess.add_output_listener(_on_pty_output, on_close=_on_pty_close)
         self._pty_viewer_sid = vsid
         self._pty_listener = _on_pty_output
+        self._pty_outbox = outbox
         # The session's baked TUI theme — the viewer renders its xterm with THIS
         # theme (a dark-seeded TUI in a light xterm paints white-on-white).
         await self._send({
@@ -297,5 +376,9 @@ class PtyViewerController:
             sess = interactive_session.get(self._pty_viewer_sid)
             if sess is not None:
                 sess.remove_output_listener(self._pty_listener)
+        outbox = getattr(self, "_pty_outbox", None)
+        if outbox is not None:
+            outbox.cancel()
+        self._pty_outbox = None
         self._pty_viewer_sid = None
         self._pty_listener = None

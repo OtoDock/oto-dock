@@ -5,6 +5,7 @@ Translates ClaudeStreamChunk → CommonEvent. Does NOT modify PersistentSession
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -30,6 +31,7 @@ from core.execution_layer import (
 from core.layers.cli import oauth as claude_oauth
 from core.layers.cli import usage as claude_usage
 from core.layers.cli.helpers import ClaudeStreamChunk
+from core.events import turn_ending
 from core.layers.cli.session import (
     PersistentSession,
     get_persistent_session, get_or_create_persistent_session,
@@ -46,6 +48,7 @@ from core.session.session_state import (
     _sessions,
     resolve_permission,
     resolve_session_permissions,
+    mark_starting, clear_starting, mark_closing, session_is_held, START_MARK_TTL_S,
 )
 
 logger = logging.getLogger("claude-proxy")
@@ -106,6 +109,13 @@ async def _interrupt_watchdog(session: PersistentSession, armed_seq: int) -> Non
 # ---------------------------------------------------------------------------
 # ClaudeStreamChunk → CommonEvent translator
 # ---------------------------------------------------------------------------
+
+def _kills_process(event: CommonEvent) -> bool:
+    """An ERROR event whose typed ending ends the engine process
+    (``turn_ending.KILLS_PROCESS``)."""
+    ending = turn_ending.from_dict(event.data.get("ending"))
+    return ending is not None and ending.reason in turn_ending.KILLS_PROCESS
+
 
 def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
     """Translate a single ClaudeStreamChunk into one or more CommonEvents.
@@ -204,9 +214,14 @@ def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
     elif et == "metadata":
         events.append(CommonEvent(type=METADATA, data=chunk.event_data))
 
-    # Error flag — can coexist with any event type
+    # Error flag — can coexist with any event type. A typed ending (a decline
+    # or a usage limit) rides its ERROR with no TEXT twin: the pump persists
+    # its line once.
     if chunk.is_error and chunk.text and not _ede_noise:
-        events.append(CommonEvent(type=ERROR, data={"message": chunk.text}))
+        data = {"message": chunk.text}
+        if et == "turn_ending":
+            data["ending"] = dict(chunk.event_data)
+        events.append(CommonEvent(type=ERROR, data=data))
 
     # Done flag — turn boundary, always last
     if chunk.is_done:
@@ -262,6 +277,7 @@ _CLI_CAPABILITIES = LayerCapabilities(
         supports_interactive_pty=True,        # the native Ink TUI under a PTY
         interactive_first_prompt_via_argv=False,   # cold prompt is a PTY write + Enter
         supports_reattach_after_restart=True, # Mode C: a satellite keeps the in-flight turn
+        readopts_idle_session=True,           # an idle session the satellite kept is taken back
         binary="claude",
         pin_key="claude_code",                # cli_pins wire key — frozen
         config_dir_name=".claude",            # CLAUDE_CONFIG_DIR under the session's scope root
@@ -351,14 +367,22 @@ class CLIExecutionLayer(ExecutionLayer):
         spawn: the session JWT minted into the process env derives its
         external claim from the live context. A failed spawn drops the
         registration again, so a replayed token never finds a live context
-        for a session that never ran.
+        for a session that never ran; a failed re-warm of a session a layer
+        still holds leaves the running process's state alone.
         """
-        register_session_state(session_id, config.permission_mode, config.security_context)
+        held = session_is_held(session_id)
+        mark_starting(session_id, START_MARK_TTL_S)
         try:
-            await self._start_session_impl(session_id, config)
-        except BaseException:
-            cleanup_session_permission_state(session_id)
-            raise
+            register_session_state(session_id, config.permission_mode, config.security_context,
+                                   token_minted_at=config.token_minted_at)
+            try:
+                await self._start_session_impl(session_id, config)
+            except BaseException:
+                if not held:
+                    cleanup_session_permission_state(session_id)
+                raise
+        finally:
+            clear_starting(session_id)
 
     async def _start_session_impl(
         self, session_id: str, config: AgentConfig,
@@ -475,12 +499,12 @@ class CLIExecutionLayer(ExecutionLayer):
             )
             mcp_path = Path(sandbox_mcp_path) if sandbox_mcp_path else None
 
-        # ssh-hosts (context-only MCP): provision the agent's authorized
-        # SSH keys into <.claude>/ssh so the prompt's ready-to-run
-        # `ssh -i "$OTO_SSH_KEY_DIR/…"` lines work from bash. Independent
-        # of mcp_path — ssh-hosts emits no mcpServers entry, so it may be
-        # the session's ONLY MCP with no config file at all. A session that
-        # takes no keys is left none from an earlier one (the helper's rule).
+        # ssh-hosts: provision the agent's authorized SSH keys into
+        # <.claude>/ssh so the prompt's ready-to-run `ssh -i
+        # "$OTO_SSH_KEY_DIR/…"` lines work from bash. Independent of
+        # mcp_path: the keys are the session's, not the config file's. A
+        # session that takes no keys is left none from an earlier one (the
+        # helper's rule).
         from core.sandbox.session_config_dir import provision_ssh_keys_for_sandbox
         ssh_dir = provision_ssh_keys_for_sandbox(
             ctx, config.agent_name, config.sandbox_host_claude_dir, sandbox_claude_dir,
@@ -586,14 +610,14 @@ class CLIExecutionLayer(ExecutionLayer):
             from services.engines.subscription_pool import (
                 bind_session, credential_scope_key,
             )
-            bind_session(
+            await asyncio.wrap_future(bind_session(
                 session_id, config.subscription_id,
                 layer="claude-code-cli", user_sub=config.subscription_user_sub,
                 scope_key=credential_scope_key(
                     config.execution_target or placement.LOCAL,
                     config.sandbox_host_claude_dir,
                 ),
-            )
+            ))
             # Rotation fan-out target — only sessions with a credential FILE
             # register (API-key sessions have nothing to rewrite).
             if credentials is not None:
@@ -727,13 +751,38 @@ class CLIExecutionLayer(ExecutionLayer):
         inject_time = kwargs.get("inject_time", False)
         settle_after_result = kwargs.get("settle_after_result", 0)
 
-        async for chunk in session.send_message(
+        async with contextlib.aclosing(session.send_message(
             message,
             inject_time=inject_time,
             settle_after_result=settle_after_result,
-        ):
-            for event in cli_chunk_to_events(chunk):
-                yield event
+        )) as chunks:
+            async for chunk in chunks:
+                events = cli_chunk_to_events(chunk)
+                if any(e.type == ERROR and _kills_process(e) for e in events):
+                    # The process ends before the ending is forwarded: a
+                    # consumer may stop at the ERROR, and a declined turn
+                    # otherwise goes on by itself with nobody reading it. The
+                    # next turn's heal resumes the session (``--resume``). An
+                    # ``error`` ending keeps the process (it answered) and an
+                    # ``exited`` one is already gone.
+                    await interrupt_persistent_session(session_id)
+                    for event in events:
+                        yield event
+                    if not any(e.type == DONE for e in events):
+                        yield CommonEvent(type=DONE, data={})
+                    return
+                for event in events:
+                    yield event
+
+    def session_idle_seconds(self, session_id: str) -> float | None:
+        """Seconds since the session's last stdout line (or its last turn
+        start, steer or drain): the resume reaper and the task watchdog read
+        it to probe a silent local turn, exactly as they probe a remote one.
+        None for a session the pool does not hold."""
+        session = _persistent_sessions.get(session_id)
+        if session is None:
+            return None
+        return time.monotonic() - session.last_activity
 
     async def abort(self, session_id: str) -> bool:
         """Abort the in-flight turn — graceful-first.
@@ -933,7 +982,8 @@ class CLIExecutionLayer(ExecutionLayer):
 
     async def prepare_resume(self, session_id: str) -> None:
         """Remove dead session from pool so start_session(resume=True) works."""
-        _persistent_sessions.pop(session_id, None)
+        if _persistent_sessions.pop(session_id, None) is not None:
+            mark_closing(session_id)
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",

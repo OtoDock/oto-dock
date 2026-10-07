@@ -22,10 +22,10 @@ deploy, once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
-import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,38 +109,47 @@ def guard(root: Path, path: Path) -> Path:
 def write_seed_source(agent: str, item: AppItem) -> Path:
     """The template's copy of a per-user app, kept for later members and
     for an update: the files a release takes (``walk_tree``: no dotfiles,
-    no ``data/``, no ``node_modules``, no links), verbatim."""
+    no ``data/``, no ``node_modules``, no links), verbatim. The copy lives
+    under ``/config``, which a manager's session writes, so it is removed
+    and written beneath the agents tree (``safe_fs``): a link at or above
+    it, or a template file turned into a link after the walk, is refused
+    and never followed. A copy refused partway leaves no seed source behind."""
     from services.apps import releases
+    from services.infra import safe_fs
     assert item.dir is not None
-    dest = guard(config.get_agent_dir(agent), seed_source_dir(agent, item.slug))
-    shutil.rmtree(dest, ignore_errors=True)
-    for rel, path in releases.walk_tree(item.dir):
-        target = dest / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, target)
+    files = releases.walk_tree(item.dir)
+    dest = seed_source_dir(agent, item.slug)
+    src_root, src_base = releases.tree_root(item.dir)
+    dst_root, dst_base = releases.agents_rel(dest)
+    safe_fs.rmtree_beneath(dst_root, dst_base, missing_ok=True)
+    try:
+        for rel, _path in files:
+            safe_fs.copy_file_beneath(
+                src_root, f"{src_base}/{rel}" if src_base else rel, dst_root, f"{dst_base}/{rel}",
+                max_size=releases.MAX_RELEASE_FILE_BYTES, mode=releases.RELEASE_FILE_MODE, mkdirs=True)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            safe_fs.rmtree_beneath(dst_root, dst_base, missing_ok=True)
+        raise
     return dest
 
 
-def _blueprint_tasks(folder: Path) -> list[dict]:
-    bp = folder / template_sig.BLUEPRINT_DOC
-    if not bp.is_file():
-        return []
+def _blueprint(folder: Path) -> dict:
+    """The folder's ``blueprint.json`` read without following a link; an
+    absent or unreadable one is empty."""
     try:
-        doc = json.loads(bp.read_text(encoding="utf-8")) or {}
+        doc = json.loads(template_sig.read_file(folder, template_sig.BLUEPRINT_DOC).decode("utf-8")) or {}
     except (OSError, ValueError):
-        return []
-    return list(doc.get("tasks") or []) if isinstance(doc, dict) else []
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _blueprint_tasks(folder: Path) -> list[dict]:
+    return list(_blueprint(folder).get("tasks") or [])
 
 
 def _blueprint_triggers(folder: Path) -> list[dict]:
-    bp = folder / template_sig.BLUEPRINT_DOC
-    if not bp.is_file():
-        return []
-    try:
-        doc = json.loads(bp.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError):
-        return []
-    return list(doc.get("triggers") or []) if isinstance(doc, dict) else []
+    return list(_blueprint(folder).get("triggers") or [])
 
 
 # A membership removal pauses the copy's seeded triggers with this mark; a
@@ -297,10 +306,12 @@ def copy_matches(item: AppItem, folder: Path) -> bool:
     its person was shown, never an edit made to the copy afterwards."""
     from services.apps import releases
     try:
-        doc = json.loads((folder / template_sig.MANIFEST_DOC).read_text(encoding="utf-8"))
-        bp_path = folder / template_sig.BLUEPRINT_DOC
-        blueprint = json.loads(bp_path.read_text(encoding="utf-8")) if bp_path.is_file() else {}
-        tree = template_sig.tree_sha(releases.walk_tree(folder))
+        doc = json.loads(template_sig.read_file(folder, template_sig.MANIFEST_DOC).decode("utf-8"))
+        try:
+            blueprint = json.loads(template_sig.read_file(folder, template_sig.BLUEPRINT_DOC).decode("utf-8"))
+        except FileNotFoundError:
+            blueprint = {}
+        tree = template_sig.tree_sha(folder, [rel for rel, _path in releases.walk_tree(folder)])
         sig = template_sig.template_app_sig(doc, blueprint or None, tree)
     except Exception:  # noqa: BLE001 — anything unreadable is not the consented copy
         return False

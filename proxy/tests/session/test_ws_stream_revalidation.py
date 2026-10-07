@@ -47,8 +47,11 @@ def _viewer(ws: FakeDashboardWebSocket, chat_id: str, sid: str, *, due: bool):
     conn.live_queue = LiveQueue()
     conn._send_lock = asyncio.Lock()
     conn._client_pushback = collections.deque()
+    conn._ended = asyncio.Event()
+    conn._recheck_wake = asyncio.Event()
     conn.pending_control_requests = []
-    conn.message_queue, conn.artifact_queue = [], []
+    conn.implement_queue, conn.artifact_queue = [], []
+    conn.notify_connection_id = f"conn-{chat_id}"
     conn._last_authz_check = time.time() - (_AUTHZ_REVALIDATE_S + 1 if due else 0)
     return conn
 
@@ -103,7 +106,12 @@ async def test_a_revoked_session_is_closed_4001_inside_a_streaming_turn(temp_db)
     ws.cookies["session"] = "no-longer-valid"
     pump = _endless_pump("rv2")
     conn = _viewer(ws, "rv2", pump.session_id, due=True)
-    conn.message_queue.append(object())
+    from core.events import input_queue
+    from core.events.common_events import TurnInput
+    q = input_queue.get("rv2")
+    q.items.append(input_queue.QueuedInput(
+        queue_id="q-1", chat_id="rv2", author_sub="user-admin", item=TurnInput("queued"),
+        origin_conn=conn.notify_connection_id))
     try:
         result = await _stream_one_message(
             conn, pump, {"type": "permission_response", "request_id": "r1", "allow": True})
@@ -111,10 +119,16 @@ async def test_a_revoked_session_is_closed_4001_inside_a_streaming_turn(temp_db)
         assert ws.closed is not None and ws.closed[0] == 4001
         assert not pump._ws_queues
         assert ws.sent[-1] == {"type": "error", "message": "Session expired: please sign in again"}
-        # A turn queued before the check is not started for the closed socket.
-        assert conn.message_queue == []
+        # A message this connection queued before the check is dropped, so
+        # no delivery starts a turn for the closed socket.
+        for _ in range(50):
+            if not q.items:
+                break
+            await asyncio.sleep(0.02)
+        assert q.items == []
     finally:
         stream_pump._active_pumps.pop("rv2", None)
+        input_queue._registry.pop("rv2", None)
         pump.producer.cancel()
 
 

@@ -295,6 +295,13 @@ class CodexPtySession(BasePtySession):
             "-s", sandbox_mode,
             "-a", approval,
             "--dangerously-bypass-hook-trust",
+            # Codex 0.157 auto-starts a shared background server (its own Codex
+            # install, outside the pin) for eligible TUIs; the trust flag above
+            # already keeps this one embedded, and --no-daemon turns the
+            # auto-start off with the "Running without the shared background
+            # server" line it printed at start (mirrors the local layer; the
+            # flag exists on 0.156.1 too).
+            "--no-daemon",
             "-C", str(self._cwd),
         ]
         model = self.config.get("model", "")

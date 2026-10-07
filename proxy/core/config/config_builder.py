@@ -6,6 +6,7 @@ duplicated across dashboard warmup, pre-warmup, and plan implementation.
 
 import asyncio
 import logging
+import time
 
 import config
 from storage.agents import agent_store
@@ -213,7 +214,9 @@ async def build_agent_config(
     # Shared-only chat, a task re-warm, a phone call as that person):
     # refused here, before a pool seat is taken, with the person's message.
     from core.sandbox.session_config_dir import refuse_agent_state_below_editor
-    refuse_agent_state_below_editor(vis.mount_scope, user_role or "")
+    from core.session.visibility import is_shared_only
+    refuse_agent_state_below_editor(vis.mount_scope, user_role or "",
+                                    shared_only=is_shared_only(agent_name))
 
     # Resolve the execution target + its placement facts BEFORE building the
     # MCP config / prompt / skills / path_env below. Device-local MCPs
@@ -280,6 +283,7 @@ async def build_agent_config(
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
             mcp_registry.build_session_mcp_config, agent_name, creds_sub,
+            session_id=session_id,
             delegation_targets=resolved_targets,
             mcp_config_format=mcp_format,
             username=username or "",
@@ -364,9 +368,10 @@ async def build_agent_config(
     # applied LAST in build_session_env, so this is the authoritative token for
     # the agent process AND every stdio MCP it spawns.
     from auth.session_token import create_session_token
+    token_minted_at = int(time.time())
     credential_env["PROXY_API_KEY"] = create_session_token(
         session_id or "", agent_name, creds_sub or "",
-        external=external_claim or "",
+        external=external_claim or "", issued_at=token_minted_at,
     )
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
 
@@ -425,6 +430,8 @@ async def build_agent_config(
         # A phone session on an engine that keeps a call on stdio MCPs never
         # connects the sidecar HTTP MCPs (Direct LLM's direct_mcp_policy).
         skip_http_mcps=bool(phone_mode and not _caps.behaviour.phone_http_mcps),
+        # The person's role filters the skills by audience (a chat has one).
+        user_role=user_role or None,
     )
 
     # Append client-specific context (dashboard adapter injects file display
@@ -615,4 +622,5 @@ async def build_agent_config(
         default_execution_mode=(agent_info or {}).get("default_execution_mode", "") or "",
         work_cwd=work_cwd or "",
         term=term or "",
+        token_minted_at=token_minted_at,
     )

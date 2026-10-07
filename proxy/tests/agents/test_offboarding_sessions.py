@@ -233,6 +233,35 @@ async def test_a_username_now_held_by_someone_else_is_not_matched(world):
 
 
 @pytest.mark.asyncio
+async def test_a_sign_out_drops_the_persons_reloaded_unheld_contexts(world, monkeypatch):
+    """A remote session the security index kept across a restart, not yet
+    reported by its machine, is held by nothing: a sign-out of its person
+    forgets its context (the re-adoption then closes it), while a held
+    session is closed the usual way and another person's context stays."""
+    from core.session import session_state
+    w = world
+    _pool(w, "pat-held", A, w.pat_name)
+    security = {
+        "pat-reloaded": SimpleNamespace(agent=A, username=w.pat_name, role="contributor"),
+        "quinn-reloaded": SimpleNamespace(agent=A, username=w.quinn_name, role="contributor"),
+    }
+    reloaded = {"pat-reloaded": ("default", 0), "quinn-reloaded": ("auto", 0)}
+    forgotten: list[str] = []
+    monkeypatch.setattr(session_state, "_session_security", security)
+    monkeypatch.setattr(session_state, "_reloaded_state", reloaded)
+    monkeypatch.setattr(session_state, "session_is_held", lambda sid: sid == "pat-held")
+    monkeypatch.setattr(session_state, "cleanup_session_permission_state",
+                        lambda sid: forgotten.append(sid) or security.pop(sid, None))
+    assert await closer.close_person_sessions(w.pat, w.pat_name, "password changed") == 2
+    await _settle()
+    assert _closed(w) == {"pat-held"}
+    assert forgotten == ["pat-reloaded"]
+    assert set(security) == {"quinn-reloaded"}
+    # No username (a person with no slug): nothing reloaded is touched.
+    assert session_state.drop_reloaded_contexts_of("") == []
+
+
+@pytest.mark.asyncio
 async def test_an_event_with_no_username_matches_no_pooled_session(world):
     w = world
     _pool(w, "blank", A, "")

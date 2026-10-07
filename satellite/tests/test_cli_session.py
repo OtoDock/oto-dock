@@ -1,11 +1,14 @@
 """Tests for CLI session management."""
 
+import asyncio
+import contextlib
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from satellite import config
 from satellite.sessions.cli_session import CLISession, _write_cli_hooks
 
 
@@ -56,11 +59,16 @@ class TestWriteCliHooks:
         # _build_sandbox_cli_settings writes for the local sandbox.
         assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "SubagentStop", "Stop"}
         stop = settings["hooks"]["Stop"][0]["hooks"][0]
-        assert "stop_tracker.py" in stop["command"] and stop["timeout"] == 604800
+        assert "stop_tracker.py" in stop["command"] and stop["timeout"] == config.HOOK_WAIT_S
         # Claude Code ≥ 2.1.275 would sync the pool account's claude.ai skills
         # and plugins into the session — both off (mirrors the proxy builder).
         assert settings["syncClaudeAiSkills"] is False
         assert settings["syncClaudeAiPlugins"] is False
+        # Every built-in plugin but the four the platform keeps (Claude Code
+        # 2.1.287+) is off by name, as the proxy builder writes them.
+        from satellite.sessions.cli_session import DISABLED_BUILTIN_PLUGINS
+        assert settings["enabledPlugins"] == {p: False for p in DISABLED_BUILTIN_PLUGINS}
+        assert "cc-plugin-plugin-authoring@builtin" in DISABLED_BUILTIN_PLUGINS
 
     def test_hook_paths_point_to_dir(self, tmp_path):
         _write_cli_hooks(tmp_path)
@@ -108,7 +116,8 @@ class TestCLISessionStart:
         claude_dir = tmp_agent_dir / "users" / "alice" / ".claude"
         assert claude_dir.is_dir()
         assert (claude_dir / "system-prompt.md").exists()
-        assert (claude_dir / "mcp-config.json").exists()
+        assert (claude_dir / "mcp-config-sess-1.json").exists()
+        assert not (claude_dir / "mcp-config.json").exists()
         assert (claude_dir / "settings.json").exists()
 
         # Verify prompt content
@@ -184,6 +193,8 @@ class TestCLISessionStart:
         assert "sess-1" in captured_cmd
         assert "--output-format" in captured_cmd
         assert "stream-json" in captured_cmd
+        # Only the platform's settings.json is read (mirrors the local layer).
+        assert captured_cmd[captured_cmd.index("--setting-sources") + 1] == "user"
 
         # Verify env
         assert captured_env["OTO_SESSION_ID"] == "sess-1"
@@ -415,3 +426,100 @@ class TestCLISessionSteer:
         assert len(proc.stdin.writes) == 1
         async for _ in turn:
             pass
+
+
+class _SlowProc(_FakeProc):
+    """A CLI whose stdout stays open with nothing to read (a turn whose
+    ``stop_turn`` never came): ``readline`` blocks like a real pipe, and a
+    second concurrent reader raises like asyncio's StreamReader does."""
+
+    def __init__(self):
+        super().__init__([])
+        self._reading = False
+        self.stdout.readline = AsyncMock(side_effect=self._blocking_readline)
+
+    async def _blocking_readline(self) -> bytes:
+        if self._reading:
+            raise RuntimeError(
+                "readuntil() called while another coroutine is already waiting for incoming data")
+        self._reading = True
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            self._reading = False
+        return b""
+
+
+class TestCLISessionOneReader:
+    """A send that arrives while the previous turn's loop still reads (its
+    ``stop_turn`` was lost or comes after this send) stops that loop and waits
+    for it, so stdout never has two readers."""
+
+    @pytest.mark.asyncio
+    async def test_a_new_turn_stops_the_previous_reader_first(
+        self, tmp_agent_dir, cli_config, sat_config,
+    ):
+        proc = _SlowProc()
+        session = CLISession("sess-r", tmp_agent_dir, cli_config, sat_config)
+        session.proc = proc
+        session._stderr_buf = []
+        first_events: list = []
+
+        async def drive_first():
+            async for ev in session.send_message("one"):
+                first_events.append(ev)
+
+        first = asyncio.create_task(drive_first())
+        await asyncio.sleep(0.05)
+        assert session._turn_active
+        second = session.send_message("two")
+        nxt = asyncio.create_task(second.__anext__())
+        await asyncio.wait_for(first, timeout=5)  # the first loop ended on its own
+        for _ in range(100):  # the second turn's write lands right after the first loop lets go
+            if len(proc.stdin.writes) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert [json.loads(w.decode())["message"]["content"] for w in proc.stdin.writes] == ["one", "two"]
+        nxt.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await nxt
+        await second.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_drainer_the_previous_turn_starts_is_stopped(
+        self, tmp_agent_dir, cli_config, sat_config,
+    ):
+        """The previous turn's handler starts the post-turn drainer the
+        moment its reader lets go (its stop_turn asked for one), before the
+        new turn resumes: the new turn stops it before reading."""
+        proc = _SlowProc()
+        session = CLISession("sess-d", tmp_agent_dir, cli_config, sat_config)
+        session.proc = proc
+        session._stderr_buf = []
+        forwarded: list = []
+
+        async def forward(ev):
+            forwarded.append(ev)
+
+        async def drive_first():
+            async for _ in session.send_message("one"):
+                pass
+            session.start_bg_drain(forward)  # the handler, without yielding
+
+        first = asyncio.create_task(drive_first())
+        await asyncio.sleep(0.05)
+        session.request_stop_turn(drain_bg=True)
+        second = session.send_message("two")
+        nxt = asyncio.create_task(second.__anext__())
+        await asyncio.wait_for(first, timeout=5)
+        for _ in range(20):
+            if len(proc.stdin.writes) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(proc.stdin.writes) == 2
+        assert session._bg_drain_task is None
+        nxt.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+            await nxt
+        await second.aclose()
+        assert forwarded == []

@@ -287,7 +287,7 @@ describe('AppApprovalCard — secrets', () => {
     const lines = screen.getAllByTestId('secret-line').map((n) => n.textContent || '')
     expect(lines).toHaveLength(3)
     expect(lines[0]).toContain('needs the secret STRIPE_SECRET_KEY (a restricted key)')
-    expect(lines[0]).toContain('sent by the platform to api.example.test as Authorization; the server never sees it')
+    expect(lines[0]).toContain('sent by the platform to api.example.test as Authorization, never seen by the server')
     expect(lines[0]).toContain('not set — required before the release goes live')
     expect(lines[1]).toContain('set')
     expect(lines[1]).not.toContain('not set')
@@ -543,5 +543,43 @@ describe('meetsFloor', () => {
       requires_status: { mcps: [{ name: 'a-mcp', assigned: true }, { name: 'b-mcp', assigned: true }], providers: [] },
     }))
     expect(screen.getByTestId('summary-mcps').textContent).toBe('Needs the MCPs a-mcp and b-mcp (all assigned)')
+  })
+})
+
+describe('AppApprovalCard — placed apps and the audience (SHARING.md)', () => {
+  const exports = {
+    methods: { status: { description: 'the status' }, 'update-project': { description: 'write one', min_role: 'editor' as const } },
+    snapshots: { board: { description: 'the board' } },
+  }
+
+  it('words the audience and the per-viewer methods, and names the agents the calls answer', () => {
+    renderCard(mkApp({
+      manifest_empty: false, kind: 'folder',
+      actions: [
+        { id: 'who', label: 'Who', type: 'platform', method: 'app.audience', min_role: 'editor' },
+        { id: 'r', label: 'R', type: 'platform', method: 'viewer.data.read' },
+        { id: 'w', label: 'W', type: 'platform', method: 'viewer.data.write' },
+      ],
+      exports,
+    }))
+    expect(screen.getByTestId('summary-data').textContent).toBe('Uses the platform for who uses it, your saved data and saving your data')
+    expect(screen.getByTestId('summary-placed-calls').textContent).toBe('Answers the agents it is placed in with the call status and the call update-project')
+    openDetails()
+    const body = screen.getByTestId('manifest-blocks').textContent || ''
+    expect(body).toContain('asks the platform for app.audience (who uses this app: its members, the agents it is placed in')
+    expect(body).toContain('asks the platform for viewer.data.write (to save your own data in this app')
+    expect(body).toContain('Offers to other apps and to the agents it is placed in')
+    expect(screen.getByTestId('offers-placed-note').textContent).toContain('also answer the chats and tasks of agents a share places this app in')
+    expect(screen.getAllByText('editors and up').length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('keeps the plain Offers words for an app that exports no call', () => {
+    renderCard(mkApp({ manifest_empty: false, kind: 'folder', exports: { snapshots: exports.snapshots } }))
+    expect(screen.queryByTestId('summary-placed-calls')).toBeNull()
+    openDetails()
+    const body = screen.getByTestId('manifest-blocks').textContent || ''
+    expect(body).toContain('Offers to other apps')
+    expect(body).not.toContain('placed in')
+    expect(screen.queryByTestId('offers-placed-note')).toBeNull()
   })
 })

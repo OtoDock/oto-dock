@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import jwt
-from fastapi import APIRouter, HTTPException, Request, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel
@@ -37,8 +37,9 @@ from api.apps.app_actions import _check_fire_rate, _run_action
 from api.apps.apps import APP_RUNTIME, _app_document
 from api.media.ui import _placeholder, _ui_response, inject_runtime, is_full_document, request_origin, wrap_fragment
 from auth import rate_limiter
-from auth.lan_check import get_client_ip
+from auth.lan_check import auth_bucket_key, get_client_ip
 from auth import confirm as _confirm
+from auth.providers import UserContext, get_current_user
 from auth.password import HashBusy, verify_password_async
 from storage import database as task_store
 from storage.sharing import share_store
@@ -346,20 +347,21 @@ class UnlockRequest(BaseModel):
 @router.post("/s/{token}/unlock")
 async def share_unlock(token: str, req: UnlockRequest, request: Request):
     """Password mode: a right password sets the link's own cookie. Wrong
-    passwords count against the client IP and the link (ten in five
-    minutes each); a right one clears the client's count. Attempts on one
-    link run one at a time, so a burst cannot all pass the check before
-    the first wrong one is counted."""
+    passwords count against the client address (``auth_bucket_key``) and
+    the link (ten in five minutes each); a right one clears the client's
+    count. Attempts on one link run one at a time, so a burst cannot all
+    pass the check before the first wrong one is counted."""
     _json_only(request)
+    ip = get_client_ip(request)
+    ip_key = auth_bucket_key(request)
     found = await asyncio.to_thread(load_live_link, token)
     if not found:
         raise HTTPException(status_code=404, detail="not available")
     share, row = found
     if not needs_password(share):
         return {"status": "ok", "release_sha": _release_sha(share, row)}
-    ip = get_client_ip(request)
     async with _one_unlock_at_a_time(share["id"]):
-        for bucket, key in (("share_unlock_ip", ip), ("share_unlock_share", share["id"])):
+        for bucket, key in (("share_unlock_ip", ip_key), ("share_unlock_share", share["id"])):
             allowed, retry_after = rate_limiter.check_rate_limit(bucket, key)
             if not allowed:
                 raise HTTPException(status_code=429,
@@ -375,10 +377,10 @@ async def share_unlock(token: str, req: UnlockRequest, request: Request):
         except HashBusy:
             raise _confirm.hash_busy()
         if not ok:
-            rate_limiter.record_attempt("share_unlock_ip", ip)
+            rate_limiter.record_attempt("share_unlock_ip", ip_key)
             rate_limiter.record_attempt("share_unlock_share", share["id"])
             raise HTTPException(status_code=403, detail="Wrong password")
-    rate_limiter.clear_rate_limit("share_unlock_ip", ip)
+    rate_limiter.clear_rate_limit("share_unlock_ip", ip_key)
     response = JSONResponse({"status": "ok", "release_sha": _release_sha(share, row)})
     response.set_cookie(
         key=_cookie_name(share), value=_mint_unlock(share), httponly=True,
@@ -792,3 +794,31 @@ async def share_unknown(token: str, rest: str) -> Response:
     """Anything else under a link is the same 404 page (never the dashboard
     shell, never a hint about the token)."""
     return _not_available_page()
+
+
+@router.get("/v1/shares/{share_id}/ui/{token}")
+async def read_snapshot_ui(share_id: str, token: str, request: Request,
+                           user: UserContext | None = Depends(get_current_user)):
+    """A snapshot's artifact page, in the same sandbox as any artifact. It
+    lives on this router (no ``require_user``): a sandboxed frame shows its
+    own sign-in page to nobody, never a JSON refusal."""
+    from api.sharing.shares import _load_snapshot_share
+    from services.sharing import chat_snapshot
+    origin = request_origin(request)
+    if user is None:
+        return _ui_response(_placeholder("Sign in to OtoDock to view this artifact."), origin, 401)
+
+    def _load() -> str | None:
+        share = _load_snapshot_share(user, share_id)
+        path = chat_snapshot.file_path(share, token)
+        return path.read_text("utf-8", "replace") if path else None
+
+    try:
+        content = await asyncio.to_thread(_load)
+    except HTTPException:
+        content = None
+    if content is None:
+        return _ui_response(_placeholder("This artifact no longer exists."), origin, 404)
+    if is_full_document(content):
+        return _ui_response(inject_runtime(content), origin)
+    return _ui_response(wrap_fragment(content), origin)

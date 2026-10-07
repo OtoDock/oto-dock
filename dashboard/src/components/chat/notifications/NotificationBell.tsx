@@ -2,25 +2,29 @@ import { useState, useRef, useEffect } from 'react'
 
 interface Props {
   unreadCount: number
+  /** Shares waiting for a decision (SHARING.md): its own teal mark, since
+   * each share also fires a delivery the red number already counts. */
+  pendingCount?: number
   onClick: () => void
   panelOpen: boolean
 }
 
-export default function NotificationBell({ unreadCount, onClick, panelOpen }: Props) {
-  const prevCount = useRef(unreadCount)
+export default function NotificationBell({ unreadCount, pendingCount = 0, onClick, panelOpen }: Props) {
+  const shown = unreadCount + pendingCount
+  const prevCount = useRef(shown)
   const [pulse, setPulse] = useState(false)
 
-  // Detect a new notification (count increased) → pulse the badge for 1s.
-  // Must be state, not a ref: a ref mutation doesn't re-render, so the
-  // animation class would never actually toggle on/off.
+  // Detect a new notification (a shown number increased) → pulse the badges
+  // for 1s. Must be state, not a ref: a ref mutation doesn't re-render, so
+  // the animation class would never actually toggle on/off.
   useEffect(() => {
-    const increased = unreadCount > prevCount.current
-    prevCount.current = unreadCount
+    const increased = shown > prevCount.current
+    prevCount.current = shown
     if (!increased) return
     setPulse(true)
     const t = setTimeout(() => setPulse(false), 1000)
     return () => clearTimeout(t)
-  }, [unreadCount])
+  }, [shown])
 
   return (
     <button
@@ -29,6 +33,7 @@ export default function NotificationBell({ unreadCount, onClick, panelOpen }: Pr
                   flex items-center justify-center text-p-text-secondary transition-colors shadow-xs
                   ${panelOpen ? 'bg-white/90 dark:bg-gray-900/90' : 'bg-white/70 dark:bg-gray-900/70 hover:bg-white/90 dark:hover:bg-gray-900/90'}`}
       title="Notifications"
+      aria-label={`Notifications${unreadCount > 0 ? `, ${unreadCount} unread` : ''}${pendingCount > 0 ? `, ${pendingCount} shared with you, waiting for you` : ''}`}
     >
       <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path
@@ -44,6 +49,17 @@ export default function NotificationBell({ unreadCount, onClick, panelOpen }: Pr
                       ${pulse ? 'animate-pulse' : ''}`}
         >
           {unreadCount > 99 ? '99+' : unreadCount}
+        </span>
+      )}
+      {pendingCount > 0 && (
+        <span
+          data-testid="bell-pending"
+          title={`${pendingCount} shared with you, waiting for you`}
+          className={`absolute -bottom-1 -right-1 min-w-[16px] h-[16px] px-1 rounded-full
+                      bg-p-accent-teal text-white text-[9px] font-bold flex items-center justify-center
+                      ${pulse ? 'animate-pulse' : ''}`}
+        >
+          {pendingCount > 99 ? '99+' : pendingCount}
         </span>
       )}
     </button>

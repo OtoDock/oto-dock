@@ -67,3 +67,49 @@ class TestLinkedTaskModel:
         assert by_slug["on-push"]["task_effective_model_source"] == "agent default"
         assert by_slug["notify-only"]["task_name"] is None
         assert by_slug["notify-only"]["task_effective_model"] == ""
+
+
+@pytest.mark.usefixtures("temp_db")
+class TestDecorationReadsOnce:
+    def test_the_listing_reads_its_names_and_apps_in_batches_off_the_loop(self, monkeypatch):
+        """However many rows: the creators' names and usernames and the apps
+        come from one batched read each, in a worker thread; the per-row
+        readers are never called."""
+        from api.events import triggers as triggers_api
+        from api.events.triggers import list_triggers_endpoint
+        from storage.automation import notification_store
+        task_id, _ = _seed(None)
+        trigger_store.create_trigger(
+            slug="on-push-2", name="On push 2", scope="user", agent=AGENT,
+            created_by="user-admin", task_id=task_id,
+        )
+        batches = []
+
+        def off_loop(name, fn):
+            def guarded(*a, **kw):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    batches.append(name)
+                    return fn(*a, **kw)
+                raise AssertionError(f"{name} ran on the event loop")
+            return guarded
+
+        monkeypatch.setattr(notification_store, "resolve_subs_to_display_names",
+                            off_loop("names", notification_store.resolve_subs_to_display_names))
+        monkeypatch.setattr(notification_store, "resolve_subs_to_usernames",
+                            off_loop("usernames", notification_store.resolve_subs_to_usernames))
+        monkeypatch.setattr(task_store, "get_apps_by_ids", off_loop("apps", task_store.get_apps_by_ids))
+        monkeypatch.setattr(notification_store, "resolve_sub_to_display_name",
+                            lambda sub: (_ for _ in ()).throw(AssertionError("per-row name read")))
+        monkeypatch.setattr(task_store, "get_app",
+                            lambda app_id: (_ for _ in ()).throw(AssertionError("per-row app read")))
+        monkeypatch.setattr(triggers_api, "trigger_store",
+                            type("S", (), {"list_triggers": staticmethod(
+                                off_loop("rows", trigger_store.list_triggers)),
+                                "list_triggers_for_user_view": staticmethod(
+                                    off_loop("rows", trigger_store.list_triggers_for_user_view)),
+                                "get_trigger": staticmethod(trigger_store.get_trigger)})())
+        out = asyncio.run(list_triggers_endpoint(agent=None, scope=None, audit=True, user=_admin()))
+        assert len(out["triggers"]) >= 2
+        assert sorted(batches) == ["apps", "names", "rows", "usernames"]

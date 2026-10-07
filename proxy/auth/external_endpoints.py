@@ -1,16 +1,17 @@
 """Endpoint allowlist for EXTERNAL sessions (phone callers who are not
-platform users) and the liveness rule for every phone-minted session token.
+platform users), beside the session refusal every session token meets.
 
 The counterpart of ``auth/service_endpoints.py`` for the other end of the
 trust scale. A session on an external route carries a JWT like any agent
 session — it sits in the CLI process env, and shell (where a role still has
 one) can ``curl`` the proxy with it — so the tool-level rules alone would be
-bypassable. The ``external_session_confinement`` middleware
-(``middleware.py``) therefore:
+bypassable. The session refusal (``middleware._session_refusal``) therefore:
 
-  1. rejects (401) any session token carrying an ``ext`` claim whose session
-     is no longer LIVE in a layer registry — a token lifted from a call is
-     dead at hangup (this applies to user-tied phone sessions too);
+  1. rejects (401) any session token whose session is not live, or that was
+     minted for an earlier life of its session id
+     (``session_state.session_token_refusal``) — a token lifted from a call
+     is dead once the hangup's closing window passes, a token lifted from a
+     chat once the chat's session closes;
   2. confines (403) tokens whose caller is not a platform user (``ext`` and
      no ``user_sub``) to the endpoints below — the memory op and the
      session-scoped callbacks the hook scripts and the attached MCPs use.
@@ -24,9 +25,9 @@ Contributor contract — when do you add an entry here?
     context decide that) calls a NEW proxy endpoint. Use an anchored
     ``^...$`` pattern scoped to the HTTP method(s) actually used, and ask
     whether an anonymous caller may drive that endpoint at all.
-  - ``verify_session_match`` still binds the token's ``sid`` to the request
-    body on the hook endpoints; this list only decides WHICH endpoints exist
-    for an external caller.
+  - ``verify_session_match_async`` still binds the token's ``sid`` to the
+    request body on the hook endpoints; this list only decides WHICH
+    endpoints exist for an external caller.
 """
 
 import re
@@ -51,6 +52,10 @@ _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
         ),
         frozenset({"POST"}),
     ),
+    # A credentialed HTTP MCP attached to the session reaches its server
+    # through the credential gateway (api/mcp/gateway.py), which binds the
+    # token's session to the MCP's stored credential.
+    (re.compile(r"^/v1/mcp-gateway/[^/]+/.*$"), frozenset({"GET", "POST", "DELETE"})),
 ]
 
 EXTERNAL_BLOCKED_DETAIL = "This endpoint is not available to external sessions"

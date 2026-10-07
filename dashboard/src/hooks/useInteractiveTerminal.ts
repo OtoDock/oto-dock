@@ -8,6 +8,7 @@ import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { openTerminalLink } from '../lib/openExternal'
 import { createPtyBrandFilter } from '../lib/ptyBrandColors'
 import { applyCtrlHold } from '../lib/terminalCtrlHold'
+import { pasteModePrefix } from '../lib/ptyPasteMode'
 import { WIRE, type WireType } from '../api/wireEvents'
 
 /**
@@ -380,7 +381,14 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         // ambiguous (empty buffer / mid-relayout).
         const buf = term.buffer.active
         const following = buf.viewportY >= buf.baseY
-        term.write(brand.push(b64ToBytes(m.data || '')))
+        const bytes = b64ToBytes(m.data || '')
+        // A replay is a fresh mirror: restore the bracketed paste a trimmed
+        // ring dropped, or a pasted line break submits (lib/ptyPasteMode).
+        if (m.replay) {
+          const prefix = pasteModePrefix(bytes)
+          if (prefix) term.write(prefix)
+        }
+        term.write(brand.push(bytes))
         if (following || Date.now() < pinBottomUntil) term.scrollToBottom()
         lastOutputAt = Date.now()
         scheduleRepaint()
@@ -469,9 +477,11 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     })
 
     const unsubStatus = subscribe(WIRE.PTY_STATUS, (m: any) => {
-      // The REMOTE PTY transport is reconnecting/reconnected (a
-      // satellite WS blip). The proxy held the session in grace, so the terminal
-      // is alive — just frozen. Show a banner + pause input until it returns.
+      // "reconnecting" is REMOTE only (a satellite WS blip): the proxy held
+      // the session in grace, so the terminal is alive, just frozen — show a
+      // banner + pause input until it returns. "reconnected" ends that, and
+      // also follows a viewer of any terminal that fell a full PTY outbox
+      // behind; either way a reset+replay pty_output precedes it.
       if (m.chat_id && m.chat_id !== chatId) return
       // The session's baked TUI theme (sent on attach) wins over the dashboard
       // mode: a dark-seeded TUI in a light xterm paints its text for a dark
@@ -507,7 +517,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         setReconnecting(false)
         // The proxy sends a reset+scrollback replay (a `pty_output` with reset)
         // right before this for a clean re-render; just re-sync the size so the
-        // satellite renders post-reconnect output at the current width (covers a
+        // PTY renders the output that follows at the current width (covers a
         // resize dropped during the gap).
         try { sendPtyResize(chatId, term.rows, term.cols) } catch { /* noop */ }
       }

@@ -400,6 +400,7 @@ _MUTATORS = {"set_user_agents", "set_user_agent_role", "delete_user", "update_us
 KNOWN_CALLERS = {
     "proxy/api/auth/admin_users.py": "dispatches offboarding after every change",
     "proxy/api/auth/identity.py": "OIDC login refreshes the platform role and dispatches offboarding on a lowered one",
+    "proxy/services/agents/shared_only_members.py": "the Shared-only switch's removals dispatch offboarding",
 }
 
 # Raw SQL that rewrites memberships or the platform role outside the store.

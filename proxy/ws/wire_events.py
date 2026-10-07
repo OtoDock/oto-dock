@@ -101,6 +101,7 @@ CHECK_VERDICT = "check_verdict"
 PERMISSION_PROMPT = "permission_prompt"
 PLAN_REVIEW = "plan_review"
 QUESTION = "question"
+PROMPT_RETIRED = "prompt_retired"   # a prompt card whose wait ended with no answer
 LOCATION_REQUEST = "location_request"
 PLAN_MODE = "plan_mode"
 SYSTEM = "system"
@@ -154,6 +155,7 @@ WARMUP_READY = "warmup_ready"
 WARMUP_FAILED = "warmup_failed"
 PRE_WARMUP_READY = "pre_warmup_ready"
 CHAT_HISTORY = "chat_history"
+CHAT_HISTORY_DELTA = "chat_history_delta"
 CHAT_STATUS = "chat_status"
 CHAT_STATUS_SNAPSHOT = "chat_status_snapshot"
 CHAT_READ = "chat_read"
@@ -183,6 +185,7 @@ APP_STATE = "app_state"
 OPEN_APP = "open_app"
 APP_DEPLOYED = "app_deployed"
 CATALOG = "catalog"
+SHARE_INBOX = "share_inbox"
 INSTALL_STARTED = "install_started"
 INSTALL_MCP_PLAN = "install_mcp_plan"
 INSTALL_PROGRESS = "install_progress"
@@ -258,6 +261,7 @@ FRAMES: dict[str, Frame] = {
     PERMISSION_PROMPT: Frame(True, PERMISSION_PROMPT),
     PLAN_REVIEW: Frame(True, PLAN_REVIEW),
     QUESTION: Frame(True, QUESTION),
+    PROMPT_RETIRED: Frame(True, None),
     LOCATION_REQUEST: Frame(True, None),
     PLAN_MODE: Frame(True, PLAN_MODE),
     SYSTEM: Frame(True, SYSTEM),
@@ -287,11 +291,14 @@ FRAMES: dict[str, Frame] = {
     ARTIFACT_ACK: Frame(False, None),
     APP_ACTION: Frame(False, APP_ACTION),
     APP_ACTION_ACK: Frame(False, None),
-    QUEUED: Frame(True, None),
-    QUEUE_REMOVED: Frame(True, None),
-    QUEUE_SENT: Frame(True, None),
-    QUEUE_CLEARED: Frame(True, None),
-    QUEUE_SNAPSHOT: Frame(True, None),
+    # The chat's queue frames are chat-routed: they reach every socket of the
+    # chat's audience whatever it views, and name the chat whose queue they
+    # describe (core/events/input_queue.py). A steer stays in its stream.
+    QUEUED: Frame(False, None),
+    QUEUE_REMOVED: Frame(False, None),
+    QUEUE_SENT: Frame(False, None),
+    QUEUE_CLEARED: Frame(False, None),
+    QUEUE_SNAPSHOT: Frame(False, None),
     STEERED: Frame(True, None),
     MODE_CHANGED: Frame(True, None),
     MODEL_CHANGED: Frame(True, None),
@@ -304,6 +311,7 @@ FRAMES: dict[str, Frame] = {
     WARMUP_FAILED: Frame(False, None),
     PRE_WARMUP_READY: Frame(False, None),
     CHAT_HISTORY: Frame(False, None),
+    CHAT_HISTORY_DELTA: Frame(True, None),
     CHAT_STATUS: Frame(False, None),
     CHAT_STATUS_SNAPSHOT: Frame(False, None),
     CHAT_READ: Frame(False, None),
@@ -329,6 +337,7 @@ FRAMES: dict[str, Frame] = {
     OPEN_APP: Frame(False, None),
     APP_DEPLOYED: Frame(False, None),
     CATALOG: Frame(False, None),
+    SHARE_INBOX: Frame(False, None),
     INSTALL_STARTED: Frame(False, None),
     INSTALL_MCP_PLAN: Frame(False, None),
     INSTALL_PROGRESS: Frame(False, None),
@@ -447,12 +456,11 @@ PUMP_PERMISSION_PROMPT = "perm_permission_prompt"  # {"perm_data", "meeting_agen
 PUMP_PLAN_REVIEW = "perm_plan_review"          # {"perm_data", "filename"}
 PUMP_QUESTION_PROMPT = "perm_question_prompt"  # {"perm_data"}
 PUMP_MODE_RESTORED = "perm_mode_restored"      # {"mode"}
-PUMP_QUEUE_TURN = "queue_turn"                 # {"text"}
 PUMP_ARTIFACT_INTERACTION = ARTIFACT_INTERACTION  # the drained chip, keys as the frame
 PUMP_APP_ACTION = APP_ACTION
 PUMP_IS_DONE = "is_done"                       # a turn boundary, rows saved
 PUMP_ALL_DONE = "all_done"                     # every turn done, rows landed
-PUMP_ERROR = "error"                           # {"message"}
+PUMP_ERROR = "error"                           # {"message", "reason"?, "resets_at"?}
 PUMP_DETACHED = "detached"                     # another socket took over
 PUMP_ENDED = "pump_ended"                      # the pump finished or died
 PUMP_TERMINAL: tuple[str, ...] = (PUMP_ALL_DONE, PUMP_ENDED, PUMP_ERROR)
@@ -471,9 +479,12 @@ ITEM_QUESTION = QUESTION                # Claude's fire-and-forget question card
 ITEM_QUESTION_PROMPT = "question_prompt"  # Codex's held question (a request_id)
 ITEM_MODE_RESTORED = "mode_restored"    # the plan-mode restore after a review
 ITEM_TOOL_RESULT = TOOL_RESULT
+# A prompt's wait ended with no answer: {"request_id", "caller_gone"?}; the
+# pump frees its slot and forwards PROMPT_RETIRED.
+ITEM_PROMPT_RETIRED = PROMPT_RETIRED
 ITEM_KINDS: frozenset[str] = frozenset({
     ITEM_PERMISSION_PROMPT, ITEM_PLAN_REVIEW, ITEM_QUESTION, ITEM_QUESTION_PROMPT,
-    ITEM_MODE_RESTORED, ITEM_TOOL_RESULT,
+    ITEM_MODE_RESTORED, ITEM_TOOL_RESULT, ITEM_PROMPT_RETIRED,
     IMAGES, IMAGE_GENERATING, IMAGE_GEN_FAILED, URL, FILE, VIDEO, AUDIO,
     MEDIA_PROCESSING, MEDIA_FAILED, DOCUMENT_PREVIEW, UI,
 })
@@ -511,6 +522,20 @@ NOTIFY_LOCATION_REQUEST = LOCATION_REQUEST    # {"data": <the frame>} when no pu
 # own (``warmup_failed.reason`` → a card; the two nudge rows → a label).
 SUBTYPE_SESSION_RESEEDED = "session_reseeded"
 SUBTYPE_UNDELIVERED_INPUT = "undelivered_input"
+# A turn's typed ending (``core/events/turn_ending``), persisted by the pump
+# after the turn's blocks so a reload shows the card where the live ``error``
+# frame showed it: ``reason``, the ``message`` (the ending's line), its
+# ``detail`` and ``resets_at``, an ``exit_code`` for an exited process.
+SUBTYPE_TURN_ENDED = "turn_ended"
+# ``undelivered_input.reason`` of a queued message nothing sent: a delivery
+# the drive gate or the session refused (``queued``) or the turn it waited
+# for ended other than cleanly (``turn_failed``), both written always (the
+# live return can be lost), or a Stop's or an offboarding's return no socket
+# of the author took (``stopped``); the terminal's abandoned cold flush
+# carries none.
+UNDELIVERED_QUEUED = "queued"
+UNDELIVERED_TURN_FAILED = "turn_failed"
+UNDELIVERED_STOPPED = "stopped"
 SUBTYPE_BG_WAKE = "bg_wake"
 SUBTYPE_CONTEXT_COMPRESSED = "context_compressed"   # the interactive tailers
 SUBTYPE_MEETING_STARTED = "meeting_started"
@@ -520,9 +545,13 @@ SUBTYPE_MEETING_CONCLUDED = "meeting_concluded"
 SUBTYPE_MEETING_AGENT_FAILED = "meeting_agent_failed"
 SUBTYPE_MEETING_AGENT_LEFT = "meeting_agent_left"
 SUBTYPE_MEETING_FAILED = "meeting_failed"
+# Live only: a turn that could not wait in the chat's queue (its row was
+# written: a server kick, an interaction) while the chat's machine is still
+# reconnecting; ``message`` says to send it again.
+SUBTYPE_MACHINE_RECONNECTING = "machine_reconnecting"
 SYSTEM_SUBTYPES: frozenset[str] = frozenset({
-    SUBTYPE_SESSION_RESEEDED, SUBTYPE_UNDELIVERED_INPUT, SUBTYPE_BG_WAKE,
-    SUBTYPE_CONTEXT_COMPRESSED,
+    SUBTYPE_SESSION_RESEEDED, SUBTYPE_UNDELIVERED_INPUT, SUBTYPE_TURN_ENDED, SUBTYPE_BG_WAKE,
+    SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING,
     SUBTYPE_MEETING_STARTED, SUBTYPE_MEETING_TURN_START, SUBTYPE_MEETING_TURN_END,
     SUBTYPE_MEETING_CONCLUDED, SUBTYPE_MEETING_AGENT_FAILED,
     SUBTYPE_MEETING_AGENT_LEFT, SUBTYPE_MEETING_FAILED,
@@ -544,10 +573,13 @@ REASON_OWN_SUB_EXPIRED = "own_sub_expired"
 REASON_POOL_CAP = "pool_cap"
 REASON_TARGET_UNAVAILABLE = "target_unavailable"
 REASON_SESSION_ERROR = "session_error"
+# A chat that runs as the agent, for a person below the editor tier
+# (``core/sandbox/session_config_dir.AgentStateRefused``): a role matter.
+REASON_BELOW_EDITOR = "below_editor"
 WARMUP_FAILED_REASONS: frozenset[str] = frozenset({
     REASON_AUTH_OFF, REASON_ADMIN_OAUTH_ONLY, REASON_NO_POOL, REASON_NONE,
     REASON_THROTTLED, REASON_OWN_SUB_EXPIRED, REASON_POOL_CAP,
-    REASON_TARGET_UNAVAILABLE, REASON_SESSION_ERROR,
+    REASON_TARGET_UNAVAILABLE, REASON_SESSION_ERROR, REASON_BELOW_EDITOR,
 })
 
 # ``session_reseeded.reason`` (``chats.pending_history_seed``'s kind prefix,
@@ -665,6 +697,18 @@ class DelegateResultFrame(_PerChat, total=False):
     agent: str
     output_text: str
     status: str           # a storage/automation/run_status.py DELEGATE_RESULTS word
+    # A worker turn's typed ending (any of turn_ending.REASONS) and its reset
+    # time; the dashboard keeps its status icon.
+    reason: str
+    resets_at: str
+    # A failed run's newest failing check verdict (services/checks, the
+    # evaluator's row), when one landed since the run started.
+    verdict: dict
+    # The deliverables the worker attached, as they landed in the
+    # delegator's tree (``{path, bytes}``, agent-tree-relative), and the
+    # ones that did not land, each with its reason (``{path, reason}``).
+    files: list
+    files_skipped: list
 
 
 class CheckVerdictFrame(_PerChat, total=False):
@@ -698,6 +742,10 @@ class QuestionFrame(_PerChat, total=False):
     request_id: str       # present for a held (Codex) question only
     tool_name: str
     tool_input: Any
+
+
+class PromptRetiredFrame(_PerChat):
+    request_id: str       # the permission, plan review or held question card
 
 
 class LocationRequestFrame(_PerChat):
@@ -772,9 +820,20 @@ class DoneFrame(_PerChat):
     pass
 
 
-class ErrorFrame(_PerChat):
-    """The dashboard socket's error: a message, a chat tag when mid-turn."""
+class _ErrorFrameBase(_PerChat):
     message: str
+
+
+class ErrorFrame(_ErrorFrameBase, total=False):
+    """The dashboard socket's error: a message, a chat tag when mid-turn, and
+    for a turn that ended typed, its ending: ``reason`` (one of
+    ``core/events/turn_ending.REASONS``: ``declined``, ``limit``, ``error``,
+    ``exited``, ``silent``, ``lost``) and ``resets_at`` (ISO-8601 UTC, ""
+    when unknown). A pump's frame always carries ``chat_id`` and a ``done``
+    follows it once the turn's rows landed; a bare error (the dispatcher's
+    refusal of one message) carries neither."""
+    reason: str
+    resets_at: str
 
 
 class AbortedFrame(_PerChat):
@@ -858,11 +917,16 @@ class MediaFailedFrame(_PerChat, total=False):
 
 class DocumentPreviewFrame(_PerChat, total=False):
     wopi_url: str
+    # The WOPI token, on the live frame only (artifact_events.LIVE_ONLY_KEYS):
+    # a stored row drops both, and a card from history mints its own.
+    access_token: str
+    access_token_ttl: int  # the token's expiry, epoch milliseconds
     filename: str
     file_id: str
     download_url: str
     snapshot_id: str
     generation: int
+    version: int  # the push's number among the file's pushes in the chat
 
 
 class UiFrame(_PerChat, total=False):
@@ -901,29 +965,65 @@ class AppActionAckFrame(TypedDict, total=False):
     reason: str
 
 
-class QueuedFrame(_PerChat):
+class _QueueAttachments(TypedDict, total=False):
+    """The attachment meta a queued or steered message carries
+    (``TurnInput.frame_fields``): the photos as saved (``{name, path}``) and
+    the validated files (``{path, name}``); absent on a text-only message."""
+    images: list
+    files: list
+
+
+class _QueueWaiting(TypedDict, total=False):
+    """Why a message waits beyond the chat's turn: ``reconnect`` while the
+    chat's machine is reconnecting (``input_queue.WAITING_RECONNECT``)."""
+    waiting: str
+
+
+class _QueueChip(_PerChat, _QueueAttachments, _QueueWaiting):
+    queue_id: str         # the client-minted id of the waiting message
+    text: str
+    author_sub: str       # who typed it (a shared chat shows a teammate's chips)
+    view_chat_id: str     # the chat its author viewed when not the queue's own
+
+
+class QueuedFrame(_QueueChip):
+    index: int            # its place in the chat's queue
+
+
+class _Returned(_QueueAttachments, total=False):
+    """On the author's sockets only: the message handed back to the
+    composer (``returned: true``, the text and the attachments)."""
+    returned: bool
+    text: str
+
+
+class QueueRemovedFrame(_PerChat, _Returned):
+    queue_id: str
     index: int
-    text: str
 
 
-class QueueRemovedFrame(_PerChat):
-    index: int
-    text: str
+class QueueSentFrame(_PerChat, _QueueAttachments):
+    queue_ids: list       # the queued messages the turn took
+    message_ids: list     # their chat_messages ids (one row per message)
+    text: str             # the batch joined, as the engine got it
 
 
-class QueueSentFrame(_PerChat):
-    text: str
-
-
-class QueueClearedFrame(_PerChat):
-    text: str
+class QueueClearedFrame(_PerChat, _Returned):
+    queue_ids: list
+    reason: str           # cancel, stopped, turn_failed, drive_refused, revoked
 
 
 class QueueSnapshotFrame(_PerChat):
-    messages: list
+    messages: list        # the chat's waiting messages, as ``_QueueChip`` entries
 
 
-class SteeredFrame(_PerChat):
+class _SteerMeta(TypedDict, total=False):
+    event_data: dict      # a delegated steer: the delegating agent's identity (lane_steer)
+    queue_id: str
+    message_id: int       # the steer's row: its place in the chat
+
+
+class SteeredFrame(_PerChat, _QueueAttachments, _SteerMeta):
     text: str
 
 
@@ -935,7 +1035,10 @@ class ModelChangedFrame(_PerChat):
     model: str
 
 
-class ExecutionModeChangedFrame(TypedDict):
+class ExecutionModeChangedFrame(_PerChat):
+    # ``chat_id``: the chat the ack or a refused pick's echo is about; absent
+    # for a new chat's pick (nothing to apply it to yet). Not a per-chat
+    # stream frame: the dashboard matches the id itself.
     execution_mode: str
 
 
@@ -1007,6 +1110,38 @@ class ChatHistoryFrame(TypedDict, total=False):
     model: str
     mode: str
     process_alive: bool
+    # Present only on a chat that runs as the agent which this person may
+    # not drive: the drive gate's sentence; the dashboard locks the mode,
+    # model and terminal pickers with it as their tooltip.
+    drive_refusal: str
+    # True when the live turn's attach follows (its ``live_state``): the
+    # dashboard holds these rows and paints them with the live blocks once.
+    live_pending: bool
+
+
+class _ChatHistoryDeltaKeys(TypedDict):
+    # The keys a delta always carries (``Required[...]`` is invisible at run
+    # time under this module's postponed annotations; the later base's
+    # requiredness wins in a TypedDict's MRO).
+    chat_id: str
+    messages: list
+    since_id: int
+
+
+class ChatHistoryDeltaFrame(ChatHistoryFrame, _ChatHistoryDeltaKeys, total=False):
+    """A history re-send of the viewed chat for a client that declared
+    ``history_deltas``: a ``resume_chat`` with ``delta`` or one of the
+    server's re-sends (a task or meeting chat's turn end, a task chat's next
+    run, the idle poll's attach, a promised pump gone before its attach).
+    ``ChatHistoryFrame``'s fields with ``messages`` holding the rows above
+    the floors of the last history this connection got for the chat (the
+    viewed chat and its sibling runs, ascending by id; a user row above a
+    live pump's cutoff can come again, so the client dedupes by id and
+    re-derives its view from every row it holds). Never the first frame of
+    a view: a connection with no floor for the chat is sent the full
+    history instead. The sender always sets
+    ``chat_id``, ``messages`` and ``since_id`` (``_ChatHistoryDeltaKeys``);
+    the rest stay optional."""
 
 
 class ChatStatusFrame(TypedDict):
@@ -1112,6 +1247,14 @@ class NotificationCountFrame(TypedDict):
     count: int
 
 
+class ShareInboxFrame(TypedDict, total=False):
+    """The recipient's "Shared with you" section changed (SHARING.md):
+    ``pending`` is their count of decisions waiting, ``agents`` the agents
+    whose Apps panel gained or lost a placed app for them."""
+    pending: int
+    agents: list
+
+
 class FileUpdatedFrame(TypedDict, total=False):
     agent_slug: str
     rel_path: str
@@ -1136,6 +1279,7 @@ class OpenAppFrame(TypedDict, total=False):
     app_id: str
     title: str
     agent: str
+    opened_by: str
     scope_chat_id: str
     scope_project_id: str
 

@@ -41,7 +41,7 @@ from collections import OrderedDict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from starlette.requests import ClientDisconnect
+from api.events import webhook_body
 
 from storage.automation import trigger_store
 from storage import database as task_store
@@ -62,7 +62,7 @@ router = APIRouter()
 def _webhook_throttle(key: str, bucket: str = "webhook") -> None:
     """Apply a rate-limit bucket to ``key`` → 429 if over. The ``webhook`` bucket
     (generous) caps a single trigger's fire rate; ``webhook_auth`` (strict) caps
-    per-IP key brute-forcing."""
+    per-address key brute-forcing."""
     from auth import rate_limiter
     ok, retry_after = rate_limiter.hit(bucket, key)
     if not ok:
@@ -74,11 +74,12 @@ def _webhook_throttle(key: str, bucket: str = "webhook") -> None:
 
 
 def _webhook_auth_failed(request: Request) -> None:
-    """Record + throttle a failed webhook auth by source IP (strict bucket), then
-    raise 403 (or 429 once the IP trips the limit) — so a leaked-URL brute force
-    is rate-limited instead of unbounded."""
-    from auth.lan_check import get_client_ip
-    _webhook_throttle(f"ip:{get_client_ip(request)}", bucket="webhook_auth")
+    """Record + throttle a failed webhook auth by source address (strict
+    bucket, keyed by ``auth_bucket_key``), then raise 403 (or 429 once the
+    address trips the limit) — so a leaked-URL brute force is rate-limited
+    instead of unbounded."""
+    from auth.lan_check import auth_bucket_key
+    _webhook_throttle(f"ip:{auth_bucket_key(request)}", bucket="webhook_auth")
     raise HTTPException(403, "Forbidden")
 
 
@@ -167,7 +168,7 @@ def _remember_key(cache_key: tuple[str, str, str], row: dict) -> None:
 
 async def _verify_fire_key(request: Request, kind: str, owner: str, slug: str) -> dict:
     """The key row authorizing this fire, or the refusal (403, or 429 on the
-    per-IP or per-prefix throttle, or 503 when the verification queue is
+    per-address or per-prefix throttle, or 503 when the verification queue is
     full)."""
     import config
     from auth import rate_limiter
@@ -221,7 +222,7 @@ async def _verify_fire_key(request: Request, kind: str, owner: str, slug: str) -
                     required_permission="triggers")
         except api_key_manager.KeyMismatch as e:
             # All failures → 403 (don't distinguish auth-format from missing-key
-            # to attackers). Log the code for ops debugging; throttle the source IP.
+            # to attackers). Log the code for ops debugging; throttle the source address.
             logger.info(f"Webhook auth failed {kind}={owner} slug={slug} code={e.code}")
             if e.code == "unknown":
                 rate_limiter.record_attempt("webhook_prefix", prefix)
@@ -522,7 +523,7 @@ async def fire_agent_trigger(
     # Cap the fire rate per trigger so a leaked key can't burn credits / DoS.
     _webhook_throttle(f"trig:agent:{agent}/{slug}")
     event_id = _event_id(request)
-    body = await _safe_json(request)
+    body = await _keyed_body(request, f"trigger:agent/{agent}/{slug}")
     return await trigger_manager.fire_trigger(
         trigger, body, trigger_source=f"agent:{agent}/{slug}", event_id=event_id,
     )
@@ -552,22 +553,43 @@ async def fire_user_trigger(
     # Cap the fire rate per trigger so a leaked key can't burn credits / DoS.
     _webhook_throttle(f"trig:user:{username}/{slug}")
     event_id = _event_id(request)
-    body = await _safe_json(request)
+    body = await _keyed_body(request, f"trigger:user/{username}/{slug}")
     return await trigger_manager.fire_trigger(
         trigger, body, trigger_source=f"user:{username}/{slug}", event_id=event_id,
     )
 
 
-async def _safe_json(request: Request) -> dict:
-    # A body the middleware cut at its tier arrives as a disconnect: the
-    # caller already holds the 413, so the fire must not go on with {}.
+async def _json_object(request: Request) -> dict:
+    """A dashboard test fire's JSON body (the middleware's JSON tier bounds
+    it); anything but an object fires with ``{}``."""
     try:
         body = await request.json()
-        return body if isinstance(body, dict) else {}
-    except ClientDisconnect:
-        raise
-    except Exception:
+    except ValueError:
         return {}
+    return body if isinstance(body, dict) else {}
+
+
+async def _keyed_body(request: Request, source: str) -> dict:
+    """The fire's JSON body, read once its key verified: up to the keyed cap
+    (``webhook_body.keyed_cap``), under the read deadlines and the in-flight
+    bounds. A body that is not a JSON object fires with ``{}``."""
+    cap = webhook_body.keyed_cap()
+    webhook_body.lift(request, cap)
+    try:
+        raw = await webhook_body.read(request, cap=cap, source=source)
+    except webhook_body.TooLarge:
+        raise HTTPException(413, "Body too large") from None
+    except webhook_body.Busy:
+        raise HTTPException(503, "Busy", headers={"Retry-After": "5"}) from None
+    except TimeoutError:
+        raise HTTPException(408, "Body timeout") from None
+    # A body the middleware cut arrives as a disconnect, which propagates:
+    # the caller already holds the 413, so the fire must not go on with {}.
+    try:
+        body = await webhook_body.parse_json(raw)
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 # =====================================================================
@@ -618,7 +640,8 @@ async def create_trigger_endpoint(
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
             raise HTTPException(400, "Trigger slug already exists in this scope")
         raise
-    response = {"status": "created", "trigger": _decorate_for_user(row, u)}
+    response = {"status": "created",
+                "trigger": _decorate_for_user(row, u, await run_db(_decoration_maps, [row]))}
     # Soft-warn on functionally-duplicate vendor-subscribed triggers.
     # The unique-index only catches exact slug collisions, but
     # (subscription_id + event_filter) ties are functionally identical —
@@ -630,7 +653,8 @@ async def create_trigger_endpoint(
     # report it back.
     if req.subscription_id:
         siblings = [
-            t for t in trigger_store.list_triggers(subscription_id=req.subscription_id)
+            t for t in await run_db(trigger_store.list_triggers,
+                                    subscription_id=req.subscription_id)
             if t["id"] != row["id"] and t.get("event_filter") == row.get("event_filter")
         ]
         if siblings:
@@ -658,28 +682,32 @@ async def list_triggers_endpoint(
     # filter in both modes. Keyed on is_service like /v1/tasks (H1/H2): a
     # session JWT is api-key-shaped but must get the user-view + the
     # accessible-agents filter exactly like a cookie caller.
-    if u.is_service or (audit and u.is_admin):
-        rows = trigger_store.list_triggers(agent=agent, scope=scope)
-    else:
-        rows = trigger_store.list_triggers_for_user_view(
-            user_sub=u.sub, agent=agent,
-        )
-        if scope:
-            rows = [r for r in rows if r.get("scope") == scope]
-    # Filter by accessible agents for non-admin. Delegation edges add the
-    # targets' AGENT-SCOPE triggers to a no-user caller's view (the store's
-    # user-view already dropped foreign user-scope rows).
-    if not (u.is_admin or u.is_service):
-        edge_reach = nouser_read_targets(u)
-        rows = [
-            r for r in rows
-            if u.can_access_agent(r["agent"])
-            or (r.get("scope") == _vis.SCOPE_AGENT and r["agent"] in edge_reach)
-        ]
-    # The linked-task lookups and the model resolution are sync DB reads:
-    # one batch, off the loop.
-    tasks_by_id = await asyncio.to_thread(_linked_tasks_for, rows)
-    return {"triggers": [_decorate_for_user(r, u, tasks_by_id) for r in rows]}
+    def _job() -> tuple[list[dict], dict]:
+        if u.is_service or (audit and u.is_admin):
+            rows = trigger_store.list_triggers(agent=agent, scope=scope)
+        else:
+            rows = trigger_store.list_triggers_for_user_view(
+                user_sub=u.sub, agent=agent,
+            )
+            if scope:
+                rows = [r for r in rows if r.get("scope") == scope]
+        # Filter by accessible agents for non-admin. Delegation edges add the
+        # targets' AGENT-SCOPE triggers to a no-user caller's view (the store's
+        # user-view already dropped foreign user-scope rows).
+        if not (u.is_admin or u.is_service):
+            edge_reach = nouser_read_targets(u)
+            rows = [
+                r for r in rows
+                if u.can_access_agent(r["agent"])
+                or (r.get("scope") == _vis.SCOPE_AGENT and r["agent"] in edge_reach)
+            ]
+        return rows, _decoration_maps(rows)
+
+    # The rows and everything their decoration reads (the linked tasks, the
+    # transfers, the creators' names, the apps): one job, four batched reads
+    # and one task read per distinct linked task, however many rows.
+    rows, maps = await run_db(_job)
+    return {"triggers": [_decorate_for_user(r, u, maps) for r in rows]}
 
 
 @router.get("/v1/triggers/{trigger_id}")
@@ -688,19 +716,29 @@ async def get_trigger_endpoint(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    row = trigger_store.get_trigger(trigger_id)
+
+    def _job():
+        row = trigger_store.get_trigger(trigger_id)
+        return row, (_decoration_maps([row]) if row and _can_view_trigger(row, u) else None)
+
+    row, maps = await run_db(_job)
     if not row:
         raise HTTPException(404, "Trigger not found")
-    if not _can_view_trigger(row, u):
+    if maps is None:
         raise HTTPException(403, "Forbidden")
-    tasks_by_id = await asyncio.to_thread(_linked_tasks_for, [row])
-    return _decorate_for_user(row, u, tasks_by_id)
+    return _decorate_for_user(row, u, maps)
+
+
+def _moved_from(rows: list[dict]) -> dict[str, str]:
+    from services.agents import offboarding_transfer
+    return offboarding_transfer.transferred_from_names(
+        [r.get("transferred_from") or "" for r in rows])
 
 
 async def _edit_impl(
     trigger_id: str, req: EditTriggerRequest, user: UserContext,
 ):
-    row = trigger_store.get_trigger(trigger_id)
+    row = await run_db(trigger_store.get_trigger, trigger_id)
     if not row:
         raise HTTPException(404, "Trigger not found")
     if not _can_manage_trigger(row, user):
@@ -756,7 +794,7 @@ async def delete_trigger_endpoint(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    row = trigger_store.get_trigger(trigger_id)
+    row = await run_db(trigger_store.get_trigger, trigger_id)
     if not row:
         raise HTTPException(404, "Trigger not found")
     if not _can_manage_trigger(row, u):
@@ -777,7 +815,7 @@ async def pause_trigger_endpoint(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    row = trigger_store.get_trigger(trigger_id)
+    row = await run_db(trigger_store.get_trigger, trigger_id)
     if not row:
         raise HTTPException(404, "Trigger not found")
     if not _can_manage_trigger(row, u):
@@ -798,7 +836,7 @@ async def resume_trigger_endpoint(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    row = trigger_store.get_trigger(trigger_id)
+    row = await run_db(trigger_store.get_trigger, trigger_id)
     if not row:
         raise HTTPException(404, "Trigger not found")
     if not _can_manage_trigger(row, u):
@@ -825,7 +863,7 @@ async def fire_test_endpoint(
     webhook calls. Useful for "test fire" buttons in dashboard.
     """
     u = require_auth(user)
-    row = trigger_store.get_trigger(trigger_id)
+    row = await run_db(trigger_store.get_trigger, trigger_id)
     if not row:
         raise HTTPException(404, "Trigger not found")
     if not _can_view_trigger(row, u):
@@ -848,7 +886,7 @@ async def fire_test_endpoint(
         _check_trigger_mutation_authority(row, u)
     if not row.get("enabled"):
         raise HTTPException(400, "Trigger is paused")
-    body = await _safe_json(request)
+    body = await _json_object(request)
     return await trigger_manager.fire_trigger(
         row, body, trigger_source=f"test:{u.sub[:8]}",
     )
@@ -859,8 +897,10 @@ async def fire_test_endpoint(
 # =====================================================================
 
 
-def trigger_webhook_path(row: dict) -> str | None:
-    """Webhook URL relative path (frontend prepends host). Lives under
+def trigger_webhook_path(row: dict, usernames: dict[str, str] | None = None) -> str | None:
+    """Webhook URL relative path (frontend prepends host). ``usernames`` is
+    the pre-resolved ``{sub: username}`` of a listing (``_decoration_maps``);
+    without it the one row's creator is read here. Lives under
     /v1/webhooks/ — same prefix as vendor-subscribed webhooks so a
     single reverse-proxy auth-gate bypass (`^/v1/webhooks/`) covers
     both inbound surfaces. Vendor triggers (subscription_id set) don't
@@ -871,7 +911,10 @@ def trigger_webhook_path(row: dict) -> str | None:
     if row.get("scope") == _vis.SCOPE_AGENT:
         return f"/v1/webhooks/agent/{row['agent']}/{row['slug']}"
     if row.get("scope") == _vis.SCOPE_USER:
-        username = notification_store.resolve_sub_to_username(row["created_by"])
+        if usernames is None:
+            username = notification_store.resolve_sub_to_username(row["created_by"])
+        else:
+            username = usernames.get(row["created_by"])
         return f"/v1/webhooks/user/{username}/{row['slug']}" if username else None
     return None
 
@@ -920,12 +963,34 @@ def _linked_tasks_for(rows: list[dict]) -> dict[str, dict]:
     return out
 
 
-def _decorate_for_user(row: dict, user: UserContext,
-                       tasks_by_id: dict[str, dict] | None = None) -> dict:
+def _decoration_maps(rows: list[dict]) -> dict:
+    """Everything ``_decorate_for_user`` reads for a set of rows, in a few
+    queries (sync store reads: call off the loop): the linked tasks, the
+    transfers' names, the creators' usernames and display names (the
+    user-scope rows), and the apps."""
+    user_rows = [r for r in rows if r.get("scope") == _vis.SCOPE_USER]
+    creators = [r.get("created_by") or "" for r in user_rows]
+    return {
+        "tasks": _linked_tasks_for(rows),
+        "moved": _moved_from(rows),
+        "usernames": notification_store.resolve_subs_to_usernames(creators),
+        "names": notification_store.resolve_subs_to_display_names(creators),
+        "apps": task_store.get_apps_by_ids([r.get("app_id") or "" for r in rows]),
+    }
+
+
+def _decorate_for_user(row: dict, user: UserContext, maps: dict | None = None) -> dict:
     """Add can_pause / can_resume / can_delete / can_edit / can_fire flags
-    + linked task name and model + webhook URL hint.
+    + linked task name and model + webhook URL hint + the name of whoever
+    the offboarding transfer moved it from, all from ``maps``
+    (``_decoration_maps``, read off the loop by every route): with them
+    nothing here reads the store; a direct caller without them reads for
+    its one row.
     """
+    if maps is None:
+        maps = _decoration_maps([row])
     out = dict(row)
+    out["transferred_from_name"] = maps["moved"].get(row.get("transferred_from") or "", "")
     can_manage = _can_manage_trigger(row, user)
     is_enabled = bool(row.get("enabled", True))
 
@@ -937,16 +1002,16 @@ def _decorate_for_user(row: dict, user: UserContext,
     # ``_can_manage_trigger`` already pins), so the flag must not lie.
     out["can_fire"] = can_manage and _can_view_trigger(row, user)
 
-    out["webhook_path"] = trigger_webhook_path(row)
+    out["webhook_path"] = trigger_webhook_path(row, maps["usernames"])
     if row.get("scope") == _vis.SCOPE_USER:
-        out["created_by_name"] = notification_store.resolve_sub_to_display_name(row["created_by"])
+        out["created_by_name"] = maps["names"].get(row["created_by"])
 
     # Linked task: its name and what it runs on (a trigger has no model of
     # its own; the linked task's pins or its agent's default decide).
-    out.update(_linked_task_fields(row, tasks_by_id))
+    out.update(_linked_task_fields(row, maps["tasks"]))
     # The app target in words (APPS.md "Handlers").
     if row.get("app_id"):
-        app_row = task_store.get_app(row["app_id"])
+        app_row = maps["apps"].get(row["app_id"])
         out["app_slug"] = (app_row or {}).get("slug")
         out["app_title"] = (app_row or {}).get("title") or (app_row or {}).get("slug")
     else:

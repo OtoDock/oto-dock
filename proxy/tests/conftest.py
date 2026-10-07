@@ -338,6 +338,22 @@ def temp_db():
         from services.notifications import notification_manager as _nm
         from services.webhooks import webhook_dispatcher as _wd
         _nm.reset_audience_cache()
+        # A file_updated window left open by a test (its timer on a loop that
+        # ended) must not join the next test's burst; the install id read
+        # once per process must not outlive the test that stubbed it.
+        _nm._file_batches.clear()
+        _nm._install_id_value = ""
+        from services.notifications import push_sender as _ps
+        _ps.reset_relay_verdict()
+        from api.agents import chats as _chats_api
+        _chats_api._active_memo.reset()
+        # The binding writer runs INLINE under the suite: the pool tests read
+        # the persisted mirror right after a bind or a release. The queue
+        # itself is exercised by tests/billing/test_binding_writer.py, which
+        # reopens it for its own tests.
+        from services.engines import subscription_pool as _pool
+        _pool._binding_writer = None
+        _pool._binding_writes_closed = True
         _wd.reset_caches()
     except Exception:
         pass
@@ -362,9 +378,40 @@ def temp_db():
     # Seed minimal user data
     _seed_users()
 
+    # The session liveness tables are per process: a test's marks, floors
+    # and headless entries must not make the next test's made-up session id
+    # live. The ids ``live_session_token`` minted for stay live (a token
+    # built at module import is used by every test of its file).
+    try:
+        from core.session import session_state as _liveness
+        _liveness.reset_liveness_for_tests()
+        for _sid in _LIVE_TEST_SIDS:
+            _liveness.mark_starting(_sid, _LIVE_TEST_TTL_S)
+    except Exception:
+        pass
+
     yield db
 
     # No teardown needed — next test truncates
+
+
+# The session ids ``live_session_token`` marked live, re-marked by ``temp_db``
+# before every test.
+_LIVE_TEST_SIDS: set[str] = set()
+_LIVE_TEST_TTL_S = 3600.0
+
+
+def live_session_token(session_id: str, agent_name: str, user_sub: str = "", **kw) -> str:
+    """A session token whose session counts as LIVE for the rest of the
+    process (marked starting; ``temp_db`` re-marks it before every test), so
+    a test that exercises a route through the session refusal gets past it
+    with a made-up session id. A test whose point is the refusal mints with
+    ``create_session_token`` directly."""
+    from auth.session_token import create_session_token
+    from core.session import session_state
+    _LIVE_TEST_SIDS.add(session_id)
+    session_state.mark_starting(session_id, _LIVE_TEST_TTL_S)
+    return create_session_token(session_id, agent_name, user_sub, **kw)
 
 
 class _LoopDbGuard:

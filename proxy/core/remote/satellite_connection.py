@@ -11,6 +11,7 @@ import json
 import logging
 import time
 import uuid
+from collections import deque
 from core import placement
 from dataclasses import dataclass, field
 
@@ -24,18 +25,156 @@ logger = logging.getLogger("claude-proxy.satellite")
 # back-pressure behavior is symmetric. Drops oldest on overflow.
 _SEND_QUEUE_SIZE = 10_000
 
-# Bounded in-flight window for chunked file pushes. push_file sends at most this
-# many 512KB chunks onto the bulk lane before awaiting a satellite ack (a
-# "flush"), then continues. This (a) caps transient memory + bulk-queue depth
-# regardless of file size, (b) paces to the satellite's apply rate
-# (backpressure — the bulk lane can no longer overflow + silently drop a chunk),
-# (c) gives a per-window timeout instead of one timeout for the whole file (a
-# large file over a slow link no longer fails the single 30s ack), and (d) lets
-# a failed/timed-out window abort the transfer early instead of blasting the
-# rest. 16 × 512KB = 8MB in flight. The satellite acks any chunk carrying a
-# command_id and commits only on the final chunk's hash, so windowing needs no
-# satellite protocol change.
-PUSH_WINDOW_CHUNKS = 16
+# The bulk credit's measurement: a connection is slow when its credit has been
+# busy for this long and the acks of that window carried less than
+# _SLOW_ACK_BYTES of file bytes (push_file then sends smaller chunks).
+_RATE_WINDOW_S = 2.0
+_SLOW_ACK_BYTES = 2 * 1024 * 1024
+
+
+class CreditFailed(RuntimeError):
+    """The connection's bulk credit is gone: the connection was replaced or
+    dropped, and nothing may be sent on it any more."""
+
+
+class _BulkCredit:
+    """The file bytes of bulk frames handed to one connection and not yet
+    answered by the satellite, bounded by ``cap``.
+
+    The protocol's own ping and pong queue behind every byte already handed
+    to the transport (uvloop, the kernel, a reverse proxy, the router), so
+    without a bound a large transfer on a slow uplink holds a pong past its
+    30 s deadline and the keepalive closes a healthy socket. With the credit
+    no more than ``cap`` of file bytes (a third more on the wire) sits ahead
+    of a pong. A frame goes alone when nothing is in flight, so a frame
+    above the cap is never stuck.
+
+    Admission is first come, first served: a frame waits behind every
+    earlier waiter, a release wakes the head only, and a cancelled waiter
+    leaves its place to the next, so no push starves another. Every frame's
+    bytes come back exactly once, by the done callback of its ack future
+    (``push_file``)."""
+
+    def __init__(self, cap: int | None = None):
+        if cap is None:
+            import config
+            cap = int(getattr(config, "BULK_CREDIT_BYTES", 1024 * 1024))
+        self.cap = max(1, cap)
+        self.inflight = 0
+        self.slow = False
+        self._tickets: "deque[tuple[int, asyncio.Future]]" = deque()
+        self._failed: CreditFailed | None = None
+        self._acked: "deque[tuple[float, int]]" = deque()
+        self._busy_since: float | None = None
+
+    def _fits(self, n: int) -> bool:
+        return self.inflight == 0 or self.inflight + n <= self.cap
+
+    def _grant(self, n: int) -> None:
+        if self.inflight == 0:
+            self._busy_since = time.monotonic()
+        self.inflight += n
+
+    def try_take(self, n: int) -> bool:
+        """Take ``n`` bytes at once when nobody waits and they fit. Raises
+        ``CreditFailed`` once the connection is gone."""
+        if self._failed is not None:
+            raise self._failed
+        if not self._tickets and self._fits(n):
+            self._grant(n)
+            return True
+        return False
+
+    def reserve(self, n: int) -> "asyncio.Future | None":
+        """Take ``n`` bytes at once (None), or queue a ticket now and return
+        the future its grant resolves. Raises ``CreditFailed`` once the
+        connection is gone. A caller that stops waiting hands the future to
+        ``abandon``."""
+        if self.try_take(n):
+            return None
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._tickets.append((n, fut))
+        return fut
+
+    def abandon(self, n: int, fut: asyncio.Future) -> None:
+        """The holder of ``reserve``'s future stopped waiting: a grant comes
+        back, a waiting ticket leaves its place to the next."""
+        if fut.done() and not fut.cancelled() and fut.exception() is None:
+            self.release(n, acked=False)
+            return
+        if not fut.done():
+            fut.cancel()
+        with contextlib.suppress(ValueError):
+            self._tickets.remove((n, fut))
+        if self._failed is None:
+            self._wake()
+
+    async def take(self, n: int) -> None:
+        """Wait until ``n`` bytes may go. Raises ``CreditFailed`` once the
+        connection is gone."""
+        fut = self.reserve(n)
+        if fut is None:
+            return
+        try:
+            await asyncio.shield(fut)
+        except BaseException:
+            self.abandon(n, fut)
+            raise
+
+    def _wake(self) -> None:
+        while self._tickets:
+            n, fut = self._tickets[0]
+            if fut.done():
+                self._tickets.popleft()
+                continue
+            if not self._fits(n):
+                return
+            self._tickets.popleft()
+            self._grant(n)
+            fut.set_result(None)
+
+    def release(self, n: int, *, acked: bool) -> None:
+        """Return ``n`` bytes. ``acked``: the satellite applied them (they
+        count towards the rate)."""
+        self.inflight = max(0, self.inflight - n)
+        now = time.monotonic()
+        if acked:
+            self._acked.append((now, n))
+            self._measure(now)
+        if self.inflight == 0:
+            self._busy_since = None
+        if self._failed is None:
+            self._wake()
+
+    def _measure(self, now: float) -> None:
+        while self._acked and now - self._acked[0][0] > _RATE_WINDOW_S:
+            self._acked.popleft()
+        if self._busy_since is not None and now - self._busy_since >= _RATE_WINDOW_S:
+            self.slow = sum(n for _, n in self._acked) < _SLOW_ACK_BYTES
+
+    def is_slow(self) -> bool:
+        """The last measurement: the link moved less than _SLOW_ACK_BYTES
+        per _RATE_WINDOW_S while busy (kept until the next one)."""
+        self._measure(time.monotonic())
+        return self.slow
+
+    def fail_all(self, why: str = "connection closed") -> None:
+        """The connection is gone: every waiter and every later ``take``
+        raises."""
+        self._failed = CreditFailed(why)
+        while self._tickets:
+            _n, fut = self._tickets.popleft()
+            if not fut.done():
+                fut.set_exception(self._failed)
+
+
+class _XferToken:
+    """Rides a bulk frame on the lane: the writer drops the frame unsent
+    once its push cancelled it."""
+    __slots__ = ("cancelled",)
+
+    def __init__(self) -> None:
+        self.cancelled = False
 
 # How long an admin-paired satellite must be CONTINUOUSLY unreachable
 # before we fire the "offline" notification to admins. This grace window
@@ -175,6 +314,13 @@ _STEPS_MIN_VERSION = (0, 5, 122)
 # name, a check outside the synced tree is an ``error`` verdict, and a Codex
 # judge gets the ordinary sandbox with the gate alone enforcing.
 _CHECKS_MIN_VERSION = (0, 5, 123)
+# The satellite-local credential gateway (CREDENTIALS.md "The credential
+# gateway"): the machine holds a session's vendor tokens in memory and adds
+# them on the way out; below it a vendor entry keeps the inline shape.
+_MCP_GATEWAY_MIN_VERSION = (0, 5, 132)
+# Paced transfers (0.5.137): the satellite's pulls ride a bounded bulk lane
+# purged on a drop, and ``file_pull_cancel`` stops one the proxy gave up on.
+_PACED_TRANSFERS_MIN_VERSION = (0, 5, 137)
 # Minimum SATELLITE_VERSION that handles `steer_turn` (a user frame written
 # into a running headless Claude CLI turn's stdin — the satellite twin of
 # PersistentSession.steer). NOT additive: an older satellite drops the frame
@@ -182,6 +328,9 @@ _CHECKS_MIN_VERSION = (0, 5, 123)
 # adapter refuses before sending and the caller keeps its queue fallback
 # (stop-and-send).
 _STEER_TURN_MIN_VERSION = (0, 5, 128)
+# Reads Codex's ``willRetry`` at the error notification's top level, so a
+# retried error no longer ends its Codex turn (SATELLITE_VERSION 0.5.131).
+_CODEX_RETRY_READ_MIN_VERSION = (0, 5, 131)
 
 # Heartbeat persistence cadence. The heartbeat handler refreshes the in-memory
 # ``last_heartbeat`` / ``last_seen_iso`` on EVERY heartbeat (20 s) but hands a
@@ -290,8 +439,10 @@ class SatelliteConnection:
     # carries CONTROL frames (commands, acks, pong, deletes, tunnel responses)
     # and ``bulk_queue`` carries file_push DATA chunks. The writer always drains
     # control first and re-checks it between every bulk frame, so a large
-    # multi-chunk file push can never delay a command ack or the keepalive past
-    # a single chunk. ``send_wakeup`` is set by enqueue_send to wake the writer
+    # multi-chunk file push delays a command ack by at most one chunk. The
+    # protocol's ping and pong bypass both lanes and queue behind every byte
+    # already handed to the transport: ``bulk_credit`` bounds those bytes.
+    # ``send_wakeup`` is set by enqueue_send to wake the writer
     # when either lane gains an item (lets it serve two lanes without cancelling
     # a blocking Queue.get()).
     send_queue: asyncio.Queue = field(
@@ -302,16 +453,27 @@ class SatelliteConnection:
     )
     send_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     writer_task: asyncio.Task | None = None
+    # The file bytes in flight on this connection (push_file) and the time
+    # of its latest inbound transfer frame (an ack of a bulk frame or any
+    # file_content, monotonic): a transfer waiting behind another one on a
+    # moving link is not stalled, and a satellite below 0.5.137 whose
+    # heartbeat queues behind a pull is still alive.
+    bulk_credit: _BulkCredit = field(default_factory=_BulkCredit)
+    last_transfer_at: float = 0.0
 
     async def enqueue_send(self, msg: dict, *, bulk: bool = False) -> None:
         """Queue a message for the writer task. Drops oldest on overflow.
 
         ``bulk=True`` routes the message to the BULK lane (file_push data
         chunks) instead of the CONTROL lane; the writer always drains control
-        first, so a large transfer can never delay command acks / the
-        keepalive. Safe to call from any coroutine. Returns immediately — the
-        actual ws.send happens inside `_writer_loop`.
+        first, so a large transfer can never delay command acks. Safe to call
+        from any coroutine. Returns immediately — the actual ws.send happens
+        inside `_writer_loop`.
         """
+        self.enqueue_send_nowait(msg, bulk=bulk)
+
+    def enqueue_send_nowait(self, msg: dict, *, bulk: bool = False) -> None:
+        """``enqueue_send`` for a caller that cannot await (a cleanup path)."""
         queue = self.bulk_queue if bulk else self.send_queue
         label = "bulk" if bulk else "control"
         try:
@@ -424,9 +586,11 @@ class SatelliteConnectionManager(
 
     def __init__(self):
         self._connections: dict[str, SatelliteConnection] = {}  # machine_id -> conn
-        # command_id -> (machine_id, future) so we can reject all pending acks
-        # for a machine on deregister instead of letting them wait 30s timeout.
-        self._pending_acks: dict[str, tuple[str, asyncio.Future]] = {}
+        # command_id -> (machine_id, future, connection the frame went out on)
+        # so deregister rejects every pending ack of a machine and a
+        # replacement those of the replaced connection, instead of letting
+        # them wait out their timeout.
+        self._pending_acks: dict[str, tuple[str, asyncio.Future, SatelliteConnection | None]] = {}
         # The pages of a paged manifest reply, by command id, until the last
         # frame resolves the wait (cleared with the ack on every other end).
         self._manifest_pages: dict[str, _ManifestJoin] = {}
@@ -738,8 +902,9 @@ class SatelliteConnectionManager(
         TWO lanes, drained CONTROL-FIRST: a control frame is sent whenever one
         is ready, and the lane is re-checked between every bulk (file_push)
         frame — so a large multi-chunk transfer on the bulk lane can delay a
-        command ack / the keepalive pong by at most one chunk, never the whole
-        file. When both lanes are empty the writer clears + re-checks
+        command ack by at most one chunk, never the whole file. A bulk frame
+        whose push was abandoned (its ``_xfer`` token cancelled) is dropped
+        unsent. When both lanes are empty the writer clears + re-checks
         ``send_wakeup`` (closing the lost-wakeup window) then awaits it, so it
         never busy-waits and never cancels a blocking Queue.get().
 
@@ -769,6 +934,9 @@ class SatelliteConnectionManager(
                         await conn.send_wakeup.wait()
                         continue
                 if not isinstance(msg, dict):
+                    continue
+                token = msg.pop("_xfer", None)
+                if token is not None and token.cancelled:
                     continue
                 try:
                     await conn.ws.send_text(json.dumps(msg))
@@ -834,6 +1002,9 @@ class SatelliteConnectionManager(
                 # satellite's buffered events replay into them.
                 conn.session_queues.update(old.session_queues)
                 conn.session_execution_paths.update(old.session_execution_paths)
+                # What waits on the old socket can never be answered: no await
+                # between this and the swap, so nothing lands on it unseen.
+                self._reject_connection_waiters(old, f"Satellite {machine_id[:8]} replaced by a new connection")
             self._connections[machine_id] = conn
             self._reset_file_changed_lane(machine_id)
 
@@ -937,6 +1108,27 @@ class SatelliteConnectionManager(
         asyncio.create_task(_kick_workspace_sync())
 
         return conn
+
+    def _reject_connection_waiters(self, conn: SatelliteConnection, why: str) -> None:
+        """Fail every ack and pull waiting on ``conn`` and its bulk credit
+        (a replaced connection). A pull that already holds every byte is
+        left to its waiter, which commits it."""
+        for cid, entry in list(self._pending_acks.items()):
+            if entry[2] is not conn:
+                continue
+            self._pending_acks.pop(cid, None)
+            self._manifest_pages.pop(cid, None)
+            if not entry[1].done():
+                entry[1].set_exception(RuntimeError(why))
+        for rid, st in list(self._pending_pulls.items()):
+            if st.conn is not conn or st.future.done():
+                continue
+            self._pending_pulls.pop(rid, None)
+            self._cleanup_pull_stream(st)
+            st.future.set_exception(RuntimeError(why))
+        credit = getattr(conn, "bulk_credit", None)
+        if credit is not None:
+            credit.fail_all(why)
 
     async def deregister(
         self, machine_id: str, expected: "SatelliteConnection | None" = None,
@@ -1052,24 +1244,28 @@ class SatelliteConnectionManager(
             # timeout. Critical for mid-install disconnects where sync_mcps
             # tarballs are in flight.
             to_reject = [
-                cid for cid, (mid, _) in self._pending_acks.items()
-                if mid == machine_id
+                cid for cid, entry in self._pending_acks.items()
+                if entry[0] == machine_id
             ]
             for cid in to_reject:
                 entry = self._pending_acks.pop(cid, None)
                 self._manifest_pages.pop(cid, None)
                 if entry:
-                    _, future = entry
+                    future = entry[1]
                     if not future.done():
                         future.set_exception(
                             RuntimeError(f"Satellite {machine_id[:8]} disconnected")
                         )
+            credit = getattr(conn, "bulk_credit", None)
+            if credit is not None:
+                credit.fail_all(f"Satellite {machine_id[:8]} disconnected")
 
             # Reject + clean up any streaming pulls for this machine so the
-            # caller wakes immediately and no .partial is left on disk.
+            # caller wakes immediately and no .partial is left on disk. A
+            # pull that already holds every byte is left to its waiter.
             pulls_to_reject = [
                 rid for rid, st in self._pending_pulls.items()
-                if st.machine_id == machine_id
+                if st.machine_id == machine_id and not st.future.done()
             ]
             for rid in pulls_to_reject:
                 st = self._pending_pulls.pop(rid, None)
@@ -1293,6 +1489,26 @@ class SatelliteConnectionManager(
             return False
         return self._satellite_at_least(machine_id, _STEPS_MIN_VERSION)
 
+    def satellite_supports_mcp_gateway(self, machine_id: str) -> bool:
+        """True if the connected satellite runs the credential gateway for
+        this session's vendor MCPs (SATELLITE_VERSION 0.5.132 and the
+        ``mcp_gateway`` capability in its handshake). When False a vendor
+        entry keeps today's inline shape until the machine updates."""
+        conn = self._connections.get(machine_id)
+        if not conn or not (conn.capabilities or {}).get("mcp_gateway"):
+            return False
+        return self._satellite_at_least(machine_id, _MCP_GATEWAY_MIN_VERSION)
+
+    def satellite_supports_paced_transfers(self, machine_id: str) -> bool:
+        """True if the connected satellite paces its pulls and handles
+        ``file_pull_cancel`` (SATELLITE_VERSION 0.5.137 and the
+        ``paced_transfers`` capability in its handshake). When False the
+        proxy never sends the cancel: an older satellite would drop it."""
+        conn = self._connections.get(machine_id)
+        if not conn or not (getattr(conn, "capabilities", None) or {}).get("paced_transfers"):
+            return False
+        return self._satellite_at_least(machine_id, _PACED_TRANSFERS_MIN_VERSION)
+
     def satellite_supports_checks(self, machine_id: str) -> bool:
         """True if the connected satellite carries the checks additions
         (SATELLITE_VERSION 0.5.123): the two ``step_run`` fields a check
@@ -1306,6 +1522,13 @@ class SatelliteConnectionManager(
         0.5.128). When False the Claude remote adapter refuses the steer
         before sending and the caller queues the message as before."""
         return self._satellite_at_least(machine_id, _STEER_TURN_MIN_VERSION)
+
+    def satellite_supports_codex_retry_read(self, machine_id: str) -> bool:
+        """True if the connected satellite keeps a Codex turn running through
+        an error Codex retries (SATELLITE_VERSION 0.5.131). When False its
+        turn ends on that notification, so the proxy keeps the ERROR for it
+        instead of letting the turn end silently."""
+        return self._satellite_at_least(machine_id, _CODEX_RETRY_READ_MIN_VERSION)
 
     def satellite_supports_long_bg_drain(self, machine_id: str) -> bool:
         """True if the connected satellite forwards post-turn stdout up to
@@ -1382,7 +1605,7 @@ class SatelliteConnectionManager(
         if not entry:
             self._manifest_pages.pop(command_id, None)
             return
-        mid, future = entry
+        mid, future = entry[0], entry[1]
         if mid != machine_id or future.done():
             return
         files = msg.get("files")
@@ -1455,7 +1678,7 @@ class SatelliteConnectionManager(
         # Create ack future keyed by (machine_id, future) so deregister can
         # cancel them en masse on disconnect.
         future: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending_acks[command_id] = (machine_id, future)
+        self._pending_acks[command_id] = (machine_id, future, conn)
         # A paged manifest's pages end with the wait, however it ends.
         future.add_done_callback(lambda _f, _cid=command_id: self._manifest_pages.pop(_cid, None))
 
@@ -1615,7 +1838,7 @@ class SatelliteConnectionManager(
             command_id = msg.get("command_id", "")
             entry = self._pending_acks.get(command_id)
             if entry:
-                _, future = entry
+                future = entry[1]
                 if not future.done():
                     future.set_result(msg)
 
@@ -1767,13 +1990,17 @@ class SatelliteConnectionManager(
 
         elif msg_type == "sessions_alive":
             # Headless twin of pty_alive: live CLI sessions + in-flight turn
-            # state. Routed to the run-recovery callback (registered at
+            # state, and (0.5.138) every other headless session the satellite
+            # holds (``other_sessions``; None when an older satellite sends no
+            # such list). Routed to the run-recovery callback (registered at
             # startup) so a restarted proxy re-adopts running turns instead
             # of failing them blind (Mode C). Absent callback → old behavior.
             cb = self._sessions_alive_callback
             if cb is not None:
+                others = msg.get("other_sessions")
                 asyncio.create_task(
-                    cb(machine_id, msg.get("sessions") or []),
+                    cb(machine_id, msg.get("sessions") or [],
+                       others if isinstance(others, list) else None),
                 )
 
         elif msg_type == "transcript_lines":
@@ -1929,6 +2156,9 @@ class SatelliteConnectionManager(
             self._on_manifest_frame(machine_id, msg)
 
         elif msg_type == "file_content":
+            conn = self._connections.get(machine_id)
+            if conn is not None:
+                conn.last_transfer_at = time.monotonic()
             request_id = msg.get("request_id", "")
             st = self._pending_pulls.get(request_id)
             if st is not None:
@@ -2008,8 +2238,8 @@ class SatelliteConnectionManager(
         """Background task: detect stale connections + drive admin alerts.
 
         Each 30s tick:
-        - 90s no heartbeat  -> DB status='disconnected'
-        - 5min no heartbeat -> kill all sessions and close the WS
+        - 90s no heartbeat (nor transfer frame) -> DB status='disconnected'
+        - 5min no heartbeat (nor transfer frame) -> kill all sessions and close the WS
         - reconcile admin offline/online notifications against sustained
           reachability (see ``_evaluate_admin_machine_alerts``).
         """
@@ -2020,7 +2250,7 @@ class SatelliteConnectionManager(
 
             from storage import remote_store
             for machine_id, conn in list(self._connections.items()):
-                elapsed = now - conn.last_heartbeat
+                elapsed = now - _last_contact(conn)
                 if elapsed > 300:
                     stale.append(machine_id)
                 elif elapsed > 90:
@@ -2053,6 +2283,13 @@ class SatelliteConnectionManager(
                 await self._evaluate_admin_machine_alerts()
             except Exception:
                 logger.exception("admin machine-alert evaluation failed")
+
+
+def _last_contact(conn) -> float:
+    """When a connection was last heard from (monotonic): its heartbeat, or a
+    transfer frame, since a satellite below 0.5.137 queues a whole pull ahead
+    of its heartbeats."""
+    return max(conn.last_heartbeat, getattr(conn, "last_transfer_at", 0.0))
 
 
 def _iso_now() -> str:

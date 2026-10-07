@@ -32,6 +32,7 @@ from auth.providers import (
     get_current_user,
     require_auth,
     require_creator,
+    require_user,
 )
 from services.departments import edge_compiler
 from storage.agents import agent_store
@@ -40,7 +41,8 @@ from auth import roles
 
 logger = logging.getLogger("claude-proxy.departments")
 
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class CreateDepartmentRequest(BaseModel):

@@ -36,7 +36,7 @@ def test_pop_ci_case_insensitive():
 def test_apply_merges_creds_and_strips_token(monkeypatch):
     monkeypatch.setattr(
         itc, "_fetch_mcp_credentials",
-        lambda token, **kw: {"env": {"GH_TOKEN": "secret"}, "http_bearer": None},
+        lambda token, **kw: {"env": {"GH_TOKEN": "secret"}},
     )
     env = {"OTO_MCP_FETCH_TOKEN": "captok", "PATH": "/bin"}
     itc._apply_broker_credentials(env)
@@ -100,9 +100,9 @@ def test_fetch_returns_env_on_200(monkeypatch):
     monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:9")
     monkeypatch.setattr(
         itc.urllib.request, "urlopen",
-        lambda req, timeout=0: _Resp(json.dumps({"env": {"K": "V"}, "http_bearer": "b"}).encode()),
+        lambda req, timeout=0: _Resp(json.dumps({"env": {"K": "V"}}).encode()),
     )
-    assert itc._fetch_mcp_credentials("tok") == {"env": {"K": "V"}, "http_bearer": "b"}
+    assert itc._fetch_mcp_credentials("tok") == {"env": {"K": "V"}}
 
 
 def test_fetch_terminal_on_401_no_retry(monkeypatch):

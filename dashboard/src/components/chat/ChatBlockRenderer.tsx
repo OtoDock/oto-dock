@@ -6,7 +6,7 @@ import ThinkingBlock from './ThinkingBlock'
 import PermissionDialog from './PermissionDialog'
 import SubagentInfo from './SubagentInfo'
 import BgCommandInfo from './BgCommandInfo'
-import DelegateTaskInfo from './DelegateTaskInfo'
+import DelegateTaskInfo, { DelegateResultFiles } from './DelegateTaskInfo'
 import CheckVerdictCard from './checks/CheckVerdictCard'
 import SystemEvent from './SystemEvent'
 import ImageGallery from './media/ImageGallery'
@@ -14,14 +14,14 @@ import VideoPlayer from './media/VideoPlayer'
 import AudioPlayer from './media/AudioPlayer'
 import DisplayUrl from './media/DisplayUrl'
 import DisplayFile from './media/DisplayFile'
-import DocumentPreview from './media/DocumentPreview'
+import DocumentCard from './media/DocumentCard'
 import UiArtifact from './media/UiArtifact'
 import PlanView from './plan/PlanView'
 import QuestionDialog from './QuestionDialog'
 import SearchHighlight from './SearchHighlight'
 import { useSearch } from '../../contexts/SearchContext'
 import type { MessageBlock } from './types'
-import type { BgCommandPair, PreviewChainMode } from '../../lib/messageBlocks'
+import type { BgCommandPair } from '../../lib/messageBlocks'
 import PlanReviewCard from './PlanReviewCard'
 
 // URL regex for linkifying plain text (user messages)
@@ -112,14 +112,13 @@ export default function BlockRenderer({
   onQuestionAnswer,
   onQuestionAnswerStructured,
   onSendMessage,
+  onSendAgain,
   onPlanFetched,
-  onDismissPreview,
   onArtifactInteraction,
   bgPair,
   agentName,
   uiSuperseded,
   uiTitle,
-  previewMode,
   dialogsInTerminal,
 }: {
   block: MessageBlock
@@ -136,15 +135,13 @@ export default function BlockRenderer({
   onQuestionAnswer?: (response: string) => void
   onQuestionAnswerStructured?: (requestId: string, answers: Record<string, { answers: string[] }>) => void
   onSendMessage?: (text: string) => void
+  /** The turn-ended card's Send again (the page re-sends the last prompt). */
+  onSendAgain?: () => void
   onPlanFetched?: (filename: string, content: string) => void
   /** A live interactive terminal owns this chat's dialogs: question and plan
    * cards render read-only — the answer / approval happens in the TUI, and a
    * card answer would only be held until the parked turn ends. */
   dialogsInTerminal?: boolean
-  /** document_preview blocks: `key` scopes the removal to ONE instance (a
-   * frozen "previous version" closing itself); undefined removes the file's
-   * whole preview trail (the live block's close). */
-  onDismissPreview?: (fileId: string, key?: { snapshotId?: string; dbMessageId?: number }) => void
   /** display_ui backchannel sender — absent on read-only surfaces (history,
       task runs), where the artifact acks `unavailable` instead. */
   onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }>
@@ -157,9 +154,6 @@ export default function BlockRenderer({
   /** ui blocks: fallback title inherited from an earlier display of the same
    * path (html-less re-displays carry none on the wire). */
   uiTitle?: string
-  /** document_preview blocks: render-time chain state (previewChainModes) —
-   * live / frozen previous version / chip. */
-  previewMode?: PreviewChainMode
 }) {
   const { query: searchQuery } = useSearch()
   switch (block.type) {
@@ -239,6 +233,9 @@ export default function BlockRenderer({
         />
       )
 
+    case 'delegate_files':
+      return <DelegateResultFiles files={block.files} skipped={block.skipped} />
+
     case 'checkverdict':
       return (
         <CheckVerdictCard
@@ -314,7 +311,7 @@ export default function BlockRenderer({
       )
 
     case 'system':
-      return <SystemEvent subtype={block.subtype} agentName={block.agentName} agentColor={block.agentColor} message={block.message} />
+      return <SystemEvent subtype={block.subtype} agentName={block.agentName} agentColor={block.agentColor} message={block.message} reason={block.reason} onSendAgain={onSendAgain} />
 
     case 'images':
       return <ImageGallery images={block.images} />
@@ -522,23 +519,17 @@ export default function BlockRenderer({
       )
 
     case 'document_preview':
+      // A card: the document opens in the chat's document pane.
       return (
-        <DocumentPreview
-          wopiUrl={block.wopiUrl}
-          filename={block.filename}
-          fileId={block.fileId}
-          downloadUrl={block.downloadUrl}
-          dbMessageId={block.dbMessageId}
-          snapshotId={block.snapshotId}
+        <DocumentCard
           chatId={chatId}
+          fileId={block.fileId}
+          filename={block.filename}
+          downloadUrl={block.downloadUrl}
+          snapshotId={block.snapshotId}
+          dbMessageId={block.dbMessageId}
+          version={block.version}
           generation={block.generation}
-          mode={previewMode}
-          onDismiss={(scope) => onDismissPreview?.(
-            block.fileId,
-            scope === 'instance'
-              ? { snapshotId: block.snapshotId, dbMessageId: block.dbMessageId }
-              : undefined,
-          )}
         />
       )
 

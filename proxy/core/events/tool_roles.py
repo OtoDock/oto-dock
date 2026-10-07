@@ -45,7 +45,7 @@ WORKFLOW = "workflow"        # runs a workflow script
 PLAN_ENTER = "plan_enter"
 PLAN_EXIT = "plan_exit"
 QUESTION = "question"        # asks the human
-ESCALATION = "escalation"    # Codex's sandbox escalation, presented as a tool
+ESCALATION = "escalation"    # Codex's privileged approvals presented as tools: a sandbox escalation, terminal input to an elevated command
 
 ROLES: tuple[str, ...] = (
     SHELL, READ, GLOB, SEARCH, WRITE, DELETE, WEB_FETCH, WEB_SEARCH, SUBAGENT,
@@ -130,6 +130,7 @@ TOOL_ROLES: dict[str, str] = {
     "AskUserQuestion": "question",
     "request_user_input": "question",
     "CodexEscalation": "escalation",
+    "CodexTerminalInput": "escalation",
 }
 
 TOOL_PAYLOADS: dict[str, str] = {
@@ -167,6 +168,7 @@ TOOL_PAYLOADS: dict[str, str] = {
     "AskUserQuestion": NONE,
     "request_user_input": NONE,
     "CodexEscalation": NONE,
+    "CodexTerminalInput": NONE,
 }
 
 SHELL_DIALECTS: dict[str, str] = {

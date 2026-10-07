@@ -96,7 +96,7 @@ def test_non_admins_get_403_and_nothing_happens(stubs, monkeypatch, role):
     monkeypatch.setattr(stubs["rs"], "get_remote_machine", lambda mid: _machine("user", "owner-sub"))
     resp = TestClient(_app(role)).delete("/v1/admin/remote-machines/m-user")
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "Admin required"
+    assert resp.json()["detail"] == "Admin access required"
     assert stubs["deleted"] == []
     assert stubs["uninstalled"] == []
     stubs["fired"].assert_not_awaited()
@@ -108,3 +108,23 @@ def test_unknown_machine_is_404(stubs, monkeypatch):
     assert resp.status_code == 404
     assert stubs["deleted"] == []
     stubs["fired"].assert_not_awaited()
+
+
+def test_an_admins_session_token_is_refused(stubs, monkeypatch):
+    """The router takes the framework's require_admin: an agent session
+    token resolves to its owner's role with is_api_key set, and is refused
+    on every admin machine route (the remote-machines guard finding)."""
+    from api.remote import remote_machines
+    from auth.providers import UserContext, get_current_user
+    from fastapi import FastAPI
+    monkeypatch.setattr(stubs["rs"], "get_remote_machine", lambda mid: _machine("user", "owner-sub"))
+    app = FastAPI()
+    app.include_router(remote_machines.router)
+    token_principal = UserContext(sub="admin-sub", email="a@x", name="a", role="admin",
+                                  agents=[], is_api_key=True, session_id="s1", agent="pa")
+    app.dependency_overrides[get_current_user] = lambda: token_principal
+    c = TestClient(app)
+    assert c.delete("/v1/admin/remote-machines/m-user").status_code == 403
+    assert c.get("/v1/admin/remote-machines").status_code == 403
+    assert c.post("/v1/admin/remote-machines/pair", json={"name": "x"}).status_code == 403
+    assert stubs["deleted"] == []

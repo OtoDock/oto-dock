@@ -20,6 +20,8 @@ const TASKS = [
     effective_model: 'claude-sonnet-5', effective_execution_path: 'claude-code-cli',
     user_tz: null, effective_tz: 'Europe/Athens', schedule_text: 'Daily at 08:00 (Europe/Athens)',
     can_run: true, can_delete: true, can_pause: true, can_resume: false,
+    transferred_from: 'local:pat', transferred_at: '2026-09-27T07:51:00+00:00',
+    transferred_from_name: 'Pat Person',
   },
   {
     id: 'dyn-2', name: 'Here', agent: 'hosting-admin', schedule: '0 9 * * 1-5', run_at: null, delay_seconds: null,
@@ -75,5 +77,17 @@ describe('AgentSchedules', () => {
     const chip = within(cards[0]).getByTitle(/Agent default: claude-sonnet-5/)
     expect(chip.className).toContain('max-w-full')
     expect(within(chip).getByText('claude-sonnet-5').className).toContain('truncate')
+  })
+
+  it('names who a moved task was transferred from, on the table and the card', () => {
+    mount()
+    const lines = screen.getAllByTestId('transferred-from')
+    // One for the desktop row and one for the phone card of the moved task;
+    // the task that never changed hands shows none.
+    expect(lines).toHaveLength(2)
+    for (const l of lines) {
+      expect(l.textContent).toBe('transferred from Pat Person')
+      expect(l.getAttribute('title')).toMatch(/^Moved to its current owner on /)
+    }
   })
 })

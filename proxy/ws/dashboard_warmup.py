@@ -36,6 +36,7 @@ from core.config.config_builder import (
 )
 from services.engines import subscription_pool
 from services.engines.subscription_pool import NoSubscriptionError
+from core.sandbox.session_config_dir import AgentStateRefused
 from core.session.history_seed import consume_pending_seed_digest
 from core.config.task_config_builder import (
     resolve_task_identity, run_allows_knowledge_rw,
@@ -61,6 +62,7 @@ from ws.dashboard_prewarm import (
     _schedule_pre_warmup_rollback,
 )
 from core.session import session_kind
+from ws.dashboard_chat_text import grace_layer
 from auth import roles
 from auth.providers import acting_role_of
 from ws import wire_events as wire
@@ -315,10 +317,15 @@ class WarmupController:
                 new_sid, build, agent_cfg, started, getattr(self, "layer", None))
             raise
         except Exception as e:
+            below_editor = isinstance(e, AgentStateRefused)
             if isinstance(e, NoSubscriptionError):
                 # A configuration state (no usable account, a pool cap), not
                 # a crash: the first real send surfaces the reason to the user.
                 logger.info(f"WS dashboard pre_warmup skipped (reason={e.reason}): {e}")
+            elif below_editor:
+                # A chat that runs as the agent, below the editor tier: the
+                # first send's warmup card explains it, once.
+                logger.info(f"WS dashboard pre_warmup skipped (below the editor tier) agent={agent}")
             else:
                 logger.error(f"WS dashboard pre_warmup failed: {e}", exc_info=True)
             await _pre_warmup_rollback(
@@ -328,7 +335,8 @@ class WarmupController:
             self._pre_warmed_exec_path = ""
             self._pre_warmed_model = ""
             self._pre_warmed_role = ""
-            await self._send_error(f"Pre-warmup failed: {e}")
+            if not below_editor:
+                await self._send_error(f"Pre-warmup failed: {e}")
 
     async def _handle_warmup(self, msg: dict, *, background: bool = True):
 
@@ -409,7 +417,7 @@ class WarmupController:
                 # Post-warmup re-apply of deferred mode/model: a mode/model
                 # change that raced the synchronous warmup is applied to the new
                 # session + echoed to the client so the UI stays in sync.
-                await self._reapply_deferred_after_warmup()
+                await self._reapply_deferred_after_warmup(self.chat_id or "", from_warmup=True)
 
         # Auto-warmup callers (from _handle_chat on a dead/missing session) need
         # the session synchronously to continue the same turn — await the
@@ -424,6 +432,7 @@ class WarmupController:
         # send-time in _do_warmup (server_kick skips re-persist). The
         # backgrounded path enqueues its own _server_kick after warmup_ready.
         if outcome == "inline" and msg.get("text") and self.session_id and self.chat_id:
+            holder = grace_layer(self.session_id, self.layer) if self.layer else None
             await self._handle_chat({
                 "text": msg.get("text", ""),
                 "images": msg.get("images", []),
@@ -431,6 +440,8 @@ class WarmupController:
                 "chat_id": self.chat_id,
                 "_server_kick": True,
                 "_focus_line": msg.get("_focus_line", ""),
+                # The reuse above already waited out the machine's reconnect.
+                "_reconnect_waited": bool(holder and holder.is_session_grace_held(self.session_id)),
             })
 
     async def _do_warmup(self, agent: str, msg: dict) -> str:
@@ -558,7 +569,14 @@ class WarmupController:
                         })
                         # Client attaches via pty_attach (see _dispatch).
                         return "inline"
-                    if self.layer and await self.layer.is_session_alive(old_session_id):
+                    # A machine in its reconnect grace is coming back: its live
+                    # session is reused, never resumed over (still reconnecting
+                    # after the wait too: the turn then waits for it).
+                    holder = grace_layer(old_session_id, self.layer) if self.layer else None
+                    if holder and (
+                            await self.layer.is_session_alive(old_session_id)
+                            or await holder.wait_session_reconnect(old_session_id)
+                            or holder.is_session_grace_held(old_session_id)):
                         # Confirm the concurrency slot (idempotent for a tracked
                         # session), using the chat's pinned target so a REMOTE
                         # session is a no-op (and a local-full proxy doesn't
@@ -611,7 +629,10 @@ class WarmupController:
             # deferred (user changed during warmup) > requested (sent with warmup
             # msg) > agent default — it must match the session's spawned model
             # because CLI processes bake --model at start and can't swap live.
-            target_model = self.deferred_model or requested_model or config.get_cli_model(agent)
+            # A deferral counts only when it is the new-chat page's (one made
+            # for another chat while its session was away stays that chat's).
+            new_chat_pick = "" if self.deferred_for else self.deferred_model
+            target_model = new_chat_pick or requested_model or config.get_cli_model(agent)
             # A chat-switch race can leave the OTHER chat's model in the
             # selector when a new chat spawns on a different engine — a
             # foreign model would bake into the chat row and 400 every turn
@@ -644,10 +665,11 @@ class WarmupController:
             minted = True
             chat_model = target_model
             chat_exec_mode = requested_exec_mode
-            self.deferred_model = ""  # consumed
-            if self.deferred_mode:
-                permission_mode = self.deferred_mode
-                self.deferred_mode = ""
+            if not self.deferred_for:
+                self.deferred_model = ""  # consumed
+                if self.deferred_mode:
+                    permission_mode = self.deferred_mode
+                    self.deferred_mode = ""
             # The chat row first, then the prompt — both on the chat's lane.
             chat_owner = await run_db(_vis.chat_history_owner, self.agent_name, self.user_sub)
             row_mode, row_model, row_exec_mode = permission_mode, chat_model, chat_exec_mode
@@ -1089,7 +1111,12 @@ class WarmupController:
                     "reason": e.reason,
                 })
             except Exception as e:
-                logger.error(f"WS dashboard warmup failed: {e}", exc_info=True)
+                if isinstance(e, AgentStateRefused):
+                    # A person below the editor tier on a chat that runs as the
+                    # agent: the card below carries the refusal, no crash.
+                    logger.info(f"WS dashboard warmup refused (below the editor tier) chat={wcid}")
+                else:
+                    logger.error(f"WS dashboard warmup failed: {e}", exc_info=True)
                 # Failed spawn — un-burn the claimed history seed so the next
                 # (successful) warmup still restores context. The claim already
                 # persisted its "Continued with a fresh session" card; a rare
@@ -1107,11 +1134,14 @@ class WarmupController:
                 # for true unavailability; a satellite that ran the command and
                 # returned an error surfaces as "Satellite command error: ...".
                 emsg = str(e)
-                fail_reason = (
-                    "target_unavailable"
-                    if ("not connected" in emsg or "command timeout" in emsg)
-                    else "session_error"
-                )
+                if isinstance(e, AgentStateRefused):
+                    fail_reason = wire.REASON_BELOW_EDITOR
+                else:
+                    fail_reason = (
+                        "target_unavailable"
+                        if ("not connected" in emsg or "command timeout" in emsg)
+                        else "session_error"
+                    )
                 await warmup_registry.emit(wcid, {
                     "type": wire.WARMUP_FAILED,
                     "chat_id": wcid,
@@ -1135,7 +1165,7 @@ class WarmupController:
             # only if they're still on this chat (else the deferred value
             # belongs to the chat they switched to, handled by that chat's flow).
             if still_viewing:
-                await self._reapply_deferred_after_warmup()
+                await self._reapply_deferred_after_warmup(self.chat_id or "", from_warmup=True)
             # Interactive: there is NO server-kicked pump turn — the human drives
             # the PTY. A cold send's text rides the warmup and is delivered HERE,
             # server-side (submit_prompt buffers until the TUI is ready and arms
@@ -1214,8 +1244,18 @@ class WarmupController:
         self._warmup_task = asyncio.create_task(_spawn_tail())
         return "bg"
 
-    async def _reapply_deferred_after_warmup(self) -> None:
-        if not self.session_id or not self.layer:
+    async def _reapply_deferred_after_warmup(self, chat_id: str, *,
+                                             from_warmup: bool = False) -> None:
+        """A mode or model picked with no live session to take it, applied to
+        ``chat_id``'s session now that it is live. A pick belongs to one chat
+        (``deferred_for``: the chat the frame named, or "" on the new-chat
+        page, for the chat the warmup mints): a warmup takes its own chat's
+        pick or the new-chat page's, a turn start on a live session only a
+        pick made for that chat, so a new-chat pick never reaches the chat
+        the socket is still bound to."""
+        if not self.session_id or not self.layer or chat_id != (self.chat_id or ""):
+            return
+        if self.deferred_for != chat_id and not (from_warmup and not self.deferred_for):
             return
         try:
             alive = await self.layer.is_session_alive(self.session_id)
@@ -1223,12 +1263,17 @@ class WarmupController:
             alive = False
         if not alive:
             return
+        self.deferred_for = ""
         if self.deferred_mode:
             pending = self.deferred_mode
             self.deferred_mode = ""
             set_session_mode(self.session_id, pending)
             if self.chat_id:
-                task_store.update_chat(self.chat_id, permission_mode=pending)
+                await chat_writer.submit(
+                    self.chat_id,
+                    functools.partial(task_store.update_chat, self.chat_id, permission_mode=pending),
+                    label="mode_change",
+                )
             try:
                 await self.layer.change_mode(self.session_id, pending)
             except Exception as e:
@@ -1244,7 +1289,8 @@ class WarmupController:
             # The deferral may predate the chat binding (no path known at
             # _handle_model_change time) — validate against the layer that
             # actually spawned before applying (see _model_allowed_for_path).
-            chat_path = (task_store.get_chat(self.chat_id) or {}).get("execution_path", "") if self.chat_id else ""
+            chat_path = ((await run_db(task_store.get_chat, self.chat_id) or {}).get("execution_path", "")
+                         if self.chat_id else "")
             if not _model_allowed_for_path(pending, chat_path):
                 logger.warning(
                     f"WS dashboard deferred model DROPPED: model={pending} is not a "
@@ -1252,7 +1298,11 @@ class WarmupController:
                 )
                 return
             if self.chat_id:
-                task_store.update_chat(self.chat_id, model=pending)
+                await chat_writer.submit(
+                    self.chat_id,
+                    functools.partial(task_store.update_chat, self.chat_id, model=pending),
+                    label="model_change",
+                )
             try:
                 await self.layer.change_model(self.session_id, pending)
             except Exception as e:

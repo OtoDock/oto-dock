@@ -164,10 +164,18 @@ class TestTaskSurface:
         task_store.update_run("run-live1", status="running",
                               session_id=prior_sid, chat_id="task-run-live1")
 
+        recorded: list = []
+
         class _Pump:
             session_id = prior_sid
             is_done = False
             source_type = "task"
+
+            def record_steer(self, qi, **kw):
+                # The pump finished meanwhile: the caller writes the row on
+                # the lane and fans the frame out itself.
+                recorded.append((qi.item.text, kw))
+                return False
 
         class _Caps:
             class behaviour:
@@ -189,9 +197,9 @@ class TestTaskSurface:
         pushed: list = []
         monkeypatch.setattr(lane_steer, "_running_delegate_run",
                             lambda cid: task_store.get_run("run-live1"))
-        from core.session import session_state
-        monkeypatch.setattr(session_state, "push_pump_event",
-                            lambda cid, ev: pushed.append((cid, ev)) or True)
+        from services.notifications import notification_manager
+        monkeypatch.setattr(notification_manager, "push_live",
+                            lambda sub, ev, **kw: pushed.append((sub, ev)) or 1)
         stream_pump._active_pumps["task-run-live1"] = _Pump()
         try:
             r = _spawn(client, continue_id="task-run-live1", prompt="also X")
@@ -211,8 +219,11 @@ class TestTaskSurface:
         assert [(m["role"], m["content"]) for m in rows] == [("user", "also X")]
         import json as _json
         assert _json.loads(rows[0]["event_data"])["badge"] == "delegated by"
+        assert [t for t, _kw in recorded] == ["also X"]
+        assert recorded[0][1]["frame_extra"]["event_data"]["badge"] == "delegated by"
         assert pushed and pushed[0][1]["type"] == "steered"
-        assert pushed[0][1]["text"] == "also X"
+        assert pushed[0][1]["text"] == "also X" and pushed[0][1]["message_id"] == rows[0]["id"]
+        assert pushed[0][1]["event_data"]["badge"] == "delegated by"
 
     def test_continue_onto_a_lane_working_for_another_caller_queues(
             self, client, monkeypatch):
@@ -499,7 +510,7 @@ class TestSpawnOverrides:
         assert r.status_code == 200
         assert client.fired[0]["task"].override_execution_mode == "interactive"
 
-    def test_continue_ignores_overrides(self, client):
+    def test_continue_ignores_layer_and_mode(self, client):
         prior_sid = str(uuid.uuid4())
         task_store.create_run("run-old2", "dyn-old2", AGENT, "manual", None,
                               "old", task_type="delegate")
@@ -508,7 +519,7 @@ class TestSpawnOverrides:
         task_store.create_chat("task-run-old2", "user-alice", AGENT, "auto",
                                origin="delegated", title="old lane")
         task_store.update_chat("task-run-old2", session_id=prior_sid)
-        r = _spawn(client, continue_id="dyn-old2", model="whatever",
+        r = _spawn(client, continue_id="dyn-old2",
                    layer="codex-cli", mode="interactive")
         assert r.status_code == 200          # invalid layer never validated
         task = client.fired[0]["task"]
@@ -516,6 +527,7 @@ class TestSpawnOverrides:
         assert task.override_model is None
         assert task.override_execution_path is None
         assert task.override_execution_mode is None
+        assert task.respawn_for_model is False
 
     def test_chat_continue_repins_worker_config(self, client):
         worker = str(uuid.uuid4())
@@ -533,6 +545,212 @@ class TestSpawnOverrides:
         assert task.override_model == "claude-opus-5"
         assert task.override_execution_path == "claude-code-cli"
         assert task.override_execution_mode == "interactive"
+
+
+class TestContinueModelChange:
+    """``delegate(continue_id=…, model=…)``: the model moves the continued
+    worker — validated against its chat's layer, refused while it works or
+    when the round would drive a live terminal, persisted on the chat row and
+    carried on the run as a respawn."""
+
+    CLAUDE_OLD = "claude-sonnet-5"
+    CLAUDE_NEW = "claude-opus-5-5"
+    CODEX = "gpt-5.5"
+
+    @pytest.fixture(autouse=True)
+    def _registry_and_frames(self, monkeypatch):
+        from core.session import session_state
+        from storage.billing import subscription_store
+
+        registry = {
+            "claude-code-cli": [{"model_id": self.CLAUDE_OLD, "enabled": True,
+                                 "layer": "claude-code-cli"},
+                                {"model_id": self.CLAUDE_NEW, "enabled": True,
+                                 "layer": "claude-code-cli"}],
+            "codex-cli": [{"model_id": self.CODEX, "enabled": True,
+                           "layer": "codex-cli"}],
+        }
+
+        def _list_models(layer=None, **kw):
+            if layer:
+                return registry.get(layer, [])
+            return [m for rows in registry.values() for m in rows]
+        monkeypatch.setattr(subscription_store, "list_models", _list_models)
+        self.frames: list = []
+        monkeypatch.setattr(session_state, "broadcast_chat_frame",
+                            lambda cid, frame: self.frames.append((cid, frame)))
+
+    def _frames_of(self, chat_id):
+        return [frame for cid, frame in self.frames if cid == chat_id]
+
+    def _worker(self, client, chat_id=None, *, model=CLAUDE_OLD):
+        chat_id = chat_id or str(uuid.uuid4())
+        task_store.create_chat(chat_id, "user-alice", AGENT,
+                               origin="delegated",
+                               parent_chat_id=client.parent_chat_id,
+                               delegate_role="worker", model=model,
+                               execution_path="claude-code-cli")
+        task_store.update_chat(chat_id, session_id=str(uuid.uuid4()))
+        return chat_id
+
+    def test_the_model_is_applied_and_persisted(self, client):
+        worker = self._worker(client)
+        r = _spawn(client, surface="chat", continue_id=worker,
+                   model=self.CLAUDE_NEW, layer="codex-cli", mode="interactive")
+        assert r.status_code == 200
+        task = client.fired[0]["task"]
+        assert task.override_model == self.CLAUDE_NEW
+        assert task.respawn_for_model is True
+        # layer and mode stay ignored: the chat's own pins ride the run.
+        assert task.override_execution_path == "claude-code-cli"
+        assert task.override_execution_mode is None
+        assert task_store.get_chat(worker)["model"] == self.CLAUDE_NEW
+        assert task_store.get_dynamic_task(task.id)["override_model"] == self.CLAUDE_NEW
+        # A viewer of the worker chat sees the picker move.
+        assert self._frames_of(worker) == [{"type": "model_changed",
+                                           "model": self.CLAUDE_NEW,
+                                           "chat_id": worker}]
+
+    def test_a_model_of_another_layer_is_refused(self, client):
+        worker = self._worker(client)
+        r = _spawn(client, surface="chat", continue_id=worker, model=self.CODEX)
+        assert r.status_code == 400
+        detail = r.json()["detail"]
+        assert self.CODEX in detail and "claude-code-cli" in detail
+        assert client.fired == []
+        assert task_store.get_chat(worker)["model"] == self.CLAUDE_OLD
+        assert self._frames_of(worker) == []
+
+    def test_a_disabled_model_is_refused_like_on_a_fresh_spawn(self, client, monkeypatch):
+        from storage.billing import subscription_store
+        rows = subscription_store.list_models("claude-code-cli")
+        monkeypatch.setattr(subscription_store, "list_models", lambda layer=None, **kw: [
+            {**m, "enabled": m["model_id"] != self.CLAUDE_NEW} for m in rows])
+        worker = self._worker(client)
+        r = _spawn(client, surface="chat", continue_id=worker, model=self.CLAUDE_NEW)
+        assert r.status_code == 400
+        assert client.fired == []
+        assert task_store.get_chat(worker)["model"] == self.CLAUDE_OLD
+
+    def test_a_provider_pinned_engine_keeps_its_provider(self, client, monkeypatch):
+        from api.tasks import delegation as route
+        import config as app_config
+        from core.session import session_manager
+        caps = session_manager.get_layer_capabilities("claude-code-cli")
+        pinned = type("Caps", (), {"display_name": "Engine X",
+                                   "behaviour": type("B", (), {"provider_pinned_per_session": True})()})()
+        monkeypatch.setattr(session_manager, "get_layer_capabilities",
+                            lambda layer: pinned if layer == "claude-code-cli" else caps)
+        monkeypatch.setattr(app_config, "get_model_provider",
+                            lambda model, layer="": "local" if model == self.CLAUDE_NEW else "vendor")
+        worker = self._worker(client)
+        r = _spawn(client, surface="chat", continue_id=worker, model=self.CLAUDE_NEW)
+        assert r.status_code == 400
+        assert "keeps its model provider" in r.json()["detail"]
+        assert task_store.get_chat(worker)["model"] == self.CLAUDE_OLD
+        assert route._provider_change_blocker({"model": ""}, "claude-code-cli", self.CLAUDE_NEW) == ""
+
+    def test_refused_while_the_worker_is_mid_turn_before_any_steer(
+            self, client, monkeypatch):
+        # A lane working on THIS caller's run would take a plain follow-up as
+        # a steer; a steer cannot change the model, so the call is refused
+        # first and nothing reaches the engine.
+        from core.events import stream_pump
+        from core.session import session_delivery
+        from services.scheduler import lane_steer
+
+        worker = self._worker(client)
+        sid = task_store.get_chat(worker)["session_id"]
+        task_store.create_dynamic_task(
+            "dyn-mid1", AGENT, "lane", "do the work", "cli", "delegate",
+            None, None, None, 3600, "user-alice",
+            on_complete_agent=AGENT, on_complete_prompt="report",
+            on_complete_session_id=PARENT_SESSION,
+            on_complete_chat_id=client.parent_chat_id,
+        )
+        task_store.create_run("run-mid1", "dyn-mid1", AGENT, "manual", None,
+                              "do the work", task_type="delegate")
+        task_store.update_run("run-mid1", status="running",
+                              session_id=sid, chat_id=worker)
+        steers: list = []
+
+        class _Caps:
+            class behaviour:
+                supports_steer = True
+
+        class _Layer:
+            def capabilities_for(self, s):
+                return _Caps()
+
+            async def steer(self, s, text):
+                steers.append(text)
+                return True
+
+        async def _chat_layer(chat):
+            return _Layer()
+        monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
+        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+                            lambda cid: task_store.get_run("run-mid1"))
+
+        class _Pump:
+            session_id = sid
+            is_done = False
+            source_type = "task"
+        stream_pump._active_pumps[worker] = _Pump()
+        try:
+            r = _spawn(client, surface="chat", continue_id=worker,
+                       model=self.CLAUDE_NEW, prompt="also X")
+        finally:
+            stream_pump._active_pumps.pop(worker, None)
+        assert r.status_code == 409
+        assert "wait for the worker's result" in r.json()["detail"].lower()
+        assert steers == []
+        assert client.fired == []
+        assert task_store.get_chat(worker)["model"] == self.CLAUDE_OLD
+        assert task_store.get_chat_messages(worker) == []
+
+        # The pump gone but the run still running (its delivery phase, a
+        # spawn window): still mid-turn.
+        r = _spawn(client, surface="chat", continue_id=worker, model=self.CLAUDE_NEW)
+        assert r.status_code == 409
+        assert client.fired == []
+
+    def test_refused_when_the_round_would_drive_a_live_terminal(
+            self, client, monkeypatch):
+        from core.session import interactive_session
+        worker = self._worker(client)
+        term = _LiveTerminal(worker, task_store.get_chat(worker)["session_id"])
+        monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
+        r = _spawn(client, surface="chat", continue_id=worker, model=self.CLAUDE_NEW)
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert "terminal" in detail and "without a model" in detail
+        assert term.queued == []
+        assert client.fired == []
+        assert task_store.get_chat(worker)["model"] == self.CLAUDE_OLD
+
+    def test_the_current_model_is_a_no_op(self, client):
+        worker = self._worker(client)
+        r = _spawn(client, surface="chat", continue_id=worker, model=self.CLAUDE_OLD)
+        assert r.status_code == 200
+        task = client.fired[0]["task"]
+        assert task.override_model == self.CLAUDE_OLD
+        assert task.respawn_for_model is False
+        assert self._frames_of(worker) == []
+
+    def test_an_unpinned_task_run_chat_takes_the_model(self, client):
+        # A task-surface lane's chat may carry no model pin: any model the
+        # agent's layer serves applies.
+        prior_sid = str(uuid.uuid4())
+        task_store.create_chat("task-run-mc1", "user-alice", AGENT, "auto",
+                               origin="delegated", title="old lane")
+        task_store.update_chat("task-run-mc1", session_id=prior_sid)
+        r = _spawn(client, continue_id="task-run-mc1", model=self.CLAUDE_NEW)
+        assert r.status_code == 200
+        task = client.fired[0]["task"]
+        assert task.override_model == self.CLAUDE_NEW
+        assert task.respawn_for_model is True
+        assert task_store.get_chat("task-run-mc1")["model"] == self.CLAUDE_NEW
 
 
 class TestAdoptProject:

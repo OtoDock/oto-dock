@@ -30,6 +30,7 @@ import websockets
 from fastapi import APIRouter, Request, Response, WebSocket
 
 import config
+from services.phone import daemon_url
 
 logger = logging.getLogger("claude-proxy.twilio-relay")
 
@@ -37,10 +38,12 @@ router = APIRouter()
 
 _FORWARD_TIMEOUT_S = 15.0
 _WS_MAX_MSG = 1024 * 1024
-# Real Twilio webhooks are a few KB of form fields; this unauthenticated
-# route must not buffer arbitrary bodies into proxy RAM (Starlette has no
-# default body cap) before the daemon's own 1 MB limit ever sees them.
-_MAX_BODY_BYTES = 256 * 1024
+# Real Twilio webhooks are a few KB of form fields. A Twilio POST carries no
+# platform credential, so the HTTP middleware cuts its body first, at the
+# unauthenticated tier (``middleware.body_cap``: ``MAX_UNAUTH_BODY_BYTES``,
+# 64 KB by default); this route's own bound is the same number, which still
+# holds on an install that turns that tier off.
+_MAX_BODY_BYTES = 64 * 1024
 
 _SERVER_ID_OK = str.isdigit
 
@@ -67,6 +70,8 @@ async def _forward_post(request: Request, path: str) -> Response:
             return Response(status_code=413)
         chunks.append(chunk)
     body = b"".join(chunks)
+    if await daemon_url.refusal():
+        return Response(status_code=502, content="phone service unavailable")
     url = f"{_daemon_base()}{path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -116,6 +121,9 @@ async def ws_twilio_media_relay(websocket: WebSocket) -> None:
         await websocket.close(code=1008)
         return
     signature = websocket.headers.get("X-Twilio-Signature", "")
+    if await daemon_url.refusal():
+        await websocket.close(code=1011)
+        return
     await websocket.accept()
     try:
         daemon_ws = await websockets.connect(

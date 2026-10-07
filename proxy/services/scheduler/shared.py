@@ -116,6 +116,12 @@ class TaskDefinition(BaseModel):
     override_model: str | None = None
     override_execution_path: str | None = None
     override_execution_mode: str | None = None
+    # A delegate continue that changed the worker's model (``override_model``
+    # is the new one, already on the chat row): the runner closes the chat's
+    # live session before the round and never rides it warm, so the round
+    # resumes the conversation on the new model. In-memory only, like the
+    # mode: it concerns this one round.
+    respawn_for_model: bool = False
     # Bounded recurring continuations (task_type='continuation'): hard fire
     # bound and/or stop time — a chat must never wake itself forever.
     max_runs: int | None = None
@@ -131,6 +137,8 @@ class TaskDefinition(BaseModel):
     # prompt's author); "" for a row that never changed hands. A transferred
     # row runs without the knowledge-write grant until a manager adopts it.
     transferred_from: str = ""
+    # When the offboarding transfer moved it ("" when it never changed hands).
+    transferred_at: str = ""
     # A check's judge run (task_type='check', in-memory only): the judge
     # profile — ``{"check": name, "mcps": [...], "judge_on": auto|platform,
     # "for_chat": the judged chat}``. A run with it is read-only, gets only

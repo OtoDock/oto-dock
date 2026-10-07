@@ -74,6 +74,22 @@ def test_manual_adapter_lifecycle():
     assert asyncio.run(a.deprovision_route({"direction": "inbound", "did": "+30210", "id": "r1"})) is None
 
 
+def test_the_call_direction_vocabulary():
+    from adapters.phone import DIRECTIONS, INBOUND, OUTBOUND, is_outbound
+    assert DIRECTIONS == (INBOUND, OUTBOUND) == ("inbound", "outbound")
+    assert is_outbound(OUTBOUND) is True
+    assert is_outbound(INBOUND) is False
+    # A route or call row without a direction is an inbound one.
+    assert is_outbound(None) is False and is_outbound("") is False
+
+
+def test_a_route_without_a_direction_provisions_as_inbound():
+    h = asyncio.run(load_adapter(_server()).provision_route(
+        {"did": "+30211", "audiosocket_uuid": "u-2", "id": "r3"}))
+    assert h.audiosocket_uuid == "u-2"
+    assert "database put otodock/route_uuid/+30211 u-2" in h.instructions
+
+
 def test_manual_adapter_rejects_sftp():
     a = load_adapter(_server())
     with pytest.raises(PhoneAdapterError) as ei:

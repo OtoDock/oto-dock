@@ -558,7 +558,7 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     # Ordered AFTER the OAuth-credential, agent-config, and cross-user denies so
     # it can never weaken them (a .output file can't match those anyway). Covers
     # Read + bash cat/tail/head/grep — their path args all route through here.
-    if path_roles.is_claude_bg_output_path(resolved):
+    if path_roles.is_claude_bg_output_path(resolved, ctx.cli_session_id):
         return _ALLOW
 
     # The sandbox's private /tmp on a local target (HOME, the CLI's runtime

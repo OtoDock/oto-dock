@@ -7,14 +7,16 @@ raw ``app.json`` and ``blueprint.json`` (whitespace and key order never
 matter) plus the tree hash of the other files. The tree hash excludes
 ``app.json`` because the importer rewrites it (task ids, formatting) and a
 member's copy differs from the next member's; ``blueprint.json`` travels
-verbatim and stays in. Pure functions: the prep catalog's generator imports
-this module too.
+verbatim and stays in. The registry's generator computes the same hashes
+from its own copy of these functions (the prep gate proves the two agree),
+so the format never changes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 MANIFEST_DOC = "app.json"
@@ -42,15 +44,25 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def tree_sha(files: list[tuple[str, Path]]) -> str:
-    """The hash of a release manifest over ``files`` (``walk_tree`` pairs)
-    with ``app.json`` left out — what a working tree still equals when only
-    the importer touched it."""
+def read_file(folder: Path, rel: str) -> bytes:
+    """One file of an app folder, read beneath the folder's root without
+    following a link (``releases.read_tree_file``): a link, a FIFO or a
+    file over the release's per-file cap is an ``OSError``, as a missing
+    one is."""
+    from services.apps import releases
+    return releases.read_tree_file(folder, rel, max_size=releases.MAX_RELEASE_FILE_BYTES)
+
+
+def tree_sha(folder: Path, rels: Iterable[str]) -> str:
+    """The hash of a release manifest over the files ``rels`` of ``folder``
+    (the paths ``walk_tree`` listed, each read by ``read_file``) with
+    ``app.json`` left out: what a working tree still equals when only the
+    importer touched it."""
     entries: dict[str, dict] = {}
-    for rel, path in files:
+    for rel in rels:
         if rel == MANIFEST_DOC:
             continue
-        data = path.read_bytes()
+        data = read_file(folder, rel)
         entries[rel] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
     return sha256_text(json.dumps({"files": entries}, sort_keys=True, separators=(",", ":")))
 

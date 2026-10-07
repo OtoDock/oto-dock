@@ -5,13 +5,16 @@ for syncing agent directories between the platform and satellite.
 """
 
 import base64
+import errno
 import fnmatch
 import hashlib
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
+from stat import S_ISREG
 
 from .._vendored import layout
 
@@ -110,15 +113,26 @@ _CLAUDE_HOST_LOCAL_FILES = frozenset({
     "auth.json",
 })
 
+# The per-session MCP config copies (0.5.133): this satellite's
+# ``mcp-config-<session_id[:12]>.json``, the proxy's
+# ``<agent>-<sha256(user_sub)[:12]>-<session_id[:12]>.json`` and the shared
+# names earlier releases wrote. Each carries its own session's tokens and is
+# rewritten at every start: host-local, never synced either direction.
+# Mirrors proxy/core/remote/file_sync.py — the pattern MUST stay identical.
+_CLAUDE_HOST_LOCAL_RE = re.compile(
+    r"^(?:mcp-config(?:-[^/]{1,12})?|[A-Za-z0-9._-]+-[0-9a-f]{12}(?:-[^/]{1,12})?)\.json$"
+)
+
 
 def _is_claude_runtime_state(rel_path: str) -> bool:
     """True for host-local ``.claude`` config files that must never sync in
-    either direction (``_CLAUDE_HOST_LOCAL_FILES``). Matches only DIRECT children
-    of ``.claude/`` — so ``.claude/projects/<hash>/<sid>.jsonl`` is unaffected."""
+    either direction (``_CLAUDE_HOST_LOCAL_FILES``, ``_CLAUDE_HOST_LOCAL_RE``).
+    Matches only DIRECT children of ``.claude/`` — so
+    ``.claude/projects/<hash>/<sid>.jsonl`` is unaffected."""
     parts = rel_path.replace("\\", "/").split("/")
     if len(parts) < 2 or parts[-2] != ".claude":
         return False
-    return parts[-1] in _CLAUDE_HOST_LOCAL_FILES
+    return parts[-1] in _CLAUDE_HOST_LOCAL_FILES or bool(_CLAUDE_HOST_LOCAL_RE.match(parts[-1]))
 
 
 def _is_venv_dir(path: Path) -> bool:
@@ -448,14 +462,34 @@ def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
     return ".backup." in file_name or ".corrupted." in file_name
 
 
+class NotARegularFile(OSError):
+    """A walk listed something that is not a regular file (a named pipe, a
+    socket, a device): never hashed, never synced."""
+
+
 def _hash_file(path: Path) -> str:
     """Stream-hash a file → ``sha256:<hex>`` without loading it fully in memory.
 
     Used to verify a chunk-assembled ``.partial`` against the platform's
     full-file hash before the atomic commit — parity with the proxy pull path's
-    incremental hashing (``_commit_pull``)."""
+    incremental hashing (``_commit_pull``).
+
+    Only a regular file is read: the open never blocks (``O_NONBLOCK``) and the
+    descriptor's type is checked before the first read, so a named pipe in a
+    workspace raises ``NotARegularFile`` (an OSError every caller skips)
+    instead of stalling the open until a writer appears."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not S_ISREG(os.fstat(fd).st_mode):
+            raise NotARegularFile(errno.EINVAL, "not a regular file", str(path))
+        if hasattr(os, "set_blocking"):
+            os.set_blocking(fd, True)
+        f = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with f:
         for block in iter(lambda: f.read(1024 * 1024), b""):
             h.update(block)
     return "sha256:" + h.hexdigest()

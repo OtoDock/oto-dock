@@ -83,3 +83,43 @@ describe('onDelegateResult dedup', () => {
     expect(delegateBubbles(result.current.messages)).toHaveLength(2)
   })
 })
+
+describe('onDelegateResult with attached files', () => {
+  const FILES = [{ path: 'users/alice/workspace/inbox/content-creator/banner.png', bytes: 2048 }]
+
+  beforeEach(() => {
+    captured.cbs = null
+  })
+
+  it('renders one bubble for two identical files-only frames', () => {
+    const { result } = renderStream()
+    const frame = { ...FRAME, output_text: '', files: FILES, files_skipped: [] }
+    act(() => captured.cbs.onDelegateResult({ ...frame }))
+    act(() => captured.cbs.onDelegateResult({ ...frame }))
+    const bubbles = delegateBubbles(result.current.messages)
+    expect(bubbles).toHaveLength(1)
+    expect(bubbles[0].blocks).toEqual([{ type: 'delegate_files', files: FILES, skipped: [] }])
+  })
+
+  it('an empty list and a missing key are the same bubble', () => {
+    const { result } = renderStream()
+    act(() => captured.cbs.onDelegateResult({ ...FRAME, files: [], files_skipped: [] }))
+    act(() => captured.cbs.onDelegateResult({ ...FRAME }))
+    expect(delegateBubbles(result.current.messages)).toHaveLength(1)
+  })
+
+  it('a later round with other files renders again', () => {
+    const { result } = renderStream()
+    act(() => captured.cbs.onDelegateResult({ ...FRAME, files: FILES }))
+    act(() => captured.cbs.onDelegateResult({
+      ...FRAME, files: [{ path: 'users/alice/workspace/inbox/content-creator/banner_1.png', bytes: 1 }],
+    }))
+    expect(delegateBubbles(result.current.messages)).toHaveLength(2)
+  })
+
+  it('neither text nor files mints nothing', () => {
+    const { result } = renderStream()
+    act(() => captured.cbs.onDelegateResult({ ...FRAME, output_text: '', files: [], files_skipped: [] }))
+    expect(delegateBubbles(result.current.messages)).toHaveLength(0)
+  })
+})

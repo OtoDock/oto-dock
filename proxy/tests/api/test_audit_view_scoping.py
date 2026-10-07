@@ -224,6 +224,7 @@ class TestSessionJwtTaskScoping:
                 self.scope, self.created_by = scope, created_by
                 self.use_persistent = False
                 self.enabled = True
+                self.transferred_from = ""
 
             def model_dump(self):
                 return {"id": self.id, "agent": self.agent}

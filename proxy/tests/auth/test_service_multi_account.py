@@ -287,7 +287,8 @@ class TestTokenMapServiceBinding:
                 mcp_name, slug, user_sub="", user_role="", session_ctx={},
             )
             assert tokens["account.label"] == "support"
-            assert tokens["credential.GOOGLE_EMAIL"] == "support@org.com"
+            assert tokens["account.email"] == "support@org.com"
+            assert not any(k.startswith("credential.") for k in tokens)
         finally:
             with get_conn() as conn:
                 conn.execute("DELETE FROM agents WHERE slug=%s", (slug,))

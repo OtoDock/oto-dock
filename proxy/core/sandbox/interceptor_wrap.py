@@ -11,9 +11,11 @@ Parameterized by ``interpreter`` + ``interceptor_path`` because the two callers
 launch the interceptor differently:
 
 * **Local proxy (bwrap sandbox)** — ``interpreter="python3"`` (resolved on the
-  sandbox's restricted PATH) + the sandbox-internal copy of the script
-  (``/users/<u>/.claude/stdio_path_interceptor.py`` etc.). The interceptor is
-  stdlib-only, so the system ``python3`` runs it.
+  sandbox's restricted PATH) with ``interpreter_args=("-I",)`` (isolated: no
+  ``PYTHON*`` variable, no user site, no script directory on the path) + the
+  sandbox-internal copy of the script (``/users/<u>/.claude/
+  stdio_path_interceptor.py`` etc.). The interceptor is stdlib-only, so the
+  system ``python3`` runs it.
 * **Satellite (native, no bwrap)** — keeps its own copy of this logic in
   ``satellite/session_manager.py`` for now (``sys.executable`` + the vendored
   script path); a later slice can collapse it onto this module.
@@ -35,6 +37,7 @@ _OTO_MCP_FETCH_TOKEN = "OTO_MCP_FETCH_TOKEN"
 
 def wrap_servers_json(
     mcp_config: dict, *, interpreter: str, interceptor_path: str,
+    interpreter_args: tuple[str, ...] = (),
 ) -> None:
     """Claude JSON config: rewrite stdio servers carrying a marker to run via
     the interceptor. Mutates ``mcp_config`` in place.
@@ -59,7 +62,7 @@ def wrap_servers_json(
         original_cmd = server["command"]
         original_args = list(server.get("args") or [])
         server["command"] = interpreter
-        server["args"] = [interceptor_path, "--", original_cmd, *original_args]
+        server["args"] = [*interpreter_args, interceptor_path, "--", original_cmd, *original_args]
 
 
 # --- Codex TOML twin ---------------------------------------------------------
@@ -85,6 +88,7 @@ def _toml_escape(value: str) -> str:
 
 def _maybe_wrap_toml_section(
     section_lines: list[str], *, interpreter: str, interceptor_path: str,
+    interpreter_args: tuple[str, ...] = (),
 ) -> list[str]:
     """Wrap one ``[mcp_servers.<slug>]`` section's command/args IF its body
     carries a marker. A stdio server is identified by its ``command`` line; the
@@ -125,7 +129,7 @@ def _maybe_wrap_toml_section(
     else:
         args_list = []  # stdio MCP with no args line — wrap with empty args.
 
-    new_args = [interceptor_path, "--", orig_cmd, *args_list]
+    new_args = [*interpreter_args, interceptor_path, "--", orig_cmd, *args_list]
     out = list(section_lines)
     out[cmd_idx] = f'command = "{_toml_escape(interpreter)}"'
     new_args_line = f'args = {json.dumps(new_args)}'
@@ -138,6 +142,7 @@ def _maybe_wrap_toml_section(
 
 def wrap_toml_text(
     toml_text: str, *, interpreter: str, interceptor_path: str,
+    interpreter_args: tuple[str, ...] = (),
 ) -> str:
     """Codex TOML twin of :func:`wrap_servers_json`. Walks the config
     section-by-section; wraps each ``[mcp_servers.<slug>]`` carrying a marker."""
@@ -156,6 +161,7 @@ def wrap_toml_text(
             out_lines.extend(_maybe_wrap_toml_section(
                 current_section,
                 interpreter=interpreter, interceptor_path=interceptor_path,
+                interpreter_args=interpreter_args,
             ))
             current_section = []
 

@@ -18,6 +18,7 @@ satellite), and the endpoint's remote-aware 404.
 Run: cd proxy && python -m pytest tests/tasks/test_send_files.py -v
 """
 
+import asyncio
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -254,6 +255,66 @@ class TestPaths:
         result = _send(_user_session(), ["reports"])
         assert len(result.landed) == 2  # q3.md + data.csv only
         assert any("symlink" in s for s in result.skipped)
+
+    def test_planted_partial_link_never_redirects_the_copy(self, send_env, tmp_path):
+        # A writer of the target workspace plants `<name>.partial` as a link
+        # to a file outside it: the proxy-side copy creates its own
+        # exclusive temporary and never touches the planted name.
+        outside = tmp_path / "outside.txt"
+        outside.write_text("ORIGINAL")
+        inbox = (config.get_agent_dir(TGT_COLLAB) / "users" / "alice"
+                 / "workspace" / "inbox" / SRC)
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "notes.md.partial").symlink_to(outside)
+        result = _send(_user_session(), ["notes.md"])
+        assert outside.read_text() == "ORIGINAL"
+        assert result.landed == [f"users/alice/workspace/inbox/{SRC}/notes.md"]
+        assert (inbox / "notes.md").read_text() == "notes"
+        assert (inbox / "notes.md.partial").is_symlink()
+        assert sorted(p.name for p in inbox.iterdir()) == ["notes.md", "notes.md.partial"]
+
+    def test_swapped_inbox_folder_never_redirects_the_copy(self, send_env, tmp_path):
+        # The same writer swaps a DIRECTORY component (its own `inbox/<src>`)
+        # for a link to a folder outside the workspace. The copy walks every
+        # component without following, so the link refuses the transfer and
+        # nothing is created on the far side, whenever the swap happens.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        inbox = (config.get_agent_dir(TGT_COLLAB) / "users" / "alice"
+                 / "workspace" / "inbox")
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / SRC).symlink_to(outside)
+        with pytest.raises(HTTPException) as exc:
+            _send(_user_session(), ["notes.md"])
+        assert exc.value.status_code == 400
+        assert "escapes the target workspace" in exc.value.detail
+        assert list(outside.iterdir()) == []
+        assert (inbox / SRC).is_symlink()
+
+    def test_a_race_on_the_name_takes_the_next_free_one(self, send_env, monkeypatch):
+        # Two sends pick the same free name at once: the exclusive rename
+        # refuses the second, which moves on to the next name instead of
+        # overwriting the first or failing the transfer.
+        from services.delegation import file_transfer
+        inbox = (config.get_agent_dir(TGT_COLLAB) / "users" / "alice"
+                 / "workspace" / "inbox" / SRC)
+        real = file_transfer.free_name
+        answers: list[str] = []
+
+        def racy(dst_fd, parent_rel, name):
+            free = real(dst_fd, parent_rel, name)
+            answers.append(free)
+            if len(answers) == 1:
+                (inbox / free).write_text("THE OTHER SENDER WON")
+            return free
+
+        monkeypatch.setattr(file_transfer, "free_name", racy)
+        result = _send(_user_session(), ["notes.md"])
+        assert answers == ["notes.md", "notes_1.md"]
+        assert result.landed == [f"users/alice/workspace/inbox/{SRC}/notes_1.md"]
+        assert (inbox / "notes.md").read_text() == "THE OTHER SENDER WON"
+        assert (inbox / "notes_1.md").read_text() == "notes"
+        assert not [p for p in inbox.iterdir() if p.name.endswith(".partial")]
 
     def test_only_symlinks_nothing_to_send(self, send_env):
         ws = config.get_agent_dir(SRC) / "users" / "alice" / "workspace"
@@ -709,6 +770,47 @@ class TestRemotePrefetch:
             with pytest.raises(HTTPException) as exc:
                 perform_send_files(authz, paths=[raw])
             assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_sends_the_platform_copy_and_says_so(
+        self, send_env, flow_reset, caplog,
+    ):
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"newer on the machine"})
+        sat.cm.pull_file_to_path = AsyncMock(return_value=False)
+        authz = _authz(_user_session())
+        with _remote(sat), caplog.at_level("INFO", logger="claude-proxy"):
+            assert await prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20) == []
+        assert (f"{USER_WS}/notes.md could not be read from 'drill-sat', the platform's "
+                "copy was sent") in caplog.text
+        assert "read through=0 fallback=['" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_read_past_the_budget_is_abandoned_for_the_platform_copy(
+        self, send_env, flow_reset, monkeypatch, caplog,
+    ):
+        """The delegation MCP stops waiting at 300 s: a pull still running at
+        the budget is cancelled and the platform's copy goes, reported."""
+        from services.delegation import file_transfer
+        monkeypatch.setattr(file_transfer, "_PREFETCH_BUDGET_S", 0.2)
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"a slow link"})
+        cancelled = asyncio.Event()
+
+        async def _endless(*_a, **_k):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        sat.cm.pull_file_to_path = AsyncMock(side_effect=_endless)
+        authz = _authz(_user_session())
+        with _remote(sat), caplog.at_level("WARNING", logger="claude-proxy"):
+            got = await asyncio.wait_for(
+                prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20), 5)
+        assert got == []
+        assert cancelled.is_set()
+        assert "the platform's copy was sent" in caplog.text
+        assert (config.get_agent_dir(SRC) / USER_WS / "notes.md").read_text() == "notes"
 
     @pytest.mark.asyncio
     async def test_prefetch_defects_degrade_and_never_abort(self, send_env, flow_reset):

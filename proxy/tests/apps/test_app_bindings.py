@@ -522,3 +522,90 @@ def test_describe_answers_for_reachable_agents_and_wiring_an_edge_is_human_only(
     r = client.put(f"/v1/agents/{AGENT_A}/delegation-targets", json={"targets": [AGENT_B]})
     assert r.status_code in (200, 400, 403), r.text    # the agent rows are not seeded here; the human check came first
     asyncio.run(asyncio.sleep(0))
+
+
+def test_the_broker_refuses_a_placed_sessions_claim(agent_tree, target_server):
+    """A claim that carries the placement marker (a session of an agent the
+    calling app is placed in) is never brokered on: not as the viewer behind
+    the call, not as the parent of a chain (APPS.md "Agents call apps")."""
+    caller = _row(AGENT_A, "board", bindings=CRM)
+    target = _row(AGENT_B, "leads", exports={"methods": {"summary": {"description": "the week"}}})
+    inst = _install(caller)
+    _install(target, port=target_server)
+    placed = app_tokens.mint(caller["id"], app_tokens.PURPOSE_CALLER, {
+        "principal": "agent", "sub": "session:s", "username": "", "role": "editor",
+        "agent": "elsewhere", "session": "s", "external": False,
+        "placement": {"kind": "agent", "share_id": "sh", "from_agent": AGENT_A, "agent": "elsewhere",
+                      "role_cap": "editor"}}, 60)
+    hdr = {"Authorization": f"Bearer {inst.token}"}
+    url = f"/v1/apps/{caller['id']}/bindings/crm/summary"
+    assert client.get(url, headers={**hdr, "X-OtoDock-Viewer": placed}).status_code == 403
+    assert client.get(url, headers={**hdr, "X-OtoDock-Caller": placed}).status_code == 403
+    assert client.get(url, headers=hdr).status_code == 200
+
+
+def test_describe_answers_a_placed_app_with_no_edge_and_no_binding(agent_tree):
+    """``describe_app`` reaches an app a share placed in the session's agent
+    (APPS.md "Bindings"): the placement and the session's call line ride
+    the answer, and ``binding`` is null when no edge reaches the home agent
+    (a placement opens no broker edge); an app of a reachable agent keeps
+    its binding and gains the placement when it is also placed here."""
+    from core.session.visibility import SCOPE_USER
+    from storage.sharing import share_store
+    c = "bind-c"
+    target = _row(c, "leads", exports={"methods": {
+        "status": {"description": "the status"},
+        "summary": {"description": "the week", "min_role": "editor"}}})
+    assert _hook("describe", {"agent": c, "slug": "leads"}).status_code == 404
+    team = share_store.create_internal_share(
+        target_kind="app", target_id=target["id"], created_by="alice-sub",
+        grantee_kind=share_store.AGENT, grantee_agent=AGENT_A, role_cap="editor",
+        decision=share_store.ACCEPTED, decided_by="alice-sub")
+    r = _hook("describe", {"agent": c, "slug": "leads"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["app_id"] == target["id"] and body["binding"] is None
+    assert body["placement"] == {"kind": "agent", "share_id": team["id"], "role_cap": "editor",
+                                 "role": "agent"}
+    assert body["call"] == f"POST $PROXY_URL/v1/apps/{target['id']}/api/<method> with your session token"
+    assert set(body["exports"]["methods"]) == {"status", "summary"}
+    # An app of a reachable agent that is also placed here: the binding and
+    # the placement both.
+    reachable = _row(AGENT_B, "crm", exports={"methods": {"x": {"description": "y"}}})
+    share_store.create_internal_share(
+        target_kind="app", target_id=reachable["id"], created_by="alice-sub",
+        grantee_kind=share_store.AGENT, grantee_agent=AGENT_A, role_cap="viewer",
+        decision=share_store.ACCEPTED, decided_by="alice-sub")
+    body = _hook("describe", {"agent": AGENT_B, "slug": "crm"}).json()
+    assert body["binding"] == {"agent": AGENT_B, "app": "crm"}
+    assert body["placement"]["kind"] == "agent" and body["placement"]["role"] == "agent"
+    plain = _row(AGENT_B, "plain", exports={"methods": {"x": {"description": "y"}}})
+    body = _hook("describe", {"agent": AGENT_B, "slug": "plain"}).json()
+    assert body["app_id"] == plain["id"] and "placement" not in body and "call" not in body
+    # An unapproved placed app: 404 as before.
+    draft = _row(c, "draft", exports={"methods": {"x": {"description": "y"}}}, approve=False)
+    share_store.create_internal_share(
+        target_kind="app", target_id=draft["id"], created_by="alice-sub",
+        grantee_kind=share_store.AGENT, grantee_agent=AGENT_A, role_cap="viewer",
+        decision=share_store.ACCEPTED, decided_by="alice-sub")
+    assert _hook("describe", {"agent": c, "slug": "draft"}).status_code == 404
+    # A placed PERSONAL row (a person share) resolves for that person's
+    # user-scope session, at the share's cap, with no binding.
+    task_store.add_user_agent("carol-sub", AGENT_A, "viewer", "test")
+    task_store.add_user_agent("alice-sub", c, "manager", "test")   # the owner holds its agent
+    personal = _row(c, "mine", exports={"methods": {"status": {"description": "s"}}},
+                    username="alice", owner="alice-sub")
+    theirs = share_store.create_internal_share(target_kind="app", target_id=personal["id"],
+                                               created_by="alice-sub", grantee_sub="carol-sub",
+                                               role_cap="editor")
+    share_store.set_decision(theirs["id"], share_store.ACCEPTED, "carol-sub", placed_agent=AGENT_A)
+    session_state.set_session_security("bind-carol", SecurityContext(
+        role="viewer", username="carol", agent=AGENT_A, is_admin_agent=False, session_scope=SCOPE_USER))
+    try:
+        body = _hook("describe", {"agent": c, "slug": "mine"}, sid="bind-carol").json()
+        assert body["app_id"] == personal["id"] and body["binding"] is None
+        assert body["placement"] == {"kind": "person", "share_id": theirs["id"], "role_cap": "editor",
+                                     "role": "editor"}
+        assert _hook("describe", {"agent": c, "slug": "mine"}).status_code == 404
+    finally:
+        session_state._session_security.pop("bind-carol", None)

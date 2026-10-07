@@ -4,18 +4,18 @@ import VideoPlayer from '../media/VideoPlayer'
 import AudioPlayer from '../media/AudioPlayer'
 import DisplayUrl from '../media/DisplayUrl'
 import DisplayFile from '../media/DisplayFile'
-import DocumentPreview from '../media/DocumentPreview'
 import UiArtifact from '../media/UiArtifact'
 
 /**
  * Renders a single display/file-tools artifact block (gallery/chart, video,
- * audio, url, file, Collabora preview) using the same renderer components as
+ * audio, url, file, ui page) using the same renderer components as
  * ChatMessages' BlockRenderer — so a prop change to any renderer breaks both
  * call sites at compile time (no drift). Used by the interactive-CLI PiP
  * floating windows, which have no inline message list.
  *
- * Returns null for any non-artifact block. `embedded` is forwarded to
- * DocumentPreview so a PiP window supplies the chrome (no duplicate header/close).
+ * Returns null for any non-artifact block (a document opens in the chat's
+ * document pane). `embedded` is forwarded to UiArtifact so a PiP window
+ * supplies the chrome (no duplicate header/close).
  */
 export default function ArtifactView({ block, agent, embedded, onArtifactInteraction }: { block: MessageBlock; agent?: string; embedded?: boolean; onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }> }) {
   switch (block.type) {
@@ -82,16 +82,6 @@ export default function ArtifactView({ block, agent, embedded, onArtifactInterac
           filename={block.filename}
           downloadUrl={block.downloadUrl}
           description={block.description}
-        />
-      )
-    case 'document_preview':
-      return (
-        <DocumentPreview
-          wopiUrl={block.wopiUrl}
-          filename={block.filename}
-          fileId={block.fileId}
-          downloadUrl={block.downloadUrl}
-          embedded={embedded}
         />
       )
     case 'ui':

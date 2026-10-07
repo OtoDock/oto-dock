@@ -8,8 +8,10 @@ file-tools' headless browser loads the real dashboard page at phone, tablet
 and desktop widths plus the other theme. What comes back is the verdict
 with its reasons, the page's own errors, what the policy blocked, and the
 pictures, which the tools hand to the agent as images. The live database is
-never touched: the check instance's data is a copy (when it is small) or
-empty, and the instance is stopped when the job ends. Without a renderer
+never touched: the check instance's data is a copy (when it is small, and
+only for the live release or code that would go live on it without a
+person's review, ``seeds_live_data``) or empty, and the instance is stopped
+when the job ends. Without a renderer
 (an older file-tools image, the container down) the verdict is
 ``unavailable`` and nothing is refused for it.
 """
@@ -28,11 +30,16 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from auth import render_principal as rp
 from services.apps import app_sandbox, app_supervisor, releases
+from storage import database as task_store
+
+if TYPE_CHECKING:
+    from services.apps.app_deploy import Manifest
 
 logger = logging.getLogger("claude-proxy.apps")
 
@@ -198,6 +205,20 @@ def copy_working_tree(row: dict, source_dir: Path) -> Path:
     return dest
 
 
+def seeds_live_data(row: dict, manifest: Manifest | None) -> bool:
+    """Whether code that is not live yet (a working tree's copy, a release
+    before it goes live, the preview) may run on a copy of the live
+    database: only when a deploy of it goes live without a person's review
+    anyway. ``manifest`` is that code's own (``app_deploy.working_manifest``;
+    None when it would not deploy): its actions and blocks must be approved
+    as the row stands, and the per-app approval switch must be off on the
+    row and in its app.json. Else the code runs on empty data."""
+    if manifest is None or manifest.requires_approval:
+        return False
+    deployed = {**row, "actions": manifest.actions_json, **manifest.blocks()}
+    return task_store.app_actions_approved(deployed) and not row.get("deploy_requires_approval")
+
+
 def _seed(row: dict, scratch: Path) -> bool:
     """The live database copied into the scratch data directory when it is
     small enough; False when there is none or it is too big to copy."""
@@ -294,10 +315,11 @@ def _store(row: dict, report: RenderReport, raw: dict) -> None:
         (d / "report.json").write_text(json.dumps(report.as_dict(images=False), indent=1), "utf-8")
 
 
-async def render_tree(row: dict, tree_dir: Path, *, approved: bool) -> RenderReport:
+async def render_tree(row: dict, tree_dir: Path, *, approved: bool, seed: bool) -> RenderReport:
     """Render ``tree_dir`` (a release copy or a scratch copy under the row's
-    release root) as the row's check instance. The caller holds the deploy
-    lock."""
+    release root) as the row's check instance, on a copy of the live
+    database when ``seed`` (``seeds_live_data`` decides for code not live
+    yet) and on empty data otherwise. The caller holds the deploy lock."""
     report = RenderReport()
     ok, reason = await renderer_available()
     if not ok:
@@ -310,22 +332,23 @@ async def render_tree(row: dict, tree_dir: Path, *, approved: bool) -> RenderRep
         return report
     async with _renderer_slot:
         scratch = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="otodock-app-render-"))
-        report.seeded = await asyncio.to_thread(_seed, row, scratch)
+        report.seeded = seed and await asyncio.to_thread(_seed, row, scratch)
         report.egress = approved
         token, jti = rp.mint(row["id"], viewer_sub_for(row), row.get("agent") or "")
         started = False
         try:
             if app_sandbox.server_entry(tree_dir):
                 try:
-                    await app_supervisor.start(row, "check", release_dir=tree_dir, data_dir=scratch,
-                                               allow_hosts=None if approved else [])
+                    await app_supervisor.start(row, app_supervisor.CHECK, release_dir=tree_dir,
+                                               data_dir=scratch, allow_hosts=None if approved else [])
                     started = True
                 except (app_sandbox.AppStartError, app_supervisor.AppUnavailable) as e:
                     report.status = "hard"
                     report.hard = [f"the server did not start: {e}"]
                     return report
             else:
-                await app_supervisor.start(row, "check", release_dir=tree_dir, data_dir=scratch)
+                await app_supervisor.start(row, app_supervisor.CHECK, release_dir=tree_dir,
+                                           data_dir=scratch)
                 started = True
             path = f"/apps/{row['id']}?render={sha}"
             raw: dict | None = None
@@ -353,25 +376,29 @@ async def render_tree(row: dict, tree_dir: Path, *, approved: bool) -> RenderRep
         finally:
             rp.release(jti)
             if started:
-                await app_supervisor.stop(row["id"], "check")
+                await app_supervisor.stop(row["id"], app_supervisor.CHECK)
             await asyncio.to_thread(shutil.rmtree, scratch, True)
 
 
 async def render_working_tree(row: dict, source_dir: Path, *, approved: bool) -> RenderReport:
     """``check_app`` and ``screenshot_app(source="working")``: a scratch copy
-    of the working tree, rendered and removed. Takes the deploy lock."""
-    from services.apps.app_deploy import _deploy_lock
+    of the working tree, rendered and removed, on live data only by
+    ``seeds_live_data`` on the copy's own manifest (the code that runs, so
+    an edit after the copy buys nothing). Takes the deploy lock."""
+    from services.apps.app_deploy import _deploy_lock, working_manifest
     async with _deploy_lock(row["id"]):
         tree = await asyncio.to_thread(copy_working_tree, row, source_dir)
         try:
-            return await render_tree(row, tree, approved=approved)
+            manifest = await asyncio.to_thread(working_manifest, row, tree)
+            return await render_tree(row, tree, approved=approved,
+                                     seed=seeds_live_data(row, manifest))
         finally:
             await asyncio.to_thread(shutil.rmtree, tree, True)
 
 
 async def render_live(row: dict, *, approved: bool) -> RenderReport:
     """``screenshot_app(source="live")``: the live release, as a check
-    instance on scratch data. Takes the deploy lock."""
+    instance on a copy of the live database. Takes the deploy lock."""
     from services.apps.app_deploy import _deploy_lock
     async with _deploy_lock(row["id"]):
         try:
@@ -382,4 +409,4 @@ async def render_live(row: dict, *, approved: bool) -> RenderReport:
             report = RenderReport()
             report.reason = "the app has no release yet"
             return report
-        return await render_tree(row, live, approved=approved)
+        return await render_tree(row, live, approved=approved, seed=True)

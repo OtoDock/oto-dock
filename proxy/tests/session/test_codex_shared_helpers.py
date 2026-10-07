@@ -95,6 +95,17 @@ def test_map_effort_gpt6_astra_unlocks_max_and_ultra():
     assert map_effort_to_codex("ultra", "gpt-6-mini") == "xhigh"
 
 
+def test_map_effort_gpt61_sol_follows_the_0_160_catalog():
+    # Codex 0.160.0's bundled catalog: GPT-6.1 Sol carries low…max + ultra
+    # (ultra delegates at xhigh). The unlock is the exact id: "gpt-6-sol" is
+    # not a prefix of "gpt-6.1-sol", so without its own entry max and ultra
+    # would clamp to xhigh.
+    assert map_effort_to_codex("max", "gpt-6.1-sol") == "max"
+    assert map_effort_to_codex("ultra", "gpt-6.1-sol") == "ultra"
+    assert map_effort_to_codex("xhigh", "gpt-6.1-sol") == "xhigh"
+    assert map_effort_to_codex("high", "gpt-6.1-sol") == "high"
+
+
 def test_map_effort_gpt6_sol_and_luna_follow_the_0_156_catalog():
     # Codex 0.156.1's bundled catalog (verified 2026-09-24): GPT-6 Sol carries
     # low…max + ultra like 5.6 Sol; GPT-6 Luna low…max, no ultra, like 5.6 Luna.
@@ -169,21 +180,22 @@ def test_supports_ultra_flags_match_openai_manifest():
     # Sol/Terra and Astra carry ultra; Luna is capped at max by OpenAI's own
     # manifest. These flags must stay in sync with helpers._ULTRA_EFFORT_MODEL_PREFIXES.
     import config as app_config
-    assert app_config.get_model_supports_ultra("gpt-6-sol") is True
+    assert app_config.get_model_supports_ultra("gpt-6.1-sol") is True
     assert app_config.get_model_supports_ultra("gpt-5.6-terra") is True
     assert app_config.get_model_supports_ultra("gpt-6-astra") is True
     assert app_config.get_model_supports_ultra("gpt-6-luna") is False
     assert app_config.get_model_supports_ultra("claude-opus-5-5") is False
-    # Registry-only gate: the retired 5.6 Sol has no row any more (the wire
-    # clamp in helpers still knows it).
+    # Registry-only gate: the retired 5.6 Sol and GPT-6 Sol have no row any
+    # more (the wire clamp in helpers still knows them).
     assert app_config.get_model_supports_ultra("gpt-5.6-sol") is False
+    assert app_config.get_model_supports_ultra("gpt-6-sol") is False
     assert app_config.get_model_supports_ultra("no-such-model") is False
 
 
 def test_gpt6_astra_registry_entry():
     # A NEW model next to the 5.6 family (not a rename): codex-cli only until
-    # the hosted relay prices it; listed right after Sol so the codex "Auto"
-    # default (registry order) stays on Sol; the 272k pricing-tier window.
+    # the hosted relay prices it; listed right after the Sol row (GPT-6.1 Sol
+    # the tier-2 default) so it reads first; the 272k window.
     import config as app_config
     entry = app_config.MODEL_REGISTRY["gpt-6-astra"]
     assert entry["provider"] == "openai"
@@ -192,7 +204,8 @@ def test_gpt6_astra_registry_entry():
     assert entry["pricing"] == (10.0, 50.0, 12.50, 1.00)
     assert entry["supports_xhigh"] and entry["supports_ultra"] and entry["supports_reasoning"]
     codex_ids = [m["value"] for m in app_config.get_layer_models("codex-cli")]
-    assert codex_ids.index("gpt-6-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-5.6-terra")
+    assert codex_ids.index("gpt-6.1-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-5.6-terra")
+    assert "gpt-6-sol" not in codex_ids
     assert "gpt-6-astra" not in {m["value"] for m in app_config.get_layer_models("direct-llm")}
     assert "gpt-6-astra" not in app_config.MODEL_SUCCESSORS
     assert app_config.get_model_supports_xhigh("gpt-6-astra") is True
@@ -208,7 +221,7 @@ def test_layer_models_emit_ultra_only_on_codex_layer():
     from core.layers.direct.layer import _DIRECT_CAPABILITIES
     codex = {m["value"]: m for m in _CODEX_CAPABILITIES.models}
     direct = {m["value"]: m for m in _DIRECT_CAPABILITIES.models}
-    assert codex["gpt-6-sol"]["supports_ultra"] is True
+    assert codex["gpt-6.1-sol"]["supports_ultra"] is True
     assert codex["gpt-5.6-terra"]["supports_ultra"] is True
     assert codex["gpt-6-luna"]["supports_ultra"] is False
     assert direct["gpt-5.6-terra"]["supports_ultra"] is False

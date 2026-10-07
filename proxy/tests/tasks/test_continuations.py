@@ -472,6 +472,48 @@ class TestUndeliverableWake:
         asyncio.run(scheduler._fire_continuation(task))
         assert task_store.get_dynamic_task(task.id) is None
 
+    def test_a_stored_wake_names_its_person_or_its_creator(self, fire_env, monkeypatch):
+        chat_id = fire_env["chat_id"]
+        task_store.add_user_agent("user-viewer", AGENT, "editor", "test")
+        task = _cont_task(chat_id, delay_seconds=60, prompt="mine").model_copy(
+            update={"created_by": "user-viewer"})
+        self._fire(monkeypatch, chat_id, task)
+        assert task_store.claim_pending_wake_records(chat_id) == [
+            {"prompt": "mine", "person": "user-viewer", "role": "editor", "by": ""}]
+        phone = str(uuid.uuid4())
+        task_store.create_chat(phone, "phone", AGENT)
+        task = _cont_task(phone, delay_seconds=60, prompt="call back").model_copy(
+            update={"created_by": "user-viewer", "scope": "agent"})
+        self._fire(monkeypatch, phone, task)
+        assert task_store.claim_pending_wake_records(phone) == [
+            {"prompt": "call back", "person": "", "role": "editor", "by": "user-viewer"}]
+
+    def test_a_wake_below_the_editor_tier_with_no_person_starts_nothing(
+            self, fire_env, monkeypatch):
+        """A caller who holds the viewer role scheduled it from a phone call:
+        the wake reaches the call while it is live, starts no session when it
+        is not (the start floor refuses one), and is not kept."""
+        from core.session import session_delivery
+        phone = str(uuid.uuid4())
+        task_store.create_chat(phone, "phone", AGENT)
+        task_store.add_user_agent("user-viewer", AGENT, "viewer", "test")
+        task = _cont_task(phone, delay_seconds=60, prompt="call back").model_copy(
+            update={"created_by": "user-viewer", "scope": "agent"})
+        seen: list = []
+
+        async def _fake(cid, prompt, **kw):
+            seen.append((kw["user_sub"], kw["role"], kw["oneshot_fn"] is not None,
+                         kw["persistent_fn"] is not None))
+            out = self._None()
+            await kw["on_outcome"](out)
+            return out
+        monkeypatch.setattr(session_delivery, "deliver_prompt", _fake)
+        asyncio.run(scheduler.add_dynamic_task(task))
+        asyncio.run(scheduler._fire_continuation(task))
+        assert seen == [(None, "viewer", False, True)]
+        assert task_store.claim_pending_delegate_wake(phone) == []
+        assert task_store.get_dynamic_task(task.id) is None
+
     def test_a_delivered_wake_is_not_stored(self, fire_env):
         chat_id = fire_env["chat_id"]
         task_store.add_user_agent("user-viewer", AGENT, "editor", "test")

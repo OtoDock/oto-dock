@@ -43,7 +43,12 @@ cd dashboard && npm run dev            # hot-reload frontend
 `dev-setup.sh` installs the pinned toolchain (Python, Node, uv, pnpm,
 bubblewrap), builds `proxy/venv`, starts a Postgres container on
 `127.0.0.1:5432`, and builds the dashboard once. Add `--service` to install a
-systemd unit instead of running the proxy by hand.
+systemd unit instead of running the proxy by hand. Re-running it after a pull
+rebuilds `proxy/venv` when the pinned Python moved (a patch release included)
+and recreates the Postgres container when the pinned Postgres moved (its data
+kept), so stop the proxy first: `dev-setup.sh` refuses to run while the
+`otodock-proxy` unit is active, and a proxy run in the foreground is yours to
+stop.
 
 ## Running the tests
 

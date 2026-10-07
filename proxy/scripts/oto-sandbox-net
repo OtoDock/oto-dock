@@ -8,10 +8,17 @@ branch during a setup race). Call sites simply prepend this launcher to the
 existing bwrap argv; see core/sandbox/sandbox.py::SandboxBuilder.build_command_prefix.
 
 Usage:
-    oto-sandbox-net [--forward PORT]... [--allow-host ADDR]... \
+    oto-sandbox-net [--beneath ROOT]... [--forward PORT]... [--allow-host ADDR]... \
                     [--dns-forward ADDR] [--block-private] \
                     [--inbound HOSTPORT:PORT] [--egress-deny] \
                     -- <inner argv (bwrap ... -- agent ...)>
+
+``--beneath ROOT`` (an agent session's resolved agent folder): the shim opens
+every ``--bind`` / ``--ro-bind`` source below ROOT as a descriptor, walking
+each component without following a link, and hands it to bwrap as
+``--bind-fd`` / ``--ro-bind-fd``. The object bwrap mounts is then the one the
+walk reached: a component swapped for a link between the proxy's checks and
+the mount refuses the launch (exit 42) instead of binding the link's target.
 
 App servers (services/apps/app_supervisor.py) add two flags the agent
 sandboxes never use: ``--inbound HOSTPORT:PORT`` splices init-namespace
@@ -24,9 +31,10 @@ and resolver carves), so an app reaches only the proxy port, its
 
 Behavior:
     1. exec pasta with an EXPLICIT port-forward policy:
-       - ``-T <port>`` per --forward: in-netns 127.0.0.1:<port> (and ::1) is
-         spliced to init-namespace loopback:<port>. This is the ONLY loopback
-         reachability the agent gets (proxy hook port + its T1 Docker MCP ports).
+       - ``-T <port>`` per --forward: in-netns 127.0.0.1:<port> is spliced to
+         init-namespace loopback:<port>. This is the ONLY loopback reachability
+         the agent gets (proxy hook port + its T1 Docker MCP ports). pasta
+         splices ::1 too, but the shim removes the namespace's ::1 (below).
        - ``-t none -u none -U none`` (+ ``-T none`` when no forwards): pasta's
          port-forward defaults are **auto** — it would periodically scan bound
          ports and forward them, silently exposing host services (Postgres
@@ -61,6 +69,11 @@ Behavior:
          at a loopback stub (systemd-resolved / Docker embedded DNS) that cannot
          exist inside the netns; core/sandbox/sandbox.py pairs this flag with a generated
          resolv.conf bind-mounted over /etc/resolv.conf.
+       - The namespace's IPv6 loopback goes (``::1`` off ``lo``, an
+         ``unreachable ::1/128`` route in its place): every forward serves a
+         host listener on 127.0.0.1, and pasta resets a spliced ``::1``
+         connection it cannot complete host-side, which a client that dials
+         ``::1`` first for "localhost" never recovers from.
        Then, before exec'ing the inner argv, the shim repairs ``/proc`` when
        pasta ran it in a NEW pid namespace while leaving ``/proc`` bound to the
        parent pidns (the container ``pasta`` build does this): it gives itself a
@@ -133,6 +146,28 @@ def _die(msg: str) -> None:
     sys.exit(127)
 
 
+def _take_beneath(argv: list[str]) -> tuple[list[str], list[str]]:
+    """``(roots, rest)``: every ``--beneath ROOT`` before the ``--``
+    separator taken out, the rest (the inner argv included) left in order."""
+    roots: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            rest.extend(argv[i:])
+            break
+        if arg == "--beneath":
+            if i + 1 >= len(argv) or not argv[i + 1].startswith("/"):
+                _die("--beneath requires an absolute directory")
+            roots.append(argv[i + 1])
+            i += 2
+            continue
+        rest.append(arg)
+        i += 1
+    return roots, rest
+
+
 def _parse_argv(
     argv: list[str],
 ) -> tuple[list[str], list[str], str, bool, str, bool, list[str]]:
@@ -181,6 +216,96 @@ def _parse_argv(
     raise AssertionError  # unreachable
 
 
+# The shim's held bind sources (``--beneath``), kept apart so tests can run it
+# without the network setup. Every bwrap option is stepped over with its
+# values, so a value is never read as an option, and the walk ends at bwrap's
+# own ``--``: the session's argv after it is never touched. An option outside
+# the table refuses the launch rather than be guessed at.
+_HELD_BINDS = '''\
+import errno, os, stat
+
+_ARITY = {
+    "--args": 1, "--unshare-all": 0, "--share-net": 0, "--unshare-user": 0,
+    "--unshare-user-try": 0, "--unshare-ipc": 0, "--unshare-pid": 0,
+    "--unshare-net": 0, "--unshare-uts": 0, "--unshare-cgroup": 0,
+    "--unshare-cgroup-try": 0, "--userns": 1, "--userns2": 1, "--pidns": 1,
+    "--disable-userns": 0, "--assert-userns-disabled": 0, "--uid": 1,
+    "--gid": 1, "--hostname": 1, "--chdir": 1, "--clearenv": 0, "--setenv": 2,
+    "--unsetenv": 1, "--lock-file": 1, "--sync-fd": 1, "--bind": 2,
+    "--bind-try": 2, "--dev-bind": 2, "--dev-bind-try": 2, "--ro-bind": 2,
+    "--ro-bind-try": 2, "--bind-fd": 2, "--ro-bind-fd": 2, "--remount-ro": 1,
+    "--overlay-src": 1, "--overlay": 3, "--tmp-overlay": 1, "--ro-overlay": 1,
+    "--exec-label": 1, "--file-label": 1, "--proc": 1, "--dev": 1,
+    "--tmpfs": 1, "--mqueue": 1, "--dir": 1, "--file": 2, "--bind-data": 2,
+    "--ro-bind-data": 2, "--symlink": 2, "--seccomp": 1, "--add-seccomp": 1,
+    "--block-fd": 1, "--userns-block-fd": 1, "--info-fd": 1,
+    "--json-status-fd": 1, "--new-session": 0, "--die-with-parent": 0,
+    "--as-pid-1": 0, "--cap-add": 1, "--cap-drop": 1, "--perms": 1,
+    "--size": 1, "--chmod": 2, "--argv0": 1, "--level-prefix": 0,
+}
+_STEP = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+
+def _open_root(root):
+    # The proxy passes the folder resolved, so no component may be a link.
+    fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for name in root.strip("/").split("/"):
+            nxt = os.open(name, _STEP | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+def _held(root, rel):
+    # root/rel reached one component at a time with no link followed: a
+    # directory on the way, anything but a link at the end.
+    fd = _open_root(root)
+    try:
+        for name in rel.split("/"):
+            if name in ("", ".", ".."):
+                raise OSError(errno.EINVAL, "not a plain relative path", root + "/" + rel)
+            nxt = os.open(name, _STEP, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            if stat.S_ISLNK(os.fstat(fd).st_mode):
+                raise OSError(errno.ELOOP, "symlink refused", root + "/" + rel)
+    except BaseException:
+        os.close(fd)
+        raise
+    os.set_inheritable(fd, True)
+    return fd
+
+def _held_binds(argv):
+    roots = [r.rstrip("/") for r in _BENEATH]
+    out = [argv[0]]
+    i = 1
+    while i < len(argv):
+        opt = argv[i]
+        if opt == "--":
+            return out + argv[i:]
+        n = _ARITY.get(opt)
+        if n is None:
+            raise OSError(errno.EINVAL, "unknown bwrap option", opt)
+        vals = argv[i + 1:i + 1 + n]
+        if len(vals) < n:
+            raise OSError(errno.EINVAL, "bwrap option without its values", opt)
+        i += 1 + n
+        root = None
+        if opt in ("--bind", "--ro-bind"):
+            root = next((r for r in roots if vals[0].startswith(r + "/")), None)
+        if root is None:
+            out += [opt, *vals]
+            continue
+        try:
+            fd = _held(root, vals[0][len(root) + 1:])
+        except OSError as e:
+            raise OSError(e.errno, e.strerror or "cannot hold", vals[0]) from None
+        out += [opt + "-fd", str(fd), vals[1]]
+    return out
+'''
+
 # The in-netns shim, run by the host python3 as userns-root (CAP_NET_ADMIN over
 # the owned netns), AFTER pasta --config-net, BEFORE bwrap. Config is baked in
 # via .format(); the inner argv arrives as sys.argv[1:] and is exec'd at the end.
@@ -193,7 +318,10 @@ def _parse_argv(
 #      — pasta re-originates host-side, so via-gw reaches on-link AND routed;
 #   5. blackholes _BLOCK_V4 + the on-link subnet(s) (fail-CLOSED, os._exit(41))
 #      and _BLOCK_V6 (tolerated — v6 may be off);
-#   6. exec's the inner argv.
+#   6. with --beneath, swaps each bind source below a root for a held
+#      descriptor (_HELD_BINDS) in the mount namespace bwrap starts from
+#      (fail-CLOSED, os._exit(42));
+#   7. exec's the inner argv.
 _PYSHIM = '''\
 import ctypes, os, subprocess, sys
 _BLOCK_V4 = {block_v4!r}
@@ -201,6 +329,8 @@ _BLOCK_V6 = {block_v6!r}
 _CARVE = {carve!r}
 _BLOCK = {block!r}
 _EGRESS_DENY = {egress_deny!r}
+_BENEATH = {beneath!r}
+{held_binds}
 
 def _ip(args, v6=False):
     cmd = ["ip"] + (["-6"] if v6 else ["-4"]) + args
@@ -313,7 +443,31 @@ if _EGRESS_DENY:
     for net in ("::/1", "8000::/1"):
         _ip(["route", "replace", "unreachable", net], v6=True)
 
+# No IPv6 loopback in the namespace. pasta's -T splice listens on ::1 as well
+# as 127.0.0.1 and resets a connection it cannot complete host-side, while
+# every forward serves a host listener on 127.0.0.1 only; a client that dials
+# ::1 first for "localhost" takes that reset as final and never tries IPv4.
+# Without ::1 the dial fails at once and the client falls back. The route is
+# added after the address goes (removing an address flushes the routes on lo
+# for it); without that route ::1 would follow the default route, so a failed
+# route puts the address back. Either step failing leaves ::1 as it was; a
+# route and a restore both failing stops the launch.
+if "inet6 ::1/128" in _ip(["addr", "show", "dev", "lo"], v6=True).stdout:
+    if _ip(["addr", "del", "::1/128", "dev", "lo"], v6=True).returncode != 0:
+        sys.stderr.write("oto-sandbox-net-shim: warning: ::1 kept (address not removed)\\n")
+    elif _ip(["route", "replace", "unreachable", "::1/128"], v6=True).returncode != 0:
+        if _ip(["addr", "add", "::1/128", "dev", "lo"], v6=True).returncode != 0:
+            sys.stderr.write("oto-sandbox-net-shim: ::1 has neither its address nor a route\\n")
+            os._exit(41)
+        sys.stderr.write("oto-sandbox-net-shim: warning: ::1 kept (no unreachable route)\\n")
+
 _ensure_proc_for_pidns()
+if _BENEATH:
+    try:
+        inner = _held_binds(inner)
+    except OSError as e:
+        sys.stderr.write("oto-sandbox-net-shim: refusing a bind source: " + str(e) + "\\n")
+        os._exit(42)
 os.execvp(inner[0], inner)
 '''
 
@@ -321,6 +475,7 @@ os.execvp(inner[0], inner)
 def _build_pyshim(
     forwards: list[str], allow_hosts: list[str],
     dns_forward: str, block_private: bool, egress_deny: bool = False,
+    beneath: "list[str] | tuple[str, ...]" = (),
 ) -> str:
     """The in-netns python3 program (config baked in). See _PYSHIM."""
     # Non-loopback forward targets (`addr/port` specs) carve back out; loopback
@@ -331,12 +486,14 @@ def _build_pyshim(
     return _PYSHIM.format(
         block_v4=_BLOCK_V4, block_v6=_BLOCK_V6,
         carve=carve, block=block_private, egress_deny=egress_deny,
+        beneath=list(beneath), held_binds=_HELD_BINDS,
     )
 
 
 def main() -> None:
+    beneath, argv = _take_beneath(sys.argv[1:])
     (forwards, allow_hosts, dns_forward, block_private,
-     inbound, egress_deny, inner) = _parse_argv(sys.argv[1:])
+     inbound, egress_deny, inner) = _parse_argv(argv)
     if not inner:
         _die("empty inner command after `--`")
 
@@ -370,7 +527,8 @@ def main() -> None:
     if dns_forward:
         cmd.extend(["--dns-forward", dns_forward])
 
-    pyshim = _build_pyshim(forwards, allow_hosts, dns_forward, block_private, egress_deny)
+    pyshim = _build_pyshim(forwards, allow_hosts, dns_forward, block_private, egress_deny,
+                           beneath)
     cmd.extend(["--", python3, "-c", pyshim, *inner])
 
     # Preserve the kill chain (see module docstring). prctl survives execve

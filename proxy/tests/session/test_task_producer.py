@@ -487,3 +487,102 @@ async def test_stall_nudge_warns_of_still_running_siblings(clean_registries):
     assert len(layer.prompts) == 2
     assert "1 background job(s) are still running" in layer.prompts[1]
     assert "do not treat their output as final" in layer.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_the_producers_agent_review_is_recorded_and_never_repeated(clean_registries):
+    """The agents a run's review names are marked reviewed (a chat monitor
+    deferred through the run's report then owes them nothing), and one a
+    review already named is not named again."""
+    sid = "tp-reviewed"
+    clean_registries.append(sid)
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-old", "t0", label="old audit")
+    reg.mark_done("sub-old")
+    reg.mark_reviewed({"sub-old"})
+    reg.register_spawn("sub-new", "t1", label="new audit")
+    reg.mark_done("sub-new")
+
+    layer = _FakeLayer(turns=[[_bg_sub_start()], []])
+    await _run(layer, sid)
+
+    assert len(layer.prompts) == 2
+    assert "new audit" in layer.prompts[1] and "old audit" not in layer.prompts[1]
+    assert reg.reviewed == {"sub-old", "sub-new"}
+
+
+class _BlipLayer(_FakeLayer):
+    """A remote session whose machine drops during the bg wait: the session
+    reads gone while it is held in the reconnect grace (``away`` polls), then
+    comes back alive or not, and its process answers the probe."""
+
+    def __init__(self, turns, *, away: int, back: bool = True, probe_dead: bool = False,
+                 **kw):
+        super().__init__(turns, **kw)
+        self.away = away
+        self.back = back
+        self.probe_dead = probe_dead
+        self.alive_calls = 0
+        self.probes = 0
+
+    async def is_session_alive(self, session_id):
+        self.alive_calls += 1
+        if self.away > 0:
+            return False
+        return self.back
+
+    def is_session_grace_held(self, session_id):
+        if self.away > 0:
+            self.away -= 1
+            return True
+        return False
+
+    async def probe_session_process_dead(self, session_id):
+        self.probes += 1
+        return self.probe_dead
+
+
+@pytest.fixture
+def fast_grace(monkeypatch):
+    from core.events import pump_bg_monitors
+    monkeypatch.setattr(pump_bg_monitors, "GRACE_POLL_S", 0.001)
+
+
+@pytest.mark.asyncio
+async def test_a_blip_during_the_bg_wait_is_ridden_out(clean_registries, fast_grace):
+    """The machine drops while a command runs: the run waits for the
+    reconnect, asks the process once, drains what the drop buffered, and
+    reviews the command when it finishes — never "session gone"."""
+    sid = "tp-blip"
+    clean_registries.append(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t1", label="cmd-a — build")
+    layer = _BlipLayer(
+        turns=[[_bg_cmd_start()], []], away=3,
+        on_drain=lambda n: bgreg.mark_done("cmd-a", surfaced=False) if n >= 1 else False,
+    )
+
+    events = await _run(layer, sid, bg_cmd_ceiling=5.0)
+
+    assert layer.probes == 1
+    assert len(layer.prompts) == 2 and "cmd-a — build" in layer.prompts[1]
+    assert len(_nudges(events)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("back, probe_dead", [(False, False), (True, True)])
+async def test_a_machine_that_does_not_come_back_ends_the_wait(
+        clean_registries, fast_grace, back, probe_dead):
+    """The grace ended with the session gone, or the machine came back
+    without the session (a satellite restarted inside the grace): the wait
+    ends as a gone session, at once, with no review."""
+    sid = f"tp-blip-gone-{back}"
+    clean_registries.append(sid)
+    get_bg_command_registry(sid).register_spawn("cmd-a", "t1")
+    layer = _BlipLayer(turns=[[_bg_cmd_start()]], away=2, back=back, probe_dead=probe_dead)
+
+    events = await _run(layer, sid, bg_cmd_ceiling=5.0)
+
+    assert layer.prompts == ["do the task"]
+    assert not _nudges(events)
+    assert layer.drain_calls == 0

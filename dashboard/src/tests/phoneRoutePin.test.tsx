@@ -100,19 +100,30 @@ describe('route PIN option', () => {
     renderTab()
     await openEdit()
     fireEvent.click(pinCard().querySelector('[role="switch"]')!)
-    fireEvent.change(screen.getByPlaceholderText('4–6 digits'), { target: { value: '4711' } })
+    fireEvent.change(screen.getByPlaceholderText('6 digits'), { target: { value: '471125' } })
     fireEvent.click(screen.getByText('Save'))
 
     await waitFor(() => {
       const put = routeSave('PUT')
       expect(put).toBeTruthy()
       const body = JSON.parse(String(put![1]!.body))
-      expect(body.pin).toBe('4711')
+      expect(body.pin).toBe('471125')
       expect(body).not.toHaveProperty('pin_configured')
       expect(body).not.toHaveProperty('acknowledge_no_pin')
     })
     expect(pinRequests()).toHaveLength(0)
     expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+  })
+
+  it('a new PIN needs 6 digits before the route saves', async () => {
+    mockApi([makeRoute()])
+    renderTab()
+    await openEdit()
+    fireEvent.click(pinCard().querySelector('[role="switch"]')!)
+    fireEvent.change(screen.getByPlaceholderText('6 digits'), { target: { value: '4711' } })
+    expect((screen.getByText('Save').closest('button') as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(screen.getByPlaceholderText('6 digits'), { target: { value: '471125' } })
+    expect((screen.getByText('Save').closest('button') as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('a new user-mode route with a PIN sends it in the POST and asks nothing', async () => {
@@ -124,14 +135,14 @@ describe('route PIN option', () => {
     await within(picker).findByText(/Alice/)
     fireEvent.change(picker, { target: { value: 'u-alice' } })
     fireEvent.click(pinCard().querySelector('[role="switch"]')!)
-    fireEvent.change(screen.getByPlaceholderText('4–6 digits'), { target: { value: '4711' } })
+    fireEvent.change(screen.getByPlaceholderText('6 digits'), { target: { value: '471125' } })
     fireEvent.click(screen.getByText('Save'))
 
     await waitFor(() => {
       const post = routeSave('POST')
       expect(post).toBeTruthy()
       const body = JSON.parse(String(post![1]!.body))
-      expect(body.pin).toBe('4711')
+      expect(body.pin).toBe('471125')
       expect(body.identity_user_sub).toBe('u-alice')
       expect(body).not.toHaveProperty('acknowledge_no_pin')
     })
@@ -144,7 +155,7 @@ describe('route PIN option', () => {
     renderTab()
     await openEdit()
     fireEvent.click(pinCard().querySelector('[role="switch"]')!)
-    fireEvent.change(screen.getByPlaceholderText('4–6 digits'), { target: { value: '4711' } })
+    fireEvent.change(screen.getByPlaceholderText('6 digits'), { target: { value: '471125' } })
     fireEvent.click(screen.getByRole('button', { name: 'outbound' }))
     fireEvent.click(screen.getByText('Save'))
     await waitFor(() => {
@@ -154,7 +165,7 @@ describe('route PIN option', () => {
       expect(body.direction).toBe('outbound')
       expect(body).not.toHaveProperty('pin')
     })
-    expect(String(routeSave('PUT')![1]!.body)).not.toContain('4711')
+    expect(String(routeSave('PUT')![1]!.body)).not.toContain('471125')
   })
 
   it('turning the toggle off on a configured route deletes the PIN on save', async () => {

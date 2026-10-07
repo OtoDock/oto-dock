@@ -686,7 +686,7 @@ def resolve_path_for_session(
     # of the home / full-FS policy so Linux/macOS satellites reach parity with
     # Windows (whose temp dir happens to sit under $HOME). Ordered AFTER the
     # protected-path + .env denies above, so it can never weaken them.
-    if not writing and path_roles.is_claude_bg_output_path(normalized):
+    if not writing and path_roles.is_claude_bg_output_path(normalized, ctx.cli_session_id):
         return PathResolution(
             access_path=normalized,
             allowed=True,

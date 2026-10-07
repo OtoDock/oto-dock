@@ -54,10 +54,10 @@ def auto_update_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 # Presence of this file in an MCP's install dir excludes it from the WEEKLY
-# automatic converge (both upgrades and downgrades). Manual admin updates
-# ignore it — an explicit Update click is an explicit decision. Meant for
-# out-of-band deploys running ahead of the catalog: touch it when deploying,
-# remove it once the catalog has caught up.
+# automatic converge. Manual admin updates ignore it — an explicit Update
+# click is an explicit decision. An install AHEAD of the catalog needs no
+# marker: the job leaves it alone (``_catalog_relation``); the marker is for
+# an install the operator does not want converged for a catalog edit at all.
 HOLD_MARKER = ".hold"
 
 
@@ -250,9 +250,8 @@ def _is_pkg_newer(target: str | None, current: str) -> bool:
 
 def _is_downgrade(target: str | None, current: str) -> bool:
     """Whether converging to ``target`` would move the installed ``current``
-    BACKWARDS. Parse-only — the flag drives loud warnings and hold semantics,
-    so unparseable versions never flag (a false positive is worse than a
-    missed one here)."""
+    BACKWARDS. Parse-only: unparseable versions never flag (a false positive
+    would hide a real update behind "ahead")."""
     if not target or not current:
         return False
     try:
@@ -260,6 +259,30 @@ def _is_downgrade(target: str | None, current: str) -> bool:
         return Version(target) < Version(current)
     except Exception:
         return False
+
+
+REL_UPDATE = "update"
+REL_AHEAD = "ahead"
+REL_SAME = "same"
+
+
+def _catalog_relation(latest: str | None, current: str) -> str:
+    """How the catalog's version of record stands to the installed one, for
+    the axes that converge to the catalog (a container's image tag, a skill
+    package): ``update`` when the catalog is newer (an empty installed
+    version counts as older, so a missed readback is re-pinned; two
+    different strings that do not both parse count as an update too, as the
+    old inequality did), ``ahead`` when the install is past the catalog (an
+    out-of-band deploy, a newer zip), ``same`` otherwise."""
+    if not latest:
+        return REL_SAME
+    if not current:
+        return REL_UPDATE
+    if latest == current:
+        return REL_SAME
+    if _is_downgrade(latest, current):
+        return REL_AHEAD
+    return REL_UPDATE
 
 
 async def detect_available_updates() -> dict:
@@ -281,15 +304,31 @@ async def detect_available_updates() -> dict:
     from services.community import community_catalog
     from services.mcp import mcp_installer
 
+    from services.community import mcp_source_swap
+
     manifests = mcp_registry.get_all_manifests()
     results: dict[str, dict] = {}
 
+    registry_ok = True
     try:
         registry_doc = await community_catalog.fetch_registry()
         catalog = {e.get("name"): e for e in registry_doc.get("mcps", []) if isinstance(e, dict)}
     except Exception as e:
         logger.warning("Catalog registry fetch failed for update check: %s", e)
         catalog = {}
+        registry_ok = False
+
+    # The source pass runs first: an MCP whose catalog source differs from
+    # the installed one gets a pending source change (persisted below, shown
+    # on the page until the admin switches it or the catalog reverts) and
+    # no ordinary update, which the install gate would refuse anyway.
+    source_changes: dict[str, dict] = {}
+    unchanged: set[str] = set()
+    if registry_ok:
+        try:
+            source_changes, unchanged = await mcp_source_swap.detect_changes(manifests, catalog)
+        except Exception:
+            logger.exception("Source-change detection failed; ordinary axes only")
 
     # npm/pypi candidates — COMMUNITY only. Update execution converges to the
     # community-catalog folder (install_from_catalog), which custom/local MCPs
@@ -299,7 +338,7 @@ async def detect_available_updates() -> dict:
     # Mirrors the weekly job's community_targets() filter.
     checks = []
     for name, m in manifests.items():
-        if m.category != "community":
+        if m.category != "community" or name in source_changes:
             continue
         parsed = mcp_installer.parse_source(m.server.source)
         if not parsed or parsed.registry not in ("npm", "pypi"):
@@ -357,6 +396,7 @@ async def detect_available_updates() -> dict:
     docker_targets = [
         (name, m) for name, m in manifests.items()
         if m.category == "community" and _mt.is_container(m.server)
+        and name not in source_changes
     ]
 
     def _docker_hashes() -> dict:
@@ -377,33 +417,35 @@ async def detect_available_updates() -> dict:
         latest = entry.get("version") if entry else None
         catalog_hash = entry.get("manifest_hash") if entry else None
         installed_hash = docker_hashes.get(name)
-        if latest == m.version and catalog_hash and installed_hash and catalog_hash != installed_hash:
+        relation = _catalog_relation(latest, m.version)
+        if relation == REL_SAME and catalog_hash and installed_hash and catalog_hash != installed_hash:
             results[name] = {
                 "current": m.version, "latest": m.version,
                 "registry": "catalog", "package": name, "reason": "manifest",
             }
-        elif latest and latest != m.version:
+        elif relation == REL_UPDATE:
             results[name] = {
                 "current": m.version, "latest": latest,
                 "registry": "catalog", "package": name, "reason": "package",
             }
-            # Docker converge is deliberately `!=` (the catalog is the version
-            # of record, so a catalog rollback must apply) — but an install
-            # running AHEAD of the catalog (out-of-band deploy waiting on its
-            # catalog push) would be silently reverted. Flag + warn loudly.
-            if _is_downgrade(latest, m.version):
-                results[name]["downgrade"] = True
-                logger.warning(
-                    "MCP %s: installed %s is AHEAD of catalog %s — converging "
-                    "would DOWNGRADE it (touch %s in the MCP dir to hold it "
-                    "out of auto-updates)",
-                    name, m.version, latest, HOLD_MARKER,
-                )
+        elif relation == REL_AHEAD:
+            # An install past the catalog (an out-of-band deploy, a newer
+            # archive) is never moved back by the job; the row reports it and
+            # the admin may revert it on purpose through the Update route.
+            results[name] = {
+                "current": m.version, "latest": latest,
+                "registry": "catalog", "package": name, "reason": "ahead",
+            }
+            logger.info(
+                "MCP %s: installed %s is ahead of the catalog %s; left alone",
+                name, m.version, latest,
+            )
 
     # Standalone skill packages (category "skill", runtime none) — the skills
-    # catalog is the version of record (docker-style `!=` converge) plus the
-    # manifest-hash axis. Registry fetch degrades to an empty catalog, so a
-    # transient outage simply reports no skill updates.
+    # catalog's version moves an install forward only (``_catalog_relation``,
+    # as for a container), plus the manifest-hash axis. Registry fetch
+    # degrades to an empty catalog, so a transient outage simply reports no
+    # skill updates.
     skills_checked = 0
     try:
         skills_doc = await community_catalog.fetch_skills_registry()
@@ -435,7 +477,18 @@ async def detect_available_updates() -> dict:
             if entry is None:
                 continue
             latest = entry.get("version")
-            pkg_newer = bool(latest) and latest != m.version
+            relation = _catalog_relation(latest, m.version)
+            if relation == REL_AHEAD:
+                results[name] = {
+                    "current": m.version, "latest": latest,
+                    "registry": "skills-catalog", "package": name, "reason": "ahead",
+                }
+                logger.info(
+                    "Skill package %s: installed %s is ahead of the catalog %s; "
+                    "left alone", name, m.version, latest,
+                )
+                continue
+            pkg_newer = relation == REL_UPDATE
             catalog_hash = entry.get("manifest_hash")
             installed_hash = skill_hashes.get(name)
             manifest_changed = (bool(catalog_hash) and bool(installed_hash)
@@ -450,8 +503,55 @@ async def detect_available_updates() -> dict:
                 "registry": "skills-catalog", "package": name, "reason": reason,
             }
 
-    return {"updates": results,
-            "checked": len(checks) + docker_checked + skills_checked}
+    checked = len(checks) + docker_checked + skills_checked + len(source_changes)
+    state = await _persist_check(results, source_changes, unchanged, registry_ok)
+    if state is None:
+        # The store is unavailable: answer with what this check found.
+        versions = {name: m.version for name, m in manifests.items()}
+        rows = [{"mcp_name": n, "status": "pending", **c} for n, c in source_changes.items()]
+        return {
+            "updates": mcp_source_swap.merge_update_state(results, rows, versions),
+            "checked": checked, "checked_at": "",
+        }
+    state["checked"] = checked
+    return state
+
+
+async def _persist_check(results: dict, source_changes: dict, unchanged: set,
+                         registry_ok: bool) -> dict | None:
+    """Write the check's results and source changes, then read the page's
+    state back. The ordinary results are replaced whole on every check; a
+    source change is upserted (the same pair keeps its row); a pending row
+    whose MCP agrees with the catalog again, or whose entry left the
+    catalog, is dropped. A check that could not read the catalog judged only
+    the npm/pypi axes: it persists nothing (the previous check stands, its
+    time unchanged) and answers with what it saw over the persisted source
+    changes. ``None`` when the store failed, so a check never fails on
+    persistence."""
+    from services.community import mcp_source_swap
+    from storage.mcp import mcp_update_state_store as state_store
+
+    def _write() -> dict:
+        if not registry_ok:
+            rows = state_store.list_source_changes()
+            versions = {n: m.version for n, m in mcp_registry.get_all_manifests().items()}
+            return {
+                "updates": mcp_source_swap.merge_update_state(results, rows, versions),
+                "checked": len(results),
+                "checked_at": state_store.last_checked_at(),
+            }
+        state_store.replace_check_results(results)
+        for name, change in source_changes.items():
+            state_store.upsert_pending_source_change(name, change)
+        for name in unchanged:
+            state_store.delete_pending_source_change(name)
+        return mcp_source_swap.build_update_state()
+
+    try:
+        return await asyncio.to_thread(_write)
+    except Exception:
+        logger.exception("The update check could not be persisted")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -599,10 +699,23 @@ async def update_one(name: str) -> dict:
             # Converge to the skills catalog (idempotent reinstall — the
             # generic runtime-none path below would 400 on "no source").
             from services.community import skills_installer
-            return await skills_installer.install_skill_package_from_catalog(name)
-        if _mt.is_container(manifest.server):
-            return await _update_docker_mcp(name)
-        return await _update_node_python_mcp(name, manifest)
+            result = await skills_installer.install_skill_package_from_catalog(name)
+        elif _mt.is_container(manifest.server):
+            result = await _update_docker_mcp(name)
+        else:
+            result = await _update_node_python_mcp(name, manifest)
+        await asyncio.to_thread(_forget_check_result, name)
+        return result
+
+
+def _forget_check_result(name: str) -> None:
+    """An applied update retires the persisted offer for the MCP; the next
+    check writes a fresh one. Best effort: the update already happened."""
+    from storage.mcp import mcp_update_state_store as state_store
+    try:
+        state_store.delete_check_result(name)
+    except Exception:
+        logger.warning("The persisted check result of %s could not be dropped", name)
 
 
 # ---------------------------------------------------------------------------

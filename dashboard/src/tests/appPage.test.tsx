@@ -27,6 +27,13 @@ vi.mock('@/api/apps', async (importOriginal) => ({
 }))
 const authUser = vi.hoisted(() => ({ current: { role: 'member', agents: ['dev'] } as any }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: authUser.current }) }))
+const hideShare = vi.hoisted(() => vi.fn())
+const patchShare = vi.hoisted(() => vi.fn())
+vi.mock('@/api/shares', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api/shares')>()),
+  useHideShare: () => ({ mutate: hideShare }),
+  usePatchShare: () => ({ mutate: patchShare }),
+}))
 
 import AppPage from '@/pages/apps/AppPage'
 
@@ -117,6 +124,18 @@ describe('AppPage', () => {
     expect(screen.getByTestId('loc').textContent).toContain('/chat/dev')
   })
 
+  it('a shared app that runs a server says Stop app for everyone, and the confirm says what is kept', () => {
+    authUser.current = { role: 'member', agents: ['dev'] }
+    appRow.current = mkApp({ kind: 'folder', has_server: true })
+    renderPage()
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    expect(screen.queryByRole('menuitem', { name: /Unpin/ })).toBeNull()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Stop app for everyone' }))
+    expect(screen.getByTestId('app-unpin-confirm').textContent).toContain(
+      'Stop “Morning brief” for everyone? Stops the app and keeps its data. Pin it again to start it.')
+    expect(screen.getByRole('button', { name: 'Stop app for everyone' })).toBeTruthy()
+  })
+
   it('a missing or denied app is the same absence', () => {
     appRow.current = null
     renderPage()
@@ -156,5 +175,97 @@ describe('AppPage socket', () => {
     expect(wsSpy.disconnect).not.toHaveBeenCalled()
     unmount()
     expect(wsSpy.disconnect).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('AppPage — an app a share placed for this viewer (SHARING.md)', () => {
+  it('a person\'s own placement goes back to its agent and offers Remove for me, which revokes their share behind a confirm', () => {
+    hideShare.mockClear()
+    patchShare.mockClear()
+    authUser.current = { role: 'member', agents: ['lite'] }
+    appRow.current = mkApp({
+      agent: 'ops', can_manage: false, can_approve: false,
+      placement: { kind: 'person', share_id: 'sh-9', from_agent: 'ops', from_agent_name: 'Ops Desk', agent: 'lite', role_cap: 'viewer', shared_by: 'u-nora', shared_by_name: 'Nora', can_remove: false },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/apps/app-1']}>
+          <Routes>
+            <Route path="/apps/:appId" element={<><AppPage /><LocationProbe /></>} />
+            <Route path="/chat/:name" element={<LocationProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+    expect(screen.getByText('shared with you')).toBeTruthy()
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    expect(screen.queryByRole('menuitem', { name: 'Hide for me' })).toBeNull()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove for me' }))
+    expect(patchShare).not.toHaveBeenCalled()
+    expect(screen.getByTestId('app-remove-confirm').textContent).toContain(
+      'Remove “Morning brief” from your apps? Nora can share it again.')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove for me' }))
+    expect(patchShare).toHaveBeenCalledWith({ id: 'sh-9', revoke: true })
+    expect(hideShare).not.toHaveBeenCalled()
+    expect(screen.getByTestId('loc').textContent).toContain('/chat/lite')
+  })
+
+  it('the page\'s Remove for me reads whole without the sharer\'s name', () => {
+    authUser.current = { role: 'member', agents: ['lite'] }
+    appRow.current = mkApp({
+      agent: 'ops', can_manage: false, can_approve: false,
+      placement: { kind: 'person', share_id: 'sh-9', from_agent: 'ops', from_agent_name: 'Ops Desk', agent: 'lite', role_cap: 'viewer', shared_by: '', shared_by_name: '', can_remove: false },
+    })
+    renderPage()
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove for me' }))
+    expect(screen.getByTestId('app-remove-confirm').textContent).toContain(
+      'Remove “Morning brief” from your apps? The person who shared it can share it again.')
+  })
+
+  it('goes back to the agent it sits in for a non-member, labels it, and hides a team placement through the share', () => {
+    hideShare.mockClear()
+    authUser.current = { role: 'member', agents: ['lite'] }
+    appRow.current = mkApp({
+      agent: 'ops', can_manage: false, can_approve: false,
+      placement: { kind: 'agent', share_id: 'sh-9', from_agent: 'ops', from_agent_name: 'Ops Desk', agent: 'lite', role_cap: 'viewer', shared_by: '', shared_by_name: '', can_remove: false },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/apps/app-1']}>
+          <Routes>
+            <Route path="/apps/:appId" element={<><AppPage /><LocationProbe /></>} />
+            <Route path="/chat/:name" element={<LocationProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+    expect(screen.getByText('shared with you')).toBeTruthy()
+    expect(frameProps.current.onSendPrompt).toBeUndefined()
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Hide for me' }))
+    expect(hideShare).toHaveBeenCalledWith({ id: 'sh-9', agent: 'lite' })
+    expect(screen.getByTestId('loc').textContent).toContain('/chat/lite')
+  })
+
+  it('a pending person share hides through its own share id and goes home', () => {
+    hideShare.mockClear()
+    authUser.current = { role: 'member', agents: [] }
+    appRow.current = mkApp({ agent: 'ops', can_manage: false, granted: true, share_id: 'sh-3' })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/apps/app-1']}>
+          <Routes>
+            <Route path="/apps/:appId" element={<><AppPage /><LocationProbe /></>} />
+            <Route path="/" element={<LocationProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+    fireEvent.click(screen.getByLabelText('Back to the agent'))
+    expect(screen.getByTestId('loc').textContent?.startsWith('/|')).toBe(true)
   })
 })

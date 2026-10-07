@@ -70,8 +70,38 @@ DISALLOWED_BUILTIN_TOOLS = [
     # quarantined at every session start. Unmanaged skill SOURCES stay
     # closed elsewhere: bundled CLI skills via
     # CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1 (env_builder + satellite spawn),
-    # plugin skills via "enabledPlugins": {} below.
+    # plugin skills via the "enabledPlugins" entries below.
+    # Claude.ai artifacts: the tool publishes to the signed-in claude.ai
+    # account, which on a pool login is the pool owner's; the platform's
+    # apps and display artifacts are the in-platform equivalent.
+    "Artifact",
+    "ArtifactComments",
+    "ArtifactData",
+    "ArtifactCheck",
 ]
+
+# Claude Code's built-in plugins (2.1.287 and later ship "mods": plugins
+# whose handlers can change the CLI's behaviour and run ahead of a
+# non-managed PreToolUse hook). An empty ``enabledPlugins`` map leaves the
+# built-ins ON (verified: ``cc-plugin-plugin-authoring`` loaded under the
+# platform's settings and its skill reached the session), and a remote
+# feature flag can switch on a built-in that shipped dark, so only the four
+# the platform wants stay on — ``cc-plugin-agents-md`` (AGENTS.md),
+# ``cc-plugin-diff`` (/diff), ``cc-plugin-telemetry`` and the managed-only
+# ``cc-plugin-sec-default`` (the deny-first guard) — and every other built-in
+# the binary names is off by name, so no flag can add a skill, an agent, a
+# command or a reply-mod. ``agents-md`` and ``telemetry`` load on 2.1.281
+# too; older CLIs ignore an id they do not know. Satellite twin:
+# ``satellite/sessions/cli_session.py``, held equal by test_sandbox.
+DISABLED_BUILTIN_PLUGINS = (
+    "cc-plugin-plugin-authoring@builtin",
+    "cc-plugin-you-should-know@builtin",
+    "cc-plugin-claude-test@builtin",
+    "cc-plugin-mods-guide@builtin",
+    "cc-plugin-mermaid@builtin",
+    "cc-plugin-responsive-mode@builtin",
+    "cc-plugin-tips@builtin",
+)
 
 
 def build_settings(sandbox_claude_dir: str) -> dict:
@@ -92,10 +122,13 @@ def build_settings(sandbox_claude_dir: str) -> dict:
     future build flips enabled back on and the inner sandbox can't
     initialise.
     """
-    gate = f"{sandbox_claude_dir}/permission_gate.py"
-    forwarder = f"{sandbox_claude_dir}/tool_result_forwarder.py"
-    subagent = f"{sandbox_claude_dir}/subagent_tracker.py"
-    stop = f"{sandbox_claude_dir}/stop_tracker.py"
+    # Each hook runs the sandbox's python in isolated mode (no PYTHON*
+    # variable, no user site, no script directory on the path), so nothing
+    # the agent sets in its environment changes what a hook executes.
+    gate = f'python3 -I "{sandbox_claude_dir}/permission_gate.py"'
+    forwarder = f'python3 -I "{sandbox_claude_dir}/tool_result_forwarder.py"'
+    subagent = f'python3 -I "{sandbox_claude_dir}/subagent_tracker.py"'
+    stop = f'python3 -I "{sandbox_claude_dir}/stop_tracker.py"'
 
     return {
         "sandbox": {
@@ -120,15 +153,17 @@ def build_settings(sandbox_claude_dir: str) -> dict:
         # satellite reconciles the pinned version). Belt-and-braces with env
         # DISABLE_AUTOUPDATER=1 (env_builder).
         "autoUpdates": False,
-        # The platform is the only skill SOURCE: with
-        # the Skill tool allowed, plugin skills must not activate outside
+        # The platform is the only skill SOURCE: with the Skill tool
+        # allowed, plugin skills must not activate outside
         # install/approval/version-pinning. This settings.json is rewritten
-        # every session start, so plugin enablement is platform-owned state —
-        # an explicit empty map keeps every plugin off. Live installs carry
-        # auto-installed marketplace trees under .claude/plugins/; those stay
-        # on disk (inert). VERIFY at dogfood: no plugin skills in the CLI's
-        # skills index (pre-impl checklist item 1, plan §checklist).
-        "enabledPlugins": {},
+        # every session start, so plugin enablement is platform-owned state:
+        # no marketplace plugin is enabled, and every built-in but the four
+        # the platform keeps is off by name (DISABLED_BUILTIN_PLUGINS). The
+        # spawns read this file alone (--setting-sources user), so a plugin
+        # enabled from a terminal at the local scope never outranks it. Live
+        # installs carry auto-installed marketplace trees under
+        # .claude/plugins/; those stay on disk (inert).
+        "enabledPlugins": {plugin: False for plugin in DISABLED_BUILTIN_PLUGINS},
         # Claude Code ≥ 2.1.275 syncs the skills and plugins enabled on the
         # signed-in claude.ai account into the session. Platform sessions run
         # on pool accounts (CLAUDE_CODE_OAUTH_TOKEN): a pool owner's personal
@@ -234,7 +269,7 @@ def ensure_persistent_claude_dir(
     # skills problem must never block a session start). See
     # skills_materializer for the full protocol.
     from core.sandbox.skills_materializer import materialize_skills_for_sandbox
-    materialize_skills_for_sandbox(agent_name, claude_dir)
+    materialize_skills_for_sandbox(agent_name, claude_dir, username=username)
 
     os.chmod(claude_dir, 0o700)
 

@@ -30,10 +30,12 @@ import httpx
 import config
 from services.mcp import mcp_registry
 from services.oauth.oauth_account_store import (
+    MCP_AUTHORIZATION_FLOW,
     _read_oauth_token,
     account_token_path,
     get_token_dir,
 )
+from services.webhooks import vendor_http
 from services.webhooks.webhook_template import (  # noqa: F401  (re-exported for callers/tests)
     _TOKEN_RE,
     _build_substitutions,
@@ -857,7 +859,11 @@ async def _call_vendor(
         account_extra=account_extra,
     )
     method = call_block["method"].upper()
-    url = _substitute_string(call_block["url_template"], subs)
+    try:
+        url = vendor_http.url_from_template(call_block["url_template"], subs)
+        await vendor_http.check_url(url)
+    except vendor_http.VendorURLRefused as e:
+        raise VendorAPIError(f"vendor call refused: {e}", vendor_status=0, vendor_body="") from e
     headers = {k: _substitute_string(v, subs) for k, v in (call_block.get("headers") or {}).items()}
     body_template = call_block.get("body_template")
     body_data = _substitute_value(body_template, subs) if body_template is not None else None
@@ -969,6 +975,17 @@ def _resolve_token_or_raise(
     if not token:
         raise SubscriptionError(
             f"OAuth token has no access_token field for {provider_id}/{account_label}",
+            status=400,
+        )
+    # A token the MCP server's own authorization server issued is meant for
+    # that server alone (RFC 8707): events need an account connected through
+    # the relay or the vendor's app.
+    extra = payload.get("extra") or {}
+    if isinstance(extra, dict) and extra.get("flow") == MCP_AUTHORIZATION_FLOW:
+        raise SubscriptionError(
+            f"The {provider_id} account {account_label!r} signed in through the MCP "
+            "server's own authorization server; its token serves the MCP server only. "
+            "Events need an account connected through OtoDock or the vendor's app.",
             status=400,
         )
     return token

@@ -24,7 +24,7 @@ from api.apps import manifest as _mf
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from core.session import session_state
 from storage import database as task_store
 
@@ -35,7 +35,7 @@ SID_SHARED = "sess-app-shared"
 AGENT = "apps-agent"
 # A session token, as the MCP sidecars send: a body past 64 KB with a bearer
 # that does not verify is refused before the route runs.
-_BEARER = {"Authorization": f"Bearer {create_session_token(SID, AGENT, '')}"}
+_BEARER = {"Authorization": f"Bearer {live_session_token(SID, AGENT, '')}"}
 
 
 def _user(sub: str = "alice-sub", role: str = "member",
@@ -336,6 +336,69 @@ def test_list_hook_shows_merged_scope(agent_tree):
     assert [a["slug"] for a in r.json()["apps"]] == ["shared-app"]
 
 
+def test_list_hook_shows_placed_apps_apart_with_role_and_methods(agent_tree):
+    """An app a share placed in this agent rides a separate ``placed`` key
+    (never the pinned order of ``apps``): the home pair with its id, the
+    placement, the role this session acts at and the exported methods; a
+    person's own placement shows to their user-scope session alone."""
+    from core.session import visibility
+    from storage.agents import agent_store
+    from storage.sharing import share_store
+    source = "apps-source"
+    agent_store.create_agent(source, "Source Desk", created_by="alice-sub")
+    exports = {"methods": {"status": {"description": "the status"},
+                           "update-project": {"description": "write one", "min_role": "editor"}}}
+    src = task_store.upsert_app(source, "", None, "register", title="Register",
+                                rel_path="workspace/apps/register", kind="folder", actions_json="[]",
+                                blocks={"exports": task_store.canonical_actions_json(exports)})
+    task_store.approve_app_actions(src["id"], task_store.manifest_sig(src), "alice-sub")
+    _pin({"slug": "mine", "html": "<p>m</p>"})
+    assert "placed" in _hook("list", {}).json() and _hook("list", {}).json()["placed"] == []
+    team = share_store.create_internal_share(
+        target_kind="app", target_id=src["id"], created_by="alice-sub",
+        grantee_kind=share_store.AGENT, grantee_agent=AGENT, role_cap="editor",
+        decision=share_store.ACCEPTED, decided_by="alice-sub")
+    body = _hook("list", {}).json()
+    assert [a["slug"] for a in body["apps"]] == ["mine"]
+    assert [(p["id"], p["agent"], p["slug"], p["title"], p["from_agent_name"], p["kind"], p["role"],
+             p["placement"], p["actions_approved"], p["hidden_for_me"]) for p in body["placed"]] == [
+        (src["id"], source, "register", "Register", "Source Desk", "folder", "editor",
+         {"kind": "agent", "share_id": team["id"], "role_cap": "editor"}, True, False)]
+    assert body["placed"][0]["exports"] == {"methods": exports["methods"]}
+    # alice manages this agent: capped at editor; a session with no person
+    # acts at the no-user word, which ranks below every floor.
+    assert _hook("list", {}, sid=SID_SHARED).json()["placed"][0]["role"] == "agent"
+    # carol, a viewer here, holds her own share at manager: her user-scope
+    # session sees the merged row at manager (her own cap uncapped); her
+    # Shared-only chat (the agent scope) sees the agent share at her row.
+    task_store.upsert_user("carol-sub", "carol@test.com", "Carol", "member")
+    _set_username("carol-sub", "carol")
+    task_store.add_user_agent("carol-sub", AGENT, "viewer", "test")
+    mine = share_store.create_internal_share(target_kind="app", target_id=src["id"],
+                                             created_by="alice-sub", grantee_sub="carol-sub",
+                                             role_cap="manager")
+    share_store.set_decision(mine["id"], share_store.ACCEPTED, "carol-sub", placed_agent=AGENT)
+    session_state.set_session_security("sess-carol", SecurityContext(
+        role="viewer", username="carol", agent=AGENT, is_admin_agent=False,
+        session_scope=visibility.SCOPE_USER))
+    session_state.set_session_security("sess-carol-shared", SecurityContext(
+        role="viewer", username="carol", agent=AGENT, is_admin_agent=False,
+        session_scope=visibility.SCOPE_AGENT))
+    try:
+        placed = _hook("list", {}, sid="sess-carol").json()["placed"]
+        assert [(p["placement"]["kind"], p["placement"]["role_cap"], p["role"]) for p in placed] == [
+            ("agent", "manager", "manager")]
+        placed = _hook("list", {}, sid="sess-carol-shared").json()["placed"]
+        assert [(p["placement"]["kind"], p["placement"]["role_cap"], p["role"]) for p in placed] == [
+            ("agent", "editor", "viewer")]
+        share_store.set_placement_hidden(src["id"], AGENT, "carol-sub", True)
+        assert _hook("list", {}, sid="sess-carol-shared").json()["placed"][0]["hidden_for_me"] is True
+    finally:
+        session_state._session_security.pop("sess-carol", None)
+        session_state._session_security.pop("sess-carol-shared", None)
+    assert [p["role"] for p in _hook("list", {}).json()["placed"]] == ["editor"]
+
+
 # ───────────────────────── GET /v1/apps/{id}/html ───────────────────────────
 
 
@@ -433,6 +496,20 @@ def test_a_file_apps_working_file_is_never_read_through_a_link(agent_tree, tmp_p
     assert r.status_code == 404 and "SECRET-CONTENT" not in r.text
     r = _pin({"slug": "brief", "html": ""})
     assert r.status_code == 400 and "SECRET-CONTENT" not in r.text, r.text
+
+
+def test_an_oversize_working_file_is_named_by_its_size(agent_tree):
+    """A single-file app grown past the 8 MB a release and the working-copy
+    serve take: the re-pin and the owner's preview frame say so."""
+    app_id = _pin({"slug": "brief", "html": "<p>x</p>"}).json()["app_id"]
+    working = agent_tree / "users/alice/workspace/apps/brief.html"
+    working.write_bytes(b"<p>" + b"x" * (9 * 1024 * 1024) + b"</p>")
+    r = _pin({"slug": "brief", "html": ""})
+    assert r.status_code == 400 and "brief.html is larger than 8 MB" in r.json()["detail"], r.text
+    r = client.get(f"/v1/apps/{app_id}/html", params={"preview": 1})
+    assert r.status_code == 404 and "is larger than 8 MB" in r.text, r.text
+    assert "not a regular file" not in r.text
+    _csp_ok(r)
 
 
 # ───────────────────────── CRUD: list / approve / exec ──────────────────────
@@ -993,6 +1070,47 @@ def test_fire_task_parameterized(agent_tree, monkeypatch):
     assert r.status_code == 200
     assert fired[-1] == ("p:plain", None)
 
+
+
+def test_fire_task_args_from_a_link_visitor_are_fenced(agent_tree, monkeypatch):
+    """F54: an external link's visitor is an outside party, so the values
+    they pass are fenced in the task prompt; a signed-in person's are not."""
+    import asyncio
+    from api.apps import app_actions
+    from services.infra import external_data
+    from storage import database as task_store
+    trig = _mk_task("trigger", scope="agent")
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE dynamic_tasks SET prompt=%s WHERE id=%s",
+                     ("Analyze the {{month}} report", trig))
+        conn.commit()
+    app_id = _pin({"slug": "q", "html": "<p>x</p>", "actions": [
+        {"id": "go", "label": "Go", "type": "fire_task", "task_id": trig,
+         "min_role": "viewer",
+         "args_schema": {"type": "object",
+                         "properties": {"month": {"type": "string", "maxLength": 20}},
+                         "required": ["month"]}},
+    ]}, sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+    fired = []
+
+    async def fake_trigger(task_def, trigger_type="manual", trigger_source=None,
+                           prompt_override=None, trigger_payload=None):
+        fired.append(prompt_override)
+        return "run-1"
+
+    from services.scheduler import scheduler
+    monkeypatch.setattr(scheduler, "trigger_task_now", fake_trigger)
+    row = task_store.get_app(app_id)
+    asyncio.run(app_actions._run_action(row, "go", {"month": "<July>"}, None, actor="share:s1"))
+    assert fired[-1] == external_data.with_note(
+        f"Analyze the {external_data.fence('<July>')} report")
+    # A handler woken by a trigger delivery passes the sender's values too.
+    asyncio.run(app_actions._run_action(row, "go", {"month": "<Aug>"}, None,
+                                        actor="delivery:d1", handler="on_event"))
+    assert fired[-1] == external_data.with_note(
+        f"Analyze the {external_data.fence('<Aug>')} report")
 
 # ───────────────────────── data_feed: manifest + runtime ────────────────────
 

@@ -2,12 +2,13 @@
 
 import asyncio
 import logging
-import threading
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
+from psycopg.errors import LockNotAvailable
 from pydantic import BaseModel
 
+import config as app_config
 from storage import database as task_store
 from auth.password import HashBusy, check_password_strength_async, hash_password_async
 from auth.providers import create_session_jwt, apply_session_cookie
@@ -16,24 +17,6 @@ logger = logging.getLogger("claude-proxy")
 router = APIRouter()
 
 _SETUP_DONE = "Setup already completed"
-# The owner is created only while no user exists. The strength check and the
-# hash run for hundreds of milliseconds after the first count, so the count
-# is read again right before the insert, in one job under this lock: two
-# setups at once make one owner, and a person who signed in meanwhile (a
-# first SSO login) ends the setup.
-_create_lock = threading.Lock()
-
-
-def _create_owner(email: str, display_name: str, pw_hash: str) -> str | None:
-    """The owner's sub, or None when a user exists already. Synchronous:
-    call it on a worker thread."""
-    with _create_lock:
-        if task_store.count_users() > 0:
-            return None
-        return task_store.create_local_user(
-            email, display_name, display_name, "admin", pw_hash,
-            is_owner=True, must_change_password=False,
-        )
 
 
 class SetupRequest(BaseModel):
@@ -74,10 +57,15 @@ async def setup_first_user(req: SetupRequest):
         raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
                             headers={"Retry-After": "5"})
 
+    # The strength check and the hash ran for hundreds of milliseconds after
+    # the first count: the store counts again and inserts in one locked
+    # transaction, so two setups make one owner and a person who signed in
+    # meanwhile (a first SSO login) ends the setup.
     try:
-        sub = await asyncio.to_thread(_create_owner, email, display_name, pw_hash)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        sub = await asyncio.to_thread(task_store.create_first_owner, email, display_name, pw_hash)
+    except LockNotAvailable:
+        raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
+                            headers={"Retry-After": "5"})
     if sub is None:
         raise HTTPException(status_code=403, detail=_SETUP_DONE)
 
@@ -128,8 +116,12 @@ async def setup_first_user(req: SetupRequest):
     from services.community import default_agent_assigner
     await asyncio.to_thread(default_agent_assigner.assign_default_agents, sub)
 
-    # Re-fetch user data after agent install
-    user = await asyncio.to_thread(task_store.get_user, sub)
+    # Re-fetch user data after agent install, and the session length the
+    # cookie and its token both take (one settings read, off the loop).
+    def _user_and_hours() -> tuple[dict | None, int]:
+        return task_store.get_user(sub), app_config.get_jwt_expiry_hours()
+
+    user, hours = await asyncio.to_thread(_user_and_hours)
 
     # Build response
     user_data = {
@@ -147,7 +139,6 @@ async def setup_first_user(req: SetupRequest):
     dashboard_url_captured = False
     if req.origin:
         try:
-            import config as app_config
             dashboard_url_captured = await asyncio.to_thread(
                 app_config.capture_dashboard_public_url, req.origin,
             )
@@ -159,11 +150,12 @@ async def setup_first_user(req: SetupRequest):
         except Exception:
             logger.exception("Setup wizard: origin capture failed (non-fatal)")
 
-    token = create_session_jwt(sub, email, display_name, "admin", auth_provider="local")
+    token = create_session_jwt(sub, email, display_name, "admin", auth_provider="local",
+                               expiry_hours=hours)
     response = JSONResponse(content={
         "user": user_data,
         "dashboard_url_captured": dashboard_url_captured,
     })
-    apply_session_cookie(response, token)
+    apply_session_cookie(response, token, expiry_hours=hours)
     logger.info(f"Setup wizard: created owner admin {email}")
     return response

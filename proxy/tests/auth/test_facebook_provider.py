@@ -234,9 +234,7 @@ class TestFacebookRefresh:
         """Meta code 190 = invalid/expired token. The message must trip the
         refresh worker's permanent-failure check, or a dead grant would
         back off and retry forever instead of waiting for a reconnect."""
-        from services.oauth.oauth_refresh_worker import (
-            _is_permanent_refresh_error,
-        )
+        from services.oauth.oauth_refresh_worker import _permanent_error_code
 
         client = _client(post_responses=[
             _resp({"error": {"message": "Session has expired",
@@ -251,12 +249,10 @@ class TestFacebookRefresh:
                     client_secret="sec",
                 )
         assert "invalid_grant" in str(exc.value)
-        assert _is_permanent_refresh_error(exc.value) is True
+        assert _permanent_error_code(exc.value, "standard") == "invalid_grant"
 
     async def test_other_codes_stay_transient(self, provider):
-        from services.oauth.oauth_refresh_worker import (
-            _is_permanent_refresh_error,
-        )
+        from services.oauth.oauth_refresh_worker import _permanent_error_code
 
         client = _client(post_responses=[
             _resp({"error": {"message": "Unsupported request",
@@ -270,7 +266,7 @@ class TestFacebookRefresh:
                     refresh_token="LL-1", client_id="cid", client_secret="sec",
                 )
         assert "invalid_grant" not in str(exc.value)
-        assert _is_permanent_refresh_error(exc.value) is False
+        assert _permanent_error_code(exc.value, "standard") == ""
 
 
 # ---------------------------------------------------------------------------

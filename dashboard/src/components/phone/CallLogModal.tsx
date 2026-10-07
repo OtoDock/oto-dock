@@ -5,7 +5,7 @@
 // (failed/locked-out PIN entries, capacity rejects) with the caller's number.
 
 import { useState } from 'react'
-import { usePhoneRouteCallLog, type PhoneRoute } from '@/api/phone'
+import { usePhoneRouteCallLog, PHONE_INBOUND, type PhoneRoute } from '@/api/phone'
 import { formatRelativeTime } from '@/lib/format'
 import { Badge } from '@/components/ui/SettingsControls'
 
@@ -119,10 +119,10 @@ export default function CallLogModal({ route, onClose }: {
                         {formatRelativeTime(c.started_at)}
                       </td>
                       <td className="px-3 py-2">
-                        <Badge variant={c.direction === 'inbound' ? 'blue' : 'default'}>{c.direction}</Badge>
+                        <Badge variant={c.direction === PHONE_INBOUND ? 'blue' : 'default'}>{c.direction}</Badge>
                       </td>
                       <td className="px-3 py-2 font-mono text-p-text">
-                        {(c.direction === 'inbound' ? c.from_number : c.to_number) || '(unknown)'}
+                        {(c.direction === PHONE_INBOUND ? c.from_number : c.to_number) || '(unknown)'}
                       </td>
                       <td className="px-3 py-2 text-p-text-secondary whitespace-nowrap" title={c.identity || undefined}>
                         {fmtIdentity(c.identity)}

@@ -17,6 +17,9 @@ STATUS_NO_CHANGE = "no_change"
 STATUS_SKIPPED_IN_USE = "skipped_in_use"
 STATUS_FAILED = "failed"
 STATUS_HELD = "held"
+# The catalog source of the MCP changed: never applied by the job, shown to
+# admins for their switch (services/community/mcp_source_swap.py).
+STATUS_NEEDS_APPROVAL = "needs_approval"
 
 
 def _now() -> str:

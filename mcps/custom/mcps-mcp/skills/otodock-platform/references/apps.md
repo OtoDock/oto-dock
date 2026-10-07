@@ -35,16 +35,21 @@ delegation project sits on that chat's **Dock** instead and is reached only thro
   buttons use the owner's connected accounts whoever presses them; the app's card says
   whose.
 - **Live platform data**: chats, tasks, notifications, file changes, checks and their
-  verdicts as they happen, each viewer their own slice.
+  verdicts as they happen, each viewer their own slice; a single-file app also keeps a
+  small document per viewer, which only that viewer's own page reads and writes.
 - **A server and a database** (a folder app: `apps/<slug>/` with `app.json`, `client/`
-  and an optional `server/`), which the agent's own sessions reach too.
+  and an optional `server/`), which the agent's own sessions reach too, and whose
+  exported methods the sessions of agents it is shared with reach at the share's role.
 - **Wakes with nobody watching**: on a schedule, when a webhook trigger fires, when a
   task finishes, a turn ends, a file changes or a check lands, or when another app emits
   an event. A vendor's signed events (Stripe, GitHub) reach it through its own route.
 - **Approved scripts** that run where the agent runs, with no model.
 - **Other agents' apps**: a shared app calls the shared apps of the agents its agent
   delegates to, a personal app those of agents its owner belongs to, both sides
-  approved.
+  approved. An agent's chats and tasks also call the exported methods of an app a
+  share placed in it, at the role the share gives, and nothing else of that app (an
+  app a person placed with their own share: only that person's own chats and tasks
+  there, never a Shared only agent's chats).
 - **Outside services** with secrets a person sets. A secret sent to an outside host is
   added by the platform on the way out and never enters the app; one the server reads
   itself is marked in amber on the card.
@@ -75,10 +80,13 @@ database goes back with it.
 | --- | --- | --- |
 | Pin (the person's chat pins it) | anyone with access | **editor+**; a contributor's or viewer's pin stays personal |
 | Approve the card | its owner | **editor+** (a manager when its scripts receive the agent's accounts; the card says so) |
-| Roll back, Logs, View the working copy, Unpin, Delete app and its data | its owner | **editor+** (**Unpin for everyone**) |
+| Roll back, Logs, View the working copy, Unpin (**Stop app** on an app with a server), Delete app and its data | its owner | **editor+** (**Unpin for everyone** / **Stop app for everyone**) |
 | Set a secret (app menu → **Settings**) | its owner | **editor+** |
-| Share | its owner | **editor+** |
-| **Hide for me** | a person it was shared with | anyone |
+| Share | its owner (with people only) | **editor+** (with a person; with an agent they are also editor+ on; a department: admin) |
+| **Hide for me** | a person it was shared with | anyone, and any member of an agent it was placed in |
+| **Remove for me** (in place of Hide for me) | a person who accepted it into one of their agents (not where an agent or department share also places it: that row is the team's) | the same; it removes their share, and anyone who may share the app can share it again |
+| Where it comes from | — | anyone, on a placed app |
+| Remove from this agent | — | **editor+** on the receiving agent (an agent share); admin (a department share, which ends it for the whole department) |
 
 Logs, View the working copy, Settings and Delete exist only on an app with a server,
 Roll back once there is an earlier release. Admins hold the same authority on every app
@@ -111,14 +119,26 @@ at" and "Agents may open apps on my screen" (both on by default).
 Default visibility never changes; a share adds access on top.
 
 - **Where**: an app's menu → **Share**; a chat's row in the chat history → **Share**.
-  A teammate gets a notification and finds it under **Shared with me** on the Agents
-  page.
+  A person gets a notification and finds it under **Shared with you** at the top of the
+  notifications panel (the bell): an app waits there until they accept it into one of
+  their agents (it opens from its own page meanwhile) or decline it (once accepted, the
+  app's menu there offers **Remove for me**, which removes it, unless a share to that
+  agent or its department also places it there); a chat opens from there. A team app
+  can also be shared with a whole **agent** (by an editor or manager of both agents: it
+  appears in that agent's Apps panel for every member, as a purple chip with a teal
+  border and a small mark (one a person accepted into their own agent is blue with the
+  same border) and a reduced menu, and the agent's chats and tasks may call what the app exports) or,
+  by an admin, with a **department** (every agent in it, following the department as it
+  changes). The sharer picks the role the recipients act as, up to
+  their own.
 - **Who**: a personal app or your own chat, its owner; a shared app, or a chat on a
   Shared only agent, **editor+**; an admin always. An app on a chat's Dock and a task run
   cannot be shared.
-- **A teammate** is a viewer of what was shared: buttons run on the approver's
-  authority, and they see none of the agent's files or chats unless they are on the
-  agent.
+- **A teammate** acts at the role the share gave them (viewer unless the sharer picked
+  higher; a placement's role is also capped by their own role on the agent it sits
+  in): buttons run on the approver's authority, and they see none of the agent's
+  files or chats unless they are on the agent. A personal app and a chat go to
+  people only.
 - **A link** is for someone without an account. It has a password by default (generated,
   shown once, editable) and expires by default (30 days, editable), and it can be
   revoked any time. A link's buttons stay off until its **Buttons** switch is turned on;
@@ -128,11 +148,16 @@ Default visibility never changes; a share adds access on top.
 - **A shared chat** is a read-only copy of the conversation as it stood when shared
   (text, artifacts, images, media, files; tool calls only when asked, with tokens
   redacted). Share again to send a newer copy.
-- **Admins**: **Admin → Shares** lists every link and revokes any. **Setup → Security →
-  Sharing** holds **External links**, **Links without a password**, **User directory
-  when sharing** and **Longest link expiry**; turning a link switch off also stops the
-  existing links of that kind.
+- **Admins**: **Admin → Shares** lists every share (to people, agents and departments,
+  and every link) with its standing, filtered by kind, agent and standing, and revokes
+  any; nobody is notified. **Setup → Security → Sharing** holds **Sharing to agents**, **Sharing to departments** (off refuses new
+  shares of that kind; the existing ones stand until removed), **External links**,
+  **Links without a password**, **User directory when sharing** and **Longest share
+  expiry**; turning a link switch off also stops the existing links of that kind.
 
 You have no share tool. When a user asks you to share, tell them where **Share** is and
-the role it takes. A link serves the app's state document whole, so keep what a stranger
+the role it takes. An app shared with your agent shows in `list_apps` under "Placed
+here" with its id; `describe_app(agent, slug)` names its exported methods and the role
+you act at. An app can list who uses it (`app.audience`): its own server, and on a page its own
+agent's editors and managers, an admin, or a personal app's owner. A link serves the app's state document whole, so keep what a stranger
 must not see out of it.

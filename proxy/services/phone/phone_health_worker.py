@@ -19,6 +19,8 @@ import contextlib
 import logging
 from datetime import datetime, timezone
 
+from adapters.phone import INBOUND
+from services.phone import daemon_url
 from services.phone.phone_adapters.twilio import normalize_did
 
 logger = logging.getLogger("claude-proxy.phone-health-worker")
@@ -53,6 +55,10 @@ async def stop_worker() -> None:
 
 
 async def _health_loop() -> None:
+    # The daemon URL's rule is judged once at start, so a plain-http URL to
+    # a public address shows in the boot log before anything is sent.
+    with contextlib.suppress(Exception):
+        await daemon_url.refusal()
     while True:
         try:
             await asyncio.sleep(_INTERVAL_SECONDS)
@@ -127,7 +133,7 @@ async def _reconcile_server(server: dict) -> None:
     db_dids = {
         normalize_did(r["did"]) for r in all_routes
         if r.get("phone_server_id") == server["id"]
-        and r.get("direction") == "inbound" and r.get("did")
+        and r.get("direction") == INBOUND and r.get("did")
     }
     pbx_dids = {normalize_did(h.did) for h in handles if h.did}
     if db_dids == pbx_dids:

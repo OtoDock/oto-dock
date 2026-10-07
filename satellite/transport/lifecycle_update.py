@@ -170,30 +170,33 @@ async def _self_uninstall_and_exit() -> None:
                 if oto_dir.exists():
                     shutil.rmtree(oto_dir, ignore_errors=True)
             else:
-                # Inline fallback — sudo-free, user scope. Set XDG_RUNTIME_DIR
-                # defensively so `systemctl --user` finds the session bus from
-                # this detached context.
+                # Inline fallback — sudo-free, user scope. The unit is touched
+                # only when it runs THIS install: another install of the same
+                # OS user (a rig started from a checkout under another HOME)
+                # reaches the same user manager, where the unit is theirs.
                 logger.info("uninstall.sh missing, doing inline cleanup")
-                env = {
-                    **os.environ,
-                    "XDG_RUNTIME_DIR": os.environ.get(
-                        "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"
-                    ),
-                }
-                unit = (Path.home() / ".config/systemd/user"
-                        / "oto-dock-satellite.service")
-                for cmd in (
-                    ["systemctl", "--user", "stop", "oto-dock-satellite"],
-                    ["systemctl", "--user", "disable", "oto-dock-satellite"],
-                ):
-                    with contextlib.suppress(Exception):
-                        subprocess.run(
-                            cmd, env=env, timeout=15,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, check=False,
-                        )
-                with contextlib.suppress(OSError):
-                    unit.unlink()
+                from ..host import service_unit
+                if service_unit.is_own_unit():
+                    env = service_unit.systemctl_env()
+                    unit = (Path.home() / ".config/systemd/user"
+                            / f"{service_unit.UNIT_NAME}.service")
+                    for cmd in (
+                        ["systemctl", "--user", "stop", service_unit.UNIT_NAME],
+                        ["systemctl", "--user", "disable", service_unit.UNIT_NAME],
+                    ):
+                        with contextlib.suppress(Exception):
+                            subprocess.run(
+                                cmd, env=env, timeout=15,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, check=False,
+                            )
+                    with contextlib.suppress(OSError):
+                        unit.unlink()
+                    with contextlib.suppress(OSError):
+                        shutil.rmtree(unit.parent / f"{service_unit.UNIT_NAME}.service.d")
+                else:
+                    logger.info("the %s unit belongs to another install; left alone",
+                                service_unit.UNIT_NAME)
                 if oto_dir.exists():
                     shutil.rmtree(oto_dir, ignore_errors=True)
     except Exception:

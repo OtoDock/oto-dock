@@ -6,6 +6,7 @@ import { useSwipeGesture } from '../hooks/useSwipeGesture'
 import ResponsiveDrawer from './ui/ResponsiveDrawer'
 import NavGroup from './ui/NavGroup'
 import { SetupBanner } from './PlatformSetupGuard'
+import { ForwardingBanner } from './admin/ForwardingBanner'
 import { useAdminMcpRequests } from '../api/community'
 
 const navItems = [
@@ -160,6 +161,7 @@ export default function Layout() {
         </div>
 
         <SetupBanner />
+        <ForwardingBanner />
         <main className="flex-1 overflow-auto p-4 md:p-6">
           {/* The admin pages are lazy routes. Router navigations run as
               transitions, so the current page stays until the next chunk

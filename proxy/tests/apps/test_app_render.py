@@ -228,3 +228,43 @@ def test_a_stale_check_copy_is_swept(renderer, _tree):
     os.utime(stale, (old, old))
     asyncio.run(app_render.render_working_tree(row, src, approved=True))
     assert not stale.exists()
+
+
+def _live_db(row: dict) -> None:
+    import sqlite3
+    data = releases.app_data_dir(row)
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "app.db")
+    con.execute("CREATE TABLE t (x)")
+    con.execute("INSERT INTO t VALUES ('a live row')")
+    con.commit()
+    con.close()
+
+
+def test_working_tree_renders_take_live_data_only_when_its_code_would_go_live_unreviewed(renderer, _tree):
+    """The working tree is code nobody reviewed: a check or a screenshot of
+    it runs on a copy of the live database only when a deploy of it would
+    go live without a person (the copy's own manifest approved as the row
+    stands, the approval switch off on the row and in that app.json), else
+    on empty data. The live release itself is always seeded."""
+    row, src = _static_app(_tree)
+    out = asyncio.run(app_deploy.deploy_folder(AGENT, "", None, "board", src, "workspace/apps/board"))
+    assert out["status"] == "ok", out
+    row = task_store.get_app(row["id"])
+    _live_db(row)
+    assert asyncio.run(app_render.render_working_tree(row, src, approved=True)).seeded is True
+    # The approval switch on: every deploy waits for a person.
+    switched = task_store.set_deploy_state(row["id"], requires_approval=True)
+    assert asyncio.run(app_render.render_working_tree(switched, src, approved=True)).seeded is False
+    assert asyncio.run(app_render.render_live(switched, approved=True)).seeded is True
+    row = task_store.set_deploy_state(row["id"], requires_approval=False)
+    # A working tree that adds an action nobody approved yet, or turns the
+    # switch on in its own app.json; and one whose app.json would not deploy.
+    me = {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}
+    for doc in ({"title": "Board", "actions": [me]}, {"title": "Board", "deploy_requires_approval": True},
+                {"title": "Board", "unknown_key": 1}):
+        (src / "app.json").write_text(json.dumps(doc))
+        assert asyncio.run(app_render.render_working_tree(row, src, approved=True)).seeded is False, doc
+    assert asyncio.run(app_render.render_live(row, approved=True)).seeded is True
+    (src / "app.json").write_text(json.dumps({"title": "Board"}))
+    assert asyncio.run(app_render.render_working_tree(row, src, approved=True)).seeded is True

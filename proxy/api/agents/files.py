@@ -1010,6 +1010,9 @@ async def _build_zip_response(
         raise
 
 
+ZIP_TOKEN_PURPOSE = "zip_download"
+
+
 def _create_zip_token(
     agent: str,
     paths: list[str],
@@ -1024,6 +1027,9 @@ def _create_zip_token(
     import jwt as _jwt
     import time as _time
     payload = {
+        # Only a token minted here opens a download: other tokens signed
+        # with the same secret carry an ``agent`` claim too.
+        "purpose": ZIP_TOKEN_PURPOSE,
         "agent": agent,
         "paths": paths,
         "user_sub": user_sub,
@@ -1870,31 +1876,53 @@ async def move_agent_paths(
     return {"moved": moved, "failed": failed}
 
 
-def _copy_one_sync(name: str, src_rel: str, dest_rel: str, scope_rel: str) -> str:
+def _copy_budget() -> safe_fs.CopyBudget:
+    """The entries (files, directories, links) and bytes one copy request
+    may copy across all its sources (a cap of 0 is no cap)."""
+    return safe_fs.CopyBudget(
+        max_entries=config.COPY_MAX_ENTRIES if config.COPY_MAX_ENTRIES > 0 else None,
+        max_bytes=config.COPY_MAX_INPUT_MB * 1024 * 1024 if config.COPY_MAX_INPUT_MB > 0 else None,
+    )
+
+
+def _copy_one_sync(name: str, src_rel: str, dest_rel: str, scope_rel: str,
+                   budget: safe_fs.CopyBudget) -> str:
     """Copy one source into ``dest_rel`` beneath the agents root: the escape
     walk, then the copy onto the first free candidate name (a file with an
     exclusive write; a directory with ``copytree_beneath``, which recreates a
-    link only where its text stays inside the tree). Returns the destination
-    agents rel."""
+    link only where its text stays inside the tree), charged to the request's
+    ``budget``; a copy past it fails whole and leaves nothing (413). Returns
+    the destination agents rel."""
     _assert_no_symlink_escape(src_rel, f"{name}/{scope_rel}")
     st = safe_fs.lstat_beneath(config.AGENTS_DIR, src_rel)
     leaf = src_rel.rsplit("/", 1)[-1]
-    for cand in _candidate_names(leaf):
-        target = f"{dest_rel}/{cand}"
-        try:
-            if stat.S_ISDIR(st.st_mode):
-                with safe_fs.open_root(config.AGENTS_DIR, name) as rootfd:
-                    safe_fs.copytree_beneath(
-                        rootfd, _sub_of(name, src_rel), rootfd, _sub_of(name, target),
-                        symlinks="copy",
+    try:
+        for cand in _candidate_names(leaf):
+            target = f"{dest_rel}/{cand}"
+            try:
+                if stat.S_ISDIR(st.st_mode):
+                    with safe_fs.open_root(config.AGENTS_DIR, name) as rootfd:
+                        safe_fs.copytree_beneath(
+                            rootfd, _sub_of(name, src_rel), rootfd, _sub_of(name, target),
+                            symlinks="copy", budget=budget,
+                        )
+                else:
+                    copied = safe_fs.copy_file_beneath(
+                        config.AGENTS_DIR, src_rel, config.AGENTS_DIR, target, exclusive=True,
+                        max_size=budget.take(_sub_of(name, src_rel)),
                     )
-            else:
-                safe_fs.copy_file_beneath(
-                    config.AGENTS_DIR, src_rel, config.AGENTS_DIR, target, exclusive=True,
-                )
-            return target
-        except FileExistsError:
-            continue
+                    budget.charge(copied)
+                return target
+            except FileExistsError:
+                continue
+    except safe_fs.FileTooLarge:
+        raise HTTPException(
+            status_code=413, detail=f"the copy is larger than {config.COPY_MAX_INPUT_MB} MB",
+        )
+    except safe_fs.TooManyEntries:
+        raise HTTPException(
+            status_code=413, detail=f"the copy has more than {config.COPY_MAX_ENTRIES} entries",
+        )
     raise HTTPException(status_code=409, detail="Too many name conflicts in destination")
 
 
@@ -1909,8 +1937,11 @@ async def copy_agent_paths(
     Cross-scope copies are allowed when the destination is writable for the
     user. Source needs only read access. Symlinks inside source subtrees
     that point outside the source's scope are rejected so copies cannot
-    smuggle data across scope boundaries. Name collisions in `dest_dir`
-    are auto-suffixed (`foo.md` → `foo_1.md`).
+    smuggle data across scope boundaries, and a whole scope root is never a
+    source. The sources share one budget of entries and bytes
+    (``COPY_MAX_ENTRIES``, ``COPY_MAX_INPUT_MB``): a source past what is
+    left fails and the ones after it still run. Name collisions in
+    `dest_dir` are auto-suffixed (`foo.md` → `foo_1.md`).
     """
     u = require_auth(user)
     require_agent_access(u, name)
@@ -1932,6 +1963,7 @@ async def copy_agent_paths(
     copied: list[dict] = []
     failed: list[dict] = []
     writer = _dashboard_writer(u, username)
+    budget = _copy_budget()
     for src_norm, src_resolved in sources:
         try:
             src_rel = _agent_rel(name, src_resolved, agent_dir)
@@ -1939,13 +1971,20 @@ async def copy_agent_paths(
             src_scope = _scope_root(src_norm)
             if not src_scope:
                 raise HTTPException(status_code=400, detail=f"Invalid source scope: {src_norm}")
+            # Never a whole scope root (`config/`, `workspace/`, `knowledge/`,
+            # `users/`, `users/<username>/`), judged on the path as named AND
+            # on the answer (a link landing on a scope root), as recursive
+            # delete judges it.
+            if src_norm in {src_scope, layout.USERS} or \
+                    src_sub in {_scope_root(src_sub), layout.USERS}:
+                raise HTTPException(status_code=403, detail="Cannot copy a whole scope root")
             if not _under_scope(src_sub, src_scope):
                 raise HTTPException(
                     status_code=403, detail="Subtree contains a symlink escaping the scope",
                 )
             async with _file_ops_slot():
                 target_rel = await asyncio.to_thread(
-                    _copy_one_sync, name, src_rel, dest_rel, src_scope,
+                    _copy_one_sync, name, src_rel, dest_rel, src_scope, budget,
                 )
             logger.info("Copied: %s -> %s", src_rel, target_rel)
             # Mirror to active remote sessions: push the new file/subtree so the
@@ -2064,6 +2103,8 @@ async def zip_download(
     except _jwt.InvalidTokenError:
         raise HTTPException(status_code=403, detail="Invalid download token")
 
+    if claims.get("purpose") != ZIP_TOKEN_PURPOSE:
+        raise HTTPException(status_code=403, detail="Invalid download token")
     if claims.get("agent") != name:
         raise HTTPException(status_code=403, detail="Token / agent mismatch")
 

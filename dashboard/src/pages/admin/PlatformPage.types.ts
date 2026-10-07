@@ -1,5 +1,7 @@
 // Shared TypeScript interfaces for the admin Setup (PlatformPage) tabs.
 
+import type { ForwardingWarning } from '../../components/admin/forwardingAdvice'
+
 export interface PlatformSettings {
   company_name: string
   platform_instructions: string
@@ -16,6 +18,9 @@ export interface PlatformSettings {
   // Storage & retention
   session_retention_enabled: boolean
   session_retention_days: string
+  // The archive of removed people: its own toggle and days (0 keeps for ever)
+  offboarded_retention_enabled: boolean
+  offboarded_retention_days: string
   // Automatic MCP updates (weekly; community MCPs)
   mcp_auto_update_enabled: boolean
   // Read each OAuth account's session and weekly usage from the vendor
@@ -63,22 +68,16 @@ export interface PlatformSettings {
   require_2fa: boolean
   // Passkey sign-in: 'passwordless' (primary button) | 'second_factor' (after password only)
   passkey_login_mode: string
-  // Sharing (SHARING.md): external links, public links, the longest link
-  // expiry in days ('' = no cap), the user directory for members.
+  // Sharing (SHARING.md): external links, public links, the longest expiry
+  // any share or link may take, in days ('' = no cap), the user directory
+  // for members.
   sharing_external_enabled: boolean
   sharing_public_links_enabled: boolean
   sharing_max_expiry_days: string
   user_directory_visible_to_members: boolean
-}
-
-export interface ForwardingWarning {
-  peer: string
-  // True when the peer is the container's gateway (a published port's clients arrive from it too)
-  gateway?: boolean
-  case: 'untrusted_forwarder' | 'edge_without_xff' | string
-  first_seen: number | string   // epoch seconds
-  last_seen: number | string
-  count: number
+  // Shares to an agent and to a department (SHARING.md); off refuses new ones.
+  sharing_to_agents_enabled: boolean
+  sharing_to_departments_enabled: boolean
 }
 
 export interface ConcurrencyBucket {

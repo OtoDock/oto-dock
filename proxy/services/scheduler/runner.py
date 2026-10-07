@@ -475,7 +475,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
     except Exception:
         _slot_target = placement.LOCAL
 
-    async with task_slot(session_id, target=_slot_target):
+    async with task_slot(session_id, target=_slot_target, ring_key=task.created_by or ""):
         start = time.monotonic()
         chat_id = task.target_chat_id or session_kind.task_chat_id(run_id)
         output_cursor = 0  # pre-run message cursor; set in step 1
@@ -510,9 +510,16 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
         row_ended = False
         final_status = ""
         final_output = ""
+        # The turn's typed ending when it ended short (any of
+        # turn_ending.REASONS): the run's error, the page and the callback name it.
+        ending = None
         # The run's start: a reused worker chat's verdicts before it belong
         # to earlier runs.
         run_started_at = shared.now_iso()
+        # The run owes its report from here (lanes.report_pending): the keys
+        # are taken now, since the body may move to another session id.
+        report_keys = (chat_id, session_id)
+        lanes.hold_report(*report_keys)
 
         try:
             # The running stamp sits INSIDE the handlers' reach: a cancel
@@ -725,7 +732,15 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
 
                         output_cursor = await chat_writer.submit(
                             chat_id, _reclear, label="run_reclear")
-                    if not lane_reaped:
+                    if task.respawn_for_model:
+                        # The continue changed the worker's model: the live
+                        # session runs the old one, so it goes (under its
+                        # layer's session lock) and the round resumes the
+                        # conversation on agent_cfg.model — never warm.
+                        await lanes._close_for_model_change(
+                            session_id, run_id, slot_target=_slot_target,
+                        )
+                    elif not lane_reaped:
                         reused_warm = await lanes._try_reuse_warm_session(
                             layer, agent_cfg, session_id, run_id,
                         )
@@ -956,9 +971,19 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
             else:
                 final_output = lanes._collect_task_output(chat_id, output_cursor)
 
+            # A turn that ended short (a decline, a limit, an error, an exit,
+            # a silence, a loss) carries its typed ending on the pump: the run
+            # failed for that reason, whatever an abort flag on the chat says.
+            ending = getattr(pump, "last_ending", None)
+            if ending is not None and final_status in (
+                    run_status.COMPLETED, run_status.USER_INTERRUPTED):
+                final_status = run_status.FAILED
+                logger.warning(f"Task run {run_id} ended by the engine: {ending.summary()}")
+
             # A run killed by a provider usage limit streams the limit notice
             # as a clean result text — without this check it lands as a
-            # deceptive `completed` with the notice as output.
+            # deceptive `completed` with the notice as output (an interactive
+            # run has no pump, so no typed ending).
             limit_line = (
                 lanes._limit_notice(final_output) if final_status == run_status.COMPLETED else None
             )
@@ -1011,12 +1036,14 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     f"Task {run_id[:8]} finishing with "
                     f"{background_leash.pending_summary(session_id)} still running"
                 )
-            row_status = run_status.FAILED if (limit_line or run_error) else run_status.COMPLETED
+            row_status = (run_status.FAILED if (ending or limit_line or run_error)
+                          else run_status.COMPLETED)
             await _end_run(
                 run_id, row_status,
                 background_pending=background_pending,
                 error_message=(
-                    f"Provider usage limit: {limit_line}" if limit_line
+                    ending.summary()[:2000] if ending
+                    else f"Provider usage limit: {limit_line}" if limit_line
                     else (run_error[:2000] if run_error else None)
                 ),
                 output_text=final_output[:10000] if final_output else "",
@@ -1038,7 +1065,9 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                 library_projector.schedule_reconcile_for_agent(task.agent)
             except Exception:
                 pass
-            if run_error and not final_output:
+            if ending and not final_output:
+                final_output = ending.line()
+            elif run_error and not final_output:
                 # Pre-output engine failure: deliver a clearly-marked
                 # NON-EMPTY terminal so a delegating agent sees the failure
                 # (not an empty bubble) and doesn't re-delegate — twin of
@@ -1054,16 +1083,19 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
             # with the limit. BEFORE the delivery: a delivery that raises must
             # not lose the page (the handler pages only a run that had no
             # verdict yet).
-            if limit_line or run_error:
+            if ending or limit_line or run_error:
                 # Engine/limit failure: the agent that would have
                 # self-notified in 'manual' mode died with the error, so warn
                 # for every mode but 'none'.
                 if task.notification_mode != "none":
                     from services.notifications import notification_manager
+                    stopped = ("declined" if ending and ending.reason == "declined"
+                               else "usage limit" if (ending or limit_line) else "")
                     asyncio.create_task(notification_manager.fire_notification(
-                        title=(f"Task stopped: usage limit — {task.name}"
-                               if limit_line else f"Task failed: {task.name}"),
-                        body=(limit_line or run_error or "")[:200],
+                        title=(f"Task stopped: {stopped} — {task.name}"
+                               if stopped else f"Task failed: {task.name}"),
+                        body=((ending.summary() if ending else "")
+                              or limit_line or run_error or "")[:200],
                         severity="warning",
                         scope=task.scope,
                         target=task.created_by if task.scope == "user" else task.agent,
@@ -1090,7 +1122,8 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                 task, final_status, final_output,
                 worker_chat_id=chat_id, output_cursor=output_cursor,
                 prompt_row_id=prompt_row_id, prompt_text=prompt,
-                run_started_at=run_started_at,
+                run_started_at=run_started_at, ending=ending,
+                run_id=run_id,
             )
             result_delivered = True
 
@@ -1172,11 +1205,13 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                         worker_chat_id=chat_id, output_cursor=output_cursor,
                         prompt_row_id=prompt_row_id, prompt_text=prompt,
                         run_started_at=run_started_at,
+                        run_id=run_id,
                     )
                 else:
                     await delivery._deliver_task_result(
                         task, run_status.CANCELLED,
                         f'⚠ Delegated task "{task.name}" was canceled before it finished.',
+                        run_id=run_id,
                     )
 
         except Exception as e:
@@ -1222,7 +1257,8 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     task, final_status, final_output,
                     worker_chat_id=chat_id, output_cursor=output_cursor,
                     prompt_row_id=prompt_row_id, prompt_text=prompt,
-                    run_started_at=run_started_at,
+                    run_started_at=run_started_at, ending=ending,
+                    run_id=run_id,
                 )
             else:
                 # Collect whatever output was saved before the error; if none
@@ -1240,6 +1276,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     worker_chat_id=chat_id, output_cursor=output_cursor,
                     prompt_row_id=prompt_row_id, prompt_text=prompt,
                     run_started_at=run_started_at,
+                    run_id=run_id,
                 )
 
             # Failure safety net: fire warning notification for 'auto' and
@@ -1292,6 +1329,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                 _state._save_sessions()
             if terminal_hold is not None:
                 terminal_hold.release()
+            lanes.release_report(*report_keys)
             # The one-time task's row is the frame's to retire (_run_task):
             # this finally never runs for a run cancelled before admission.
 

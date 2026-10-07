@@ -72,6 +72,7 @@ no double-count.
 """
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -386,10 +387,17 @@ def _fill_owner(session_id: str, owner: str | None) -> None:
         _session_owner[session_id] = owner
 
 
+def _cap_owner(session_id: str) -> str:
+    """Whom a session counts against under the per-person cap: the ledger's
+    owner only. A session with none counts against nobody, so it is also no
+    one's to give up at the cap (``_make_room_under_user_cap``)."""
+    return _session_owner.get(session_id, "")
+
+
 def _owned(owner: str) -> int:
-    """Chat sessions the ledger holds for ``owner``."""
+    """Chat sessions the ledger holds for ``owner`` (``_cap_owner``)."""
     return sum(1 for sid, kind in _sessions.items()
-               if kind == "chat" and _session_owner.get(sid) == owner)
+               if kind == "chat" and _cap_owner(sid) == owner)
 
 
 def _at_user_cap(owner: str) -> bool:
@@ -440,7 +448,7 @@ async def acquire(session_id: str, kind: str, *, target: str = placement.LOCAL,
                   execution_path: str | None = None, blocking: bool = False,
                   user_sub: str | None = None, per_user_cap: bool = True,
                   speculative: bool = False, queue_wait_s: float | None = None,
-                  mcp_config_path: str = "") -> Admission:
+                  mcp_config_path: str = "", ring_key: str = "") -> Admission:
     """Acquire a local-session slot.
 
     Returns an :class:`Admission` (truthy = admitted) — admitted immediately
@@ -470,7 +478,7 @@ async def acquire(session_id: str, kind: str, *, target: str = placement.LOCAL,
     owner = user_sub or ""
 
     if blocking:
-        return await _acquire_task(session_id, kind, est, owner)
+        return await _acquire_task(session_id, kind, est, owner, ring_key=ring_key)
     if speculative:
         async with _cond:
             if session_id in _sessions:
@@ -577,6 +585,9 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
 async def _make_room_under_user_cap(session_id: str, owner: str) -> Admission | None:
     """A person at their cap first gives up one of their own idle sessions.
 
+    "Their own" is what the cap counts (``_cap_owner``), so every session
+    closed here frees one counted seat.
+
     Returns the admission when the id turns out to be tracked already, the
     cap denial when every one of the person's sessions is in use, or None to
     continue with the ordinary admission (which re-checks the cap in the lock
@@ -606,23 +617,81 @@ async def _make_room_under_user_cap(session_id: str, owner: str) -> Admission | 
         await _evict_one(*scan.victim)
 
 
-async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "") -> Admission:
-    """Blocking task acquire — waits until both gates allow (with HEAVY headroom).
-    Task-side eviction is driven by the maintenance loop (keeps wait_for pure)."""
+# The parked tasks' ring (`_acquire_task`): one FIFO per creator and the
+# round-robin order of the creators, so one person's burst takes one slot
+# per round and a single run waits behind at most one run of each other
+# creator. A waiter is its (session id, estimate) ticket.
+_task_ring: dict[str, collections.deque[tuple[str, int]]] = {}
+_task_ring_order: collections.deque[str] = collections.deque()
+
+
+def _ring_join(key: str, ticket: tuple[str, int]) -> None:
+    line = _task_ring.get(key)
+    if line is None:
+        line = _task_ring[key] = collections.deque()
+        _task_ring_order.append(key)
+    line.append(ticket)
+
+
+def _ring_leave(key: str, ticket: tuple[str, int]) -> None:
+    line = _task_ring.get(key)
+    if line is None:
+        return
+    with contextlib.suppress(ValueError):
+        line.remove(ticket)
+    if not line:
+        del _task_ring[key]
+        with contextlib.suppress(ValueError):
+            _task_ring_order.remove(key)
+
+
+def _ring_turn(key: str, ticket: tuple[str, int]) -> bool:
+    """Whether ``ticket`` is the one the ring admits now: the head of the
+    first creator in ring order whose head fits (a heavy head of one creator
+    never blocks a lighter head of another)."""
+    for k in _task_ring_order:
+        line = _task_ring.get(k)
+        if not line:
+            continue
+        head = line[0]
+        if _has_room(head[1], is_task=True):
+            return k == key and head == ticket
+    return False
+
+
+def _ring_rotate(key: str) -> None:
+    """The admitted creator goes to the back; the next head is woken."""
+    with contextlib.suppress(ValueError):
+        _task_ring_order.remove(key)
+    if key in _task_ring:
+        _task_ring_order.append(key)
+    _schedule_notify()
+
+
+async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "",
+                        ring_key: str = "") -> Admission:
+    """Blocking task acquire — waits until both gates allow (with HEAVY headroom),
+    in the parked tasks' ring: the creators take turns. Task-side eviction is
+    driven by the maintenance loop (keeps wait_for pure)."""
     global _parked_tasks
     async with _cond:
         if session_id in _sessions:
             _fill_owner(session_id, owner)
             return _ADMITTED
-        if not _has_room(est, is_task=True):
+        if not _has_room(est, is_task=True) or _task_ring:
+            key = ring_key or "-"
+            ticket = (session_id, est)
+            _ring_join(key, ticket)
             _parked_tasks += 1
             logger.info("Task %s parked: no slot (reserved=%d/%dMB, sessions=%d)",
                         session_id[:8], _reserved_mb, _budget_mb, len(_sessions))
             try:
                 await _cond.wait_for(
-                    lambda: session_id in _sessions or _has_room(est, is_task=True))
+                    lambda: session_id in _sessions or _ring_turn(key, ticket))
             finally:
                 _parked_tasks -= 1  # decrement even on Cancelled/Timeout
+                _ring_leave(key, ticket)
+                _ring_rotate(key)
         if session_id in _sessions:
             _fill_owner(session_id, owner)
             return _ADMITTED
@@ -832,11 +901,13 @@ def release_chat_slot(session_id: str) -> None:
 
 @asynccontextmanager
 async def task_slot(session_id: str, *, target: str = placement.LOCAL,
-                    execution_path: str | None = None):
+                    execution_path: str | None = None, ring_key: str = ""):
     """Background-task slot — blocking acquire (both gates + HEAVY headroom), then
-    always releases on exit. A remote task consumes no local slot and never blocks."""
+    always releases on exit. A remote task consumes no local slot and never blocks.
+    ``ring_key`` (the task's creator) is the parked tasks' round-robin key: never
+    the slot's owner, which keeps counting chats only."""
     await acquire(session_id, "task", target=target, execution_path=execution_path,
-                  blocking=True)
+                  blocking=True, ring_key=ring_key)
     try:
         yield
     finally:
@@ -901,7 +972,7 @@ def _turn_live(sid: str, s: object) -> bool:
                 or getattr(s, "turn_open", False) or getattr(s, "question_parked", False)):
             return True
         from core.session import session_state
-        if session_state.has_pending_question(sid):
+        if session_state.has_pending_prompt(sid):
             return True
         # The in-process engine touches last_activity only at the start and
         # end of a turn; its layer's stream map is the truthful signal.
@@ -928,11 +999,13 @@ async def _oldest_evictable_local(min_idle_s: float, *,
     locals). A candidate must hold a ``chat`` reservation (task, meeting and
     phone reservations are released by their owners) and be idle
     ≥ ``min_idle_s``, idle age counting from the newer of ``last_activity``
-    and the last permission hook. ``only_user`` limits the scan to one
-    person's sessions. Ordering: unclaimed **pre-warms first** (speculative,
-    unused; at any age with ``prewarm_any_age``) → the **requesting user's
-    own** idle sessions → everyone else; within a group, most-idle first.
-    The owner is the ledger's, else the session's own ``user_sub``.
+    and the last permission hook. ``only_user`` limits the scan to the
+    sessions the per-person cap counts for that person (``_cap_owner``, the
+    owner ``_owned`` counts by). Ordering: unclaimed **pre-warms first**
+    (speculative, unused; at any age with ``prewarm_any_age``) → the
+    **requesting user's own** idle sessions → everyone else; within a group,
+    most-idle first. The order's owner is the ledger's, else the session's
+    own ``user_sub``: it orders and never counts.
     """
     now = time.monotonic()
     try:
@@ -953,9 +1026,9 @@ async def _oldest_evictable_local(min_idle_s: float, *,
         nonlocal spared_background, spared_live
         if _sessions.get(sid) != "chat":
             return  # must hold a reclaimable reservation to be worth evicting
-        owner = _session_owner.get(sid) or getattr(s, "user_sub", None) or ""
-        if only_user is not None and owner != only_user:
+        if only_user is not None and _cap_owner(sid) != only_user:
             return
+        owner = _cap_owner(sid) or getattr(s, "user_sub", None) or ""
         age = now - max(getattr(s, "last_activity", now), get_hook_activity(sid))
         is_pw = sid in _pw_entries
         if not (is_pw and prewarm_any_age):

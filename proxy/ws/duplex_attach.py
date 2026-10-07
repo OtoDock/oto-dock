@@ -44,6 +44,9 @@ from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
+# A closing pump's tail: what is left to forward once its producer is done.
+_PUMP_END_WAIT_S = 30.0
+
 
 @dataclass
 class _AttachState:
@@ -149,10 +152,13 @@ async def _resolve(bridge) -> "_AttachState | str":
         from core.sandbox.session_config_dir import (
             AgentStateRefused, refuse_agent_state_below_editor,
         )
+        from core.session.visibility import is_shared_only
         from storage.pg import run_db
-        pool_role = await run_db(acting_role_of, bridge.sub, chat.get("agent") or "")
+        _agent = chat.get("agent") or ""
+        pool_role, shared_only = await run_db(
+            lambda: (acting_role_of(bridge.sub, _agent), is_shared_only(_agent)))
         try:
-            refuse_agent_state_below_editor(SCOPE_AGENT, pool_role)
+            refuse_agent_state_below_editor(SCOPE_AGENT, pool_role, shared_only=shared_only)
         except AgentStateRefused as e:
             return str(e)
     session_id = chat.get("session_id") or ""
@@ -280,9 +286,14 @@ async def run_utterance(bridge, frame: dict) -> None:
         # as the abort target: a barge-in against this turn must interrupt
         # THAT pump's generation (st.pump stays None by invariant, which
         # used to silently drop the abort).
-        live.queue_message(TurnInput(_build_prompt(st, text, barge_in_chars)))
-        st.abort_target = live
-        _start_forward(bridge, st, live, turn)
+        if live.queue_message(TurnInput(
+                _build_prompt(st, text, barge_in_chars))) != live.QUEUE_CLOSED:
+            st.abort_target = live
+            _start_forward(bridge, st, live, turn)
+            return
+        # Its turn is ending (the producer is past its last drain): the
+        # utterance becomes its own turn once that pump is done.
+        await _after_pump_end(bridge, live, frame, turn)
         return
 
     if st.pump is not None and _active_pumps.get(bridge.chat_id) is st.pump:
@@ -292,8 +303,12 @@ async def run_utterance(bridge, frame: dict) -> None:
         # turn id and drops stale labels, so without the restart the queued
         # utterance's reply would be relayed under the old turn and silently
         # discarded.
-        st.pump.queue_message(TurnInput(_build_prompt(st, text, barge_in_chars)))
-        _start_forward(bridge, st, st.pump, turn)
+        own = st.pump
+        if own.queue_message(TurnInput(
+                _build_prompt(st, text, barge_in_chars))) != own.QUEUE_CLOSED:
+            _start_forward(bridge, st, own, turn)
+            return
+        await _after_pump_end(bridge, own, frame, turn)
         return
 
     # New turn — no live pump to ride, so the session process must actually
@@ -512,32 +527,57 @@ async def _run_new_turn(
     msg_queue: list = []
     sys_queue: list = []
     art_queue: list = []
+    # The chat's queue: a message typed during the call drains as this
+    # producer's next turn (on a Shared-only chat, this person's only).
+    from core.events import input_queue
+    input_q = await input_queue.loaded(bridge.chat_id)
+    drain_as = (bridge.sub or "") if _vis.is_shared_only(st.agent) else None
+
+    def _queued_waiting() -> bool:
+        return any(drain_as is None or qi.author_sub == drain_as for qi in input_q.items)
+
+    async def _send_turn(text: str, **kwargs) -> bool:
+        """One engine turn onto the pump; True when it yielded an ERROR."""
+        failed = False
+        async for event in layer.send_message(sid, text, **kwargs):
+            await event_queue.put(event)
+            failed = failed or event.type == ERROR
+        return failed
 
     async def _produce():
         try:
             async with layer.session_lock(sid):
-                async for event in layer.send_message(
-                    sid, prompt, inject_time=True,
-                    barge_in_chars=barge_in_chars,
-                ):
-                    await event_queue.put(event)
+                failed = await _send_turn(
+                    prompt, inject_time=True, barge_in_chars=barge_in_chars)
                 # Post-turn drains — the dashboard producer shape (audit F3):
-                # a typed message queued mid-voice must run, not drop.
-                while msg_queue or art_queue or sys_queue:
-                    if msg_queue:
-                        batch = TurnInput.combine(msg_queue)
-                        msg_queue.clear()
+                # a typed message queued mid-voice must run, not drop. After
+                # an ERROR the session may be dead: nothing more is sent, and
+                # the pump's end returns or delivers the chat's queue.
+                while not failed and (_queued_waiting() or msg_queue
+                                      or art_queue or sys_queue):
+                    taken = input_q.take(drain_as)
+                    spoken = [input_queue.QueuedInput(
+                        queue_id="", chat_id=bridge.chat_id, author_sub=bridge.sub or "",
+                        item=it) for it in msg_queue]
+                    msg_queue.clear()
+                    if taken or spoken:
+                        batch = TurnInput.combine([qi.item for qi in taken + spoken])
+                        # The rows land first, then the engine gets the batch.
+                        accepted = asyncio.get_running_loop().create_future()
                         await event_queue.put(CommonEvent(
                             type=QUEUE_TURN,
-                            data={"text": batch.text, "event_data": batch.event_meta},
+                            data={"inputs": taken + spoken, "accepted": accepted},
                         ))
+                        try:
+                            await accepted
+                        except Exception:
+                            input_q.put_back(taken)
+                            raise
                         drain_kwargs = {"inject_time": True}
                         if batch.images:
                             drain_kwargs["images"] = batch.images
-                        async for event in layer.send_message(
-                                sid, batch.cli_text, **drain_kwargs):
-                            await event_queue.put(event)
-                    if art_queue:
+                        failed = await _send_turn(batch.cli_text, **drain_kwargs)
+                    if art_queue and not failed:
                         from ws import artifact_interactions as _ai
                         batch = list(art_queue)
                         art_queue.clear()
@@ -546,13 +586,14 @@ async def _run_new_turn(
                             type=ARTIFACT_TURN,
                             data={"interactions": batch, "text": framed},
                         ))
-                        async for event in layer.send_message(
-                                sid, framed, inject_time=True):
-                            await event_queue.put(event)
-                    while sys_queue:
+                        failed = await _send_turn(framed, inject_time=True)
+                    while sys_queue and not failed:
                         sys_prompt = sys_queue.pop(0)
-                        async for event in layer.send_message(sid, sys_prompt):
-                            await event_queue.put(event)
+                        failed = await _send_turn(sys_prompt)
+                # No await between the loop's last check and the close: a typed
+                # message queued after it waits for the pump's end, an utterance
+                # is refused.
+                pump.close_queue()
         except Exception as e:
             await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
         finally:
@@ -570,7 +611,9 @@ async def _run_new_turn(
     pump.message_queue = msg_queue
     pump.system_queue = sys_queue
     pump.system_queue_consumer = True  # duplex drains it each turn
+    pump.wake_person = bridge.sub or ""  # the turn runs as the bridge's person
     pump.artifact_queue = art_queue
+    pump.queue_closed = False  # this producer drains them until it closes them
     _active_pumps[bridge.chat_id] = pump
     pump.start()
     st.pump = pump
@@ -580,6 +623,22 @@ async def _run_new_turn(
         await _abort(bridge, st)
 
     bridge.abort_inflight_turn = _abort_inflight
+
+
+async def _after_pump_end(bridge, pump, frame: dict, turn: int) -> None:
+    """An utterance a closing pump refused: run it as its own turn once that
+    pump is done (its tail is a few frames), or report the chat busy."""
+    from core.events.stream_pump import _active_pumps
+    task = getattr(pump, "_task", None)
+    if task is not None and not task.done():
+        await asyncio.wait({task}, timeout=_PUMP_END_WAIT_S)
+    if not pump.is_done or _active_pumps.get(bridge.chat_id) is pump:
+        await _engine_send(bridge, {
+            "type": wire.ERROR, "turn": turn,
+            "data": {"message": "The previous turn is still ending; say it again in a moment."},
+        })
+        return
+    await run_utterance(bridge, frame)
 
 
 def _start_forward(bridge, st: _AttachState, pump, turn: int) -> None:

@@ -131,6 +131,12 @@ class AgentConfig:
     # renders to match the user's actual terminal. Empty (dashboard/headless and
     # any non-otodock session) → the satellite keeps its xterm-256color default.
     term: str = ""
+    # The ``iat`` of the session token a builder minted into credential_env
+    # BEFORE the layer registers the session (the config builder's, a
+    # wake's): the session's token floor (session_state.register_session_state).
+    # 0 when the builder minted nothing and the layer's spawn-time mint is
+    # the process's token.
+    token_minted_at: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +205,9 @@ class RuntimeProfile:
     can spawn under a PTY. ``interactive_first_prompt_via_argv``: a fresh
     interactive spawn takes its cold prompt as a launch argument (the TUI
     auto-runs it) instead of a PTY write. ``supports_reattach_after_restart``:
-    an in-flight remote turn survives a proxy restart and is re-adopted, so
+    an in-flight remote turn survives a proxy restart and is re-adopted.
+    ``readopts_idle_session``: an idle remote session the satellite kept
+    across a proxy restart is taken back (its adapter's ``adopt_state``), so
     shutdown leaves it open. ``binary`` is the CLI executable's name on PATH
     ("" for an in-process engine); ``pin_key`` is the WIRE key the satellite
     reads the pinned version under — frozen vocabulary (``claude_code`` /
@@ -229,6 +237,7 @@ class RuntimeProfile:
     supports_interactive_pty: bool = False
     interactive_first_prompt_via_argv: bool = False
     supports_reattach_after_restart: bool = False
+    readopts_idle_session: bool = False
     binary: str = ""
     pin_key: str = ""
     config_dir_name: str = ""
@@ -245,6 +254,7 @@ class RuntimeProfile:
             "supports_interactive_pty": self.supports_interactive_pty,
             "interactive_first_prompt_via_argv": self.interactive_first_prompt_via_argv,
             "supports_reattach_after_restart": self.supports_reattach_after_restart,
+            "readopts_idle_session": self.readopts_idle_session,
             "binary": self.binary,
             "pin_key": self.pin_key,
             "config_dir_name": self.config_dir_name,
@@ -594,6 +604,9 @@ class RemoteStartPlan:
     payload: dict
     credential_file_delivered: bool = False
     start_timeout_s: float = 60.0
+    # The machine runs the credential gateway, so the session's vendor
+    # tokens are pushed to it before the spawn (the shared builder sets it).
+    gateway_mode: bool = False
 
 
 @dataclass
@@ -606,9 +619,11 @@ class RemoteStartContext:
     rewrite is OS-aware), the scope root the session works in
     (``users/<u>`` or ``workspace`` — the adapter names its config dir under
     it), the MUTABLE session env (the adapter pops its private carriers and
-    may add), the per-session JWT and the two bundle-key sets the MCP
-    rewriters need, and the connection manager (``cm``, typed loosely: the
-    adapter calls the satellite version gates and names it already uses)."""
+    may add), the per-session JWT, the bundle-key set and the credential
+    gateway's facts the MCP rewriters need (``gateway`` by mcpServers key;
+    ``gateway_mode`` says the machine runs the gateway), and the connection
+    manager (``cm``, typed loosely: the adapter calls the satellite version
+    gates and names it already uses)."""
     session_id: str
     machine_id: str
     sat_port: int
@@ -618,7 +633,8 @@ class RemoteStartContext:
     env: dict
     proxy_api_key: str
     secret_bundle_keys: set
-    bearer_swap_keys: set
+    gateway: dict
+    gateway_mode: bool
     cm: object
 
 
@@ -672,6 +688,20 @@ class RemoteEngineAdapter(ABC):
         """The payload with the named (manifest-name) MCPs removed from its
         config — an MCP the satellite could not install must not be spawned."""
 
+    # The payload fields that carry the session's prompt text.
+    prompt_payload_keys: tuple[str, ...] = ("system_prompt",)
+
+    def with_unavailable_mcps(self, payload: dict, reasons: dict[str, str]) -> dict:
+        """The payload's prompt told the truth about the MCPs the satellite
+        could not install (``without_mcps`` took them out of the config):
+        they leave the prompt's catalog and are listed, with their reason,
+        as unavailable (``config.fold_unavailable_mcps``)."""
+        from config import fold_unavailable_mcps
+        for key in self.prompt_payload_keys:
+            if isinstance(payload.get(key), str):
+                payload[key] = fold_unavailable_mcps(payload[key], reasons)
+        return payload
+
     # --- per-session state ---------------------------------------------------
 
     @abstractmethod
@@ -679,11 +709,12 @@ class RemoteEngineAdapter(ABC):
         """A session just started on the satellite: create the adapter's
         per-session record on ``info.engine_state`` (and any consumer task)."""
 
-    def adopt_state(self, info) -> None:
+    def adopt_state(self, info, cm) -> None:
         """A proxy restart re-adopts a session the satellite kept alive
-        (``runtime.supports_reattach_after_restart``): rebuild the per-turn
-        state the replay streams through. Default: the engine has no live
-        re-adopt."""
+        (``runtime.supports_reattach_after_restart`` for a turn in flight,
+        ``runtime.readopts_idle_session`` for an idle one): rebuild the state
+        a replay or the next turn streams through, from ``info``. Default:
+        the engine has no live re-adopt."""
         raise NotImplementedError(
             f"{type(self).__name__}: this engine has no live re-adopt"
         )
@@ -849,6 +880,12 @@ class LayerCapabilities:
 # ---------------------------------------------------------------------------
 # ExecutionLayer ABC
 # ---------------------------------------------------------------------------
+
+# How long a turn start waits for a machine in its reconnect grace before it
+# reads the session as dead: a satellite is back about a second after a
+# network blip, and a person's send must not wait for the whole grace.
+RECONNECT_WAIT_S = 10.0
+
 
 class ExecutionLayer(ABC):
     """Abstract interface for all execution backends.
@@ -1369,6 +1406,22 @@ class ExecutionLayer(ABC):
         producer no longer receives events (wedged). Lets the dashboard reap a
         zombie pump immediately on resume instead of waiting out the staleness
         window. Local CLI / Codex / Direct sessions are never severed → False."""
+        return False
+
+    async def wait_session_reconnect(self, session_id: str, *,
+                                     timeout: float = RECONNECT_WAIT_S) -> bool:
+        """Wait, at most ``timeout`` seconds, for a session whose machine is
+        reconnecting; True when it is alive again. Every place a turn start
+        decides a session is dead asks this first, so a short network blip
+        does not take the destructive dead path (record popped, background
+        registries dropped, a fresh session in place of the live one). Local
+        sessions have no machine → False at once."""
+        return False
+
+    def is_session_grace_held(self, session_id: str) -> bool:
+        """True while the session's machine dropped and its reconnect grace
+        still holds the session: reconnecting, not dead. Local sessions have
+        no machine → False."""
         return False
 
     @abstractmethod

@@ -28,8 +28,8 @@
 # fresh isolated /proc. NO cap_add (SYS_ADMIN dropped), NOT --privileged. Net a
 # privilege REDUCTION vs a root-run proxy.
 
-ARG PYTHON_IMAGE=python:3.13.14-slim-bookworm
-ARG NODE_IMAGE=node:24.18.0-slim
+ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm
+ARG NODE_IMAGE=node:24.21.0-slim
 
 # --- Node stage: source the pinned Node 24 (same bookworm/glibc base) ---
 FROM ${NODE_IMAGE} AS node
@@ -86,13 +86,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && rm -rf /var/lib/apt/lists/* \
  && docker --version && docker compose version
 
-# Baseline agent tooling — the single shared installer (git, gh, uv, pnpm,
-# bubblewrap, poppler-utils, sqlite3, the pinned claude/codex CLIs, the git
-# credential helper, best-effort passt/iproute2). Same script the satellite +
-# bare-metal installs run, so the sandbox sees identical tools everywhere.
-# Copied first (small, changes rarely) for layer caching. (VERSIONS.md is NOT
-# needed here — the installer carries its own pinned CLI defaults — so it's
-# copied later to keep doc edits from busting this expensive layer.)
+# Baseline agent tooling — the single shared installer (git, gh, uv, pnpm, Bun,
+# sympy, bubblewrap, poppler-utils, sqlite3, the pinned claude/codex CLIs, the
+# git credential helper, passt/iproute2 (required), xfsprogs (best-effort)).
+# Same script the satellite + bare-metal installs run, so the sandbox sees
+# identical tools everywhere. Copied first (small, changes rarely) for layer
+# caching. (VERSIONS.md is NOT needed here — the installer carries its own
+# pinned defaults (uv, pnpm, Bun, sympy, the CLIs; the mirror tests hold them
+# equal; Node comes from the node stage above, so its Node step is skipped) —
+# so it's copied later to keep doc edits from busting this expensive layer.)
 COPY scripts/ /opt/otodock/scripts/
 RUN bash /opt/otodock/scripts/install-baseline-tools.sh \
  && rm -rf /var/lib/apt/lists/*
@@ -105,7 +107,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /opt/otodock/bin \
  && mv /usr/bin/ffmpeg /usr/bin/ffprobe /opt/otodock/bin/ \
- && /opt/otodock/bin/ffmpeg -version | head -1
+ && /opt/otodock/bin/ffmpeg -version > /dev/null
 
 # Proxy Python deps into a venv (parity with bare-metal; keeps the proxy's heavy
 # deps OUT of the sandbox-visible system site-packages). requirements.txt copied
@@ -172,7 +174,7 @@ EXPOSE 8400
 # proxy the moment Docker calls it unhealthy, so the period matches what
 # scripts/upgrade.sh itself waits. A success is still reported at once.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=300s --retries=6 \
-  CMD curl -fsS http://localhost:8400/health || exit 1
+  CMD ["sh", "-c", "curl -fsS http://localhost:8400/health || exit 1"]
 
 # Drop to the non-root runtime user for the proxy process (and thus the bwrap'd
 # agents, which inherit this uid → uid 1000, capability-less).

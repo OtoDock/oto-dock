@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from .. import config
 from ..config import otodock_dir
 from .._vendored import layout
 from .lifecycle_update import (
@@ -65,7 +66,7 @@ class InsecureTransportRefused(RuntimeError):
     operator has not opted in via ``allow_insecure_transport = true``."""
 
 
-def assert_transport_secure(url: str, *, allow_insecure: bool = False) -> None:
+def assert_transport_secure(url: str, *, allow_insecure: bool = False) -> bool:
     """Refuse plaintext ``ws://`` to a publicly-resolving host unless the
     operator explicitly opted in.
 
@@ -79,19 +80,23 @@ def assert_transport_secure(url: str, *, allow_insecure: bool = False) -> None:
     used on the LAN, a VPN/overlay where the name resolves publicly but is
     reached privately), so those setups set ``allow_insecure_transport =
     true`` in ``satellite.conf`` once — with the opt-in the old error-level
-    warning is logged and the connection proceeds.
+    warning is logged and the connection proceeds. Returns True for that
+    opted-in plaintext link: the satellite then announces it
+    (``insecure_transport``) and refuses the frames that carry code or end
+    the install (``update_required``, ``uninstall``, the 4006 close), since
+    nothing on such a link can be authenticated.
     """
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     if scheme == "wss":
-        return
+        return False
     host = parsed.hostname or "?"
     if scheme != "ws":
         logger.warning(
             "platform_url scheme is %r (expected wss://); the connection may fail.",
             scheme,
         )
-        return
+        return False
     if _classify_host(host) == "public":
         if not allow_insecure:
             raise InsecureTransportRefused(
@@ -108,15 +113,17 @@ def assert_transport_secure(url: str, *, allow_insecure: bool = False) -> None:
             "host (%s) with allow_insecure_transport=true — the machine secret "
             "and session tokens travel in the clear and the channel is "
             "MITM-able. Re-pair with a wss:// URL unless this host is only "
-            "ever reached over a trusted (LAN/VPN) path.",
+            "ever reached over a trusted (LAN/VPN) path. Updates and a remote "
+            "uninstall are refused on this link: re-run the installer by hand.",
             host,
         )
-        return
+        return True
     logger.warning(
         "platform_url uses plaintext ws:// (host=%s). Acceptable on a trusted LAN "
         "or same host, but use wss:// for anything crossing an untrusted network.",
         host,
     )
+    return False
 
 
 # WS ping/timeout values, symmetric with proxy/app.py uvicorn config.
@@ -182,6 +189,28 @@ _RECONNECT_BACKOFF_CAP = 30.0
 # Send queue capacity. Same as previous _send_buffer cap.
 _SEND_QUEUE_SIZE = 10_000
 
+# The bulk lane (0.5.137): file_pull's chunks, at most this many frames
+# queued (each about 0.7 MB on the wire). Its producer waits for room, so the
+# file is read as fast as the link drains it, and control frames (acks,
+# heartbeats, hook and MCP calls) go out between chunks.
+_BULK_LANE_SIZE = 3
+
+# When PTY output and bulk both wait, one bulk frame goes after this many PTY
+# frames: a terminal flooding output never stalls a pull for good.
+_PTY_FRAMES_PER_BULK = 8
+
+# TCP_NOTSENT_LOWAT: the kernel holds at most this much unsent data, so the
+# protocol's own ping and pong wait behind little more than it. Python names
+# the option only on some builds: the number by host family otherwise.
+_NOTSENT_LOWAT_BYTES = 128 * 1024
+_NOTSENT_LOWAT_OPTION = {config.LINUX: 25, config.DARWIN: 0x201}
+
+
+def _notsent_lowat_option() -> int | None:
+    """TCP_NOTSENT_LOWAT's option number on this host, None where it has none."""
+    return getattr(socket, "TCP_NOTSENT_LOWAT", None) or _NOTSENT_LOWAT_OPTION.get(config.HOST.name)
+
+
 # Capacity of the dedicated LOSSLESS interactive-PTY output lane (frames;
 # each ≤ one 64 KB PTY read → ~16 MB max buffered). Unlike _send_queue this lane
 # BLOCKS the producer when full (the PTY reader pauses → the TUI's write() blocks)
@@ -227,6 +256,21 @@ def _set_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 60)
     except OSError as e:
         logger.warning("Failed to set TCP keepalive: %s", e)
+    option = _notsent_lowat_option()
+    if option is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, _NOTSENT_LOWAT_BYTES)
+        except OSError as e:
+            logger.debug("TCP_NOTSENT_LOWAT not set: %s", e)
+
+
+# A satellite on a plaintext link refuses a remote uninstall and waits this
+# long between reconnects after one, so a deleted machine never spins.
+_INSECURE_RECONNECT_WAIT_S = 600.0
+
+
+class _InsecureUninstallRefused(Exception):
+    """The platform asked for a self-uninstall over a plaintext link."""
 
 
 class SatelliteWSClient:
@@ -247,6 +291,9 @@ class SatelliteWSClient:
         # CONTROL-FIRST by _writer_loop. _send_wakeup lets the writer serve both
         # lanes without blocking on a single queue's get().
         self._pty_send_queue: asyncio.Queue = asyncio.Queue(maxsize=_PTY_LANE_SIZE)
+        # The bounded, backpressured bulk lane (file_pull chunks), drained
+        # after control and PTY and purged on a drop.
+        self._bulk_send_queue: asyncio.Queue = asyncio.Queue(maxsize=_BULK_LANE_SIZE)
         self._send_wakeup: asyncio.Event = asyncio.Event()
         self._authenticated = False
         # Set by __main__.py post-construction; the WS routes inbound
@@ -318,7 +365,7 @@ class SatelliteWSClient:
         """Reconnect loop with jittered exponential backoff (1s base → 30s cap)."""
         # Refuse plaintext ws:// to a public host (unless the operator opted
         # in via allow_insecure_transport) — checked once, before the loop.
-        assert_transport_secure(
+        self._insecure_link = assert_transport_secure(
             self.config.platform_url,
             allow_insecure=getattr(self.config, "allow_insecure_transport", False),
         )
@@ -373,11 +420,18 @@ class SatelliteWSClient:
                     # disconnect or unhandled exception.
                     await self._message_loop()
 
+            except _InsecureUninstallRefused:
+                await asyncio.sleep(_INSECURE_RECONNECT_WAIT_S)
+                continue
             except ConnectionClosed as e:
                 logger.warning(f"WS connection closed: {e.code} {e.reason}")
                 # Close code 4006 (machine_deleted) → run the uninstall script +
                 # exit instead of looping forever.
                 if e.code == 4006:
+                    if getattr(self, "_insecure_link", False):
+                        self._log_insecure_refusal("the 4006 close")
+                        await asyncio.sleep(_INSECURE_RECONNECT_WAIT_S)
+                        continue
                     logger.info(
                         "Machine deleted from platform (4006). "
                         "Running self-uninstall.",
@@ -447,6 +501,25 @@ class SatelliteWSClient:
                         break
                 if purged:
                     logger.info("Purged %d buffered pty frame(s) on disconnect", purged)
+                # The pulls the platform just failed stop first (a producer
+                # parked on a full lane is cancelled before the purge frees
+                # room), then their chunks go: none reaches the next
+                # connection, whose platform no longer waits for them.
+                try:
+                    stopped = self.sm.cancel_pulls()
+                except Exception:
+                    logger.exception("cancel_pulls failed")
+                    stopped = 0
+                purged = 0
+                while True:
+                    try:
+                        self._bulk_send_queue.get_nowait()
+                        purged += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if stopped or purged:
+                    logger.info("Stopped %d file pull(s), purged %d bulk frame(s) on disconnect",
+                                stopped, purged)
 
             # If we were paused (the WS close above was deliberate), skip
             # the backoff sleep and let the top-of-loop gate park us.
@@ -566,39 +639,84 @@ class SatelliteWSClient:
         await self._pty_send_queue.put(msg)
         self._send_wakeup.set()
 
+    async def enqueue_bulk(self, msg: dict) -> bool:
+        """Queue a file_pull chunk on the BOUNDED bulk lane, waiting for room.
+
+        False at once while disconnected (the platform failed the pull with
+        the link), and the producer stops. The lane is purged on a drop.
+        """
+        if self._ws is None or not self._authenticated:
+            return False
+        await self._bulk_send_queue.put(msg)
+        self._send_wakeup.set()
+        return True
+
+    def drop_bulk(self, matches) -> int:
+        """Drop the queued bulk frames ``matches(frame)`` picks (a pull the
+        platform gave up on), keeping the others in order."""
+        kept, dropped = [], 0
+        while True:
+            try:
+                frame = self._bulk_send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if matches(frame):
+                dropped += 1
+            else:
+                kept.append(frame)
+        for frame in kept:
+            self._bulk_send_queue.put_nowait(frame)
+        return dropped
+
+    def _lanes_empty(self) -> bool:
+        return (self._send_queue.empty() and self._pty_send_queue.empty()
+                and self._bulk_send_queue.empty())
+
     async def _writer_loop(self) -> None:
-        """Single coroutine that owns ws.send(), draining TWO lanes CONTROL-FIRST:
-        the drop-oldest control queue (acks, session/transcript/pty
-        lifecycle events) and the LOSSLESS, backpressured pty-output lane. Control
-        is drained fully before each pty frame, so a burst of terminal output can
-        never delay an ack/heartbeat behind it (which would risk a false
-        disconnect). When both lanes are empty the writer clears + re-checks
-        _send_wakeup (closing the lost-wakeup window) then awaits it.
+        """Single coroutine that owns ws.send(), draining THREE lanes
+        CONTROL-FIRST: the drop-oldest control queue (acks, session/transcript/pty
+        lifecycle events), the LOSSLESS, backpressured pty-output lane, and the
+        bounded bulk lane (file_pull chunks). Control is drained fully before
+        each pty or bulk frame, so a burst of terminal output or a large pull
+        can never delay an ack/heartbeat behind it (which would risk a false
+        disconnect). PTY goes before bulk, but one bulk frame goes after every
+        _PTY_FRAMES_PER_BULK pty frames while both wait. When every lane is
+        empty the writer clears + re-checks _send_wakeup (closing the
+        lost-wakeup window) then awaits it.
 
         On send failure: requeue to the SAME lane (slight reorder accepted over
         loss) then exit — the outer connect_forever loop reconnects and a fresh
         writer drains the persisted lanes.
         """
+        pty_run = 0
         try:
             while True:
-                # Control-first: prefer a ready control frame, else one pty frame,
-                # else sleep until a producer signals via _send_wakeup.
+                # Control-first: prefer a ready control frame, else one pty frame
+                # (or a bulk one after a run of them), else one bulk frame, else
+                # sleep until a producer signals via _send_wakeup.
                 lane = self._send_queue
                 try:
                     msg = lane.get_nowait()
                 except asyncio.QueueEmpty:
-                    lane = self._pty_send_queue
-                    try:
-                        msg = lane.get_nowait()
-                    except asyncio.QueueEmpty:
+                    lanes = [self._pty_send_queue, self._bulk_send_queue]
+                    if pty_run >= _PTY_FRAMES_PER_BULK:
+                        lanes.reverse()
+                    for lane in lanes:
+                        try:
+                            msg = lane.get_nowait()
+                            break
+                        except asyncio.QueueEmpty:
+                            continue
+                    else:
                         self._send_wakeup.clear()
                         # Re-check after clear so a producer that enqueued in the
                         # gap isn't missed; one that enqueues later re-sets the
                         # event we await. No lost wakeup, no busy-wait.
-                        if not (self._send_queue.empty() and self._pty_send_queue.empty()):
+                        if not self._lanes_empty():
                             continue
                         await self._send_wakeup.wait()
                         continue
+                    pty_run = pty_run + 1 if lane is self._pty_send_queue else 0
                 if not isinstance(msg, dict):
                     continue
                 try:
@@ -625,10 +743,27 @@ class SatelliteWSClient:
         except asyncio.CancelledError:
             return
 
+    def _log_insecure_refusal(self, what: str) -> None:
+        """Said once per kind: the frame a plaintext link cannot carry."""
+        seen = getattr(self, "_insecure_refusals", None)
+        if seen is None:
+            seen = self._insecure_refusals = set()
+        if what in seen:
+            return
+        seen.add(what)
+        logger.error(
+            "SECURITY: %s refused: this satellite's link is plaintext with "
+            "allow_insecure_transport, so no code and no uninstall is taken from it. "
+            "Update or remove it by hand: re-run the installer, or uninstall.sh.",
+            what,
+        )
+
     async def _authenticate(self) -> None:
         """Send auth message directly, wait for auth_result (5s timeout)."""
         from ..config import SATELLITE_VERSION
         caps = self.sm.detect_capabilities()
+        if getattr(self, "_insecure_link", False):
+            caps["insecure_transport"] = True
         auth_msg = {
             "type": "auth",
             "machine_id": self.config.machine_id,
@@ -648,6 +783,9 @@ class SatelliteWSClient:
         # loop hasn't started yet at this point, so without handling
         # update_required during auth the connection would hard-fail.
         if resp.get("type") == "update_required":
+            if getattr(self, "_insecure_link", False):
+                self._log_insecure_refusal("update_required")
+                raise ConnectionError("update refused on a plaintext link")
             logger.info(
                 "Received update_required during auth %s → %s — applying",
                 resp.get("previous_version", "?"),
@@ -671,6 +809,9 @@ class SatelliteWSClient:
             # ConnectionError previously short-circuited before code 4006
             # was observed.
             if resp.get("action") == "uninstall":
+                if getattr(self, "_insecure_link", False):
+                    self._log_insecure_refusal("uninstall")
+                    raise _InsecureUninstallRefused()
                 logger.warning(
                     "Auth rejected by platform (reason=%s) with action=uninstall. "
                     "Running self-uninstall.",
@@ -696,12 +837,13 @@ class SatelliteWSClient:
 
         # Headless twin of pty_alive: live CLI sessions + their in-flight
         # turn state, so a RESTARTED proxy can re-adopt running turns
-        # (Mode C) instead of failing them blind at startup.
+        # (Mode C) instead of failing them blind at startup, and every other
+        # headless session held, so it takes an idle one back or closes it.
         try:
-            await self.enqueue_send({
-                "type": "sessions_alive",
-                "sessions": self.sm.headless_sessions_alive(),
-            })
+            from ..sessions import alive_report
+            frame = alive_report.sessions_alive_frame(self.sm)
+            if frame is not None:
+                await self.enqueue_send(frame)
         except Exception:
             logger.debug("sessions_alive enqueue failed", exc_info=True)
 
@@ -871,7 +1013,18 @@ class SatelliteWSClient:
                 elif msg_type == "file_push":
                     asyncio.create_task(self.sm.file_push(msg, self))
                 elif msg_type == "file_pull":
-                    asyncio.create_task(self.sm.file_pull(msg, self))
+                    # Registered here, not at the task's first step: a cancel
+                    # read in the same batch as its pull must find it.
+                    task = asyncio.create_task(self.sm.file_pull(msg, self))
+                    rid = msg.get("request_id", "")
+                    if rid:
+                        self.sm._pulls[rid] = task
+                        task.add_done_callback(
+                            lambda t, rid=rid: self.sm._pulls.pop(rid, None)
+                            if self.sm._pulls.get(rid) is t else None)
+                elif msg_type == "file_pull_cancel":
+                    # The platform gave up on a pull (0.5.137): stop producing.
+                    self.sm.file_pull_cancel(msg, self)
                 elif msg_type == "file_stat":
                     # Cheap cache-revalidation probe (0.5.95+) — replies as
                     # a command ack; validation mirrors file_pull.
@@ -884,6 +1037,30 @@ class SatelliteWSClient:
                     # An app step (proxy APPS.md "Steps", 0.5.122): its own
                     # task, so a long script never blocks the loop.
                     asyncio.create_task(self.sm.step_run(msg, self))
+                elif msg_type in ("mcp_gateway_token", "mcp_gateway_wipe"):
+                    # The credential gateway: a vendor token for a session,
+                    # pushed before its spawn and renewed under its lease, or
+                    # the wipe at the session's close. Handled inline so a push
+                    # that precedes the spawn frame lands first; acknowledged
+                    # so the proxy repeats a push the link dropped.
+                    if self.tunnel is not None:
+                        if msg_type == "mcp_gateway_token":
+                            ok = self.tunnel.gateway.table.push(msg)
+                        else:
+                            self.tunnel.gateway.table.wipe(msg)
+                            ok = True
+                    else:
+                        ok = False
+                    if msg.get("command_id"):
+                        await self.enqueue_send({
+                            "type": "ack", "command_id": msg["command_id"],
+                            "status": "ok" if ok else "error",
+                            **({} if ok else {"error": "gateway unavailable or frame incomplete"}),
+                        })
+                elif msg_type in ("uninstall", "update_required") and getattr(self, "_insecure_link", False):
+                    # Code and the end of the install never come over a
+                    # plaintext link: refused, said once.
+                    self._log_insecure_refusal(msg_type)
                 elif msg_type == "uninstall":
                     # Platform asked us to self-uninstall (admin/user
                     # deleted the remote machine from the dashboard). Run

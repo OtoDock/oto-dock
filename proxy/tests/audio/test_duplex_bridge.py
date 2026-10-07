@@ -561,6 +561,8 @@ async def test_an_utterance_during_a_typed_turn_queues_onto_its_pump(monkeypatch
     from core.events.stream_pump import _active_pumps
 
     class FakePump:
+        QUEUE_CLOSED = -2
+
         def __init__(self):
             self.queued: list = []
 
@@ -618,3 +620,174 @@ async def test_a_voice_never_speaks_into_a_colleagues_terminal(temp_db, monkeypa
     assert any(f.get("data", {}).get("message") == "access_denied"
                for f in bridge.engine_ws.sent if isinstance(f, dict))
     duplex_attach._interactive_feeds.clear()
+
+
+@pytest.mark.asyncio
+async def test_an_utterance_a_closing_pump_refuses_becomes_its_own_turn(monkeypatch):
+    """A typed turn past its producer's last drain refuses the utterance
+    (QUEUE_CLOSED): it runs as its own turn once that pump is done, never
+    dropped."""
+    from core.events.stream_pump import _active_pumps
+
+    class ClosingPump:
+        QUEUE_CLOSED = -2
+        is_done = False
+
+        def queue_message(self, item):
+            return self.QUEUE_CLOSED
+
+    bridge = _bridge(chat_id="chat-c")
+    bridge.engine_ws = FakeWebSocket()
+    st = duplex_attach._AttachState(chat_id="chat-c", session_id="s1", layer=object())
+    st.context_injected = True
+    duplex_attach._states[bridge.duplex_id] = st
+    live = ClosingPump()
+
+    async def _end():
+        await asyncio.sleep(0.01)
+        live.is_done = True
+        _active_pumps.pop("chat-c", None)
+
+    live._task = asyncio.create_task(_end())
+    _active_pumps["chat-c"] = live
+    started: list = []
+
+    async def _ensure(_bridge, _st):
+        return None
+
+    async def _new_turn(_bridge, _st, turn, text, _chars):
+        started.append((turn, text))
+
+    monkeypatch.setattr(duplex_attach, "_ensure_live_session", _ensure)
+    monkeypatch.setattr(duplex_attach, "_run_new_turn", _new_turn)
+    monkeypatch.setattr(duplex_attach, "_start_forward", lambda *a, **k: None)
+    try:
+        await duplex_attach.run_utterance(bridge, {"turn": 4, "text": "one more thing"})
+        assert started == [(4, "one more thing")]
+    finally:
+        _active_pumps.pop("chat-c", None)
+
+
+@pytest.mark.asyncio
+async def test_a_pump_that_does_not_end_reports_the_chat_busy(monkeypatch):
+    from core.events.stream_pump import _active_pumps
+
+    class StuckPump:
+        QUEUE_CLOSED = -2
+        is_done = False
+        _task = None
+
+        def queue_message(self, item):
+            return self.QUEUE_CLOSED
+
+    bridge = _bridge(chat_id="chat-s")
+    bridge.engine_ws = FakeWebSocket()
+    st = duplex_attach._AttachState(chat_id="chat-s", session_id="s1", layer=object())
+    st.context_injected = True
+    duplex_attach._states[bridge.duplex_id] = st
+    _active_pumps["chat-s"] = StuckPump()
+    sent: list = []
+
+    async def _send(_bridge, payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(duplex_attach, "_engine_send", _send)
+    try:
+        await duplex_attach.run_utterance(bridge, {"turn": 5, "text": "hello"})
+        assert sent and sent[-1]["type"] == "error" and sent[-1]["turn"] == 5
+    finally:
+        _active_pumps.pop("chat-s", None)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_voice_turn_sends_nothing_more_into_its_session(temp_db, monkeypatch):
+    """After a turn that yielded an ERROR (a typed ending ends the process)
+    the voice producer sends nothing more into the session: what was queued
+    is left to a dashboard viewer's drain, which heals the session first, and
+    with no viewer attached at the close it is kept in the chat as a "not
+    sent" card."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from core.events import stream_pump
+    from core.events.common_events import ERROR, CommonEvent, TurnInput
+    from core.events.stream_pump import _active_pumps
+
+    sent: list[str] = []
+
+    class FakeLayer:
+        def capabilities_for(self, _sid):
+            return SimpleNamespace(behaviour=SimpleNamespace(rebuilds_history_from_db=True))
+
+        @asynccontextmanager
+        async def session_lock(self, _sid):
+            yield
+
+        async def send_message(self, _sid, text, **_kw):
+            sent.append(text)
+            _active_pumps["chat-f"].queue_message(TurnInput("typed meanwhile"))
+            yield CommonEvent(type=ERROR, data={"message": "declined", "ending": {"reason": "declined"}})
+
+    async def _no_focus(_bridge):
+        return ""
+
+    monkeypatch.setattr(duplex_attach, "_focus_for", _no_focus)
+    monkeypatch.setattr(duplex_attach.task_store, "add_chat_message", lambda *a, **k: None)
+    monkeypatch.setattr(duplex_attach, "_start_forward", lambda *a, **k: None)
+    kept: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(stream_pump, "shelve_undelivered",
+                        lambda cid, items: kept.append((cid, [q.text for q in items])))
+    bridge = _bridge(chat_id="chat-f")
+    st = duplex_attach._AttachState(chat_id="chat-f", session_id="s-f", layer=FakeLayer())
+    st.context_injected = True
+    try:
+        await duplex_attach._run_new_turn(bridge, st, 1, "say it", None)
+        await asyncio.wait_for(st.pump._task, timeout=5)
+        assert len(sent) == 1
+        assert kept == [("chat-f", ["typed meanwhile"])]
+    finally:
+        _active_pumps.pop("chat-f", None)
+
+
+@pytest.mark.asyncio
+async def test_a_voice_turn_left_wake_is_stored_for_the_bridge_person(temp_db, monkeypatch):
+    """A delegated result queued on a voice turn's pump that the producer
+    never sends (the turn yielded an ERROR) is stored as the chat's wake for
+    the person the bridge runs as."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from core.events import chat_writer
+    from core.events.common_events import ERROR, CommonEvent
+    from core.events.stream_pump import _active_pumps
+    from storage import database as task_store
+
+    class FakeLayer:
+        def capabilities_for(self, _sid):
+            return SimpleNamespace(behaviour=SimpleNamespace(rebuilds_history_from_db=True))
+
+        @asynccontextmanager
+        async def session_lock(self, _sid):
+            yield
+
+        async def send_message(self, _sid, text, **_kw):
+            _active_pumps["chat-w"].system_queue.append("a delegated result")
+            yield CommonEvent(type=ERROR, data={"message": "declined", "ending": {"reason": "declined"}})
+
+    async def _no_focus(_bridge):
+        return ""
+
+    task_store.create_chat("chat-w", "user-admin", "a1")
+    monkeypatch.setattr(duplex_attach, "_focus_for", _no_focus)
+    monkeypatch.setattr(duplex_attach.task_store, "add_chat_message", lambda *a, **k: None)
+    monkeypatch.setattr(duplex_attach, "_start_forward", lambda *a, **k: None)
+    bridge = _bridge(chat_id="chat-w", sub="user-admin")
+    st = duplex_attach._AttachState(chat_id="chat-w", session_id="s-w", layer=FakeLayer())
+    st.context_injected = True
+    try:
+        await duplex_attach._run_new_turn(bridge, st, 1, "say it", None)
+        await asyncio.wait_for(st.pump._task, timeout=5)
+        assert st.pump.wake_person == "user-admin"
+        await chat_writer.drain("chat-w", timeout=5)
+        assert task_store.claim_pending_wake_records("chat-w") == [
+            {"prompt": "a delegated result", "person": "user-admin", "role": "admin", "by": ""}]
+    finally:
+        _active_pumps.pop("chat-w", None)

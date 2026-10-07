@@ -31,11 +31,16 @@ def test_claude_settings_name_the_four_events_and_the_long_stop_timeout():
     assert set(s["hooks"]) == EVENTS
     for ev in EVENTS:
         h = s["hooks"][ev][0]["hooks"][0]
-        assert h["type"] == "command" and h["command"].startswith("/users/alice/.claude/")
-    assert s["hooks"]["Stop"][0]["hooks"][0]["command"].endswith("stop_tracker.py")
-    assert s["hooks"]["Stop"][0]["hooks"][0]["timeout"] == scd.STOP_HOOK_TIMEOUT_S == 604800
+        assert h["type"] == "command"
+        # isolated: python3 -I "<sandbox .claude>/<hook>.py"
+        assert h["command"].startswith('python3 -I "/users/alice/.claude/')
+    assert s["hooks"]["Stop"][0]["hooks"][0]["command"].endswith('stop_tracker.py"')
+    assert s["hooks"]["Stop"][0]["hooks"][0]["timeout"] == scd.STOP_HOOK_TIMEOUT_S
+    # An hour past the prompt's own wait, so the proxy always answers first.
+    from core.session.session_state import PROMPT_WAIT_S
+    assert scd.LONG_HOOK_TIMEOUT_S == PROMPT_WAIT_S + 3600
     assert s["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == scd.LONG_HOOK_TIMEOUT_S
-    assert s["hooks"]["SubagentStop"][0]["hooks"][0]["command"].endswith("subagent_tracker.py")
+    assert s["hooks"]["SubagentStop"][0]["hooks"][0]["command"].endswith('subagent_tracker.py"')
 
 
 def test_codex_hooks_json_is_an_object_with_the_same_four_events():
@@ -46,10 +51,10 @@ def test_codex_hooks_json_is_an_object_with_the_same_four_events():
         group = h["hooks"][ev]
         assert isinstance(group, list) and group[0]["matcher"] == ""
         cmd = group[0]["hooks"][0]["command"]
-        assert cmd.startswith("python3 /workspace/.codex/")
-    assert h["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 604800
-    assert h["hooks"]["Stop"][0]["hooks"][0]["command"].endswith("stop_tracker.py")
-    assert h["hooks"]["SubagentStop"][0]["hooks"][0]["command"].endswith("subagent_tracker.py")
+        assert cmd.startswith('python3 -I "/workspace/.codex/')
+    assert h["hooks"]["Stop"][0]["hooks"][0]["timeout"] == scd.LONG_HOOK_TIMEOUT_S
+    assert h["hooks"]["Stop"][0]["hooks"][0]["command"].endswith('stop_tracker.py"')
+    assert h["hooks"]["SubagentStop"][0]["hooks"][0]["command"].endswith('subagent_tracker.py"')
     # The list shape Codex rejects must never come back.
     assert not isinstance(h.get("hooks"), list)
 
@@ -106,6 +111,11 @@ def test_the_two_codex_spawns_carry_their_bypass():
     assert '"--dangerously-bypass-hook-trust"' in tui
     sat_tui = (root.parent / "satellite" / "terminal" / "codex_pty_session.py").read_text()
     assert '"--dangerously-bypass-hook-trust"' in sat_tui
+    # Codex 0.157 auto-starts a shared background server (its own Codex
+    # install, outside the pin) for eligible TUIs; the trust flag already keeps
+    # both TUIs out of it, and both opt out explicitly, which also drops the
+    # line it printed at start (the flag exists on the previous pin 0.156.1 too).
+    assert '"--no-daemon"' in tui and '"--no-daemon"' in sat_tui
     from core.layers.codex.session import CodexAppServerSession
     floored = CodexAppServerSession(
         session_id="11111111-2222-4333-8444-555555555555", agent_name="pa",

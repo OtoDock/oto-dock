@@ -23,7 +23,7 @@ from core.events.common_events import (
 from core.execution_layer import ExecutionLayer
 from core.session.session_state import get_subagent_registry
 from core.events.bg_command_state import get_bg_command_registry
-from core.events.pump_bg_monitors import format_job_list, hold_bg_monitors
+from core.events.pump_bg_monitors import format_job_list, hold_bg_monitors, ride_out_grace
 
 logger = logging.getLogger("claude-proxy")
 
@@ -238,7 +238,9 @@ async def task_produce(
                             f"still-running work)"
                         )
                         continue
-                    if not await layer.is_session_alive(session_id):
+                    # A machine in its reconnect grace is waited for, not
+                    # read as gone (the horizons above keep running).
+                    if not await ride_out_grace(layer, session_id):
                         logger.info(
                             f"Task {run_id[:8]}: session gone during bg wait"
                         )
@@ -286,10 +288,13 @@ async def task_produce(
                 # spawn) — the count-only wording let the model read a
                 # still-running sibling's output as final (2026-08-27 find).
                 if bg_count and reg.pending_count == 0:
-                    listed = format_job_list(
-                        [reg.label_for(t) for t in sorted(reg.completed)])
+                    # Named: the agents no review named yet (a chat monitor
+                    # waits out this run's report and then owes only the rest).
+                    named = sorted(reg.owed)
+                    listed = format_job_list([reg.label_for(t) for t in named])
                     bits.append(f"{bg_count} background agent(s)"
                                 + (f" ({listed})" if listed else ""))
+                    reg.mark_reviewed(named)
                 # Snapshot the unsurfaced ids NOW — clear_unsurfaced() below
                 # destroys the set right after this nudge is composed.
                 bash_unseen_ids = sorted(bgreg.unsurfaced)

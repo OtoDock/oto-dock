@@ -9,6 +9,7 @@ re-exports CodexEventTranslator (and _codex_tool_summary) for back-compat.
 import logging
 
 import config as app_config
+from core.events import turn_ending
 from core.events.bg_command_state import get_bg_command_registry, shorten_label
 from core.events.common_events import (
     CommonEvent, TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
@@ -16,7 +17,8 @@ from core.events.common_events import (
     METADATA, DONE, ERROR, TODO_UPDATE, GOAL_UPDATE, CONTEXT_COMPACT,
 )
 from core.layers.codex import tool_names
-from core.layers.codex.session import CodexEvent
+from core.layers.codex.helpers import will_retry
+from core.layers.codex.session import TURN_ENDING_EVENT, CodexEvent
 
 logger = logging.getLogger("codex-layer")
 
@@ -114,6 +116,27 @@ _SUPPRESSED_METHODS = frozenset({
 })
 
 
+# ``TurnError.codexErrorInfo`` values that end a turn for a reason the
+# platform names (app-server schema of Codex 0.160.0): (reason, detail).
+_ENDING_INFO = {
+    "usageLimitExceeded": (turn_ending.LIMIT, ""),
+    "cyberPolicy": (turn_ending.DECLINED, "cyber"),
+    "misalignmentPolicyViolation": (turn_ending.DECLINED, "policy"),
+    "tooManyDenials": (turn_ending.DECLINED, turn_ending.DENIALS),   # Guardian's circuit breaker (0.160)
+}
+
+
+def _declared_window(minutes) -> str:
+    """The declared window (``LayerCapabilities.usage.windows``) a reported
+    window length in minutes belongs to; "" when it reports none."""
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
+        return ""
+    from core.layers.codex.layer import _CODEX_CAPABILITIES
+    from services.engines.subscription_windows import spec_for_length
+    spec = spec_for_length({s.key: s for s in _CODEX_CAPABILITIES.usage.windows}, minutes * 60)
+    return spec.key if spec is not None else ""
+
+
 class CodexEventTranslator:
     """Translate ``codex app-server`` notifications into CommonEvents.
 
@@ -147,6 +170,15 @@ class CodexEventTranslator:
         # satellites — no idle delivery), still-open terminals are resolved to
         # "completed" at every turn end so a badge can never dangle.
         self._supervised_bg_commands = supervised_bg_commands
+        # Whether an ``error`` notification Codex will retry still ends the
+        # platform's turn: a remote session on a satellite below 0.5.131,
+        # which ends its own turn on that notification (it read ``willRetry``
+        # nested), keeps the ERROR so the turn does not end silently.
+        self.retried_errors_end_turn: bool = False
+        # The reset instant and the declared key of the account's reached
+        # window (the last rate-limit snapshot), for a usage-limit ending.
+        self._limit_resets_at: str = ""
+        self._limit_window: str = ""
         # Open commandExecution items with a non-null ``processId`` (the
         # unified_exec session id; non-null ⟺ PTY-backed, background-capable).
         # itemId → {process_id, command, started, swept}: ``started`` once
@@ -312,11 +344,24 @@ class CodexEventTranslator:
         if method == "turn/completed":
             return self._on_turn_completed(params.get("turn", {}))
 
+        if method == TURN_ENDING_EVENT:
+            # The session's own typed ending (silence past the ceiling, the
+            # daemon gone): the ERROR with the ending, then the turn's end.
+            ending = turn_ending.from_dict(params)
+            if ending is None:
+                return [CommonEvent(type=ERROR, data={"message": "Codex error"}),
+                        CommonEvent(type=DONE)]
+            return [CommonEvent(type=ERROR, data={"message": ending.line(),
+                                                   "ending": ending.as_dict()}),
+                    CommonEvent(type=DONE)]
+
         if method == "error":
             err = params.get("error", {}) or {}
-            return [CommonEvent(type=ERROR, data={
-                "message": err.get("message", "Codex error"),
-            })]
+            if will_retry(params) and not self.retried_errors_end_turn:
+                # Codex retries it and goes on: the turn is not over.
+                logger.info("Codex: retrying after %s", err.get("message", "an error"))
+                return []
+            return [self._error_event(err, "Codex error")]
 
         if method == "account/rateLimits/updated":
             # The account's own window state. Recorded for the pool on a
@@ -331,7 +376,39 @@ class CodexEventTranslator:
         logger.debug(f"Codex translator: unhandled notification {method}")
         return []
 
+    def _error_event(self, err: dict, fallback: str) -> CommonEvent:
+        """The turn's ERROR: a typed ending when ``codexErrorInfo`` names a
+        usage limit or a policy decline, a plain error otherwise."""
+        message = err.get("message") or fallback
+        reason, detail = _ENDING_INFO.get(err.get("codexErrorInfo") if isinstance(
+            err.get("codexErrorInfo"), str) else "", ("", ""))
+        if not reason:
+            # The engine's own error: the daemon stays warm, the ending
+            # names the reason and carries Codex's words.
+            ending = turn_ending.TurnEnding(reason=turn_ending.ERROR, detail=message)
+            return CommonEvent(type=ERROR, data={"message": ending.line(),
+                                                 "ending": ending.as_dict()})
+        ending = turn_ending.TurnEnding(
+            reason=reason,
+            resets_at=self._limit_resets_at if reason == turn_ending.LIMIT else "",
+            detail=message if reason == turn_ending.LIMIT else detail,
+            window=self._limit_window if reason == turn_ending.LIMIT else "",
+        )
+        return CommonEvent(type=ERROR, data={"message": ending.line(), "ending": ending.as_dict()})
+
     def _record_rate_limits(self, params) -> None:
+        if isinstance(params, dict):
+            snapshot = params.get("rateLimits") if isinstance(params.get("rateLimits"), dict) else params
+            reached = [w for w in (snapshot.get("primary"), snapshot.get("secondary"))
+                       if isinstance(w, dict) and (w.get("usedPercent") or 0) >= 100]
+            if reached:
+                # The account frees when every reached window has reset: the
+                # ending names the one that resets last. Both Codex windows are
+                # account-wide; each is filed under the declared window its
+                # length covers ("" when it reports none).
+                last = max(reached, key=lambda w: w.get("resetsAt") or 0)
+                self._limit_resets_at = turn_ending.epoch_to_iso(last.get("resetsAt") or 0)
+                self._limit_window = _declared_window(last.get("windowDurationMins"))
         if not self._session_id or not isinstance(params, dict):
             return
         from core.layers.codex.usage import record_snapshot_async
@@ -716,10 +793,7 @@ class CodexEventTranslator:
         status = turn.get("status", "completed")
         if status == "failed":
             err = turn.get("error", {}) or {}
-            return sweep + [
-                CommonEvent(type=ERROR, data={"message": err.get("message", "Turn failed")}),
-                CommonEvent(type=DONE),
-            ]
+            return sweep + [self._error_event(err, "Turn failed"), CommonEvent(type=DONE)]
         if status == "interrupted":
             # Abort path — the turn was interrupted; just close it out.
             return sweep + [CommonEvent(type=DONE)]

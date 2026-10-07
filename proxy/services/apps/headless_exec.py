@@ -148,7 +148,7 @@ def _bundles_with_token_files(agent: str, identity: "TaskIdentity", secret_bundl
     return {k: v for k, v in bundles.items() if k in mcps}
 
 
-def _build_session_parts(agent: str, row: dict, mcps: frozenset[str]):
+def _build_session_parts(agent: str, row: dict, mcps: frozenset[str], session_id: str = ""):
     """Blocking build (runs in a thread): MCP config for the app's identity,
     sandbox builder, and the SecurityContext to register. Mirrors
     ``task_config_builder`` (identity/visibility/path_env) and the Direct-LLM
@@ -182,6 +182,7 @@ def _build_session_parts(agent: str, row: dict, mcps: frozenset[str]):
     mcp_config, credential_env, _excl, secret_bundles, _bash = (
         mcp_registry.build_session_mcp_config(
             agent, identity.creds_user_sub,
+            session_id=session_id,
             task_mode=True,
             task_scope=identity.scope,
             username=identity.username,
@@ -271,13 +272,16 @@ async def _create_entry(agent: str, row: dict, scope_key: str,
                         mcps: frozenset[str]) -> _Entry:
     session_id = f"appx-{uuid.uuid4().hex[:12]}"
     mcp_config, bundles, credential_env, builder, ctx = await asyncio.to_thread(
-        _build_session_parts, agent, row, mcps,
+        _build_session_parts, agent, row, mcps, session_id,
     )
     # Register the synthetic session BEFORE start: MCP subprocesses hold a
     # session JWT (minted in build_session_env) and their hook callbacks
     # (resolve-path, display, …) resolve through this context.
-    from core.session.session_state import set_session_security, _record_session_use
+    from core.session.session_state import (
+        set_session_security, _record_session_use, mark_headless_live,
+    )
     set_session_security(session_id, ctx)
+    mark_headless_live(session_id)
     _record_session_use(session_id, client_type=session_kind.APP.name, agent=agent)
 
     mgr = AgentMCPManager(
@@ -307,7 +311,11 @@ async def _dispose(entry: _Entry) -> None:
     """Full synthetic-session teardown: close (terminates bwrap children)
     → permission-state cleanup (security ctx + brokered secrets). Each step
     best-effort so one failure never strands the rest."""
-    from core.session.session_state import cleanup_session_permission_state
+    from core.session.session_state import (
+        cleanup_session_permission_state, clear_headless_live, mark_closing,
+    )
+    mark_closing(entry.session_id)
+    clear_headless_live(entry.session_id)
     try:
         await entry.manager.close()
     except Exception:

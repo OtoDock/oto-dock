@@ -265,7 +265,7 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
             setCustomTexts((prev) => ({ ...prev, [activeTab]: e.target.value }))
           }
           placeholder={q.options ? 'Or type a custom response...' : 'Type your answer...'}
-          className="mt-2 w-full px-3 py-1.5 rounded-md border border-gray-200 dark:border-gray-700 text-sm
+          className="mt-2 w-full px-3 py-1.5 rounded-md border border-gray-200 dark:border-gray-700 text-sm pointer-coarse:text-base
                      focus:outline-hidden focus:ring-2 focus:ring-blue-400 focus:border-transparent
                      bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light"
         />

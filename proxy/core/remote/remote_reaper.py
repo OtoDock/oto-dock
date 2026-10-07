@@ -73,6 +73,8 @@ async def reap_idle_remote_sessions() -> None:
                 # per-machine is_pty_in_grace).
                 connected = (layer._cm.is_connected(info.machine_id)
                              or layer._cm.is_session_in_grace(info.machine_id, sid))
+                if connected and _state.has_pending_prompt(sid):
+                    continue  # a prompt waits on a person; its own wait bounds it
                 if info.turn_active and connected:
                     # Mid-turn event silence is not idleness: a network stall
                     # on the satellite box leaves the CLI alive and working

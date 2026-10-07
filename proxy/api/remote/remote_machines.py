@@ -24,12 +24,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_admin, require_auth
 from services.remote.remote_status import get_live_machine_status
 from core import placement
 from core import host_os
 from storage import remote_store
 from storage.agents import agent_store
+from storage.pg import run_db
 from auth import roles
 
 
@@ -39,8 +40,11 @@ def _merge_live_status(machine: dict) -> dict:
     The DB `status` column is updated on lifecycle events only and lags the
     live connection state. Callers should never return the raw DB `status`
     to API clients; use this wrapper instead.
+
+    Runs on the loop: the row the caller already holds is handed to the
+    status helper so it never re-reads the store for an offline machine.
     """
-    live = get_live_machine_status(machine["id"])
+    live = get_live_machine_status(machine["id"], machine=machine)
     machine["status"] = live["state"]
     machine["last_heartbeat_age_s"] = live["last_heartbeat_age_s"]
     machine["reachable"] = live["reachable"]
@@ -296,7 +300,7 @@ async def serve_bootstrap(request: Request):
     # Atomic exchange: validates token, returns machine_secret, clears
     # the pairing token from the DB (one-time use). Failure modes:
     # invalid token, expired token, already-exchanged token.
-    try:
+    def _exchange() -> tuple[str, str] | None:
         import hashlib as _h
         token_hash = _h.sha256(token.encode()).hexdigest()
         with __import__("storage.pg", fromlist=["get_conn"]).get_conn() as conn:
@@ -305,16 +309,21 @@ async def serve_bootstrap(request: Request):
                 (token_hash,),
             ).fetchone()
         if not row:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid or already-exchanged pairing token",
-            )
-        machine_id = row["id"]
-        machine_secret = remote_store.exchange_pairing_token(
-            machine_id=machine_id, pairing_token=token,
+            return None
+        return row["id"], remote_store.exchange_pairing_token(
+            machine_id=row["id"], pairing_token=token,
         )
+
+    try:
+        exchanged = await run_db(_exchange)
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
+    if not exchanged:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or already-exchanged pairing token",
+        )
+    machine_id, machine_secret = exchanged
 
     import config as _cfg
     public_host = _cfg.get_platform_public_url()
@@ -603,6 +612,10 @@ class SetBrowserTokenRequest(BaseModel):
     token: str
 
 
+class SetBrowserUnattendedRequest(BaseModel):
+    enabled: bool
+
+
 class ExchangeTokenRequest(BaseModel):
     machine_id: str
     pairing_token: str
@@ -613,13 +626,6 @@ class AssignAgentRequest(BaseModel):
 
 
 # --- Helpers ---
-
-
-def _require_admin(user: UserContext | None) -> UserContext:
-    u = require_auth(user)
-    if not u.is_admin:
-        raise HTTPException(status_code=403, detail="Admin required")
-    return u
 
 
 # --- Pairing endpoints ---
@@ -635,7 +641,7 @@ async def pair_machine(
     Returns the machine_id, pairing_token, and an install command
     that can be run on the remote machine.
     """
-    _require_admin(user)
+    require_admin(user)
     _require_satellite_source()
 
     # Admin pairing defaults to home-only (least privilege / opt-in full-FS).
@@ -645,7 +651,8 @@ async def pair_machine(
     allow_full_fs = body.allow_full_fs if body.allow_full_fs is not None else False
     machine_id = str(uuid.uuid4())
     try:
-        result = remote_store.create_remote_machine(
+        result = await run_db(
+            remote_store.create_remote_machine,
             machine_id=machine_id,
             name=body.name.strip(),
             registered_by=user.sub,
@@ -692,8 +699,8 @@ async def pair_machine(
 @router.get("/v1/admin/remote-machines")
 async def list_machines(user: UserContext | None = Depends(get_current_user)):
     """List all remote machines with status and assigned agents."""
-    _require_admin(user)
-    machines = remote_store.get_all_remote_machines()
+    require_admin(user)
+    machines = await run_db(remote_store.get_all_remote_machines)
     # Parse capabilities JSON + merge live WS status for frontend
     import json
 
@@ -721,8 +728,15 @@ async def get_machine(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Get a single remote machine with details."""
-    _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
+    require_admin(user)
+
+    def _job() -> tuple[dict | None, list[str]]:
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
+            return None, []
+        return machine, remote_store.get_agents_for_machine(machine_id)
+
+    machine, assigned_agents = await run_db(_job)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     import json
@@ -733,7 +747,7 @@ async def get_machine(
     # device_grants TEXT JSON-array → list for the dashboard.
     machine["device_grants"] = sorted(placement.parse_device_grants(machine.get("device_grants")))
     _shape_browser_fields(machine)
-    machine["assigned_agents"] = remote_store.get_agents_for_machine(machine_id)
+    machine["assigned_agents"] = assigned_agents
     machine["cli_pins"] = _cli_pins_by_binary()
     _merge_live_status(machine)
     return machine
@@ -777,12 +791,12 @@ async def delete_machine(
     (auth handler rejects with close code 4006 ``machine_deleted``).
     A user-paired machine's owner (when it is not the caller) is notified.
     """
-    u = _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
+    u = require_admin(user)
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     await _trigger_self_uninstall(machine_id)
-    remote_store.delete_remote_machine(machine_id)
+    await run_db(remote_store.delete_remote_machine, machine_id)
     owner = machine.get("registered_by") or ""
     if machine.get("pairing_scope") == placement.PAIRING_USER and owner and owner != u.sub:
         await _notify_owner_machine_removed(machine, owner)
@@ -813,15 +827,22 @@ async def self_uninstall_notify(
     by definition when it calls this; no need to send it a WS message
     telling it to do so.
     """
-    machine = remote_store.get_remote_machine(machine_id)
-    if machine is None:
+    def _job() -> str:
+        if remote_store.get_remote_machine(machine_id) is None:
+            return "missing"
+        if not remote_store.verify_machine_secret(machine_id, x_machine_secret):
+            return "bad_secret"
+        remote_store.delete_remote_machine(machine_id)
+        return "deleted"
+
+    outcome = await run_db(_job)
+    if outcome == "missing":
         # Already deleted (or never existed). Return success — the
         # satellite's local cleanup already proceeded; we just confirm
         # there's no dashboard record to clean.
         return {"ok": True, "deleted": False}
-    if not remote_store.verify_machine_secret(machine_id, x_machine_secret):
+    if outcome == "bad_secret":
         raise HTTPException(status_code=401, detail="Invalid machine secret")
-    remote_store.delete_remote_machine(machine_id)
     return {"ok": True, "deleted": True}
 
 
@@ -837,11 +858,7 @@ async def sync_mcps_now(
     target is this machine. Progress is logged to proxy.log; the admin can
     watch there while the request runs (may take 30-60s on a cold machine).
     """
-    _require_admin(user)
-
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
-        raise HTTPException(status_code=404, detail="Machine not found")
+    require_admin(user)
 
     from services.mcp import mcp_sync, mcp_registry
 
@@ -851,11 +868,18 @@ async def sync_mcps_now(
     # after a manager flips an explicit MCP on would fail because the satellite
     # hadn't installed it yet. Cost: the satellite installs MCPs that may
     # never be enabled. Acceptable for v1.
-    assigned_union: set[str] = set()
-    agent_slugs = remote_store.get_agents_for_machine(machine_id)
-    for slug in agent_slugs:
-        for manifest in mcp_registry.get_visible_mcps_for_agent(slug):
-            assigned_union.add(manifest.name)
+    def _job() -> set[str] | None:
+        if not remote_store.get_remote_machine(machine_id):
+            return None
+        union: set[str] = set()
+        for slug in remote_store.get_agents_for_machine(machine_id):
+            for manifest in mcp_registry.get_visible_mcps_for_agent(slug):
+                union.add(manifest.name)
+        return union
+
+    assigned_union = await run_db(_job)
+    if assigned_union is None:
+        raise HTTPException(status_code=404, detail="Machine not found")
 
     result = await mcp_sync.sync_mcps_for_session(
         machine_id, session_id="", agent_assigned_mcps=list(assigned_union),
@@ -887,11 +911,16 @@ async def set_machine_auto_update(
     rejects version-mismatched satellites instead of pushing the new
     tarball — admin must click "Update now" to trigger the push.
     """
-    _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
+    require_admin(user)
+
+    def _job() -> dict | None:
+        machine = remote_store.get_remote_machine(machine_id)
+        if machine:
+            remote_store.set_auto_update_enabled(machine_id, body.enabled)
+        return machine
+
+    if not await run_db(_job):
         raise HTTPException(status_code=404, detail="Machine not found")
-    remote_store.set_auto_update_enabled(machine_id, body.enabled)
     return {"ok": True, "auto_update_enabled": body.enabled}
 
 
@@ -919,11 +948,16 @@ async def admin_set_allow_full_fs(
     immediately. Without this the satellite would keep the stale
     policy until the next reconnect.
     """
-    _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
+    require_admin(user)
+
+    def _job() -> dict | None:
+        machine = remote_store.get_remote_machine(machine_id)
+        if machine:
+            remote_store.set_allow_full_fs(machine_id, body.enabled)
+        return machine
+
+    if not await run_db(_job):
         raise HTTPException(status_code=404, detail="Machine not found")
-    remote_store.set_allow_full_fs(machine_id, body.enabled)
     await _push_policy_update(machine_id)
     return {"ok": True, "allow_full_fs": body.enabled}
 
@@ -944,7 +978,7 @@ async def admin_set_max_sessions(
     (``machine_at_capacity``) honors this; the satellite hard-caps at its
     physical max on its own, so no push is needed.
     """
-    _require_admin(user)
+    require_admin(user)
     from storage.pg import run_db
     machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
@@ -972,21 +1006,27 @@ async def user_set_allow_full_fs(
     machines (the user is not the registering admin) reject with 403.
     """
     u = _require_user_authenticated(user)
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
-        raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") != placement.PAIRING_USER:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This is an admin-paired (platform) machine. Ask an "
-                "admin to flip the toggle from the admin Remote "
-                "Machines page."
-            ),
-        )
-    if machine["registered_by"] != u.sub:
-        raise HTTPException(status_code=403, detail="Not your machine")
-    remote_store.set_allow_full_fs(machine_id, body.enabled)
+
+    # The ownership gates sit between the read and the write, so they run
+    # in the job; an HTTPException raised there reaches the client unchanged.
+    def _job() -> None:
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
+            raise HTTPException(status_code=404, detail="Machine not found")
+        if machine.get("pairing_scope") != placement.PAIRING_USER:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This is an admin-paired (platform) machine. Ask an "
+                    "admin to flip the toggle from the admin Remote "
+                    "Machines page."
+                ),
+            )
+        if machine["registered_by"] != u.sub:
+            raise HTTPException(status_code=403, detail="Not your machine")
+        remote_store.set_allow_full_fs(machine_id, body.enabled)
+
+    await run_db(_job)
     await _push_policy_update(machine_id)
     return {"ok": True, "allow_full_fs": body.enabled}
 
@@ -1027,12 +1067,18 @@ async def admin_set_device_grants(
     Admin can set this on ANY machine (admin-paired AND user-paired). Pushes a
     ``policy_update`` so a connected satellite + warm sessions refresh live.
     """
-    _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
+    require_admin(user)
+
+    def _job() -> list[str] | None:
+        if not remote_store.get_remote_machine(machine_id):
+            return None
+        grants = _validate_device_grants(body.grants)
+        remote_store.set_device_grants(machine_id, grants)
+        return grants
+
+    grants = await run_db(_job)
+    if grants is None:
         raise HTTPException(status_code=404, detail="Machine not found")
-    grants = _validate_device_grants(body.grants)
-    remote_store.set_device_grants(machine_id, grants)
     await _push_policy_update(machine_id)
     return {"ok": True, "device_grants": grants}
 
@@ -1049,21 +1095,26 @@ async def user_set_device_grants(
     stops an admin reaching a user's PRIVATE laptop with device control.
     """
     u = _require_user_authenticated(user)
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
-        raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") != placement.PAIRING_USER:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This is an admin-paired (platform) machine. Ask an admin to "
-                "set device-control grants from the admin Remote Machines page."
-            ),
-        )
-    if machine["registered_by"] != u.sub:
-        raise HTTPException(status_code=403, detail="Not your machine")
-    grants = _validate_device_grants(body.grants)
-    remote_store.set_device_grants(machine_id, grants)
+
+    def _job() -> list[str]:
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
+            raise HTTPException(status_code=404, detail="Machine not found")
+        if machine.get("pairing_scope") != placement.PAIRING_USER:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This is an admin-paired (platform) machine. Ask an admin to "
+                    "set device-control grants from the admin Remote Machines page."
+                ),
+            )
+        if machine["registered_by"] != u.sub:
+            raise HTTPException(status_code=403, detail="Not your machine")
+        grants = _validate_device_grants(body.grants)
+        remote_store.set_device_grants(machine_id, grants)
+        return grants
+
+    grants = await run_db(_job)
     await _push_policy_update(machine_id)
     return {"ok": True, "device_grants": grants}
 
@@ -1109,8 +1160,10 @@ def _normalize_browser_token(raw: str) -> str:
     return tok
 
 
+# The four helpers below read or write the store: routes call them inside a
+# ``run_db`` job, never on the loop.
 def _browser_machine_for_admin(machine_id: str, user: UserContext | None) -> dict:
-    _require_admin(user)
+    require_admin(user)
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
@@ -1174,6 +1227,17 @@ def _apply_browser_token(machine: dict, token: str | None) -> dict:
     return {"ok": True, "browser_extension_token_set": True}
 
 
+def _apply_browser_unattended(machine: dict, enabled: bool) -> dict:
+    """Whether unattended sessions (tasks, calls, meetings) get the saved
+    own-browser token; off, a session a person drives still does."""
+    if enabled and remote_store._parse_browser_mode(machine.get("browser_mode")) != "own":
+        raise HTTPException(
+            status_code=422, detail="Turn on \"Use my own browser\" first.",
+        )
+    remote_store.set_browser_unattended(machine["id"], enabled)
+    return {"ok": True, "browser_unattended": bool(enabled)}
+
+
 @router.put("/v1/admin/remote-machines/{machine_id}/browser-mode")
 async def admin_set_browser_mode(
     machine_id: str,
@@ -1185,7 +1249,10 @@ async def admin_set_browser_mode(
     (422). The stored extension token survives a switch back to ``dedicated``;
     it is only delivered while the mode is ``own``. User-paired machines reject
     with 403 (the owner decides)."""
-    return _apply_browser_mode(_browser_machine_for_admin(machine_id, user), body.mode)
+    def _job() -> dict:
+        return _apply_browser_mode(_browser_machine_for_admin(machine_id, user), body.mode)
+
+    return await run_db(_job)
 
 
 @router.put("/v1/admin/remote-machines/{machine_id}/browser-token")
@@ -1198,7 +1265,10 @@ async def admin_set_browser_token(
     ``own`` mode (422 otherwise). The value is encrypted at rest and never
     returned; ``browser_extension_token_set`` on the machine row says whether
     one is stored."""
-    return _apply_browser_token(_browser_machine_for_admin(machine_id, user), body.token)
+    def _job() -> dict:
+        return _apply_browser_token(_browser_machine_for_admin(machine_id, user), body.token)
+
+    return await run_db(_job)
 
 
 @router.delete("/v1/admin/remote-machines/{machine_id}/browser-token")
@@ -1208,7 +1278,37 @@ async def admin_clear_browser_token(
 ):
     """Forget the stored extension token — sessions go back to asking for a
     click in the browser."""
-    return _apply_browser_token(_browser_machine_for_admin(machine_id, user), None)
+    def _job() -> dict:
+        return _apply_browser_token(_browser_machine_for_admin(machine_id, user), None)
+
+    return await run_db(_job)
+
+
+@router.put("/v1/admin/remote-machines/{machine_id}/browser-unattended")
+async def admin_set_browser_unattended(
+    machine_id: str,
+    body: SetBrowserUnattendedRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Let unattended sessions on an ADMIN-paired machine use its saved
+    own-browser token (``{enabled}``; turning it on needs ``own`` mode)."""
+    def _job() -> dict:
+        return _apply_browser_unattended(_browser_machine_for_admin(machine_id, user), body.enabled)
+
+    return await run_db(_job)
+
+
+@router.put("/v1/users/me/remote-machines/{machine_id}/browser-unattended")
+async def user_set_browser_unattended(
+    machine_id: str,
+    body: SetBrowserUnattendedRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Owner-scoped twin of the admin route."""
+    def _job() -> dict:
+        return _apply_browser_unattended(_browser_machine_for_owner(machine_id, user), body.enabled)
+
+    return await run_db(_job)
 
 
 @router.put("/v1/users/me/remote-machines/{machine_id}/browser-mode")
@@ -1220,7 +1320,10 @@ async def user_set_browser_mode(
     """Owner-scoped browser-control mode (user-paired machines only; 403 for
     admin-paired and for anyone but the pairing user). Same body + rules as
     the admin route."""
-    return _apply_browser_mode(_browser_machine_for_owner(machine_id, user), body.mode)
+    def _job() -> dict:
+        return _apply_browser_mode(_browser_machine_for_owner(machine_id, user), body.mode)
+
+    return await run_db(_job)
 
 
 @router.put("/v1/users/me/remote-machines/{machine_id}/browser-token")
@@ -1230,7 +1333,10 @@ async def user_set_browser_token(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Owner-scoped: store the extension token of the caller's own machine."""
-    return _apply_browser_token(_browser_machine_for_owner(machine_id, user), body.token)
+    def _job() -> dict:
+        return _apply_browser_token(_browser_machine_for_owner(machine_id, user), body.token)
+
+    return await run_db(_job)
 
 
 @router.delete("/v1/users/me/remote-machines/{machine_id}/browser-token")
@@ -1239,7 +1345,10 @@ async def user_clear_browser_token(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Owner-scoped: forget the stored extension token."""
-    return _apply_browser_token(_browser_machine_for_owner(machine_id, user), None)
+    def _job() -> dict:
+        return _apply_browser_token(_browser_machine_for_owner(machine_id, user), None)
+
+    return await run_db(_job)
 
 
 def _shape_browser_fields(machine: dict) -> None:
@@ -1248,6 +1357,7 @@ def _shape_browser_fields(machine: dict) -> None:
     leaves the store)."""
     machine["browser_mode"] = remote_store._parse_browser_mode(machine.get("browser_mode"))
     machine["browser_extension_token_set"] = bool(machine.get("browser_extension_token_set"))
+    machine["browser_unattended"] = bool(machine.get("browser_unattended"))
 
 
 async def _push_policy_update(machine_id: str) -> None:
@@ -1265,8 +1375,11 @@ async def _push_policy_update(machine_id: str) -> None:
     targeting this machine — that cache is the primary gate (Read/Write/Edit/
     Bash/MCP, plus the device-control auto-approve), baked at warmup and
     otherwise stale until re-warm.
+
+    Only the row read leaves the loop; the session-state refresh and the
+    send stay on it.
     """
-    machine = remote_store.get_remote_machine(machine_id) or {}
+    machine = await run_db(remote_store.get_remote_machine, machine_id) or {}
     allow_full_fs = bool(machine.get("allow_full_fs") or False)
     device_grants = sorted(placement.parse_device_grants(machine.get("device_grants")))
     try:
@@ -1302,10 +1415,38 @@ async def _push_policy_update(machine_id: str) -> None:
         )
 
 
+#: The refusal of an update to a machine on a plaintext link, in the words of
+#: the auth path's (``ws/satellite.py``): the satellite takes no code over it.
+_PLAINTEXT_UPDATE_REFUSAL = (
+    "This machine's link is plaintext, so no update is pushed to it: "
+    "re-run the installer there."
+)
+
+
+def _plaintext_link(conn, machine: dict) -> bool:
+    """Whether the machine runs on a plaintext link it opted into
+    (``insecure_transport``): the live connection's capabilities, else the
+    ones it last reported (the row's JSON column)."""
+    if conn is not None:
+        caps = getattr(conn, "capabilities", None) or {}
+    else:
+        caps = machine.get("capabilities") or {}
+        if isinstance(caps, str):
+            import json
+            try:
+                caps = json.loads(caps)
+            except ValueError:
+                caps = {}
+    return isinstance(caps, dict) and bool(caps.get("insecure_transport"))
+
+
 async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
     """Shared logic for the admin and user "Update now" endpoints.
     Pushes the tarball if connected, else sets pending_update for next
-    reconnect. Caller is responsible for authorization."""
+    reconnect. A machine on a plaintext link it opted into takes no code
+    over it (the satellite refuses ``update_required``, and the auth path
+    never pushes to it): 409, nothing sent, queued or announced. Caller is
+    responsible for authorization."""
     _require_satellite_source()
     from core.remote.satellite_connection import get_connection_manager
     from ws.satellite import (
@@ -1316,7 +1457,11 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
     import base64 as _b64
 
     cm = get_connection_manager()
-    if cm.is_connected(machine_id):
+    connected = cm.is_connected(machine_id)
+    live = cm.get_connection(machine_id) if connected else None
+    if _plaintext_link(live, machine):
+        raise HTTPException(status_code=409, detail=_PLAINTEXT_UPDATE_REFUSAL)
+    if connected:
         tarball_bytes, expected_sha256 = get_satellite_tarball_with_hash()
         conn = cm.get_connection(machine_id)
         if conn is not None:
@@ -1344,7 +1489,7 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
 
     # Offline: set pending_update so the next reconnect triggers the
     # push even if auto_update_enabled is False.
-    remote_store.set_pending_update(machine_id, True)
+    await run_db(remote_store.set_pending_update, machine_id, True)
     return {"ok": True, "queued": True, "pushed_now": False}
 
 
@@ -1358,8 +1503,8 @@ async def trigger_machine_update_now(
     and closes the WS with code 4007. If offline, sets pending_update so
     the next reconnect triggers the push (bypassing the auto_update gate).
     """
-    _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
+    require_admin(user)
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     return await _do_trigger_update_now(machine_id, machine)
@@ -1375,46 +1520,49 @@ async def assign_agent(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Assign an agent to run on a remote machine."""
-    _require_admin(user)
+    require_admin(user)
 
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
-        raise HTTPException(status_code=404, detail="Machine not found")
+    def _job() -> None:
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
+            raise HTTPException(status_code=404, detail="Machine not found")
 
-    # Per-user satellite isolation: agent default execution targets must
-    # point at admin-paired machines. User-paired machines belong to one
-    # user's personal sessions only; allowing them as an agent default
-    # would let any session on that agent expose data to a user-owned
-    # satellite the rest of the agent's users can't see.
-    if not placement.machine_is_admin_paired(machine):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Agent default execution targets must be admin-paired "
-                f"machines. Machine '{machine.get('name', machine_id)}' "
-                "was paired via User Settings (personal scope). The user "
-                "may attach it as a per-user override there instead."
-            ),
+        # Per-user satellite isolation: agent default execution targets must
+        # point at admin-paired machines. User-paired machines belong to one
+        # user's personal sessions only; allowing them as an agent default
+        # would let any session on that agent expose data to a user-owned
+        # satellite the rest of the agent's users can't see.
+        if not placement.machine_is_admin_paired(machine):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Agent default execution targets must be admin-paired "
+                    f"machines. Machine '{machine.get('name', machine_id)}' "
+                    "was paired via User Settings (personal scope). The user "
+                    "may attach it as a per-user override there instead."
+                ),
+            )
+
+        if not agent_store.agent_exists(body.agent_slug):
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        # An engine that cannot run on a satellite cannot be assigned one
+        agent = agent_store.get_agent(body.agent_slug)
+        from core.session.session_manager import get_layer_capabilities
+        _ac = get_layer_capabilities((agent or {}).get("execution_path") or "") if agent else None
+        if _ac is not None and not _ac.runtime.supports_remote_execution:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{_ac.display_name} agents always run locally (API calls, no subprocess)",
+            )
+
+        remote_store.set_agent_remote_target(
+            agent_slug=body.agent_slug,
+            machine_id=machine_id,
+            added_by=user.sub,
         )
 
-    if not agent_store.agent_exists(body.agent_slug):
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-    # An engine that cannot run on a satellite cannot be assigned one
-    agent = agent_store.get_agent(body.agent_slug)
-    from core.session.session_manager import get_layer_capabilities
-    _ac = get_layer_capabilities((agent or {}).get("execution_path") or "") if agent else None
-    if _ac is not None and not _ac.runtime.supports_remote_execution:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{_ac.display_name} agents always run locally (API calls, no subprocess)",
-        )
-
-    remote_store.set_agent_remote_target(
-        agent_slug=body.agent_slug,
-        machine_id=machine_id,
-        added_by=user.sub,
-    )
+    await run_db(_job)
     _kick_presync(machine_id, body.agent_slug)
     return {"ok": True}
 
@@ -1426,8 +1574,8 @@ async def unassign_agent(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Remove an agent's remote target, resetting it to local execution."""
-    _require_admin(user)
-    remote_store.remove_agent_remote_target(agent_slug)
+    require_admin(user)
+    await run_db(remote_store.remove_agent_remote_target, agent_slug)
     return {"ok": True}
 
 
@@ -1478,9 +1626,16 @@ async def list_my_machines(user: UserContext | None = Depends(get_current_user))
     infrastructure stays in the admin dashboard).
     """
     u = _require_user_authenticated(user)
-    machines = remote_store.get_visible_machines_for_user(
-        u.sub, include_admin_paired=u.is_admin,
-    )
+
+    def _job() -> tuple[list[dict], list[dict]]:
+        return (
+            remote_store.get_visible_machines_for_user(
+                u.sub, include_admin_paired=u.is_admin,
+            ),
+            remote_store.get_user_remote_targets(u.sub),
+        )
+
+    machines, targets = await run_db(_job)
     import json
     for m in machines:
         try:
@@ -1492,7 +1647,6 @@ async def list_my_machines(user: UserContext | None = Depends(get_current_user))
         m["device_grants"] = sorted(placement.parse_device_grants(m.get("device_grants")))
         _shape_browser_fields(m)
         _merge_live_status(m)
-    targets = remote_store.get_user_remote_targets(u.sub)
     return {
         "machines": machines,
         "targets": targets,
@@ -1508,29 +1662,35 @@ async def pair_my_machine(
     u = _require_user_authenticated(user)
     _require_satellite_source()
 
-    # Admin kill-switch. When off, user pairing is refused outright.
     from storage import database as _db
-    if _db.get_platform_setting("allow_user_paired_machines") == "0":
-        raise HTTPException(
-            status_code=403,
-            detail="User-paired machines are disabled by your administrator.",
-        )
 
     # User pairing defaults to home-only (the safer baseline for
     # personal laptops). The user can flip the toggle in the pairing
     # modal to opt into full-FS access.
     allow_full_fs = body.allow_full_fs if body.allow_full_fs is not None else False
     machine_id = str(uuid.uuid4())
-    try:
-        result = remote_store.create_remote_machine(
+
+    def _job() -> dict | None:
+        # Admin kill-switch. When off, user pairing is refused outright.
+        if _db.get_platform_setting("allow_user_paired_machines") == "0":
+            return None
+        return remote_store.create_remote_machine(
             machine_id=machine_id,
             name=body.name.strip(),
             registered_by=u.sub,
             pairing_scope="user",
             allow_full_fs=allow_full_fs,
         )
+
+    try:
+        result = await run_db(_job)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    if result is None:
+        raise HTTPException(
+            status_code=403,
+            detail="User-paired machines are disabled by your administrator.",
+        )
 
     import config as _cfg
     public_host = _cfg.get_platform_public_url()
@@ -1569,7 +1729,7 @@ async def delete_my_machine(
     Triggers self-uninstall on the satellite before removing the row.
     """
     u = _require_user_authenticated(user)
-    machine = remote_store.get_remote_machine(machine_id)
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     if machine.get("pairing_scope") != placement.PAIRING_USER:
@@ -1583,7 +1743,7 @@ async def delete_my_machine(
     if machine["registered_by"] != u.sub:
         raise HTTPException(status_code=403, detail="Not your machine")
     await _trigger_self_uninstall(machine_id)
-    remote_store.delete_remote_machine(machine_id)
+    await run_db(remote_store.delete_remote_machine, machine_id)
     return {"ok": True}
 
 
@@ -1597,12 +1757,16 @@ async def set_my_machine_auto_update(
     machines — sensitive servers can be pinned by their owner without
     needing admin intervention."""
     u = _require_user_authenticated(user)
-    machine = remote_store.get_remote_machine(machine_id)
-    if not machine:
-        raise HTTPException(status_code=404, detail="Machine not found")
-    if machine["registered_by"] != u.sub and not u.is_admin:
-        raise HTTPException(status_code=403, detail="Not your machine")
-    remote_store.set_auto_update_enabled(machine_id, body.enabled)
+
+    def _job() -> None:
+        machine = remote_store.get_remote_machine(machine_id)
+        if not machine:
+            raise HTTPException(status_code=404, detail="Machine not found")
+        if machine["registered_by"] != u.sub and not u.is_admin:
+            raise HTTPException(status_code=403, detail="Not your machine")
+        remote_store.set_auto_update_enabled(machine_id, body.enabled)
+
+    await run_db(_job)
     return {"ok": True, "auto_update_enabled": body.enabled}
 
 
@@ -1614,7 +1778,7 @@ async def trigger_my_machine_update_now(
     """Mirror of the admin update-now trigger for owners of user-paired
     machines."""
     u = _require_user_authenticated(user)
-    machine = remote_store.get_remote_machine(machine_id)
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     if machine["registered_by"] != u.sub and not u.is_admin:
@@ -1676,7 +1840,7 @@ async def list_my_remote_targets(
     users select per-agent in the dashboard UI.
     """
     u = _require_user_authenticated(user)
-    targets = remote_store.get_user_remote_targets(u.sub)
+    targets = await run_db(remote_store.get_user_remote_targets, u.sub)
     return {"targets": targets}
 
 
@@ -1699,42 +1863,46 @@ async def set_my_per_agent_target(
     if not agent_slug:
         raise HTTPException(status_code=400, detail="agent_slug required")
 
-    # Access gate: user must be assigned to the agent.
     from storage import database as _db
-    if not u.is_admin:
-        roles = _db.get_user_agent_roles(u.sub)
-        if agent_slug not in roles:
-            raise HTTPException(
-                status_code=403,
-                detail="Not assigned to this agent",
-            )
 
-    machine = remote_store.get_remote_machine(body.machine_id)
-    if not machine:
-        raise HTTPException(status_code=404, detail="Machine not found")
-    # Ownership gate: non-admins can only target machines they paired.
-    if not u.is_admin and machine.get("registered_by") != u.sub:
-        raise HTTPException(status_code=403, detail="Not your machine")
+    def _job() -> None:
+        # Access gate: user must be assigned to the agent.
+        if not u.is_admin:
+            roles = _db.get_user_agent_roles(u.sub)
+            if agent_slug not in roles:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Not assigned to this agent",
+                )
 
-    # Shared-only (agent-scoped) agents have ONE shared chat history across ALL
-    # users — they may not be pinned to a personal (user-paired) machine, which
-    # must hold only that user's own scoped chats. They run on admin machines
-    # only. (If the agent later leaves shared-only mode, personal overrides are
-    # allowed again; switching INTO shared-only purges existing ones.)
-    if (machine.get("pairing_scope") or "") == placement.PAIRING_USER:
-        from core.session import visibility
-        if visibility.is_shared_only(agent_slug):
-            raise HTTPException(
-                status_code=400,
-                detail=("This agent is shared-only (agent-scoped): its chats are "
-                        "shared across all users, so it can't run on a personal "
-                        "machine. Shared-only agents run on admin machines only."),
-            )
+        machine = remote_store.get_remote_machine(body.machine_id)
+        if not machine:
+            raise HTTPException(status_code=404, detail="Machine not found")
+        # Ownership gate: non-admins can only target machines they paired.
+        if not u.is_admin and machine.get("registered_by") != u.sub:
+            raise HTTPException(status_code=403, detail="Not your machine")
 
-    try:
-        remote_store.set_user_remote_target(u.sub, body.machine_id, agent_slug)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Shared-only (agent-scoped) agents have ONE shared chat history across ALL
+        # users — they may not be pinned to a personal (user-paired) machine, which
+        # must hold only that user's own scoped chats. They run on admin machines
+        # only. (If the agent later leaves shared-only mode, personal overrides are
+        # allowed again; switching INTO shared-only purges existing ones.)
+        if (machine.get("pairing_scope") or "") == placement.PAIRING_USER:
+            from core.session import visibility
+            if visibility.is_shared_only(agent_slug):
+                raise HTTPException(
+                    status_code=400,
+                    detail=("This agent is shared-only (agent-scoped): its chats are "
+                            "shared across all users, so it can't run on a personal "
+                            "machine. Shared-only agents run on admin machines only."),
+                )
+
+        try:
+            remote_store.set_user_remote_target(u.sub, body.machine_id, agent_slug)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    await run_db(_job)
     _kick_presync(body.machine_id, agent_slug)
     return {"ok": True}
 
@@ -1749,5 +1917,5 @@ async def remove_my_per_agent_target(
     u = _require_user_authenticated(user)
     if not agent_slug:
         raise HTTPException(status_code=400, detail="agent_slug required")
-    remote_store.remove_user_remote_target(u.sub, agent_slug)
+    await run_db(remote_store.remove_user_remote_target, u.sub, agent_slug)
     return {"ok": True}

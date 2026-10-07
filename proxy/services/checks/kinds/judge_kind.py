@@ -284,6 +284,11 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
     else:
         target_override = target.chat.get("execution_target") or (
             where.machine_id if target.on_machine else placement.LOCAL)
+    from services.checks import documents
+    problem = await asyncio.to_thread(documents.judge_envelope_problem, target.agent, judge)
+    if problem:
+        # A pin the agent no longer enables never runs on that engine.
+        return Verdict(section="judge", status="error", duration_ms=ms(), reason=problem)
     inputs = await asyncio.to_thread(_read_inputs, target.agent, target.security,
                                      list(check.doc.get("inputs") or []))
     prompt = build_prompt(check, target, changed, inputs)

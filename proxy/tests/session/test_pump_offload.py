@@ -302,3 +302,162 @@ def test_a_failed_search_rebuild_keeps_the_rows_and_warns(temp_db, monkeypatch, 
         "kept", "also kept"]
     warnings = [r for r in caplog.records if "chat_search rebuild failed" in r.getMessage()]
     assert len(warnings) == 1          # rate-limited
+
+
+def _batch_fallbacks(monkeypatch) -> list:
+    """Record the row-by-row fallback's writes (the batch calls the module's
+    own ``add_chat_message``)."""
+    from storage.chat import db_chats
+    calls: list = []
+    real = db_chats.add_chat_message
+
+    def recording(*a, **kw):
+        calls.append(a)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(db_chats, "add_chat_message", recording)
+    return calls
+
+
+@pytest.mark.parametrize("error", ["operational", "pool_timeout"])
+def test_a_connection_failure_fails_the_batch_once(temp_db, monkeypatch, error):
+    """A failure of the connection or the pool is not a row's fault: the
+    batch raises once instead of retrying every row through the same broken
+    path."""
+    import psycopg
+    import psycopg_pool
+    from storage.chat import db_chats
+    temp_db.create_chat("po-conn", "user-admin", "a1")
+    fallbacks = _batch_fallbacks(monkeypatch)
+    exc = (psycopg.OperationalError("server closed the connection unexpectedly")
+           if error == "operational" else psycopg_pool.PoolTimeout("couldn't get a connection"))
+
+    def broken(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(db_chats, "get_conn", broken)
+    with pytest.raises(type(exc)):
+        task_store.add_chat_messages_batch("po-conn", [("assistant", "a", "", ""),
+                                                       ("assistant", "b", "", "")])
+    assert fallbacks == []
+
+
+def test_a_commit_with_an_unknown_outcome_is_not_written_again(temp_db, monkeypatch):
+    """A commit that fails may have landed on the server: the rows are never
+    written a second time row by row (a duplicated turn)."""
+    import contextlib
+    import psycopg
+    from storage.chat import db_chats
+    temp_db.create_chat("po-commit", "user-admin", "a1")
+    fallbacks = _batch_fallbacks(monkeypatch)
+    real = db_chats.get_conn
+
+    @contextlib.contextmanager
+    def failing_commit(*a, **kw):
+        with real(*a, **kw) as conn:
+            class _Conn:
+                def execute(self, *ea, **ekw):
+                    return conn.execute(*ea, **ekw)
+
+                def transaction(self):
+                    return conn.transaction()
+
+                def commit(self):
+                    raise psycopg.OperationalError("connection lost during COMMIT")
+
+            yield _Conn()
+
+    monkeypatch.setattr(db_chats, "get_conn", failing_commit)
+    with pytest.raises(psycopg.OperationalError):
+        task_store.add_chat_messages_batch("po-commit", [("assistant", "once", "", "")])
+    assert fallbacks == []
+
+
+def test_a_deleted_chat_fails_the_batch_once(temp_db, monkeypatch):
+    """Every row of a turn whose chat is gone breaks the same foreign key: no
+    row-by-row retry."""
+    import psycopg
+    fallbacks = _batch_fallbacks(monkeypatch)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        task_store.add_chat_messages_batch("po-gone", [("assistant", "a", "", ""),
+                                                       ("assistant", "b", "", "")])
+    assert fallbacks == []
+
+
+def test_a_search_rebuild_that_cannot_connect_keeps_the_batch(temp_db, monkeypatch):
+    """The rows landed: a pool timeout on the search rebuild after them is
+    logged, never raised, so the writer lane counts the turn as saved."""
+    import psycopg_pool
+    from storage.chat import db_chats
+    temp_db.create_chat("po-search", "user-admin", "a1")
+    real = db_chats.get_conn
+    calls = {"n": 0}
+
+    def first_only(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise psycopg_pool.PoolTimeout("couldn't get a connection")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(db_chats, "get_conn", first_only)
+    monkeypatch.setattr(db_chats, "_rebuild_warned_at", 0.0)
+    last = task_store.add_chat_messages_batch("po-search", [("assistant", "landed", "", "")])
+    monkeypatch.setattr(db_chats, "get_conn", real)
+    rows = task_store.get_chat_messages("po-search")
+    assert [r["content"] for r in rows] == ["landed"]
+    assert last == rows[-1]["id"]
+
+
+def test_a_lone_surrogate_costs_only_its_row(temp_db):
+    """Text the client cannot encode (half a surrogate pair from a CLI's
+    JSON) is a row's fault, like a NUL byte."""
+    temp_db.create_chat("po-sur", "user-admin", "a1")
+    task_store.add_chat_messages_batch("po-sur", [
+        ("assistant", "before", "", ""),
+        ("assistant", "half \ud800 pair", "", ""),
+        ("assistant", "after", "", ""),
+    ])
+    assert [r["content"] for r in task_store.get_chat_messages("po-sur")] == ["before", "after"]
+
+
+def test_a_pool_timeout_before_the_commit_is_tried_once_more(temp_db, monkeypatch):
+    """Nothing was committed, so the whole batch is safe to send again once:
+    a busy pool does not cost the turn."""
+    import psycopg_pool
+    from storage.chat import db_chats
+    temp_db.create_chat("po-retry", "user-admin", "a1")
+    fallbacks = _batch_fallbacks(monkeypatch)
+    real = db_chats.get_conn
+    calls = {"n": 0}
+
+    def busy_once(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise psycopg_pool.PoolTimeout("couldn't get a connection")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(db_chats, "get_conn", busy_once)
+    last = task_store.add_chat_messages_batch("po-retry", [("assistant", "a", "", ""),
+                                                           ("assistant", "b", "", "")])
+    monkeypatch.setattr(db_chats, "get_conn", real)
+    rows = task_store.get_chat_messages("po-retry")
+    assert [r["content"] for r in rows] == ["a", "b"] and last == rows[-1]["id"]
+    assert fallbacks == []
+
+
+def test_a_cancel_before_the_commit_is_not_sent_again(temp_db, monkeypatch):
+    """A statement timeout or an admin cancel is the server's answer, not a
+    busy pool: the batch raises at once instead of holding the lane twice."""
+    import psycopg
+    from storage.chat import db_chats
+    temp_db.create_chat("po-cancel", "user-admin", "a1")
+    calls = {"n": 0}
+
+    def cancelled(*a, **kw):
+        calls["n"] += 1
+        raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(db_chats, "get_conn", cancelled)
+    with pytest.raises(psycopg.errors.QueryCanceled):
+        task_store.add_chat_messages_batch("po-cancel", [("assistant", "a", "", "")])
+    assert calls["n"] == 1

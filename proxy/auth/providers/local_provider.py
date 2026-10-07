@@ -10,7 +10,6 @@ from auth.rate_limiter import (
     check_account_tarpit,
     release_device_attempt,
     trusted_device_for,
-    undo_failed_login,
 )
 from auth.totp import create_2fa_session_token
 from storage import database as db
@@ -118,7 +117,7 @@ class LocalAuthProvider(AuthProvider):
             if device_key:
                 release_device_attempt(device_key)
             else:
-                await run_db(undo_failed_login, sub)
+                await run_db(db.undo_failed_login, sub)
             raise
         # The failure result carries ``sub``, and ONLY this branch does, so
         # the unknown-email / OIDC-account / passwordless branches above never

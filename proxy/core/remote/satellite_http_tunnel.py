@@ -52,8 +52,8 @@ _ALLOWLIST_REGEXES = [
     ),
     # display-mcp pinned apps (pin/unpin/list) and the live-apps hooks
     # (push/state/open, APPS.md "Live apps") — session-JWT gated
-    # proxy-side like every hook (verify_session_match + scope from the
-    # session ctx); the artifact hook itself is the `ui` entry above.
+    # proxy-side like every hook (verify_session_match_async + scope from
+    # the session ctx); the artifact hook itself is the `ui` entry above.
     re.compile(r"^/v1/hooks/apps/(pin|unpin|list|push|state|open|rollback|"
                r"deploy|check|status|preview|logs|restart|purge|describe|export|import|screenshot)$"),
     # Agents calling apps (APPS.md "Agents call apps"): an app's own API,
@@ -84,8 +84,9 @@ _ALLOWLIST_REGEXES = [
     re.compile(r"^/v1/phone/calls(/.*)?$"),
     # Platform-management stdio MCPs (notifications/task/meetings/triggers/
     # memory/mcps/agent-config) call these back via the framework-standard
-    # PROXY_URL (remote-rewritten to the loopback tunnel). verify_session_match
-    # still gates each by the session JWT. Keep BOTH allowlists identical.
+    # PROXY_URL (remote-rewritten to the loopback tunnel).
+    # verify_session_match_async still gates each by the session JWT. Keep
+    # BOTH allowlists identical.
     re.compile(r"^/v1/session/current$"),
     re.compile(r"^/v1/notifications(/.*)?$"),
     re.compile(r"^/v1/tasks(/.*)?$"),
@@ -186,16 +187,22 @@ _HOOK_POOL_MAX = 4096
 # and the hook would fail open with the fix round lost. The two prompt hooks
 # wait on a person and share that ceiling.
 _VERDICT_HOOK_PATH = "/v1/hooks/stop"
-_UNCLAMPED_HOOK_PATHS = frozenset({
-    _VERDICT_HOOK_PATH, "/v1/hooks/permission", "/v1/hooks/codex-question",
-})
+_PROMPT_HOOK_PATHS = frozenset({"/v1/hooks/permission", "/v1/hooks/codex-question"})
+_UNCLAMPED_HOOK_PATHS = frozenset({_VERDICT_HOOK_PATH, *_PROMPT_HOOK_PATHS})
+# A prompt waits on a person up to ``session_state.PROMPT_WAIT_S`` (the
+# proxy answers by then; its stream carries keepalives meanwhile): its stream
+# lives an hour past that, beyond the absolute cap every other stream keeps.
+_PROMPT_STREAM_MAX_S = 3 * 24 * 3600 + 3600
 
 
 def _stream_timeout_ceiling(path: str) -> int:
     # The verdict hook waits on a check's budget and the two prompt hooks
     # wait on a person; each holds one stream of the hook class on its own
     # pool, so they may outlive the clamp every other stream keeps.
-    if path.split("?", 1)[0] in _UNCLAMPED_HOOK_PATHS:
+    bare = path.split("?", 1)[0]
+    if bare in _PROMPT_HOOK_PATHS:
+        return _PROMPT_STREAM_MAX_S
+    if bare in _UNCLAMPED_HOOK_PATHS:
         return _STREAM_MAX_AGE_S
     return _MAX_STREAM_TIMEOUT_S
 
@@ -271,82 +278,53 @@ def _resolve_upstream_url(path: str) -> str | None:
     return f"http://127.0.0.1:{port}{path}"
 
 
-def _swap_brokered_bearer(path: str, headers: dict) -> None:
-    """Swap a per-session-JWT ``Authorization`` bearer for the real upstream
-    token from the in-memory broker store. Mutates ``headers`` in place.
-
-    A proxy-terminable HTTP MCP (github/m365) ships the per-session JWT as its
-    Authorization bearer (agent-readable, leaks nothing); this runs at the tunnel
-    boundary — just before forwarding to the localhost sidecar — and replaces it
-    with the REAL token so the real secret never reaches the satellite disk.
-
-    Self-gating: only fires when the store holds an ``http_bearer`` for this
-    ``(session, mcp)`` pair, so non-bearer tunneled MCPs (file-tools) and any
-    non-JWT / non-MCP Authorization header are forwarded untouched. A store miss
-    leaves the JWT in place → the sidecar 401s (fail-closed)."""
-    mcp_match = _MCP_PATH_RE.match(path.split("?", 1)[0])
-    if not mcp_match:
-        return
-    auth_key = next((k for k in headers if k.lower() == "authorization"), None)
-    auth_val = headers.get(auth_key, "") if auth_key else ""
-    if not auth_val.startswith("Bearer "):
-        return
-    from auth.session_token import validate_session_token
-    from core.credentials import mcp_broker
-    payload = validate_session_token(auth_val[7:])
-    if not payload:
-        return
-    bundle = mcp_broker.get(payload.get("sid") or "", mcp_match.group(1))
-    if bundle and bundle.http_bearer:
-        if auth_key:
-            headers.pop(auth_key, None)
-        headers["Authorization"] = f"Bearer {bundle.http_bearer}"
-    elif bundle is None:
-        # No bundle for this (session, mcp): a callback MCP (file-tools)
-        # never has one and its JWT is forwarded as designed; a brokered MCP
-        # has none only after a proxy restart (the store died with the
-        # process) and its sidecar 401s until the session re-warms. The
-        # tunnel cannot tell the two apart, so the line names both, once
-        # per (session, mcp).
-        key = (payload.get("sid") or "", mcp_match.group(1))
-        if _first_swap_miss(key):
-            logger.info(
-                "tunnel: no broker bundle for session %s mcp %s (a callback MCP "
-                "carries its JWT; a brokered MCP after a proxy restart needs a re-warm)",
-                key[0][:8], key[1],
-            )
-
-
-# (session_id, mcp) pairs whose bearer-swap miss was already logged — the miss
-# repeats on every request of the session, one line is enough. Bounded: every
-# callback-MCP session adds a pair for the life of the process, so the set
-# starts over past the cap (a repeated line after that is harmless).
-_swap_miss_logged: set[tuple[str, str]] = set()
-_SWAP_MISS_LOG_CAP = 4096
-
-
-def _first_swap_miss(key: tuple[str, str]) -> bool:
-    if key in _swap_miss_logged:
+def _takes_gateway_credential(name: str) -> bool:
+    """Whether the MCP behind the tunnel slug ``name`` takes a credential the
+    gateway adds (``credentials.oauth.bearer_required`` or
+    ``credentials.api_key_header``): such an MCP is never reached by the
+    direct hop, whose bearer is the session token."""
+    try:
+        from services.mcp import mcp_registry
+        manifest = mcp_registry.get_manifest_by_config_key(name)
+    except Exception:
         return False
-    if len(_swap_miss_logged) >= _SWAP_MISS_LOG_CAP:
-        _swap_miss_logged.clear()
-    _swap_miss_logged.add(key)
-    return True
+    creds = getattr(manifest, "credentials", None)
+    oauth = getattr(creds, "oauth", None)
+    header = getattr(creds, "api_key_header", None)
+    return bool((isinstance(oauth, dict) and oauth.get("bearer_required"))
+                or isinstance(header, dict))
 
 
-# The holder of a tunneled session token. Every tunneled HTTP MCP carries
-# the session JWT as its bearer (the brokered ones swap it for the real
-# upstream secret above; the callback ones forward it to reach the hooks),
-# and the signature alone would honour it for its 24 h life after the person
-# was removed or changed their credentials. The judge is the session routes'
-# (``auth.providers.session_token_holder_ok``: the person still exists and
-# the token predates no credential change), its answer cached per (sub, iat)
-# for the same TTL; the cache is the tunnel's own because ``core/remote``
-# imports nothing from ``api/``. A token with no person (an agent-scope run)
-# is not judged.
-_HOLDER_TTL_S = 60.0
-_HOLDER_ANSWERS_MAX = 4096
-_holder_answers: dict[tuple[str, int], tuple[bool, float]] = {}
+async def _gateway_forward(session_id: str, path: str, method: str, headers: dict):
+    """The credential gateway's part of a tunneled ``/mcp/<name>/`` request:
+    None when the MCP takes no credential (the direct hop to the sidecar, as
+    for file-tools), a refusal when the session holds a vendor credential (a
+    machine session's vendor traffic leaves the machine through its own
+    gateway; the proxy forwards none of it), when the MCP takes a credential
+    the session does not hold (a store miss: a session adopted with no
+    gateway descriptor; the session token is never handed to the sidecar as
+    its token) or when the gateway refuses, else the prepared forward (the
+    sidecar's credential added, the session token kept here)."""
+    base, _, query = path.partition("?")
+    m = _MCP_PATH_RE.match(base)
+    if not m:
+        return None
+    from core.credentials import mcp_gateway
+    name = m.group(1)
+    cred = mcp_gateway.credential(session_id, name)
+    if cred is None:
+        if _takes_gateway_credential(name):
+            return mcp_gateway.Refusal("no_credential", mcp_gateway._REFUSAL_NO_CREDENTIAL)
+        return None
+    if not cred.proxy_local:
+        return mcp_gateway.Refusal(
+            "vendor_not_tunneled",
+            "A machine session reaches a vendor MCP through the machine's own "
+            "gateway; the platform forwards none of that traffic.",
+        )
+    return await mcp_gateway.prepare_forward(
+        session_id, name, method, m.group(2) or "/", query.encode("latin-1"), headers.items(),
+    )
 
 
 class _AmbiguousAuthorization(Exception):
@@ -373,22 +351,8 @@ def _session_bearer_payload(headers: dict) -> dict | None:
 
 
 async def _holder_current(payload: dict) -> bool:
-    sub = payload.get("user_sub") or ""
-    if not sub:
-        return True
-    iat = payload.get("iat")
-    key = (sub, iat if isinstance(iat, int) else 0)
-    now = time.monotonic()
-    hit = _holder_answers.get(key)
-    if hit is not None and hit[1] >= now:
-        return hit[0]
-    from auth import providers
-    from storage.pg import run_db_fast
-    ok = bool(await run_db_fast(providers.session_token_holder_ok, payload))
-    if len(_holder_answers) >= _HOLDER_ANSWERS_MAX:
-        _holder_answers.clear()
-    _holder_answers[key] = (ok, now + _HOLDER_TTL_S)
-    return ok
+    from auth import token_holder
+    return await token_holder.holder_ok(payload)
 
 
 @dataclass
@@ -693,9 +657,11 @@ class SatelliteHttpTunnelDispatcher:
                 )
                 return
 
-            # A tunneled MCP request is judged on its token's holder before
-            # the bearer swap: a person who is gone gets a 401 and the
-            # upstream is never contacted.
+            # A tunneled MCP request is judged on its session's liveness and
+            # its token's holder before anything else: a closed session or
+            # a person who is gone gets a 401 and the upstream is never
+            # contacted.
+            payload = None
             if stream.kind == "mcp":
                 try:
                     payload = _session_bearer_payload(headers)
@@ -704,6 +670,19 @@ class SatelliteHttpTunnelDispatcher:
                         manager, machine_id, stream_id,
                         status=400, headers={}, body=b"",
                         error="ambiguous-authorization", body_eof=True,
+                    )
+                    return
+                from core.session.session_state import session_token_refusal
+                if payload is not None and session_token_refusal(payload):
+                    logger.info(
+                        "tunnel: session token refused for %s (machine %s, session %s)",
+                        path.split("?", 1)[0], machine_id[:8],
+                        str(payload.get("sid") or "")[:8],
+                    )
+                    await self._send_response(
+                        manager, machine_id, stream_id,
+                        status=401, headers={}, body=b"",
+                        error="session-not-live", body_eof=True,
                     )
                     return
                 if payload is not None and not await _holder_current(payload):
@@ -717,12 +696,6 @@ class SatelliteHttpTunnelDispatcher:
                         error="session-holder-gone", body_eof=True,
                     )
                     return
-
-            # HTTP bearer-swap: a proxy-terminable HTTP MCP (github/m365)
-            # ships the per-session JWT as its Authorization bearer; swap it for
-            # the real upstream token at the tunnel boundary so the real secret
-            # never reaches the satellite disk.
-            _swap_brokered_bearer(path, headers)
 
             # Build the request body. If the first frame is body_eof=True,
             # the body is inline; else collect chunks until eof.
@@ -755,9 +728,32 @@ class SatelliteHttpTunnelDispatcher:
                 body_bytes = b"".join(body_chunks)
 
             # Make the upstream call on the stream class's own client. Use
-            # stream=True so SSE/large responses don't buffer in memory.
+            # stream=True so SSE/large responses don't buffer in memory. A
+            # sidecar the session holds a gateway credential for goes through
+            # the gateway's own forward instead: the credential is added
+            # here, the session token stays with the tunnel, and a refusal
+            # answers in the shape the MCP client reads.
             is_mcp = stream.kind == "mcp"
             client = self._get_client(is_mcp)
+            gateway_sid = str(payload.get("sid") or "") if (is_mcp and payload) else ""
+            if gateway_sid:
+                from core.credentials import mcp_gateway
+                prepared = await _gateway_forward(gateway_sid, path, method, headers)
+                if isinstance(prepared, mcp_gateway.Refusal):
+                    logger.info(
+                        "tunnel: gateway refused %s for session %s", prepared.reason,
+                        gateway_sid[:8],
+                    )
+                    r_status, r_headers, r_body = mcp_gateway.refusal_shape(
+                        method, body_bytes, prepared.detail,
+                    )
+                    await self._send_response(
+                        manager, machine_id, stream_id,
+                        status=r_status, headers=r_headers, body=r_body, body_eof=True,
+                    )
+                    return
+                if prepared is not None:
+                    url, headers, client = str(prepared.url), prepared.headers, prepared.client
             # Streaming MCP calls (e.g. camoufox browser actions) can legitimately
             # run far longer than a hook callback and stream their result sparsely
             # — a fixed read-timeout would sever a slow-but-valid browser op midway
@@ -964,7 +960,10 @@ class SatelliteHttpTunnelDispatcher:
         for key, stream in list(self._streams.items()):
             idle = now - max(stream.created_at, stream.last_activity)
             age = now - stream.created_at
-            if age > _STREAM_MAX_AGE_S or idle > stream.timeout_s + _STREAM_GRACE_S:
+            # A prompt stream's ceiling outlives the absolute cap (its own
+            # timeout); every other stream's ceiling is below it.
+            max_age = max(_STREAM_MAX_AGE_S, stream.timeout_s + _STREAM_GRACE_S)
+            if age > max_age or idle > stream.timeout_s + _STREAM_GRACE_S:
                 expired.append(key)
         for key in expired:
             machine_id, stream_id = key

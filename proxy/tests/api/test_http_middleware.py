@@ -26,7 +26,7 @@ import config
 import middleware
 from app import app
 from auth.providers import create_session_jwt
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from storage import pg
 
 CHUNK = 64 * 1024
@@ -38,7 +38,7 @@ def _cookie(sub: str = "user-admin", role: str = "admin") -> str:
 
 def _drive(method: str, path: str, *, chunks: int = 0, chunk: int = CHUNK,
            headers: list[tuple[str, str]] = (), query: str = "",
-           declared: int | None = None, target=app):
+           declared: int | None = None, target=app, client: str = "127.0.0.1"):
     """Send ``chunks`` body chunks over raw ASGI (no Content-Length unless
     ``declared``). Returns (status, response headers, bytes handed to the
     app)."""
@@ -67,7 +67,7 @@ def _drive(method: str, path: str, *, chunks: int = 0, chunk: int = CHUNK,
     scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
              "http_version": "1.1", "method": method, "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": query.encode(), "root_path": "",
-             "headers": raw, "client": ("127.0.0.1", 5000), "server": ("127.0.0.1", 8400),
+             "headers": raw, "client": (client, 5000), "server": ("127.0.0.1", 8400),
              "state": {}}
 
     async def run():
@@ -112,7 +112,7 @@ def test_an_authenticated_body_is_cut_at_the_default():
 def test_a_credential_lifts_the_unauthenticated_tier():
     status, _, _ = _drive("POST", "/v1/triggers", chunks=4, headers=[("cookie", _cookie())])
     assert status not in (401, 413)
-    token = create_session_token(str(uuid.uuid4()), "some-agent", "user-admin")
+    token = live_session_token(str(uuid.uuid4()), "some-agent", "user-admin")
     status, _, _ = _drive("POST", "/v1/triggers", chunks=4,
                           headers=[("authorization", f"Bearer {token}")])
     assert status not in (401, 413)
@@ -175,6 +175,10 @@ def test_the_per_route_caps():
     assert middleware.body_cap("PUT", "/v1/upload/chunked/AbC_-1/3") == (
         config.UPLOAD_CHUNK_BYTES + 64 * 1024, True)
     assert middleware.body_cap("POST", "/v1/hooks/images") == (64 * 1024 * 1024, True)
+    from core.credentials.mcp_gateway import MAX_BODY_BYTES
+    assert MAX_BODY_BYTES > config.MAX_JSON_BODY_BYTES
+    assert middleware.body_cap("POST", "/v1/mcp-gateway/github/mcp") == (
+        min(MAX_BODY_BYTES, backstop), True)
     assert middleware.body_cap("POST", "/wopi/files/abc/contents") == (backstop, True)
     assert middleware.body_cap("POST", "/v1/webhooks/github/x")[1] is False
     assert middleware.body_cap("GET", "/v1/upload") == (config.MAX_JSON_BODY_BYTES, True)
@@ -281,11 +285,12 @@ def test_a_presented_but_invalid_credential_is_timed(short_body_deadline):
 
 
 def test_the_webhook_receivers_keep_their_own_read_bounds(short_body_deadline):
-    from api.events import webhooks
+    from api.events import webhook_body
     assert not middleware._times_body("/v1/webhooks/github/sub-1")
     assert not middleware._times_body("/v1/webhooks/relay/slack")
+    assert not middleware._times_body("/v1/webhooks/user/u/s")
     assert middleware._times_body("/auth/login/local")
-    assert webhooks._CHUNK_GAP_S <= 10.0 and webhooks._BODY_S <= 30.0
+    assert webhook_body._CHUNK_GAP_S <= 10.0 and webhook_body._BODY_S <= 30.0
 
 
 def test_waiting_for_the_disconnect_after_the_body_is_not_timed(short_body_deadline):
@@ -414,3 +419,222 @@ def test_an_unauthenticated_call_is_refused_401_not_500(method, path):
     from app import app
     r = TestClient(app, raise_server_exceptions=False).request(method, path, json={})
     assert r.status_code in (401, 422), (method, path, r.status_code)
+
+
+# ── the webhook caps: a route lifts its own cap after its check ───────────────
+
+
+def _webhook_route(lift_to: int | None):
+    """An ASGI app on a webhook path that lifts the cap (or not) the way
+    ``api/events/webhook_body.lift`` does, then reads the whole body."""
+    from api.events import webhook_body
+
+    async def route(scope, receive, send):
+        if lift_to is not None:
+            scope[webhook_body.SCOPE_KEY] = lift_to
+        size = 0
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.disconnect":
+                return
+            size += len(msg.get("body", b""))
+            if not msg.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": str(size).encode()})
+    return middleware.PlatformHttpMiddleware(route)
+
+
+def test_a_webhook_body_past_the_first_cap_needs_the_route_to_lift(monkeypatch):
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 4 * CHUNK)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_KEYED_BODY_BYTES", 32 * CHUNK)
+    status, _, _ = _drive("POST", "/v1/webhooks/user/u/s", chunks=10,
+                          target=_webhook_route(None))
+    assert status == 413
+    status, _, handed = _drive("POST", "/v1/webhooks/user/u/s", chunks=10,
+                               target=_webhook_route(32 * CHUNK))
+    assert status == 200 and handed == 10 * CHUNK
+
+
+def test_a_declared_webhook_length_is_judged_against_the_ceiling(monkeypatch):
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 4 * CHUNK)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_SIGNED_BODY_BYTES", 32 * CHUNK)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_KEYED_BODY_BYTES", 16 * CHUNK)
+    # Within the ceiling: the route runs and decides (here it never lifts).
+    status, _, _ = _drive("POST", "/v1/webhooks/github/s", chunks=10, declared=10 * CHUNK,
+                          target=_webhook_route(None))
+    assert status == 413
+    # Past every cap a webhook route may lift to: refused before the route.
+    status, _, handed = _drive("POST", "/v1/webhooks/github/s", declared=64 * CHUNK,
+                               target=_webhook_route(64 * CHUNK))
+    assert status == 413 and handed == 0
+
+
+def test_a_raised_first_cap_is_kept(monkeypatch):
+    from api.events import webhook_body
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 40 * 1024 * 1024)
+    assert webhook_body.keyed_cap() == webhook_body.signed_cap() == 40 * 1024 * 1024
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 0)
+    assert webhook_body.unknown_cap() == config.MAX_REQUEST_BODY_BYTES
+
+
+# ── F52: the shell's script policy and the origin check ──────────────────────
+
+
+def _html_app(content_type="text/html; charset=utf-8", own_policy=None):
+    async def app_(scope, receive, send):
+        while (await receive()).get("more_body"):
+            pass
+        headers = [(b"content-type", content_type.encode())]
+        if own_policy:
+            headers.append((b"content-security-policy", own_policy.encode()))
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": b"<html></html>"})
+    return middleware.PlatformHttpMiddleware(app_)
+
+
+def _early_app():
+    """Answers at once without reading the body."""
+    async def app_(scope, receive, send):
+        await send({"type": "http.response.start", "status": 404,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b"{}"})
+    return middleware.PlatformHttpMiddleware(app_)
+
+
+def test_an_answer_before_the_body_is_read_closes_the_connection():
+    _, headers, _ = _drive("POST", "/v1/webhooks/github/x", declared=4096, target=_early_app())
+    assert headers.get("connection") == "close"
+    _, headers, _ = _drive("POST", "/v1/webhooks/github/x", chunks=2,
+                           headers=[("transfer-encoding", "chunked")], target=_early_app())
+    assert headers.get("connection") == "close"
+    # No body, or a body read to its end: the connection stays.
+    _, headers, _ = _drive("POST", "/v1/webhooks/github/x", declared=0, target=_early_app())
+    assert "connection" not in headers
+    _, headers, _ = _drive("POST", "/", chunks=1, declared=CHUNK, target=_html_app())
+    assert "connection" not in headers
+
+
+@pytest.mark.parametrize("path, expected", [
+    ("/", True), ("/agents/pa/chat/x", True), ("/auth/callback", True),
+    ("/setup.html", False), ("/v1/oauth/github/callback", False),
+    ("/s/tok", False), ("/collabora/browser/dist/cool.html", False),
+])
+def test_the_script_policy_rides_the_shell_only(path, expected):
+    _, headers, _ = _drive("GET", path, target=_html_app())
+    policy = headers.get("content-security-policy-report-only")
+    assert (policy == middleware.SHELL_SCRIPT_POLICY) is expected, (path, policy)
+    # Enforced framing is unchanged.
+    if not path.startswith("/collabora/"):
+        assert headers.get("content-security-policy") == "frame-ancestors 'none'"
+
+
+def test_a_route_policy_and_a_json_answer_carry_no_report_only_header():
+    _, headers, _ = _drive("GET", "/", target=_html_app(own_policy="sandbox allow-scripts"))
+    assert "content-security-policy-report-only" not in headers
+    _, headers, _ = _drive("GET", "/", target=_html_app(content_type="application/json"))
+    assert "content-security-policy-report-only" not in headers
+
+
+def _write(origin=None, *, path="/v1/triggers", extra=(), cookie=True, method="POST",
+           client="127.0.0.1"):
+    headers = [("host", "dash.example.com"), *extra]
+    if cookie:
+        headers.append(("cookie", _cookie()))
+    if origin is not None:
+        headers.append(("origin", origin))
+    status, _, _ = _drive(method, path, chunks=1, headers=headers, target=_html_app(),
+                          client=client)
+    return status
+
+
+def test_a_cookie_write_from_a_foreign_origin_is_refused(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
+    assert _write("https://evil.example") == 403
+    assert _write("null") == 403
+    assert _write("http://dash.example.com:3000") == 403  # another port
+    for method in ("PUT", "PATCH", "DELETE"):
+        assert _write("https://evil.example", method=method) == 403
+
+
+def test_the_install_own_origins_pass(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://public.example.org")
+    assert _write("https://dash.example.com") == 200
+    assert _write("https://dash.example.com:443") == 200
+    assert _write("https://public.example.org") == 200
+
+
+def test_what_the_check_leaves_alone(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
+    assert _write(None) == 200                                   # no Origin: not a browser
+    assert _write("https://evil.example", cookie=False) == 200   # nothing to ride
+    assert _write("https://evil.example", method="GET") == 200    # not a write
+    bearer = [("authorization", "Bearer x")]
+    assert _write("null", extra=bearer) != 403                   # an app frame's bearer call
+    # An edge's Basic credential the browser adds by itself is no bearer.
+    basic = [("authorization", "Basic dXNlcjpwYXNz")]
+    assert _write("https://evil.example", extra=basic) == 403
+    assert _write("https://evil.example", path="/wopi/files/f/contents") == 200
+    assert _write("https://evil.example", path="/s/tok/actions/a") == 200
+    assert _write("https://evil.example", path="/v1/csp-report") == 200
+
+
+def test_a_forwarded_host_counts_only_from_a_trusted_hop(monkeypatch):
+    """The real hop rule: a container peer that TRUSTED_PROXY names (an
+    IPv4-mapped form too) may name the public host; nobody else may."""
+    from auth import lan_check
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
+    monkeypatch.setattr(config, "RUNNING_IN_DOCKER", True)
+    fwd = [("x-forwarded-host", "edge.example.com")]
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
+    lan_check.reset_state()
+    for peer in ("10.0.0.5", "::ffff:10.0.0.5"):
+        assert _write("https://edge.example.com", extra=fwd, client=peer) == 403
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", ["10.0.0.5"])
+    lan_check.reset_state()
+    for peer in ("10.0.0.5", "::ffff:10.0.0.5"):
+        assert _write("https://edge.example.com", extra=fwd, client=peer) == 200
+    assert _write("https://edge.example.com", extra=fwd, client="10.0.0.6") == 403
+    lan_check.reset_state()
+
+
+def test_a_csp_report_is_logged_once_and_extensions_are_dropped(caplog):
+    import json as _json
+    from api.auth import csp
+    csp._seen.clear()
+    csp._window.update(started=0.0, suppressed=0)
+    c = TestClient(app)
+    report = {"csp-report": {"document-uri": "https://dash.example.com/agents/pa?x=1",
+                             "effective-directive": "script-src-elem",
+                             "blocked-uri": "https://cdn.evil.example/x.js", "line-number": 3}}
+    ext = {"csp-report": {"document-uri": "https://dash.example.com/", "effective-directive": "script-src",
+                          "blocked-uri": "chrome-extension://abc/inject.js"}}
+    with caplog.at_level("WARNING"):
+        for body in (report, report, ext):
+            r = c.post("/v1/csp-report", content=_json.dumps(body),
+                       headers={"content-type": "application/csp-report"})
+            assert r.status_code == 204
+    lines = [m for m in caplog.messages if m.startswith("CSP report-only")]
+    assert len(lines) == 1
+    assert "script-src-elem would block https://cdn.evil.example on /agents/pa" in lines[0]
+
+
+def test_a_csp_report_logs_one_line_with_a_numeric_line_number(caplog):
+    import json as _json
+    from api.auth import csp
+    csp._seen.clear()
+    csp._window.update(started=0.0, suppressed=0)
+    c = TestClient(app)
+    report = {"csp-report": {"document-uri": "https://dash.example.com/a",
+                             "effective-directive": "script-src\nFAKE second line",
+                             "blocked-uri": "inline", "line-number": "x" * 500}}
+    with caplog.at_level("WARNING"):
+        c.post("/v1/csp-report", content=_json.dumps(report),
+               headers={"content-type": "application/csp-report"})
+    (line,) = [m for m in caplog.messages if m.startswith("CSP report-only")]
+    assert "\n" not in line and "xxx" not in line and "(source ?)" in line
+
+
+def test_a_large_csp_report_is_refused():
+    status, _, _ = _drive("POST", "/v1/csp-report", chunks=20)
+    assert status == 413

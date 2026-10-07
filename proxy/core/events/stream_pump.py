@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from storage import database as task_store
 from storage.automation import run_status
 from storage.pg import run_db
-from core.events import chat_writer, tool_roles
+from core.events import chat_writer, input_queue, tool_roles, turn_ending
 from services.notifications import notification_manager
 from core.events import artifact_events
 from core.events.artifact_events import artifact_event_from_perm_item
@@ -122,6 +122,12 @@ def _delta_key(event_type: str, payload: dict) -> tuple | None:
 # Pending permission prompts per session (survives WebSocket reconnects)
 _pending_permissions: dict[str, dict] = {}  # session_id -> perm event data
 
+# A pump-internal event (never a layer's): a message the engine took into
+# the running turn, put on the pump's own event queue by ``record_steer`` so
+# its row lands in stream order. ``{"item": QueuedInput, "extra_meta",
+# "frame_extra"}``.
+STEER_ACCEPTED = "steer_accepted"
+
 # Active stream pumps per chat — decoupled from WebSocket connections.
 # When a WS detaches (chat switch, browser close), the pump keeps running.
 # When a WS reconnects, it attaches to the existing pump for live updates.
@@ -134,11 +140,34 @@ _active_pumps: dict[str, "ChatStreamPump"] = {}  # chat_id -> pump
 _recovery_suppress_flush: set[str] = set()  # chat_id
 
 
+def pending_preview_snapshot(chat_id: str, file_id: str) -> str | None:
+    """The snapshot of a document push the chat's pump holds for the turn's
+    flush (pushed this turn, not yet persisted), None when there is none. A
+    save from the document pane refreshes that version rather than the
+    file's previous one. Read on the loop."""
+    pump = _active_pumps.get(chat_id)
+    if pump is None:
+        return None
+    evt = pump._pending_previews.get(file_id)
+    return (evt or {}).get("snapshot_id") or None
+
+
 def suppress_recovery_flush(chat_id: str) -> None:
     """Mark a chat's in-flight turn for satellite re-adopt: its pump skips the
     durable turn-block + cost persist so the post-restart replay doesn't
-    duplicate them."""
+    duplicate them. The blocks a steer saved in the middle of the turn are
+    deleted now (the replay writes the whole turn again, after the steer's
+    row). Runs at shutdown, so the delete is a synchronous write."""
     _recovery_suppress_flush.add(chat_id)
+    pump = _active_pumps.get(chat_id)
+    ranges = list(getattr(pump, "_steer_saved_ranges", None) or ())
+    if not ranges:
+        return
+    try:
+        n = task_store.delete_chat_message_ranges(chat_id, ranges)
+        logger.info(f"chat={chat_id[:8]}: {n} row(s) a steer saved early left to the replay")
+    except Exception:
+        logger.exception(f"chat={chat_id[:8]}: the rows a steer saved early were not removed")
 
 # Tracks CLI's cumulative cost per session across pump instances.
 # CLI's total_cost_usd is cumulative per process — new pumps need the last
@@ -158,6 +187,73 @@ def _evict_latest(blocks: list[dict], kind: str) -> None:
         if blocks[i].get("type") == kind:
             blocks.pop(i)
             return
+
+
+def undelivered_card(items: "list[TurnInput]", *, reason: str = wire.UNDELIVERED_QUEUED,
+                     ) -> dict | None:
+    """The undelivered-input card of queued messages nothing will send: the
+    ``system`` block a ``reason: queued`` row stores (and a viewing socket is
+    sent live), the texts joined as ``queue_cleared`` joins them and the
+    attachments named. None when there is nothing to show."""
+    text = "\n\n".join(i.text for i in items if i.text)
+    names = [m.get("name") or (m.get("path") or "").rsplit("/", 1)[-1]
+             for i in items for m in (*i.image_meta, *i.files)]
+    names = [n for n in names if n]
+    if names:
+        text = (text + "\n\n" if text else "") + "Attached: " + ", ".join(names)
+    if not text:
+        return None
+    return {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_UNDELIVERED_INPUT,
+            "reason": reason, "message": text}
+
+
+def shelve_undelivered(chat_id: str, items: "list[TurnInput]", *,
+                       reason: str = wire.UNDELIVERED_QUEUED) -> None:
+    """Queued messages nothing will send, kept in their chat as one
+    undelivered-input card (the system row an abandoned terminal flush writes
+    too) on the chat's writer lane, so the person finds the text there and
+    sends it again (``undelivered_card``). ``reason`` says why (the wire's
+    ``UNDELIVERED_*`` words)."""
+    if not chat_id or not items:
+        return
+    block = undelivered_card(items, reason=reason)
+    if block is None:
+        return
+    chat_writer.submit(
+        chat_id,
+        functools.partial(task_store.add_chat_message, chat_id, "event", "",
+                          event_type=wire.SYSTEM, event_data=json.dumps(block)),
+        label="undelivered_input",
+    )
+    logger.info(f"chat={chat_id[:8]}: {len(items)} queued message(s) nothing sent, "
+                f"kept as an undelivered-input card")
+
+
+def turn_ended_block(ending: "turn_ending.TurnEnding") -> dict:
+    """The ``system`` block of a turn's typed ending (subtype
+    ``turn_ended``): the reason, the line the card shows, the engine's
+    detail, a limit's reset and an exited process's code."""
+    block = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_TURN_ENDED,
+             "reason": ending.reason, "message": ending.line(),
+             "detail": ending.detail, "resets_at": ending.resets_at}
+    if ending.exit_code is not None:
+        block["exit_code"] = ending.exit_code
+    return block
+
+
+def store_chat_wake(chat_id: str, prompt: str, person: str = "") -> bool:
+    """Store ``prompt`` as the chat's durable wake for ``person``, the person
+    the chat's turn runs as, at their role on the chat's agent now; "" names
+    no person. The redelivery sweep runs a stored person's wake as them
+    (TASKS.md "Stored wakes"). True when stored. Synchronous: call it on the
+    DB executor or the chat's writer lane."""
+    role = ""
+    if person:
+        from auth.providers import acting_role_of
+        agent = (task_store.get_chat(chat_id) or {}).get("agent") or ""
+        role = acting_role_of(person, agent)
+    return bool(task_store.append_pending_delegate_wake(
+        chat_id, prompt, person=person, role=role))
 
 
 def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
@@ -189,7 +285,10 @@ def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
                 })
             rows.append(("assistant", block["content"], "", event_data))
         else:
-            rows.append(("event", "", block["type"], json.dumps(block)))
+            stored = block
+            if artifact is not None and any(k in block for k in artifact_events.LIVE_ONLY_KEYS):
+                stored = {k: v for k, v in block.items() if k not in artifact_events.LIVE_ONLY_KEYS}
+            rows.append(("event", "", block["type"], json.dumps(stored)))
     return rows
 
 
@@ -320,9 +419,32 @@ class ChatStreamPump:
         # engine failure ("Not logged in", a cross-engine model 400) never
         # lands as a deceptive `completed` run with empty output.
         self.last_error: str = ""
+        # The typed ending of the turn (every way it ended short: a decline,
+        # a limit, an error, an exit, a silence, a loss); the runner and the
+        # delegator read it.
+        self.last_ending: "turn_ending.TurnEnding | None" = None
 
-        # Message queue (shared with producer closure)
+        # Spoken utterances and the plan's implement message (never a typed
+        # message: those wait in the chat's own queue, input_queue.py), shared
+        # with a producer that drains them as its next turn while the queue
+        # is open (``queue_message``); one left at the close is kept in the
+        # chat as an undelivered card.
         self.message_queue: list[TurnInput] = []
+        self._leftover_messages: list[TurnInput] = []
+        # Accept jobs this pump has in flight (a steer's row, a drained
+        # batch's rows): a resume drains the chat's lane before its cut.
+        self.accepts_in_flight = 0
+        # The person pressed Stop (``ws/dashboard_dispatch._on_abort``): the
+        # queue was returned there, nothing is returned at the end.
+        self.stopped = False
+        # The queue sequence at this pump's failure: the messages queued up
+        # to it are returned at its end, later ones go out as the next turn.
+        self._return_upto: int | None = None
+        # A satellite turn the proxy may re-adopt after a restart: the id
+        # ranges a steer's early save wrote (the replay writes them again),
+        # since the current engine turn began.
+        self._recovery_eligible: bool | None = None
+        self._steer_saved_ranges: list[tuple[int, int]] = []
         # System prompt queue — delivered silently (no user bubble).
         # Used for delegate results and bg nudges during background drain.
         self.system_queue: list[str] = []
@@ -331,10 +453,24 @@ class ChatStreamPump:
         # delivery ladder must not "succeed" onto a queue nobody reads
         # (queue_pump_prompt checks this flag).
         self.system_queue_consumer: bool = False
+        # The person this pump's turns run as, set by a producer that runs
+        # as one (the dashboard and duplex turns): a system prompt left on
+        # the queue at close is stored as their wake. "" stores no person.
+        self.wake_person: str = ""
         # Artifact-interaction queue (shared with producer closure) — pending
         # otodock.send payloads from display_ui artifacts, delivered as their
         # own framed turn(s) at the boundary (ws/artifact_interactions.py).
         self.artifact_queue: list[dict] = []
+        # The artifact queue accepts only while a producer still drains it
+        # (a typed message waits in the chat's own queue instead,
+        # core/events/input_queue.py). A producer that drains it opens it
+        # when it shares its list; a pump nothing drains (task run,
+        # recovery, phone, delegate echo) keeps it closed, so queue_artifact
+        # refuses instead of acknowledging an interaction nobody sends.
+        # close_queue moves what it holds to the leftover list a viewer
+        # takes once.
+        self.queue_closed: bool = True
+        self.artifact_leftover: list[dict] = []
 
         # Subagent spawn/finish tracking is authoritative in the per-session
         # SubagentRegistry (core/session/session_state.py), keyed by session_id —
@@ -440,6 +576,12 @@ class ChatStreamPump:
     def is_done(self) -> bool:
         return self._done
 
+    @property
+    def has_viewers(self) -> bool:
+        """Whether any consumer (a dashboard viewer, a phone or duplex
+        stream) is attached to the pump now."""
+        return bool(self._ws_queues)
+
     def attach(self, *, bounded: bool = False) -> asyncio.Queue:
         """Attach a WS consumer. Returns queue to read pump events from.
 
@@ -505,6 +647,29 @@ class ChatStreamPump:
         else:
             # No more pending — clear reconnect storage
             _pending_permissions.pop(self.session_id, None)
+
+    async def _retire_prompt(self, request_id: str, *, caller_gone: bool) -> None:
+        """A prompt's wait ended with no answer (``api/hooks/permission``
+        ``_wait_on_person``): it leaves the buffer, the viewers drop its card,
+        and when it holds the slot the next prompt shows. A plan review whose
+        caller went away leaves the turn's blocks too, since the retried call
+        raises its own; one that ran out or was released stays the
+        transcript's record of the review."""
+        if not request_id:
+            return
+        self._permission_buffer[:] = [
+            p for p in self._permission_buffer if p.get("request_id") != request_id]
+        if caller_gone:
+            # Only the turn's unsaved blocks: a plan review is never a live
+            # block (its card rides pending_permission).
+            self._turn_blocks[:] = [
+                b for b in self._turn_blocks
+                if not (b.get("type") == wire.PLAN_REVIEW and b.get("request_id") == request_id)]
+        await self._forward({"pump_type": wire.PUMP_WS_EVENT,
+                             "event": {"type": wire.PROMPT_RETIRED, "request_id": request_id}})
+        active = self._permission_active
+        if active is not None and active.get("request_id") == request_id:
+            await self.resolve_active_permission()
 
     def clear_permission_state(self):
         """Drop the active + buffered permission slots without advancing.
@@ -584,43 +749,173 @@ class ChatStreamPump:
         else:
             self._permission_buffer.append(perm_data)
 
-    # Cap the pending-message backlog per pump. A client that holds a turn
-    # open and keeps sending `chat` frames (which, when steer isn't available,
-    # queue with no DB write) would otherwise grow this list without bound in
-    # the shared proxy process. ~64 unsent messages is far beyond any real
-    # between-turns backlog.
+    # Cap the utterance backlog per pump (spoken turns arrive one by one).
     _QUEUE_CAP = 64
+    # queue_message's refusal of a closed queue (-1 is the cap).
+    QUEUE_CLOSED = -2
 
     def queue_message(self, item: TurnInput) -> int:
-        """Queue a user message for the producer. Returns the index, or -1 when
-        the backlog cap is hit (caller surfaces a 'queue full' notice)."""
+        """Queue a spoken utterance (or the plan's implement message) for the producer's
+        next turn. Returns the index, -1 at the cap, ``QUEUE_CLOSED`` when
+        nothing drains the queue any more. A typed message never comes here:
+        it waits in the chat's queue (``core/events/input_queue.py``)."""
+        if self.queue_closed:
+            return self.QUEUE_CLOSED
         if len(self.message_queue) >= self._QUEUE_CAP:
             return -1
         self.message_queue.append(item)
         return len(self.message_queue) - 1
 
-    def cancel_queued(self, index: int) -> TurnInput | None:
-        """Remove queued message by index. Returns the removed item or None."""
-        if 0 <= index < len(self.message_queue):
-            return self.message_queue.pop(index)
-        return None
+    def record_steer(self, qi: "input_queue.QueuedInput", *,
+                     extra_meta: dict | None = None, frame_extra: dict | None = None) -> bool:
+        """A message the engine took into the running turn, recorded in
+        stream order: the event goes on the pump's own queue, so the blocks
+        the engine produced before it are saved first and its user row lands
+        after them, then ``steered`` with the row's id reaches the attached
+        viewers at that point of the stream. False when the pump is done (the
+        caller writes the row on the lane and fans the frame out)."""
+        if self._done:
+            return False
+        self.accepts_in_flight += 1
+        self.event_queue.put_nowait(CommonEvent(type=STEER_ACCEPTED, data={
+            "item": qi, "extra_meta": extra_meta, "frame_extra": frame_extra,
+        }))
+        return True
 
-    def cancel_all_queued(self) -> str:
-        """Remove all queued messages (artifact interactions too — they were
-        never delivered, so nothing persists). Returns combined user text."""
-        combined = "\n\n".join(i.text for i in self.message_queue) if self.message_queue else ""
+    async def _accept_steer(self, data: dict) -> None:
+        """The STEER_ACCEPTED handler: the text so far flushed and the blocks
+        saved, the steer's row awaited on the lane after them, then the
+        frame forwarded in place."""
+        qi = data["item"]
+        try:
+            self._flush_pending_text()
+            # Previews held for the turn's end are in the blocks this save
+            # writes: the dashboard gets them now, ahead of the steer.
+            await self._flush_pending_previews()
+            if self._recovery_eligible is None:
+                from services.scheduler import run_recovery
+                self._recovery_eligible = bool(await run_db(
+                    run_recovery.is_recovery_eligible, self.chat_id))
+            self._save_turn_blocks(note_range=self._recovery_eligible)
+            ids = await input_queue.get(self.chat_id).accept_job(
+                [qi], extra_meta=data.get("extra_meta"))
+        finally:
+            self.accepts_in_flight -= 1
+        await self._forward({"pump_type": wire.PUMP_WS_EVENT,
+                             "event": input_queue.steered_frame(
+                                 self.chat_id, qi, ids, data.get("frame_extra"))})
+
+    async def _accept_queue_turn(self, data: dict) -> None:
+        """The QUEUE_TURN handler: the producer drained the chat's queue (or
+        its spoken utterances) as its next turn. The blocks so far are saved
+        first, so the user rows land after them in DB order (the previous
+        turn's tail, a meeting turn's content), then the accept job, one
+        user row per message with its attachments and, in a meeting, the
+        moderator's badge. The producer waits on ``accepted`` before the
+        engine gets the batch, so a crash in between leaves the rows
+        queued, never answered twice. A nudge's ``text`` is a row of its
+        own."""
+        self._flush_pending_text()
+        if self._turn_blocks:
+            self._save_turn_blocks()
+        # The restart replay covers the engine turn starting now only.
+        self._steer_saved_ranges = []
+        inputs = list(data.get("inputs") or [])
+        if not inputs and data.get("text"):
+            meta = data.get("event_data") or {}
+            inputs = [input_queue.QueuedInput(
+                queue_id="", chat_id=self.chat_id, author_sub="",
+                item=TurnInput(data["text"], image_meta=list(meta.get("images") or []),
+                               files=list(meta.get("files") or [])))]
+        meeting_agent = data.get("meeting_agent")
+        extra_meta: dict | None = None
+        if meeting_agent:
+            from storage.agents import agent_store as _agent_store
+            ad = _agent_store.get_agent(meeting_agent)
+            extra_meta = {
+                "agent_slug": meeting_agent,
+                "agent_display_name": (ad or {}).get("display_name", meeting_agent),
+                "agent_color": (ad or {}).get("color", ""),
+                "badge": "meeting prompt",
+            }
+        accepted = data.get("accepted")
+        self.accepts_in_flight += 1
+        try:
+            q = await input_queue.loaded(self.chat_id)
+            ids = await q.accept_job(inputs, extra_meta=extra_meta)
+        except Exception as e:
+            if accepted is not None and not accepted.done():
+                accepted.set_exception(e)
+            raise
+        finally:
+            self.accepts_in_flight -= 1
+        if accepted is not None and not accepted.done():
+            accepted.set_result(ids)
+        batch = TurnInput.combine([qi.item for qi in inputs])
+        # The live echo to every socket of the chat's audience and of the
+        # authors (the attached viewer among them): the joined bubble now,
+        # one bubble per row after a reload.
+        input_queue.fan_out(self.chat_id, {
+            "type": wire.QUEUE_SENT,
+            "queue_ids": [qi.queue_id for qi in inputs if qi.queue_id],
+            "message_ids": ids, "text": batch.text, **batch.frame_fields(),
+        }, authors={qi.author_sub for qi in inputs})
+
+    def cancel_all_queued(self, reason: str = "revoked") -> None:
+        """Everything queued behind this pump's turn, for a caller that stops
+        it outside a dashboard socket (offboarding): the turn is stopped,
+        the interactions and the utterances go, and the chat's queue goes
+        back to its authors."""
+        self.stopped = True
+        self.cancel_all_artifacts()
         self.message_queue.clear()
+        input_queue.return_soon(self.chat_id, reason)
+
+    def cancel_all_artifacts(self) -> None:
+        """Drop the queued artifact interactions, a closed queue's leftover
+        included (they were never delivered, so nothing persists)."""
         self.artifact_queue.clear()
-        return combined
+        self.artifact_leftover.clear()
 
     def queue_artifact(self, interaction: dict) -> bool:
         """Queue an artifact interaction for the boundary drain. False when
-        the pending cap is hit (each delivery costs a real agent turn)."""
+        the queue is closed or the pending cap is hit (each delivery costs a
+        real agent turn)."""
         from ws.artifact_interactions import QUEUE_CAP
-        if len(self.artifact_queue) >= QUEUE_CAP:
+        if self.queue_closed or len(self.artifact_queue) >= QUEUE_CAP:
             return False
         self.artifact_queue.append(interaction)
         return True
+
+    def close_queue(self) -> None:
+        """Nothing drains the queues from here on: queue_message and
+        queue_artifact refuse, an utterance still queued is kept for the
+        pump's end (an undelivered card), and an interaction moves to the
+        leftover list (``take_artifact_leftover``). A typed message is the
+        chat's own queue's, delivered at this pump's end. A system prompt
+        still queued is not a viewer's to send: it goes to the chat's
+        durable wake (for ``wake_person``), which the chat's next turn
+        replays, and ``system_queue_consumer`` drops so the delivery ladder
+        takes its other rungs. Idempotent."""
+        self.queue_closed = True
+        self.system_queue_consumer = False
+        self._leftover_messages.extend(self.message_queue)
+        self.message_queue.clear()
+        self.artifact_leftover.extend(self.artifact_queue)
+        self.artifact_queue.clear()
+        for text in self.system_queue:
+            chat_writer.submit(
+                self.chat_id,
+                functools.partial(store_chat_wake, self.chat_id, text, self.wake_person),
+                label="queue_wake",
+            )
+        self.system_queue.clear()
+
+    def take_artifact_leftover(self) -> list[dict]:
+        """What the closed artifact queue held, once, in queue order."""
+        arts = list(self.artifact_leftover)
+        self.artifact_leftover.clear()
+        return arts
 
     def _flush_pending_text(self):
         """Flush accumulated text to _turn_blocks as a text segment.
@@ -687,7 +982,7 @@ class ChatStreamPump:
             await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
         self._pending_previews.clear()
 
-    def _save_turn_blocks(self) -> asyncio.Future | None:
+    def _save_turn_blocks(self, *, note_range: bool = False) -> asyncio.Future | None:
         """Persist the turn blocks accumulated so far, in order, off the loop.
 
         The rows are serialised HERE (the block dicts keep mutating on the
@@ -698,7 +993,8 @@ class ChatStreamPump:
         trimmed from live_state, so a viewer reconnecting during the write
         still sees the turn (live_state), and afterwards from chat_history —
         never neither, never both. Returns the job's future, or None when
-        nothing was queued.
+        nothing was queued. ``note_range`` records the id range the job wrote
+        (a steer's early save on a turn a restart may replay).
         """
         if self.chat_id in _recovery_suppress_flush:
             # This turn will be re-adopted + re-persisted from the satellite
@@ -710,13 +1006,22 @@ class ChatStreamPump:
         rows = _serialize_turn_rows(self._turn_blocks)
         self._turn_blocks.clear()
         self._todo_block = None
+        # A tool still open is not in these rows: its live block stays, and
+        # it lands at the head of the blocks that follow (its start index
+        # pointed into the list just cleared).
+        open_tools = {id(b) for b in self._active_tools.values()}
+        for b in self._active_tools.values():
+            b["_insert_idx"] = 0
         gc_pending, self._gc_snapshots_pending = self._gc_snapshots_pending, False
         chat_id = self.chat_id
         live = _chat_streaming_state.get(chat_id)
         live_list = live.get("live_blocks") if live else None
         live_len = len(live_list) if live_list is not None else 0
 
+        ranges = self._steer_saved_ranges if note_range else None
+
         def _job() -> int:
+            before = task_store.get_last_chat_message_id(chat_id) if ranges is not None else 0
             # One transaction and ONE search-row rebuild for the turn's rows.
             task_store.add_chat_messages_batch(chat_id, [
                 ("assistant", content, "", event_data) if role == "assistant"
@@ -732,7 +1037,10 @@ class ChatStreamPump:
                     preview_snapshots.gc_chat(chat_id)
                 except Exception:
                     logger.debug("preview snapshot GC failed", exc_info=True)
-            return task_store.get_last_chat_message_id(chat_id)
+            last = task_store.get_last_chat_message_id(chat_id)
+            if ranges is not None:
+                ranges.append((before or 0, last or 0))
+            return last
 
         fut = chat_writer.submit(chat_id, _job, label="turn_blocks")
 
@@ -749,7 +1057,8 @@ class ChatStreamPump:
             cur = _chat_streaming_state.get(chat_id)
             if (cur is not None and live_list is not None
                     and cur.get("live_blocks") is live_list):
-                del live_list[:live_len]
+                live_list[:live_len] = [b for b in live_list[:live_len]
+                                        if id(b) in open_tools]
 
         fut.add_done_callback(_landed)
         return fut
@@ -1123,33 +1432,50 @@ class ChatStreamPump:
                 if event.type == ERROR:
                     err_msg = event.data.get("message", "")
                     self.last_error = err_msg or "engine error"
-                    # Failover: if the turn died on a provider limit/overload, rest
-                    # this session's subscription so the next chat/turn picks another.
-                    # A real rate/usage limit gets the full cooldown; a transient
-                    # overload (529) gets only a brief nudge (the account is fine and
-                    # the CLI retries) so an immediate retry isn't blocked.
+                    typed = turn_ending.from_dict(event.data.get("ending"))
+                    # Every error that ends the turn is typed: an untyped one
+                    # (a session gone, a producer's exception) is the
+                    # ``error`` ending with its own words, so the chat keeps
+                    # its card and the next message starts a new turn.
+                    ending = typed or turn_ending.TurnEnding(
+                        reason=turn_ending.ERROR, detail=err_msg or "engine error",
+                    )
+                    self.last_ending = ending
+                    # Failover: a turn that died on a provider limit or overload
+                    # rests this session's subscription so the next chat or turn
+                    # picks another: a typed limit ending until the window it
+                    # names resets (account-wide, or for that model family only),
+                    # else the usual cooldown; a transient overload (529) only a
+                    # brief nudge, so an immediate retry isn't blocked
+                    # (subscription_pool.rest_after_limit).
                     try:
                         from services.engines import subscription_pool as _subpool
-                        _cooldown = _subpool.throttle_cooldown_for(err_msg)
-                        if _cooldown:
-                            _subpool.mark_subscription_throttled(
-                                self.session_id, cooldown_s=_cooldown,
-                            )
+                        _subpool.rest_after_limit(self.session_id, typed, err_msg)
                     except Exception:
                         pass
-                    await self._forward({"pump_type": wire.PUMP_ERROR, "message": err_msg})
-                    # For an interruption that genuinely lost
-                    # output (satellite reconnect-grace expiry — `durable_marker`),
-                    # persist a visible ⚠ block so a refresh shows it instead of a
-                    # silent truncation. This loop BREAKS on ERROR (the trailing
-                    # DONE never flows through the pump), but the `finally` runs
-                    # _flush_pending_text() + _save_turn_blocks() on exit — so
-                    # flush the partial turn text FIRST, then append the marker,
-                    # and both land in chat_history in order. Ordinary transient
-                    # errors omit the flag → today's live-only behaviour.
-                    if event.data.get("durable_marker") and err_msg:
-                        self._flush_pending_text()
-                        self._turn_blocks.append({"type": wire.TEXT, "content": err_msg})
+                    # Closed before the viewer sees the error: the session
+                    # may be dead, and a message sent from here on waits in
+                    # the chat's queue for the next turn.
+                    self.close_queue()
+                    frame = {"pump_type": wire.PUMP_ERROR,
+                             "message": err_msg if typed else ending.line(),
+                             "reason": ending.reason, "resets_at": ending.resets_at}
+                    await self._forward(frame)
+                    # The ending is the chat's ``turn_ended`` row, after the
+                    # turn's text so far: a reload shows the card where the
+                    # live frame showed it. This loop BREAKS on ERROR (the
+                    # trailing DONE never flows through the pump), and the
+                    # `finally` saves the blocks in order. The flags a lost
+                    # partial turn needs ride the same lane, before the row's
+                    # save.
+                    self._flush_pending_text()
+                    self._turn_blocks.append(self._stamp_speaker(turn_ended_block(ending)))
+                    stamps = ending.abort_stamps()
+                    if stamps:
+                        self._submit_chat_update("abort_flags", **stamps)
+                    # What was queued until now goes back to its authors at
+                    # the pump's end; a message sent after it is the next turn.
+                    self._return_upto = input_queue.get(self.chat_id).seq
                     break
 
                 if event.type == PRODUCER_DONE:
@@ -1194,44 +1520,16 @@ class ChatStreamPump:
                     self._completed = True
                     break
 
-                if event.type == QUEUE_TURN:
-                    # During a meeting turn, flush+save accumulated blocks first
-                    # so the user message appears after prior content in DB order.
-                    if self._meeting_agent:
-                        self._flush_pending_text()
-                        if self._turn_blocks:
-                            self._save_turn_blocks()
-                    meeting_agent = event.data.get("meeting_agent")
-                    # The row's meta: the batch's attachments (photos and
-                    # files the drained messages carried) plus, in a
-                    # meeting, the moderator's identity badge.
-                    event_meta: dict = dict(event.data.get("event_data") or {})
-                    if meeting_agent:
-                        from storage.agents import agent_store as _agent_store
-                        ad = _agent_store.get_agent(meeting_agent)
-                        event_meta.update({
-                            "agent_slug": meeting_agent,
-                            "agent_display_name": (ad or {}).get("display_name", meeting_agent),
-                            "agent_color": (ad or {}).get("color", ""),
-                            "badge": "meeting prompt",
-                        })
-                    event_data_str = json.dumps(event_meta) if event_meta else ""
-                    # Lane-ordered after the blocks saved above; the frame is
-                    # the live echo, not a read.
-                    chat_writer.submit(
-                        self.chat_id,
-                        functools.partial(
-                            task_store.add_chat_message, self.chat_id, "user",
-                            event.data["text"], event_data=event_data_str,
-                        ),
-                        label="queue_turn",
-                    )
-                    forwarded = {"pump_type": wire.PUMP_QUEUE_TURN, "text": event.data["text"]}
-                    if event_meta.get("images"):
-                        forwarded["images"] = event_meta["images"]
-                    if event_meta.get("files"):
-                        forwarded["files"] = event_meta["files"]
-                    await self._forward(forwarded)
+                if event.type in (QUEUE_TURN, STEER_ACCEPTED):
+                    # An accept that fails (a lane or DB error) ends the turn
+                    # typed, with its row and its card, like any error.
+                    try:
+                        await (self._accept_queue_turn if event.type == QUEUE_TURN
+                               else self._accept_steer)(event.data)
+                    except Exception as e:
+                        logger.exception(f"chat={self.chat_id[:8]}: an accept failed")
+                        await self.event_queue.put(CommonEvent(type=ERROR, data={
+                            "message": f"the message could not be saved: {e}"}))
                     continue
 
                 if event.type == ARTIFACT_TURN:
@@ -1271,6 +1569,9 @@ class ChatStreamPump:
             )
         finally:
             self._done = True
+            # Whatever ended the pump (a cancelled producer, an exception),
+            # nothing drains the queues any more.
+            self.close_queue()
             self.producer.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self.producer
@@ -1292,6 +1593,18 @@ class ChatStreamPump:
                 self._turn_blocks.append(tool_evt)
             self._save_turn_blocks()
             self._submit_cost_job()
+            # A steer the engine accepted after the loop's last read: its row
+            # lands after the final save, and its frame still reaches the
+            # attached viewers before their done.
+            while not self.event_queue.empty():
+                late = self.event_queue.get_nowait()
+                if late.type == STEER_ACCEPTED:
+                    with contextlib.suppress(Exception):
+                        await self._accept_steer(late.data)
+            if self._leftover_messages:
+                # Spoken utterances nothing sent stay in the chat as a card.
+                shelve_undelivered(self.chat_id, self._leftover_messages)
+                self._leftover_messages = []
 
             if self.implementing_plan:
                 chat_writer.submit(
@@ -1370,6 +1683,20 @@ class ChatStreamPump:
                         _chat_streaming_state.pop(self.chat_id, None)
                 if still_active:
                     del _active_pumps[self.chat_id]
+                    # What the chat's queue still holds: what was queued
+                    # before a failure goes back to its authors, the rest
+                    # goes out as the next turn (an attached viewer drains its
+                    # own on its loop's way out first). A pump that ended
+                    # without its result and without a Stop failed too. A
+                    # superseded pump leaves it to the pump that owns the
+                    # chat now.
+                    if (self._return_upto is None and not self._completed
+                            and not self.stopped):
+                        self._return_upto = input_queue.get(self.chat_id).seq
+                    input_queue.on_pump_end(
+                        self.chat_id, return_upto=self._return_upto,
+                        viewers=self.has_viewers,
+                    )
 
                 # Signal any remaining subscribers (a later attach gets it too)
                 self._flush_deltas()
@@ -2264,6 +2591,9 @@ class ChatStreamPump:
             })
             # Gate: only show one blocking prompt at a time
             await self._queue_or_show_permission(enriched)
+        elif evt_type == wire.ITEM_PROMPT_RETIRED:
+            await self._retire_prompt(perm_data.get("request_id", ""),
+                                      caller_gone=bool(perm_data.get("caller_gone")))
         elif evt_type == wire.ITEM_MODE_RESTORED:
             mode = perm_data.get("mode", "default")
             self._submit_chat_update("mode_restored", permission_mode=mode)

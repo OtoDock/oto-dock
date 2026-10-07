@@ -31,6 +31,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("satellite")
 
+# A turn's reader checks its stop flag every second (``_read_stdout_until_stop``).
+_READER_HANDOFF_S = 10.0
+
+# Claude Code's built-in plugins (2.1.287+) but the four the platform keeps
+# on (agents-md, diff, telemetry, the managed-only sec-default), switched off
+# by name in settings.json: an empty map leaves them on. The proxy's list
+# (core/layers/cli/config_dir.DISABLED_BUILTIN_PLUGINS) is the source; the
+# proxy suite holds the two equal.
+DISABLED_BUILTIN_PLUGINS = (
+    "cc-plugin-plugin-authoring@builtin",
+    "cc-plugin-you-should-know@builtin",
+    "cc-plugin-claude-test@builtin",
+    "cc-plugin-mods-guide@builtin",
+    "cc-plugin-mermaid@builtin",
+    "cc-plugin-responsive-mode@builtin",
+    "cc-plugin-tips@builtin",
+)
+
 
 def _format_time() -> str:
     return datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M")
@@ -56,19 +74,21 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
         # reconciles the pinned version). Belt-and-braces with env
         # DISABLE_AUTOUPDATER=1 set in CLISession/PtySession.
         "autoUpdates": False,
-        # Platform is the only skill source: plugin skills must not activate
-        # outside install/approval (mirrors the proxy-side settings builder).
-        "enabledPlugins": {},
+        # Platform is the only skill source: no marketplace plugin is enabled
+        # and every built-in but the four the platform keeps is off by name
+        # (mirrors the proxy-side settings builder).
+        "enabledPlugins": {plugin: False for plugin in DISABLED_BUILTIN_PLUGINS},
         # Claude Code ≥ 2.1.275 syncs the signed-in claude.ai account's skills
         # and plugins into the session; sessions run on pool accounts, so
         # both stay off (mirrors core/layers/cli/config_dir.build_settings).
         "syncClaudeAiSkills": False,
         "syncClaudeAiPlugins": False,
         # Built-in-tool deny list, shipped by the proxy (single source of truth:
-        # core/layers/cli/config_dir.DISALLOWED_BUILTIN_TOOLS, plus the session's own
-        # denials from the engine's descriptor) so a REMOTE session enforces the
+        # core/layers/cli/config_dir.DISALLOWED_BUILTIN_TOOLS alone: a session's own
+        # denials ride the gate over the tunnel, since this file is the scope's and
+        # the CLI reloads it live) so a REMOTE session enforces the
         # SAME permissions.deny as the local sandbox (the claude.ai
-        # Cron/Trigger/Push/integration tools; Skill is ALLOWED since 2026-07 —
+        # Cron/Trigger/Push/Artifact/integration tools; Skill is ALLOWED since 2026-07 —
         # platform-managed skills activate through it). Omitted → no deny block.
         **(
             {"permissions": {"deny": list(disallowed_tools)}}
@@ -80,7 +100,7 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
                 "hooks": [{
                     "type": "command",
                     "command": gate,
-                    "timeout": 604800,
+                    "timeout": config.HOOK_WAIT_S,
                 }],
             }],
             "PostToolUse": [{
@@ -114,7 +134,7 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
                 "hooks": [{
                     "type": "command",
                     "command": stop,
-                    "timeout": 604800,
+                    "timeout": config.HOOK_WAIT_S,
                 }],
             }],
         }
@@ -175,6 +195,8 @@ class CLISession:
         # Set by SessionManager when the proxy sends `stop_turn` — ends
         # the current send_message iteration cleanly.
         self.stop_turn_event: asyncio.Event = asyncio.Event()
+        # One reader per stdout: a turn's loop holds this until it exits.
+        self._reader_lock: asyncio.Lock = asyncio.Lock()
         # Post-turn background-command drain: when the proxy's stop_turn carries
         # drain_bg (a bg command still pending), keep reading + forwarding stdout
         # AFTER the turn so the command's completion frame (claude emits it idle,
@@ -245,7 +267,11 @@ class CLISession:
         # is not a valid JSON". Forward slashes are valid Python paths
         # on Windows and don't need JSON escaping.
         mcp_config = self.config.get("mcp_config")
-        mcp_file = self._claude_dir / "mcp-config.json"
+        # Named per session: two concurrent sessions of one person on one
+        # agent never read each other's token; the shared-named copy an
+        # earlier satellite wrote is removed.
+        mcp_file = self._claude_dir / f"mcp-config-{self.session_id[:12]}.json"
+        (self._claude_dir / "mcp-config.json").unlink(missing_ok=True)
         if mcp_config and mcp_config.get("mcpServers"):
             # Wrap stdio MCPs that declared `tool_arg_paths`
             # with the path interceptor BEFORE serialization, so the
@@ -318,9 +344,11 @@ class CLISession:
         cmd += ["--append-system-prompt-file", str(prompt_file)]
         # Claude Code ≥ 2.1.267 would otherwise re-send the prompt it recorded
         # on the conversation's first request on every --resume, discarding
-        # the fresh file above (mirrors the local CLI layer; the flag exists
-        # on the previous pin 2.1.263 too).
-        cmd += ["--system-prompt-snapshot", "off"]
+        # the fresh file above; and only the platform's settings.json is read
+        # (a plugin enabled from a terminal at the local scope lands in
+        # settings.local.json). Mirrors the local CLI layer; both flags exist
+        # on the previous pin 2.1.281 too.
+        cmd += ["--system-prompt-snapshot", "off", "--setting-sources", "user"]
         cmd += ["--output-format", "stream-json"]
         cmd += ["--input-format", "stream-json"]
         cmd += ["--verbose", "--include-partial-messages"]
@@ -465,13 +493,6 @@ class CLISession:
                 f"stderr: {stderr_text[-300:] if stderr_text else '(empty)'}"
             )
 
-        # A new turn reclaims stdout — stop any post-turn bg-command drainer
-        # first (single reader on the CLI's stdout).
-        await self.cancel_bg_drain()
-        # Clear any residual stop_turn signal from a previous turn
-        self.stop_turn_event.clear()
-        self._drain_bg = False
-
         if inject_time:
             prompt = f"[Current time: {_format_time()}]\n{prompt}"
 
@@ -491,8 +512,31 @@ class CLISession:
             "type": "user",
             "message": {"role": "user", "content": prompt},
         })
-        self.proc.stdin.write((msg + "\n").encode())
-        await self.proc.stdin.drain()
+
+        # A new turn reclaims stdout — stop any post-turn bg-command drainer
+        # first (single reader on the CLI's stdout).
+        await self.cancel_bg_drain()
+        # A previous turn's loop still reading (its stop_turn was lost, or
+        # arrives after this send) is told to stop and waited for BEFORE the
+        # stop flag is cleared: two loops on one stdout raise readuntil().
+        if self._reader_lock.locked():
+            self.stop_turn_event.set()
+        try:
+            await asyncio.wait_for(self._reader_lock.acquire(), timeout=_READER_HANDOFF_S)
+        except asyncio.TimeoutError:
+            raise RuntimeError("the previous turn is still reading this session") from None
+        # Clear any residual stop_turn signal from a previous turn
+        self.stop_turn_event.clear()
+        self._drain_bg = False
+        try:
+            # The previous turn's handler runs on, without yielding, when its
+            # reader lets go: a drainer it started meanwhile stops here.
+            await self.cancel_bg_drain()
+            self.proc.stdin.write((msg + "\n").encode())
+            await self.proc.stdin.drain()
+        except BaseException:
+            self._reader_lock.release()
+            raise
 
         # Read every line until stop_turn or EOF. No filtering.
         self._turn_active = True
@@ -505,6 +549,7 @@ class CLISession:
                 yield event
         finally:
             self._turn_active = False
+            self._reader_lock.release()
 
     async def steer(self, text: str) -> bool:
         """Write a user frame into the RUNNING turn's stdin — the satellite

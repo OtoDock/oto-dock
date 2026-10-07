@@ -118,7 +118,8 @@ class PtySession(BasePtySession):
         prompt_file.write_text(self.config.get("system_prompt", ""))
 
         mcp_config = self.config.get("mcp_config")
-        mcp_file = self._claude_dir / "mcp-config.json"
+        mcp_file = self._claude_dir / f"mcp-config-{self.session_id[:12]}.json"
+        (self._claude_dir / "mcp-config.json").unlink(missing_ok=True)
         if mcp_config and mcp_config.get("mcpServers"):
             from ..sessions.mcp_interceptor import wrap_interceptor_in_mcp_config
             wrap_interceptor_in_mcp_config(mcp_config)
@@ -205,10 +206,12 @@ class PtySession(BasePtySession):
         # The prompt file on fresh AND --resume starts, as the local TUI (which
         # reuses the -p argv) always did: transcripts persist messages only.
         # Claude Code ≥ 2.1.267 would otherwise re-send the prompt it recorded
-        # on the conversation's first request on every resume — recording off
-        # (the flag exists on the previous pin 2.1.263 too).
+        # on the conversation's first request on every resume — recording off;
+        # and only the platform's settings.json is read (a plugin enabled from
+        # this terminal at the local scope lands in settings.local.json). Both
+        # flags exist on the previous pin 2.1.281 too.
         cmd += ["--append-system-prompt-file", str(prompt_file)]
-        cmd += ["--system-prompt-snapshot", "off"]
+        cmd += ["--system-prompt-snapshot", "off", "--setting-sources", "user"]
         # NO --output-format/--input-format/--verbose: that's the -p pump's wire.
         if _is_resume:
             cmd += ["--resume", self.config["session_id_for_resume"]]

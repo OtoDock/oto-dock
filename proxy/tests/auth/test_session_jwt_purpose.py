@@ -15,6 +15,21 @@ from auth.providers import create_session_jwt, validate_session_jwt
 from auth.totp import create_2fa_session_token
 
 
+def test_characters_after_a_valid_signature_are_refused():
+    # A token is valid only in its exact compact form: PyJWT before 2.14
+    # dropped characters outside the base64url alphabet from the signature
+    # segment, so a token with junk appended still verified. The floor in
+    # requirements.in keeps that closed for both session schemes.
+    from auth.session_token import create_session_token, validate_session_token
+    cookie = create_session_jwt("local:u1", "u@x.com", "User", "member")
+    bearer = create_session_token("sess-1", "agent-1")
+    assert validate_session_jwt(cookie) is not None
+    assert validate_session_token(bearer) is not None
+    for junk in ("!!", "**", "%%%"):
+        assert validate_session_jwt(cookie + junk) is None, junk
+        assert validate_session_token(bearer + junk) is None, junk
+
+
 def test_real_session_cookie_validates():
     tok = create_session_jwt("local:u1", "u@x.com", "User", "member")
     payload = validate_session_jwt(tok)

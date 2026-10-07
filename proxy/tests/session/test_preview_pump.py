@@ -3,9 +3,10 @@
 The pump buffers one preview per file per turn (replace-in-place). With
 push-time snapshots, the replaced intra-turn push's snapshot was never exposed
 to the dashboard (previews only forward at flush) — the pump must delete it —
-and the flushed event must persist ITS OWN snapshot_id, which the dashboard's
-frozen "previous version" block later renders. The flush also arms the
-reference-driven snapshot GC, which runs only after the rows persist.
+and the flushed event must persist ITS OWN snapshot_id, the version the
+document pane's Versions menu later opens. The flush also arms the
+reference-driven snapshot GC, which runs only after the rows persist; until
+the flush, a save from the pane refreshes the pending push's version.
 
 Run: env TEST_DATABASE_URL=... venv/bin/python -m pytest tests/session/test_preview_pump.py -q
 """
@@ -119,3 +120,26 @@ async def test_flush_forwards_and_persists_snapshot_identity(temp_db, monkeypatc
         assert gc_calls == ["pv3"]
     finally:
         pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_pending_push_of_a_file_is_readable_until_the_flush(temp_db):
+    # A save from the document pane while the turn still holds a push of the
+    # file refreshes that push's version, not the file's previous one.
+    from core.events import stream_pump
+    temp_db.create_chat("pv9", "user-admin", "a1")
+    pump = _mk_pump("pv9")
+    stream_pump._active_pumps["pv9"] = pump
+    try:
+        assert stream_pump.pending_preview_snapshot("pv9", "f1") is None
+        await pump._handle_perm_event(_preview_item("f1", "snap-a", 1))
+        await pump._handle_perm_event(_preview_item("f1", "snap-b", 2))
+        assert stream_pump.pending_preview_snapshot("pv9", "f1") == "snap-b"
+        assert stream_pump.pending_preview_snapshot("pv9", "f2") is None
+        assert stream_pump.pending_preview_snapshot("nope", "f1") is None
+        await pump._flush_pending_previews()
+        assert stream_pump.pending_preview_snapshot("pv9", "f1") is None
+    finally:
+        stream_pump._active_pumps.pop("pv9", None)
+        pump.producer.cancel()
+

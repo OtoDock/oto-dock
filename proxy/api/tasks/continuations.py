@@ -24,14 +24,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from api.tasks import task_quota
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_auth, require_user
 from core.session.session_state import get_user_tz
 from services.scheduler import scheduler, task_kinds
 from storage import database as task_store
 from core.session.visibility import is_synthetic_owner
 
 logger = logging.getLogger("claude-proxy.continuations")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 _IN_SECONDS_MIN = 30
 _MAX_RUNS_CAP = 100

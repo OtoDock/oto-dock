@@ -39,6 +39,7 @@ class _FakeCodexSession:
     def __init__(self, idle: float, *, alive: bool = True):
         self.last_activity = 1000.0 - idle
         self.is_alive = alive
+        self._current_turn_id = None
 
 
 @pytest.fixture
@@ -68,12 +69,12 @@ class TestCodexReapCandidates:
         _park_question("s-parked")
         assert codex_session._codex_reap_candidates(1000.0, 100) == []
 
-    def test_pending_question_reaped_over_cap(self, codex_registry):
-        # One extra idle window only — an abandoned question can't pin the slot.
-        codex_registry["s-parked"] = _FakeCodexSession(
-            idle=codex_session._QUESTION_PARK_TIMEOUT_MULT * 100 + 10)
+    def test_pending_question_spared_while_it_waits(self, codex_registry):
+        # The prompt's own wait (PROMPT_WAIT_S) bounds the spare, not the
+        # idle knob: a question parked overnight is still answerable.
+        codex_registry["s-parked"] = _FakeCodexSession(idle=10 * 100 + 10)
         _park_question("s-parked")
-        assert codex_session._codex_reap_candidates(1000.0, 100) == ["s-parked"]
+        assert codex_session._codex_reap_candidates(1000.0, 100) == []
 
     def test_answered_question_does_not_spare(self, codex_registry):
         # The waiter is gone (answered/released) → nothing left to wait on.
@@ -109,9 +110,14 @@ class _FakeConnection(ClientMessageDispatcher):
         self.session_id = "sid-reaped"
         self.chat_id = chat_id
         self.streaming = streaming
-        self.message_queue: list[str] = []
         self.sent: list[dict] = []
         self.chat_calls: list[dict] = []
+        # What waits in a chat's queue for its next turn (the chat queue's
+        # own behaviour is tests/session/test_input_queue.py's).
+        self.queued: list[tuple[str, str]] = []
+
+    async def _queue_for_next_turn(self, cid, item, queue_id=None) -> None:
+        self.queued.append((cid, item.text))
 
     async def _may_resolve_permission(self, request_id: str) -> bool:
         return True
@@ -164,8 +170,7 @@ class TestQuestionResponseFallback:
             "answers": _answers("Option B"),
         })
         assert conn.chat_calls == []
-        assert [q.text for q in conn.message_queue] == ["Option B"]
-        assert conn.sent == [{"type": "queued", "index": 0, "text": "Option B"}]
+        assert conn.queued == [("chat-q", "Option B")]
 
     async def test_no_waiter_and_no_answer_text_is_a_noop(self):
         conn = _FakeConnection()
@@ -173,7 +178,7 @@ class TestQuestionResponseFallback:
             "type": "question_response", "request_id": "q-dead", "answers": {},
         })
         assert conn.chat_calls == []
-        assert conn.message_queue == []
+        assert conn.queued == []
 
 
 class TestAnswersToText:

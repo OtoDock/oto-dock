@@ -128,6 +128,16 @@ if not src or not os.path.isfile(src):
 shutil.copyfile(src, dest)
 '''
 
+# A stand-in for `ip -o -4 addr show`: one line per address in FAKE_IP_ADDRS,
+# each call logged to FAKE_IP_LOG.
+FAKE_IP = r'''#!/usr/bin/env python3
+import os, sys
+with open(os.environ.get("FAKE_IP_LOG", os.devnull), "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\n")
+for n, a in enumerate(os.environ.get("FAKE_IP_ADDRS", "127.0.0.1").split(), 1):
+    print(f"{n}: eth{n}    inet {a}/24 brd 0.0.0.0 scope global eth{n}\\       valid_lft forever")
+'''
+
 PG = {"id": "pg-t2", "labels": {"com.docker.compose.project": "otodock",
                                 "com.docker.compose.service": "otodock-postgres"}}
 PROXY = {"id": "proxy-t2", "labels": {"com.docker.compose.project": "otodock",
@@ -165,6 +175,7 @@ def fakebin(tmp_path):
     b.mkdir()
     _write_exec(b / "docker", FAKE_DOCKER)
     _write_exec(b / "curl", FAKE_CURL)
+    _write_exec(b / "ip", FAKE_IP)
     return b
 
 
@@ -646,3 +657,61 @@ def test_install_lists_an_override_after_the_base(tmp_path, fakebin, override, w
     # the phone ports follow the public host, else loopback; no stale default
     assert "listen on\n# OTO_AUDIOSOCKET_PUBLIC_HOST above, else on 127.0.0.1" in text
     assert "publish on\n# 127.0.0.1 by default" not in text
+
+
+# ── the phone publish address: a literal this host does not hold ─────────────
+
+NOT_HELD = "is not an address of this host"
+
+
+@pytest.mark.parametrize("env_tail, addrs, warned", [
+    ("OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10\n", "127.0.0.1 192.168.1.10", False),
+    ("OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10\n", "127.0.0.1 10.0.0.4", True),
+    ('OTO_AUDIOSOCKET_PUBLIC_HOST="192.168.1.10"  # the PBX dials this\n', "127.0.0.1", True),
+    ("OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10\nOTO_PHONE_BIND=10.0.0.4\n", "10.0.0.4", False),
+    ("OTO_AUDIOSOCKET_PUBLIC_HOST=0.0.0.0\n", "10.0.0.4", False),
+    ("OTO_AUDIOSOCKET_PUBLIC_HOST=127.0.0.1\n", "10.0.0.4", False),
+    ("", "10.0.0.4", False),
+])
+def test_a_phone_publish_address_this_host_does_not_hold_is_named(
+        tmp_path, fakebin, raw, env_tail, addrs, warned):
+    """The phone overlay publishes on OTO_PHONE_BIND, else on
+    OTO_AUDIOSOCKET_PUBLIC_HOST: a literal address this host does not hold
+    passes the file check and fails only when the phone container starts, so
+    the upgrade names it before the swap (a warning: the run goes on)."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + env_tail)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_IP_ADDRS=addrs)
+    assert r.returncode == 0, r.stderr
+    assert (NOT_HELD in r.stderr) is warned, r.stderr
+    if warned:
+        assert "192.168.1.10" in r.stderr and "OTO_PHONE_BIND" in r.stderr
+
+
+def test_the_publish_address_is_named_in_a_dry_run(tmp_path, fakebin, raw):
+    """Named before anything changes: a dry run, which stops ahead of the
+    swap, carries it."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10\n")
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run", FAKE_IP_ADDRS="10.0.0.4")
+    assert r.returncode == 0, r.stderr
+    assert NOT_HELD in r.stderr
+    assert _tree(inst) == before
+
+
+@pytest.mark.parametrize("env_tail, containers", [
+    # A host name is the file check's to refuse, never this one's to judge.
+    (PHONE_LINE + "OTO_AUDIOSOCKET_PUBLIC_HOST=pbx.example.lan\n", (PG, PROXY)),
+    (PHONE_LINE + "OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1\n", (PG, PROXY)),
+    # The overlay not in use: nothing publishes on the address.
+    ("COMPOSE_FILE=docker-compose.yml\nOTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10\n", (PG, PROXY, PHONE)),
+    ("OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10\n", (PG, PROXY)),
+])
+def test_the_publish_address_check_judges_only_a_literal_the_overlay_uses(
+        tmp_path, fakebin, raw, env_tail, containers):
+    inst = _install(tmp_path, SECRET_ENV + env_tail)
+    ip_log = tmp_path / "ip.log"
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=containers,
+             FAKE_IP_ADDRS="10.0.0.4", FAKE_IP_LOG=str(ip_log))
+    assert r.returncode == 0, r.stderr
+    assert NOT_HELD not in r.stderr
+    assert not ip_log.exists()

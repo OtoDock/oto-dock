@@ -129,7 +129,7 @@ function RenameInput({ initial, onCommit, onCancel }: {
           else if (e.key === 'Escape') finish(false)
         }}
         onBlur={() => finish(false)}
-        className="min-w-0 flex-1 text-xs font-medium bg-white dark:bg-p-surface text-p-text
+        className="min-w-0 flex-1 text-xs pointer-coarse:text-base font-medium bg-white dark:bg-p-surface text-p-text
                    rounded-sm border border-brand/50 px-1.5 py-1
                    focus:outline-hidden focus:ring-1 focus:ring-brand/40"
       />
@@ -753,7 +753,7 @@ export default function ChatHistory({
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
             placeholder={tasksMode ? 'Search tasks...' : 'Search chats...'}
-            className="w-full pl-8 pr-7 py-1.5 text-xs rounded-lg border border-p-border-light bg-white dark:bg-p-surface
+            className="w-full pl-8 pr-7 py-1.5 text-xs pointer-coarse:text-base rounded-lg border border-p-border-light bg-white dark:bg-p-surface
                        text-p-text placeholder:text-p-text-light
                        focus:outline-hidden focus:ring-1 focus:ring-brand/40 focus:border-brand/40
                        transition-colors"

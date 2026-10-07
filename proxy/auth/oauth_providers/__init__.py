@@ -83,6 +83,12 @@ def get_provider(provider_id: str) -> "OAuthProvider":
     )
 
 
+def hardcoded_provider_ids() -> frozenset[str]:
+    """The provider ids whose Python class fixes the protocol (the manifest
+    validator refuses ``authorization_server`` on them)."""
+    return frozenset(_HARDCODED)
+
+
 def list_provider_ids() -> list[str]:
     """All known provider_ids (hardcoded + currently-cached manifest-derived).
 
@@ -131,7 +137,12 @@ def _build_from_manifest(provider_id: str) -> "OAuthProvider | None":
         pat_only = bool(flows) and all(
             f == "personal_access_token" for f in flows
         )
-        if (not authorization_url or not token_url) and not pat_only:
+        # A server that names its own authorization server
+        # (``authorization_server``) declares no URL: the flow discovers
+        # them (services/oauth/mcp_authorization.py) and never calls this
+        # provider's URL-bound methods; it carries the identity settings.
+        names_its_server = bool(oauth.get("authorization_server"))
+        if (not authorization_url or not token_url) and not pat_only and not names_its_server:
             logger.warning(
                 "Manifest %s declares provider_id=%s but is missing "
                 "authorization_url/token_url; cannot build provider.",

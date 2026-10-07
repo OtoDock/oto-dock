@@ -84,6 +84,10 @@ interface Props {
    * scheduler's 'auto' → Don't Ask) read-only — the popup lists only the
    * active mode and selection is a no-op. */
   modeLocked?: boolean
+  /** Why the pickers are locked on a chat that runs as the agent (the
+   * server's drive-gate sentence): shown on the mode and model triggers
+   * after their label and on the terminal switch. */
+  lockReason?: string
   /** Optional content rendered on the LEFT of the status row, filling the space
    * that is otherwise the flex spacer (so the model control stays right-aligned).
    * Used by the interactive terminal control-key bar —
@@ -137,7 +141,7 @@ function getModelLetter(model: string, label?: string): string {
 const DEFAULT_MODEL_OPTIONS = [
   { value: 'claude-fable-5-1', label: 'Fable 5.1 (1M)' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5 (1M)' },
-  { value: 'claude-sonnet-5', label: 'Sonnet 5 (1M)' },
+  { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (1M)' },
 ]
 
 // The mode and model pickers share the icon dropdown in components/ui.
@@ -147,9 +151,10 @@ type ModelGroup = IconDropdownGroup
 // Interactive-terminal on/off switch — rendered at the top of the Model popup.
 // A row: label + sliding switch. Disabled while a session is live;
 // switching a running session involves a kill+rewarm.
-function InteractiveToggle({ on, disabled, onToggle }: {
+function InteractiveToggle({ on, disabled, disabledReason, onToggle }: {
   on: boolean
   disabled: boolean
+  disabledReason?: string
   onToggle?: (next: boolean) => void
 }) {
   return (
@@ -160,7 +165,7 @@ function InteractiveToggle({ on, disabled, onToggle }: {
       disabled={disabled}
       onClick={() => { if (!disabled) onToggle?.(!on) }}
       title={disabled
-        ? 'Switching…'
+        ? disabledReason || 'Switching…'
         : on
           ? 'Interactive terminal is ON — toggle off to switch back to normal mode'
           : 'Run this chat as the interactive CLI (terminal)'}
@@ -209,6 +214,7 @@ export default function ChatStatusBar({
   interactiveActive,
   modelLocked,
   modeLocked,
+  lockReason,
   leftSlot,
   onModeChange,
   onModelChange,
@@ -473,7 +479,7 @@ export default function ChatStatusBar({
               trigger={
                 <span
                   className={`flex items-center justify-center w-7 h-7 rounded-lg border ${mc.bg} ${mc.border} ${mc.text} hover:brightness-95 transition-colors cursor-pointer`}
-                  title={`Mode: ${mc.label}`}
+                  title={`Mode: ${mc.label}${lockReason ? ` · ${lockReason}` : ''}`}
                 >
                   {mc.icon}
                 </span>
@@ -506,12 +512,13 @@ export default function ChatStatusBar({
               onChange={modelLocked ? () => {} : onModelChange}
               onOpen={onModelMenuOpen}
               topSlot={interactiveAvailable
-                ? <InteractiveToggle on={!!interactiveOn} disabled={!!interactiveDisabled} onToggle={onInteractiveToggle} />
+                ? <InteractiveToggle on={!!interactiveOn} disabled={!!interactiveDisabled}
+                    disabledReason={lockReason} onToggle={onInteractiveToggle} />
                 : undefined}
               trigger={
                 <span
                   className="flex items-center justify-center w-7 h-7 rounded-lg border bg-p-surface border-p-border-light/60 dark:border-gray-700 text-p-text-secondary hover:bg-white dark:hover:bg-p-surface-hover hover:border-p-border transition-colors cursor-pointer text-xs font-semibold"
-                  title={`Model: ${modelLabel}${modelTier ? ` · ${modelTier}` : ''}`}
+                  title={`Model: ${modelLabel}${modelTier ? ` · ${modelTier}` : ''}${lockReason ? ` · ${lockReason}` : ''}`}
                 >
                   {modelLetter}
                 </span>

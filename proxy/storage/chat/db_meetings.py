@@ -6,6 +6,7 @@ synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
 import contextlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -161,6 +162,30 @@ def get_active_meeting_for_chat(parent_chat_id: str) -> dict | None:
             (parent_chat_id, sorted(meeting_status.LIVE)),
         ).fetchone()
         return dict(row) if row else None
+
+
+def chat_has_meeting_event(chat_id: str, subtype: str, meeting_id: str) -> bool:
+    """Whether the chat holds a persisted ``system`` row of ``subtype`` for
+    ``meeting_id``. ``subtype`` comes from the caller (``ws/wire_events``;
+    a SQL literal reads no vocabulary). ``event_data`` is TEXT and ``''`` on
+    most rows, so a LIKE prefilters on the default ``json.dumps``
+    separators and the meeting id is compared after parsing."""
+    if not (chat_id and subtype and meeting_id):
+        return False
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_data FROM chat_messages "
+            "WHERE chat_id=%s AND event_type='system' AND event_data LIKE %s",
+            (chat_id, f'%"subtype": {json.dumps(subtype)}%'),
+        ).fetchall()
+    for row in rows:
+        try:
+            data = json.loads(row["event_data"] or "")
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("meeting_id") == meeting_id:
+            return True
+    return False
 
 
 def _meeting_conditions(agent, status, scope_user_sub, created_by,

@@ -102,7 +102,7 @@ async def build_phone_agent_config(
     return await _build_external_config(
         agent_name, route_identity, call_type=call_type,
         phone_context_override=phone_context_override, phone_mode=phone_mode,
-        trigger_payload=trigger_payload,
+        trigger_payload=trigger_payload, session_id=session_id,
     )
 
 
@@ -153,6 +153,7 @@ async def _build_external_config(
     phone_context_override: str,
     phone_mode: bool,
     trigger_payload: dict | None,
+    session_id: str = "",
 ) -> AgentConfig:
     """An EXTERNAL principal — the caller is not a platform user. Always a
     viewer of the shared space, whatever a legacy route row says."""
@@ -235,10 +236,13 @@ async def _build_external_config(
     # the external rule drops the platform-management MCPs.
     mcp_config_path, credential_env, excluded_mcps, secret_bundles, _ = await asyncio.to_thread(
         mcp_registry.build_session_mcp_config,
-        agent_name, None, phone_mode=phone_mode,
+        agent_name, None, phone_mode=phone_mode, session_id=session_id,
         placement=target,
         target_browser=target_browser,
         external=True,
+        # The caller's role: an MCP or skill whose audience is above it stays
+        # out, as in the prompt below.
+        user_role=role,
         mcp_config_format=mcp_format,
     )
     if mcp_format == "toml" and mcp_config_path and credential_env:
@@ -289,6 +293,10 @@ async def _build_external_config(
         skip_http_mcps=not _caps.behaviour.phone_http_mcps,
         external=True,
         external_home=external_home,
+        # The caller's viewer role: the skills (inline and in the catalog)
+        # and the MCP catalog drop what an audience above it names, as the
+        # session config above does.
+        user_role=role,
     ) or ""
     agent_prompt += build_permission_context(
         phone_security,

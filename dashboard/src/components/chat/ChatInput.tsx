@@ -27,9 +27,15 @@ function debugLevels(): { mic: number; out: number } {
   return { mic: level, out: level }
 }
 import { useCoarsePointer } from '../../hooks/useCoarsePointer'
+import { usePrimaryPointerCoarse } from '../../hooks/usePrimaryPointerCoarse'
+import { usePasteGuard } from '../../hooks/usePasteGuard'
+import { useComposerHeight } from '../../hooks/useComposerHeight'
+import { enterAction, insertNewline, isComposingKey } from '../../lib/composerKeys'
 import { useAuth } from '../../contexts/AuthContext'
 import { useTransferStore } from '../../store/transferStore'
+import { saveDocumentPane, useDocumentPushStore } from '../../store/documentPaneStore'
 import { Bar, fmtSize, pct } from '../common/TransferBar'
+import { SEND_SAVE_TIMEOUT_MS } from './media/DocumentFrame'
 import ImageLightbox from './media/ImageLightbox'
 
 // Any file type is accepted (no extension allowlist — see lib/fileTypes);
@@ -38,6 +44,9 @@ import ImageLightbox from './media/ImageLightbox'
 // Shipped default; the per-install override rides user.feature_flags
 // (upload_max_bytes) — see useUploadCap below.
 const MAX_FILE_SIZE = 1024 * 1024 * 1024 // 1 GB (universal)
+
+/** How long the composer says a send went out before the document saved. */
+export const DOC_NOTICE_MS = 8000
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -129,11 +138,15 @@ interface Props {
    * pre-warm for non-favorite agents. NOT fired on focus or on mount. */
   onEngage?: () => void
   disabled?: boolean
-  /** Blocks ONLY sending (button + Enter) while keeping the composer
+  /** Blocks ONLY sending (the button and the send keys) while keeping the composer
    * typeable — the user can keep drafting. Used while a cross-engine switch
    * awaits its confirmation (prompting is not allowed until it resolves). */
   sendDisabled?: boolean
   streaming?: boolean
+  /** A send now joins the running turn (queued or steered): Send shows
+   * beside Stop. False while the session warms up, where a send waits in a
+   * single slot instead. */
+  queueable?: boolean
   aborting?: boolean
   placeholder?: string
   queuedCount?: number
@@ -167,6 +180,11 @@ interface Props {
   /** Lights up a small dot on the toggle while the overlay is open and a new
    * assistant message has arrived. */
   workspaceHasNewMessage?: boolean
+  /** Animate the shrink and the regrow on a focus change (default). The host
+   * turns it off while the slot above holds something that re-lays out on
+   * every frame of it: a live terminal (each row is a PTY resize), an overlay,
+   * the floating document pane. */
+  animateHeight?: boolean
   /** Forwarded to the textarea so dropped agent file paths splice at the cursor. */
   textareaRef?: React.RefObject<HTMLTextAreaElement | null>
   /** Voice mode (AgentChat only). Hands-free speak → send → hear. Omitted where
@@ -209,6 +227,7 @@ export default function ChatInput({
   disabled,
   sendDisabled,
   streaming,
+  queueable,
   aborting,
   placeholder,
   queuedCount = 0,
@@ -230,6 +249,7 @@ export default function ChatInput({
   onToggleProjects,
   dockKind,
   textareaRef: externalTextareaRef,
+  animateHeight = true,
   voice,
   draftKey,
 }: Props) {
@@ -279,6 +299,7 @@ export default function ChatInput({
   const docInputRef = useRef<HTMLInputElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const plusBtnRef = useRef<HTMLButtonElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
 
   // Detect camera availability on mount
   useEffect(() => {
@@ -316,22 +337,77 @@ export default function ChatInput({
   // on desktop (fine pointer) they reveal on tile hover.
   const coarse = useCoarsePointer()
   const removeBtnVisibility = coarse ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+  // The send keys exist only where the primary pointer is fine (a laptop or a
+  // desktop); a phone or a tablet sends with the button.
+  const touchPrimary = usePrimaryPointerCoarse()
+  const pasteGuard = usePasteGuard()
+  // The pending-photo lightbox is portaled out of the composer: while it is
+  // open, using it never shrinks the composer.
+  const height = useComposerHeight(textareaRef, rootRef, { animate: animateHeight, holdOpen: lightbox !== null })
 
-  const handleSend = useCallback(() => {
-    if (anyFileUploading || sendDisabled) return
-    const trimmed = text.trim()
+  // The chat's document pane holds unsaved edits: the agent reads the
+  // stored file, so a send saves them first (FEATURES.md "Document pane").
+  const docDirty = useDocumentPushStore((s) => (draftKey ? s.dirty[draftKey] ?? null : null))
+  const docDirtyName = useDocumentPushStore((s) => (draftKey ? s.dirtyNames[draftKey] ?? '' : ''))
+  const [docSaving, setDocSaving] = useState(false)
+  const [docNotice, setDocNotice] = useState('')
+  useEffect(() => {
+    if (!docNotice) return
+    const t = setTimeout(() => setDocNotice(''), DOC_NOTICE_MS)
+    return () => clearTimeout(t)
+  }, [docNotice])
+  const attachmentsRef = useRef(0)
+  attachmentsRef.current = pendingImages.length + pendingFiles.length
+  // The composer's own guards as they are when the save answers.
+  const blockedRef = useRef(false)
+  blockedRef.current = anyFileUploading || anyFileErrored || !!sendDisabled
+  // The page's send as it is at the moment it runs: a send that waited for
+  // the save goes out with the page's state then (a turn may have started
+  // or ended, attachments changed), never the state of the tap.
+  const onSendRef = useRef(onSend)
+  onSendRef.current = onSend
+  // The save a send waits for: a chat switch lets it go (its send is then
+  // dropped), so the next chat's composer is never held by it.
+  const savingRef = useRef<object | null>(null)
+  useEffect(() => {
+    savingRef.current = null
+    setDocSaving(false)
+    setDocNotice('')
+  }, [draftKey])
+
+  const handleSend = useCallback(async () => {
+    if (anyFileUploading || sendDisabled || savingRef.current) return
+    let trimmed = text.trim()
     if (!trimmed && pendingImages.length === 0 && pendingFiles.length === 0) return
-    onSend(trimmed)
+    if (docDirty && draftKey) {
+      // The button stays disabled while the editor saves (up to 1.5 s). What
+      // goes out is the composer as it is then, in the chat it was sent in.
+      const key = draftKey
+      const mine = {}
+      savingRef.current = mine
+      setDocSaving(true)
+      let saved: boolean
+      try {
+        saved = await saveDocumentPane(key, SEND_SAVE_TIMEOUT_MS)
+      } finally {
+        if (savingRef.current === mine) {
+          savingRef.current = null
+          setDocSaving(false)
+        }
+      }
+      if (draftKeyRef.current !== key || blockedRef.current) return
+      trimmed = valueRef.current.trim()
+      if (!trimmed && attachmentsRef.current === 0) return
+      if (!saved) setDocNotice("The document's last edits are not saved yet.")
+    }
+    onSendRef.current(trimmed)
     setText('')
     // Close an open dictation mic AND drop its tail: the text was just sent,
     // so a late stop-flush final must not re-fill the cleared input. Reset
     // the dictation accumulator for the same reason.
     dictBaseRef.current = ''
     setMicDiscardSignal(n => n + 1)
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto'
-    }
-  }, [text, pendingImages, pendingFiles, onSend, anyFileUploading, sendDisabled])
+  }, [text, pendingImages, pendingFiles, anyFileUploading, sendDisabled, docDirty, draftKey])
 
   // First genuine interaction with the composer → fire onEngage once. Guarded
   // by a ref so it never re-fires; bound to keydown/pointerdown (NOT focus or
@@ -343,12 +419,15 @@ export default function ChatInput({
     onEngage?.()
   }
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     handleEngage()
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      if (!anyFileUploading && !anyFileErrored) handleSend()
-    }
+    height.settle()
+    pasteGuard.onKeyDown(e)
+    if (isComposingKey(e.nativeEvent)) return
+    const action = enterAction(e.nativeEvent, { coarse: touchPrimary, pasteHeld: pasteGuard.held() })
+    if (action !== 'pass') e.preventDefault()
+    if (action === 'newline') insertNewline(e.currentTarget, setText)
+    if (action === 'send' && !anyFileUploading && !anyFileErrored) void handleSend()
     if (e.key === 'ArrowUp' && !text && queuedCount > 0 && onEditQueued) {
       e.preventDefault()
       onEditQueued()
@@ -360,9 +439,8 @@ export default function ChatInput({
     // Manual edit mid-dictation → re-baseline so the next partial/final builds on
     // the edited text (otherwise a deleted phrase reappears on the next utterance).
     if (dictatingRef.current) dictBaseRef.current = e.target.value
-    const ta = e.target
-    ta.style.height = 'auto'
-    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
+    height.settle()
+    height.fit()
   }
 
   // Mic dictation shows live interim text as you speak and commits each final at
@@ -373,10 +451,7 @@ export default function ChatInput({
   const dictatingRef = useRef(false)   // mic actively dictating → manual edits re-baseline
   const joinText = (a: string, b: string) =>
     a ? `${a}${a.endsWith(' ') || a.endsWith('\n') ? '' : ' '}${b}` : b
-  const nudgeResize = () => {
-    const ta = textareaRef.current
-    if (ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px' }
-  }
+  const nudgeResize = () => height.fit()
   // Autosize on EVERY value change: programmatic sets bypass handleInput —
   // a draft restored from localStorage on mount, edit/template insertion,
   // and clears all rendered at rows=1 (or stayed stretched) until the next
@@ -389,6 +464,9 @@ export default function ChatInput({
   // (live partials append onto it). Live-mode barge-in is handled in VoiceControl.
   const onMicActive = (active: boolean) => {
     dictatingRef.current = active
+    // Dictated text must land in view; phone mode's caption bridge calls this
+    // on every utterance and leaves the height alone.
+    if (active && !voice?.duplex?.active) height.grow()
     if (active) {
       dictKeyRef.current = draftKeyRef.current
       dictBaseRef.current = valueRef.current
@@ -516,13 +594,43 @@ export default function ChatInput({
   const canSend =
     !disabled &&
     !sendDisabled &&
+    !docSaving &&
     !anyFileUploading &&
     !anyFileErrored &&
     (text.trim().length > 0 || pendingImages.length > 0 || pendingFiles.length > 0)
 
+  // While a turn runs Stop takes Send's place; with something to send, Send
+  // comes back beside a square Stop so a phone can still queue a message.
+  // Never in phone mode: the live caption fills the box, and the engine sends
+  // the spoken turn itself.
+  const queueSend = !!queueable && canSend && !aborting && !voice?.duplex?.active
+  const sendButton = (
+    <button
+      onClick={() => void handleSend()}
+      disabled={!canSend}
+      aria-label="Send"
+      title={touchPrimary ? undefined : 'Send (Shift+Enter)'}
+      aria-keyshortcuts={touchPrimary ? undefined : 'Shift+Enter Control+Enter Meta+Enter'}
+      className="w-9 h-9 rounded-lg text-sm font-medium text-white flex items-center justify-center
+                 bg-brand hover:bg-brand-hover disabled:bg-p-surface disabled:text-p-text-light disabled:cursor-not-allowed
+                 transition-colors shrink-0"
+    >
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19V5m0 0l-7 7m7-7l7 7" />
+      </svg>
+    </button>
+  )
+
   return (
-    <div className="px-3 pb-composer-safe">
+    <div ref={rootRef} className="px-3 pb-composer-safe">
       <div className="max-w-4xl mx-auto">
+        {(docNotice || docDirty) && (
+          <p role="status" className="mb-1 truncate px-1 text-xs text-amber-700 dark:text-amber-400">
+            {docNotice || (docSaving
+              ? `Saving ${docDirtyName || 'the document'} before sending.`
+              : `Unsaved edits in ${docDirtyName || 'the document'}.`)}
+          </p>
+        )}
         {/* relative wrapper: the PresenceHalo canvas positions against the
             pill; the pill's explicit z-[1] keeps content above the glow
             (before, that layering only held by accident of backdrop-blur's
@@ -834,9 +942,15 @@ export default function ChatInput({
               value={text}
               onChange={handleInput}
               onKeyDown={handleKeyDown}
+              onKeyUp={pasteGuard.onKeyUp}
               onPointerDown={handleEngage}  // first genuine interaction → lazy pre-warm (non-favorite agents)
-              onFocus={() => setMicStopSignal(n => n + 1)}  // clicking the input stops/pauses the mic
-              onBlur={() => {
+              onFocus={() => {
+                setMicStopSignal(n => n + 1)  // clicking the input stops/pauses the mic
+                height.onFocus()
+              }}
+              onBlur={(e) => {
+                pasteGuard.onBlur()
+                height.onBlur(e)
                 // Click-to-edit abandoned: leaving an EMPTY composer while a
                 // live conversation is held resumes listening (a non-empty
                 // draft keeps the hold — Send is the only way it dispatches).
@@ -858,6 +972,7 @@ export default function ChatInput({
                 })
               }}
               onPaste={(e) => {
+                pasteGuard.onPaste()
                 // Ctrl/Cmd+V with files on the clipboard (screenshots, copied
                 // files) attaches them exactly like the + menu; plain text
                 // pastes are untouched.
@@ -870,10 +985,9 @@ export default function ChatInput({
               placeholder={placeholder || 'Type a message...'}
               disabled={disabled}
               rows={1}
-              className="flex-1 resize-none rounded-lg px-3 py-2 text-sm bg-transparent
+              className="flex-1 resize-none rounded-lg px-3 py-2 text-sm pointer-coarse:text-base bg-transparent
                          focus:outline-hidden order-first basis-full
                          disabled:text-p-text-light placeholder:text-p-text-light"
-              style={{ maxHeight: '200px' }}
             />
 
             {/* Right controls (mic/live + send) — pushed to the right end of
@@ -908,30 +1022,35 @@ export default function ChatInput({
               />
             )}
             {streaming && onAbort ? (
-              <button
-                onClick={onAbort}
-                disabled={aborting}
-                className={`px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors shrink-0 ${
-                  aborting
-                    ? 'bg-p-text-light cursor-not-allowed'
-                    : 'bg-p-accent-red hover:bg-red-700'
-                }`}
-              >
-                {aborting ? 'Stopping...' : 'Stop'}
-              </button>
-            ) : (
-              <button
-                onClick={handleSend}
-                disabled={!canSend}
-                className="w-9 h-9 rounded-lg text-sm font-medium text-white flex items-center justify-center
-                           bg-brand hover:bg-brand-hover disabled:bg-p-surface disabled:text-p-text-light disabled:cursor-not-allowed
-                           transition-colors shrink-0"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19V5m0 0l-7 7m7-7l7 7" />
-                </svg>
-              </button>
-            )}
+              <>
+                {queueSend ? (
+                  <button
+                    onClick={onAbort}
+                    aria-label="Stop"
+                    title="Stop"
+                    className="w-9 h-9 rounded-lg flex items-center justify-center text-white shrink-0
+                               bg-p-accent-red hover:bg-red-700 transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+                      <rect x="5" y="5" width="14" height="14" rx="2" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button
+                    onClick={onAbort}
+                    disabled={aborting}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors shrink-0 ${
+                      aborting
+                        ? 'bg-p-text-light cursor-not-allowed'
+                        : 'bg-p-accent-red hover:bg-red-700'
+                    }`}
+                  >
+                    {aborting ? 'Stopping...' : 'Stop'}
+                  </button>
+                )}
+                {queueSend && sendButton}
+              </>
+            ) : sendButton}
             </div>
           </div>
 

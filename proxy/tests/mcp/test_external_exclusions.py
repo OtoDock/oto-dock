@@ -222,6 +222,9 @@ class TestDirectManager:
         mgr = AgentMCPManager("agent", phone_mode=True, session_id="s", external=True)
         await mgr._start_impl()
         assert seen["external"] is True and seen["phone_mode"] is True
+        # Built into the session's own directory, never the identity's
+        # shared file another session of the agent rewrites.
+        assert seen["session_id"] == "s"
 
 
 SHIPPED_EXTERNAL_OPT_OUTS = [
@@ -259,8 +262,33 @@ class TestHttpWarmup:
                         headers={"Authorization": "Bearer master"})
         assert r.status_code == 410
         # A session token cannot warm sessions at all.
-        from auth.session_token import create_session_token
-        tok = create_session_token("00000000-0000-4000-8000-000000000000", "x")
+        from tests.conftest import live_session_token
+        tok = live_session_token("00000000-0000-4000-8000-000000000000", "x")
         r = client.post("/v1/sessions/warmup", json={"model": "x"},
                         headers={"Authorization": f"Bearer {tok}"})
         assert r.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_a_cli_warmup_builds_its_mcp_config_for_its_session(self, monkeypatch):
+        import config
+        from api.sessions import sessions
+        from services.mcp import mcp_registry as reg
+        monkeypatch.setattr(config, "is_master_key", lambda k: k == "master")
+        monkeypatch.setattr(config, "build_agent_prompt", lambda *a, **kw: "")
+        seen = {}
+
+        def _fake_build(agent, user_sub, **kw):
+            seen.update(kw)
+            return None, {}, {}, {}, set()
+
+        async def _fake_session(**kw):
+            seen["warmed"] = kw["session_id"]
+
+        monkeypatch.setattr(reg, "build_session_mcp_config", _fake_build)
+        monkeypatch.setattr(sessions, "get_or_create_persistent_session", _fake_session)
+        out = await sessions.warmup_session_endpoint(
+            sessions.WarmupRequest(model="x", session_id="s-warm"),
+            authorization="Bearer master",
+        )
+        assert out["session_id"] == "s-warm"
+        assert seen["session_id"] == "s-warm" and seen["warmed"] == "s-warm"

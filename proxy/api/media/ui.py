@@ -45,6 +45,7 @@ from fastapi.responses import HTMLResponse
 import config
 from api.media.access import can_serve_token
 from api.media.media import MediaUnserveable, locate_media_row
+from auth.lan_check import trusted_forwarded_proto
 from auth.providers import UserContext, get_current_user
 from services.infra import safe_fs
 from storage import database as task_store
@@ -55,6 +56,8 @@ router = APIRouter()
 # The hook caps an artifact at 2 MB when it is minted; the agent may Edit the
 # file afterwards, so the serve allows some growth before it gives up.
 _UI_SERVE_MAX_BYTES = 8 * 1024 * 1024
+
+_ORIGIN_SCHEMES = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
 
 
 # The artifact runtime, injected into wrapped fragments:
@@ -193,8 +196,11 @@ def request_origin(request: Request) -> str:
     otherwise pins an ``http://`` CSP under an ``https://`` page and the
     browser blocks every kit subresource — artifacts render unstyled (found
     live on the trusted-VM install, 2026-07-10). All other accesses (LAN-IP
-    dev boxes, secondary hostnames) derive from the request: ``Host`` header
-    + ``X-Forwarded-Proto`` (first hop) falling back to the socket scheme."""
+    dev boxes, secondary hostnames) derive from the request: the ``Host``
+    header and the scheme a trusted hop's ``X-Forwarded-Proto`` names
+    (``lan_check.trusted_forwarded_proto``, which the ASGI shim also stamps on
+    the scope), else the socket's own, a WebSocket's ``ws``/``wss`` read as
+    ``http``/``https``."""
     host = (request.headers.get("host") or request.url.netloc or "").strip()
     pub = (config.DASHBOARD_PUBLIC_URL or "").strip().rstrip("/")
     if pub and host:
@@ -203,8 +209,8 @@ def request_origin(request: Request) -> str:
         if p.scheme in ("http", "https") and p.netloc \
                 and host.lower() == p.netloc.lower():
             return f"{p.scheme}://{p.netloc}"
-    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
-    scheme = proto or request.url.scheme or "http"
+    scheme = trusted_forwarded_proto(request.scope) \
+        or _ORIGIN_SCHEMES.get(request.url.scheme, "http")
     return f"{scheme}://{host}"
 
 

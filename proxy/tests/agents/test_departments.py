@@ -929,6 +929,11 @@ class TestPromptDepartmentLine:
         assert "level(s) below" in text and "`dl-jun`" in text
         assert "same-level" not in text and "`dl-peer`" not in text
         assert "level(s) above" not in text and "`dl-head`" not in text
+        # the bottom level with no target at all: the line alone, so the
+        # agent still learns its place
+        bare = _delegation_mcp_context("dl-jun", delegation_targets=[])
+        assert "level **Junior**" in bare and "runs downward only" in bare
+        assert "delegation targets" not in bare
         # the bottom level with a manual target elsewhere: the department
         # line still appears, with the clause and no buckets
         agent_store.set_delegation_targets("dl-jun", ["dl-out"])

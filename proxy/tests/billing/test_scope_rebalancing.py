@@ -32,6 +32,8 @@ def _reset():
     sp._issued_token_expiry.clear()
     sp._throttled_until.clear()
     sp._throttled_hard.clear()
+    sp._window_rests.clear()
+    sp._scoped_rests.clear()
     sp._scope_rebalance_last.clear()
     sp._refresh_backoff.clear()
 
@@ -415,6 +417,39 @@ class TestModelAwareRebalance:
         with self._chat_model("claude-sonnet-5"):
             assert sp.rebalance_scopes(reason="windows") == 0
         assert sp._session_subscriptions["sess-1"] == "sub-a"
+
+    @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
+    @patch.object(tf, "session_target",
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_a_rest_for_the_scopes_model_moves_it(self, mock_store, _t, mock_fan):
+        # A usage limit on sub-a's Fable window rests it for Fable only: the
+        # Fable scope moves to sub-b, a Sonnet scope on sub-a stays.
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        mock_store.latest_window_samples.side_effect = lambda ids: {}
+        sp._scoped_rests[("sub-a", "fable")] = (time.time() + 86400, time.time())
+        _bind()
+        with self._chat_model("claude-fable-5-1"):
+            assert sp.rebalance_scopes(reason="provider limit") == 1
+        assert sp._session_subscriptions["sess-1"] == "sub-b"
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        sp._scoped_rests[("sub-a", "fable")] = (time.time() + 86400, time.time())
+        _bind()
+        with self._chat_model("claude-sonnet-5"):
+            assert sp.rebalance_scopes(reason="provider limit") == 0
+        assert sp._session_subscriptions["sess-1"] == "sub-a"
+        # A replacement resting for the scope's model is no replacement.
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        sp._scoped_rests[("sub-a", "fable")] = (time.time() + 86400, time.time())
+        sp._scoped_rests[("sub-b", "fable")] = (time.time() + 86400, time.time())
+        _bind()
+        with self._chat_model("claude-fable-5-1"):
+            assert sp.rebalance_scopes(reason="provider limit") == 0
+        assert sp._session_subscriptions["sess-1"] == "sub-a"
+        _reset()
 
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)

@@ -326,8 +326,8 @@ def routes(temp_db, monkeypatch):
 
 
 def _session_headers(agent: str, named: str, user_sub: str = "") -> dict:
-    from auth.session_token import create_session_token
-    return {"Authorization": f"Bearer {create_session_token(f'sid-{agent}', agent, user_sub)}",
+    from tests.conftest import live_session_token
+    return {"Authorization": f"Bearer {live_session_token(f'sid-{agent}', agent, user_sub)}",
             "X-Agent-Name": named}
 
 

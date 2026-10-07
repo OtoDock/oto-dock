@@ -20,7 +20,6 @@ import asyncio
 import contextlib
 import base64
 import functools
-import json
 import logging
 from typing import NamedTuple
 
@@ -30,7 +29,7 @@ from storage import database as task_store
 from storage.pg import run_db
 from storage.automation import notification_store
 from services.notifications import notification_manager
-from core.events import chat_writer
+from core.events import chat_writer, input_queue
 from core.session.session_state import (
     set_session_mode,
     resolve_permission,
@@ -157,130 +156,185 @@ class ClientMessageDispatcher:
                                        "is not on. Reopen the chat and send it again.")
                 await self._send({"type": wire.DONE, "chat_id": msg_cid})
                 return None
+            if not (text or images or files):
+                return None
+            # The chat's queue (the pump's chat: the one its producer drains).
+            # A re-send after a reconnect is answered once: a message still
+            # waiting re-announces its chip, one a turn already took is done.
+            q = await input_queue.loaded(pump.chat_id)
+            queue_id = str(msg.get("queue_id") or "") or input_queue.mint_queue_id()
+            waiting = q.find(queue_id)
+            if waiting is not None and waiting.author_sub == self.user_sub:
+                input_queue.announce_queued(waiting, q.index_of(queue_id))
+                return None
+            if waiting is not None:
+                # Another person's waiting id: the steer takes its own, so
+                # its accept never deletes their row.
+                queue_id = input_queue.mint_queue_id()
+            if queue_id in q.accepted:
+                return None
             # Same task continue-gate the between-turns/warmup/
             # permission paths enforce — WITHOUT it a viewer of a
             # shared-only agent's task chat could steer/queue into a
             # running task run they're not allowed to continue
             # (Codex steer injects into the live turn). Applies only
             # to task-{run} chats; a no-op for regular chats.
-            if ((text or images or files)
-                    and await self._deny_task_continue(pump.chat_id)):
-                text, images, files = "", [], []
-            if text or images or files:
-                # The busy send carries exactly what an idle send does:
-                # the photos are saved and the files validated NOW, the
-                # engine text gets their paths, the row gets the meta
-                # (the pump's session: an attach viewer may hold a
-                # different session id than the streaming turn).
-                item = await self._prepare_turn_input(
-                    text, images, files, session_id=pump.session_id,
-                )
-                if item is None:
-                    return None
-                # Steer-first: engines that support it (Codex
-                # turn/steer) take the message INTO the running
-                # turn — delivered exactly-once on accept, so it
-                # must never also enter the queue. The user row
-                # persists immediately (it is part of this turn's
-                # context; the pump's turn blocks save after it,
-                # matching the interactive tailers' mid-turn user
-                # rows). Plan-implement enqueues use the
-                # plan_review handler and never steer.
-                steered = False
-                if (self.session_id and self.layer
-                        and getattr(pump, "source_type", session_kind.DASHBOARD.source_type)
-                        in session_kind.STEERABLE_SOURCE_TYPES):
-                    steered = bool(await self.layer.steer(self.session_id, item.cli_text))
-                # Queued behind the turn, the message cuts it: a check
-                # round that started before it is cancelled and the
-                # turn is not continued (CHECKS.md). A steered message
-                # is part of the running turn. The pump's session: an
-                # attach viewer may hold a different one.
-                if not steered and pump.session_id:
-                    from core.session import session_events
-                    session_events.note_user_message(pump.session_id)
-                # Either way the message re-targets the end-of-turn
-                # alert to this device.
-                notification_manager.set_chat_turn_origin(
-                    self.user_sub, pump.chat_id, self.notify_connection_id,
-                )
-                if steered:
-                    _meta = item.event_meta
-                    await chat_writer.submit(
-                        pump.chat_id,
-                        functools.partial(task_store.add_chat_message,
-                                          pump.chat_id, "user", item.text,
-                                          event_data=json.dumps(_meta) if _meta else "",
-                                          author_sub=self.user_sub),
-                        label="steered_row",
-                    )
-                    await self._send({"type": wire.STEERED, "text": item.text,
-                                      "chat_id": stream.chat_id, **item.frame_fields()})
-                else:
-                    idx = pump.queue_message(item)
-                    if idx < 0:
-                        await self._send_error(
-                            "Too many queued messages — wait for the "
-                            "current turn to finish.")
-                    else:
-                        await self._send({"type": wire.QUEUED, "index": idx, "text": item.text,
-                                          "chat_id": stream.chat_id, **item.frame_fields()})
-                        # Stop-and-send (Claude CLI headless): fire a
-                        # graceful-only interrupt so the producer's
-                        # queue drain delivers this message as the
-                        # next turn in seconds, not at turn end.
-                        self._maybe_stop_and_send(pump)
+            if await self._deny_task_continue(pump.chat_id):
+                return None
+            # The busy send carries exactly what an idle send does: the
+            # photos are saved and the files validated NOW, the engine text
+            # gets their paths, the row gets the meta (the pump's session:
+            # an attach viewer may hold a different session id than the
+            # streaming turn).
+            item = await self._prepare_turn_input(
+                text, images, files, session_id=pump.session_id,
+            )
+            if item is None:
+                return None
+            qi = input_queue.QueuedInput(
+                queue_id=queue_id, chat_id=pump.chat_id, author_sub=self.user_sub or "",
+                item=item, origin_conn=self.notify_connection_id, conn=self,
+                view_chat_id=stream.chat_id if stream.chat_id != pump.chat_id else "",
+            )
+            # Steer-first: an engine that takes input into the running turn
+            # (Claude's stdin frame, Codex turn/steer) gets it now, delivered
+            # exactly once on accept, so it never also enters the queue. Its
+            # row is recorded by the pump in stream order (``record_steer``).
+            steered = False
+            if self._steer_possible(pump):
+                steered = bool(await self.layer.steer(self.session_id, item.cli_text))
+            # Queued behind the turn, the message cuts it: a check round that
+            # started before it is cancelled and the turn is not continued
+            # (CHECKS.md). A steered message is part of the running turn.
+            if not steered and pump.session_id:
+                from core.session import session_events
+                session_events.note_user_message(pump.session_id)
+            # Either way the message re-targets the end-of-turn alert to
+            # this device.
+            notification_manager.set_chat_turn_origin(
+                self.user_sub, pump.chat_id, self.notify_connection_id,
+            )
+            if steered:
+                q.accepted.append(queue_id)
+                if not pump.record_steer(qi):
+                    await input_queue.record_steer_late(pump.chat_id, qi)
+                return None
+            status, qi, idx = await q.add(
+                queue_id, qi.author_sub, item, origin_conn=qi.origin_conn, conn=self,
+                view_chat_id=qi.view_chat_id,
+            )
+            if status == input_queue.FULL:
+                await self._send_error("Too many queued messages. Wait for the "
+                                       "current turn to finish.")
+                return None
+            if qi is not None:
+                input_queue.announce_queued(qi, idx)
+            if pump.is_done:
+                input_queue.arm(pump.chat_id)
+            elif status == input_queue.QUEUED:
+                # Stop-and-send (Claude CLI headless): a graceful-only
+                # interrupt, so the producer's drain delivers this message as
+                # the next turn in seconds, not at the turn's end.
+                self._maybe_stop_and_send(pump)
             return None
         if self.streaming:
-            # Queue the message (capped: a client can't grow this list
-            # without bound by spamming `chat` while a turn streams).
+            # Between two turns of a stream this socket drives: the message
+            # waits in the chat's queue for the next turn.
             text = msg.get("text", "")
             images = msg.get("images") or []
             files = msg.get("files") or []
-            if text or images or files:
-                if len(self.message_queue) >= 64:
-                    await self._send_error(
-                        "Too many queued messages — wait for the current "
-                        "turn to finish.")
-                else:
-                    item = await self._prepare_turn_input(text, images, files)
-                    if item is None:
-                        return None
-                    self.message_queue.append(item)
-                    await self._send({"type": wire.QUEUED, "index": len(self.message_queue) - 1,
-                                      "text": item.text, **item.frame_fields()})
+            cid = self.chat_id or msg.get("chat_id") or ""
+            if (text or images or files) and not cid:
+                await self._send_error("This message names no chat. Reopen the chat "
+                                       "and send it again.")
+            elif text or images or files:
+                item = await self._prepare_turn_input(text, images, files)
+                if item is None:
+                    return None
+                await self._queue_for_next_turn(cid, item, msg.get("queue_id"))
         else:
             await self._handle_chat(msg)
         return None
 
+    async def _queue_for_next_turn(self, cid: str, item: TurnInput, queue_id=None, *,
+                                   waiting: str = "") -> None:
+        """A message that waits in ``cid``'s queue for the chat's next turn:
+        queued, its chip announced, and the delivery armed when no pump is
+        left to drain it. ``waiting`` says on the chip why it waits (its
+        chat's machine is reconnecting)."""
+        q = await input_queue.loaded(cid)
+        status, qi, idx = await q.add(
+            str(queue_id or "") or input_queue.mint_queue_id(), self.user_sub or "", item,
+            origin_conn=self.notify_connection_id, conn=self, waiting=waiting,
+        )
+        if status == input_queue.FULL:
+            await self._send_error("Too many queued messages. Wait for the current "
+                                   "turn to finish.")
+            return
+        if qi is not None:
+            input_queue.announce_queued(qi, idx)
+        live = _active_pumps.get(cid)
+        if live is None or live.is_done:
+            input_queue.arm(cid)
+
+    def _steer_possible(self, pump) -> bool:
+        """Whether a typed message may go INTO ``pump``'s running turn: an
+        engine that steers, on a pump whose turns a person drives (a
+        dashboard turn or a task run). A parked permission card or question
+        is ``layer.steer``'s own refusal."""
+        if not (self.session_id and self.layer):
+            return False
+        if getattr(pump, "source_type", session_kind.DASHBOARD.source_type) \
+                not in session_kind.STEERABLE_SOURCE_TYPES:
+            return False
+        try:
+            return bool(self.layer.capabilities_for(self.session_id).behaviour.supports_steer)
+        except Exception:
+            return True
+
     async def _on_cancel_queued(self, msg: dict, *, stream: StreamCtx | None = None):
-        # The removed item's text AND attachment meta go back: the
-        # dashboard returns both to the composer.
-        idx = msg.get("index", -1)
-        if stream is not None:
-            if await self._deny_task_continue(stream.pump.chat_id):
-                return None
-            item = stream.pump.cancel_queued(idx)
-            if item is not None:
-                await self._send({"type": wire.QUEUE_REMOVED, "index": idx, "text": item.text,
-                                  "chat_id": stream.chat_id, **item.frame_fields()})
+        # By its queue id (a 1.7.0 client sends the index only). Its author
+        # or an admin may cancel it; the author's sockets get the text and
+        # the attachments back into the composer, the other sockets of the
+        # chat drop the chip.
+        cid = (stream.pump.chat_id if stream is not None
+               else msg.get("chat_id") or self.chat_id or "")
+        if not cid:
             return None
-        if 0 <= idx < len(self.message_queue):
-            item = self.message_queue.pop(idx)
-            await self._send({"type": wire.QUEUE_REMOVED, "index": idx, "text": item.text,
-                              **item.frame_fields()})
+        if stream is not None and await self._deny_task_continue(cid):
+            return None
+        q = await input_queue.loaded(cid)
+        qid = str(msg.get("queue_id") or "")
+        idx = msg.get("index", -1)
+        qi = q.find(qid) if qid else (
+            q.items[idx] if isinstance(idx, int) and 0 <= idx < len(q.items) else None)
+        if qi is None:
+            return None
+        if qi.author_sub != (self.user_sub or "") and not roles.is_admin(self.user_role):
+            await self._send_error("Only its author or an admin can cancel a queued message.")
+            return None
+        index = await q.remove(qi)
+        if index < 0:
+            return None
+        input_queue.fan_out(cid, {"type": wire.QUEUE_REMOVED, "queue_id": qi.queue_id,
+                                  "index": index},
+                            returned_to={qi.author_sub: input_queue.combined_fields([qi])}
+                            if qi.author_sub else None)
         return None
 
     async def _on_cancel_all_queued(self, msg: dict, *, stream: StreamCtx | None = None):
+        # The socket's own messages (Edit): back into this person's
+        # composer. A teammate's waiting messages stay; an admin cancels
+        # another person's by its id. The interactions queued for the chat go.
+        cid = (stream.pump.chat_id if stream is not None
+               else msg.get("chat_id") or self.chat_id or "")
         if stream is not None:
-            if await self._deny_task_continue(stream.pump.chat_id):
+            if await self._deny_task_continue(cid):
                 return None
-            combined = stream.pump.cancel_all_queued()
-            await self._send({"type": wire.QUEUE_CLEARED, "text": combined, "chat_id": stream.chat_id})
-            return None
-        combined = "\n\n".join(q.text for q in self.message_queue) if self.message_queue else ""
-        self.message_queue.clear()
-        await self._send({"type": wire.QUEUE_CLEARED, "text": combined})
+            stream.pump.cancel_all_artifacts()
+        if cid:
+            self._cancel_artifacts(cid)
+            await input_queue.cancel_own(cid, self.user_sub or "")
         return None
 
     async def _on_abort(self, msg: dict, *, stream: StreamCtx | None = None):
@@ -305,17 +359,16 @@ class ClientMessageDispatcher:
                 from core.session import session_events
                 session_events.note_user_message(pump.session_id)
             graceful = False
+            # Stop means stop: the pump owns no failure to return later,
+            # what waits in the chat's queue goes back to its authors now
+            # (a message sent after the Stop goes out as the next turn), and
+            # the queued interactions go.
+            pump.stopped = True
             if self.session_id and self.layer:
                 graceful = bool(await self.layer.abort(self.session_id))
-            # Queued messages never survive an abort (the user asked
-            # everything to stop): without the clear, the graceful
-            # producer's post-turn drain would run them as new turns
-            # and the hard path silently dropped them (pre-existing).
-            _dropped_q = pump.cancel_all_queued()
-            if _dropped_q:
-                await self._send({"type": wire.QUEUE_CLEARED,
-                                  "text": _dropped_q,
-                                  "chat_id": stream.chat_id})
+            pump.cancel_all_artifacts()
+            self._cancel_artifacts(stream.chat_id)
+            await input_queue.return_all(pump.chat_id, "stopped")
             if not graceful:
                 pump.abort()
             pump.detach(stream.queue)
@@ -394,25 +447,23 @@ class ClientMessageDispatcher:
         # the hard path cancels it as before (the streaming half above).
         self.implementing_plan = ""
         graceful = False
+        pump = _active_pumps.get(self.chat_id)
+        if pump and not pump.is_done:
+            pump.stopped = True
         if self.session_id and self.layer:
             from core.session import session_events
             session_events.note_user_message(self.session_id)
             graceful = bool(await self.layer.abort(self.session_id))
-        pump = _active_pumps.get(self.chat_id)
         if pump and not pump.is_done:
-            _dropped_q = pump.cancel_all_queued()
-            if _dropped_q:
-                await self._send({"type": wire.QUEUE_CLEARED, "text": _dropped_q})
+            pump.cancel_all_artifacts()
             if not graceful:
                 pump.abort()
-        # The connection's own between-turns queue dies with the abort too
-        # (pending artifact interactions included — never delivered, never
-        # persisted).
-        self.artifact_queue.clear()
-        if self.message_queue:
-            _dropped_c = "\n\n".join(q.text for q in self.message_queue)
-            self.message_queue.clear()
-            await self._send({"type": wire.QUEUE_CLEARED, "text": _dropped_c})
+        # What waits in the chat's queue goes back to its authors, and the
+        # interactions this connection queued for the chat go (never
+        # delivered, never persisted).
+        if self.chat_id:
+            self._cancel_artifacts(self.chat_id)
+            await input_queue.return_all(self.chat_id, "stopped")
         if self.session_id:
             _pending_permissions.pop(self.session_id, None)
         # last_turn_aborted feeds the scheduler's user_interrupted on every
@@ -439,16 +490,26 @@ class ClientMessageDispatcher:
 
     # -- the prompts: permission, question, location, plan review -----------
 
+    @staticmethod
+    async def _advance_prompt_slot(pump, request_id: str, resolved: bool) -> None:
+        """The pump's one-prompt slot moves on for an answer that resolved a
+        wait or that names the prompt holding the slot. An answer to a card
+        already retired (its wait gone) leaves the retried call's prompt in
+        the slot, so a reconnect still re-presents it."""
+        active = pump._permission_active
+        if resolved or (active is not None and active.get("request_id") == request_id):
+            await pump.resolve_active_permission()
+
     async def _on_permission_response(self, msg: dict, *, stream: StreamCtx | None = None):
         # Resolve hook-based permission (unblocks the long-poll in hook endpoint).
         if stream is not None:
             if await self._may_resolve_permission(msg["request_id"]):
-                resolve_permission(msg["request_id"], msg.get("approved", True))
+                resolved = resolve_permission(msg["request_id"], msg.get("approved", True))
                 for sid, pd in list(_pending_permissions.items()):
                     if pd.get("request_id") == msg["request_id"]:
                         del _pending_permissions[sid]
                         break
-                await stream.pump.resolve_active_permission()
+                await self._advance_prompt_slot(stream.pump, msg["request_id"], resolved)
             return None
         # dual-control: while a local `otodock` terminal is the active
         # controller, the human answers permissions in the native TUI — drop a
@@ -475,12 +536,12 @@ class ClientMessageDispatcher:
             # permission slot (else a later prompt in the same held turn
             # buffers forever + a reconnect re-renders the answered card).
             if await self._may_resolve_permission(msg["request_id"]):
-                resolve_question(msg["request_id"], msg.get("answers") or {})
+                resolved = resolve_question(msg["request_id"], msg.get("answers") or {})
                 for sid, pd in list(_pending_permissions.items()):
                     if pd.get("request_id") == msg["request_id"]:
                         del _pending_permissions[sid]
                         break
-                await stream.pump.resolve_active_permission()
+                await self._advance_prompt_slot(stream.pump, msg["request_id"], resolved)
             return None
         # Codex request_user_input answer arriving between turns (safety net;
         # a held question normally resolves mid-stream).
@@ -535,14 +596,14 @@ class ClientMessageDispatcher:
                 set_session_mode(self.session_id, "acceptEdits")
             elif action == "implement_default":
                 set_session_mode(self.session_id, "default")
-        resolve_permission(msg["request_id"], approved)
+        resolved = resolve_permission(msg["request_id"], approved)
         for sid, pd in list(_pending_permissions.items()):
             if pd.get("request_id") == msg["request_id"]:
                 del _pending_permissions[sid]
                 break
         if stream is not None:
             pump = stream.pump
-            await pump.resolve_active_permission()
+            await self._advance_prompt_slot(pump, msg["request_id"], resolved)
             # Save the user's action in the DB turn block
             req_id = msg.get("request_id", "")
             for tb in pump._turn_blocks:
@@ -576,8 +637,7 @@ class ClientMessageDispatcher:
                     label="plan_implement_mode",
                 )
                 await self._send({"type": wire.MODE_CHANGED, "mode": "acceptEdits"})
-                pump.queue_message(TurnInput("Please implement the plan now."))
-                pump.implementing_plan = plan_fn
+                self._queue_implement(stream, plan_fn)
             elif action == "implement_default":
                 # Pinned asymmetry: no control request is queued here (the
                 # between-turns half changes the mode through the layer).
@@ -588,8 +648,7 @@ class ClientMessageDispatcher:
                     label="plan_implement_mode",
                 )
                 await self._send({"type": wire.MODE_CHANGED, "mode": "default"})
-                pump.queue_message(TurnInput("Please implement the plan now."))
-                pump.implementing_plan = plan_fn
+                self._queue_implement(stream, plan_fn)
             return None
         if self.chat_id and plan_fn and action == "reject":
             task_store.update_chat_plan_status(self.chat_id, plan_fn, "rejected")
@@ -602,15 +661,29 @@ class ClientMessageDispatcher:
             self.implementing_plan = plan_fn
             # If session is dead (stale plan_review), queue implement for after warmup
             if not self.session_id:
-                self.message_queue.append(TurnInput("Please implement the plan now."))
+                self.implement_queue.append(TurnInput("Please implement the plan now.",
+                                                      chat_id=self.chat_id or ""))
                 logger.info(f"WS dashboard: queued implement message for dead session, plan={plan_fn}")
         elif action == "implement_default":
             await self._handle_mode_change({"mode": "default", "chat_id": self.chat_id})
             self.implementing_plan = plan_fn
             if not self.session_id:
-                self.message_queue.append(TurnInput("Please implement the plan now."))
+                self.implement_queue.append(TurnInput("Please implement the plan now.",
+                                                      chat_id=self.chat_id or ""))
                 logger.info(f"WS dashboard: queued implement message for dead session, plan={plan_fn}")
         return None
+
+    def _queue_implement(self, stream: StreamCtx, plan_fn: str) -> None:
+        """The plan's implement message behind the streaming turn: on the
+        pump's own list (never a person's queue row), or once that closed on
+        the connection's, whose drain turn then carries the plan
+        (``implementing_plan``)."""
+        item = TurnInput("Please implement the plan now.", chat_id=stream.chat_id)
+        if stream.pump.queue_message(item) == stream.pump.QUEUE_CLOSED:
+            self.implement_queue.append(item)
+            self.implementing_plan = plan_fn
+        else:
+            stream.pump.implementing_plan = plan_fn
 
     # -- the backchannel: artifacts and app actions --------------------------
 
@@ -641,7 +714,7 @@ class ClientMessageDispatcher:
                     a_frame.update(status="denied", reason=a_err)
                 elif not _ai.check_rate(a_chat, a_token):
                     a_frame.update(status="denied", reason="rate limited")
-                elif pump.queue_artifact(interaction):
+                elif self._queue_interaction(pump, interaction, stream.chat_id):
                     a_frame["status"] = "queued"
                     notification_manager.set_chat_turn_origin(
                         self.user_sub, pump.chat_id, self.notify_connection_id,
@@ -684,7 +757,7 @@ class ClientMessageDispatcher:
                     ap_frame.update(status="denied", reason=ap_err)
                 elif not _ai.check_rate(ap_chat, f"app:{ap_id}"):
                     ap_frame.update(status="denied", reason="rate limited")
-                elif pump.queue_artifact(interaction):
+                elif self._queue_interaction(pump, interaction, stream.chat_id):
                     ap_frame["status"] = "queued"
                     notification_manager.set_chat_turn_origin(
                         self.user_sub, pump.chat_id, self.notify_connection_id,
@@ -848,6 +921,10 @@ class ClientMessageDispatcher:
     async def _on_client_info(self, msg: dict, *, stream: StreamCtx | None = None):
         platform = msg.get("platform", "web")
         notification_manager.set_connection_platform(self.user_sub, self.notify_connection_id, platform)
+        # A client that takes a task or meeting chat's turn end as a delta
+        # of rows (dashboard_chat_resume) says so; an older build is served
+        # the full history as before.
+        self._history_deltas = bool(msg.get("history_deltas"))
         time_zone = msg.get("time_zone")
         if time_zone:
             set_user_tz(self.user_sub, time_zone)
@@ -917,10 +994,9 @@ class ClientMessageDispatcher:
             str(msg.get("request_id"))[:8], chat_id,
         )
         if self.streaming:
-            self.message_queue.append(TurnInput(text))
-            await self._send({
-                "type": wire.QUEUED, "index": len(self.message_queue) - 1, "text": text,
-            })
+            # Queued in its chat as a typed message is (``_on_chat``): the
+            # same cap, the same chip.
+            await self._queue_for_next_turn(chat_id, TurnInput(text, chat_id=chat_id))
             return
         await self._handle_chat({"text": text, "chat_id": chat_id})
 

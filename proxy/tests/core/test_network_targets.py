@@ -234,6 +234,21 @@ class TestHostSelfRewrite:
         mcp_registry._rewrite_host_self_targets_to_loopback(m, env, "pa")
         assert env["PROMETHEUS_URL"] == "http://192.168.30.12:9090"  # remote → untouched
 
+    def test_ipv6_loopback_target_dials_ipv4(self, monkeypatch):
+        """The sandbox has no IPv6 loopback: a host service reached through
+        the loopback splice is dialed on 127.0.0.1."""
+        from core.config import deployment
+        monkeypatch.setattr(deployment, "in_docker_compose", lambda: False)
+        monkeypatch.setattr(mcp_registry, "manifest_capability_available", lambda mm: True)
+        monkeypatch.setattr(mcp_registry, "network_access_enabled", lambda mm: True)
+        m = _manifest("prom", [NetworkTargetDecl("config", "PROMETHEUS_URL", port_default=9090)])
+        env = {"PROMETHEUS_URL": "http://[::1]:9090/api"}
+        mcp_registry._rewrite_host_self_targets_to_loopback(m, env, "pa")
+        assert env["PROMETHEUS_URL"] == "http://127.0.0.1:9090/api"
+        assert mcp_registry.loopback_if_host_self("http://[::1]:8080/v1") == "http://127.0.0.1:8080/v1"
+        assert mcp_registry.loopback_if_host_self("http://localhost:8080/v1") == "http://localhost:8080/v1"
+        assert mcp_registry._ipv4_loopback("::1") == "127.0.0.1"
+
     def test_no_rewrite_in_t2(self, monkeypatch):
         from core.config import deployment
         monkeypatch.setattr(deployment, "in_docker_compose", lambda: True)  # T2
@@ -322,3 +337,37 @@ class TestPlatformRefusal:
             "dbhost": ["127.0.0.1"], "target.lan": ["192.168.0.50"],
         }, compose=False, port=9090, local_ips=("192.168.0.50",))
         assert "9090" in forwards
+
+    def test_bare_metal_never_splices_the_public_urls_port_on_this_host(self, monkeypatch):
+        import config
+        # An edge on this host fronts the proxy on the public URL's port.
+        monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://otodock.lan")
+        forwards, _ = self._homelab(monkeypatch, {
+            "otodock.lan": ["192.168.0.50"], "target.lan": ["192.168.0.50"],
+        }, compose=False, port=443, local_ips=("192.168.0.50",))
+        assert "443" not in forwards
+
+    def test_an_explicit_public_port_is_refused_too(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://otodock.lan:8443")
+        forwards, _ = self._homelab(monkeypatch, {
+            "otodock.lan": ["192.168.0.50"], "target.lan": ["192.168.0.50"],
+        }, compose=False, port=8443, local_ips=("192.168.0.50",))
+        assert "8443" not in forwards
+
+    def test_a_public_host_elsewhere_keeps_its_port_spliceable(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://otodock.example.com")
+        forwards, _ = self._homelab(monkeypatch, {
+            "otodock.example.com": ["203.0.113.7"], "target.lan": ["192.168.0.50"],
+        }, compose=False, port=443, local_ips=("192.168.0.50",))
+        assert "443" in forwards
+
+    def test_a_target_on_the_proxy_port_is_refused_and_the_hook_forward_stays(
+            self, monkeypatch, caplog):
+        import config
+        forwards, _ = self._homelab(monkeypatch, {"target.lan": ["192.168.0.50"]},
+                                    compose=False, port=config.PORT,
+                                    local_ips=("192.168.0.50",))
+        assert forwards == [str(config.PORT)]
+        assert "platform listener" in caplog.text

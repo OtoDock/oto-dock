@@ -41,8 +41,8 @@ def test_claude_injects_token_and_wraps_only_bundle_mcp(tmp_path):
         src, host_dir, sandbox_config_dir="/users/alice/.claude",
         session_id="sess-1", secret_bundles=bundles,
     )
-    assert out_path == "/users/alice/.claude/agent-abc123.json"
-    written = json.loads((host_dir / "agent-abc123.json").read_text())
+    assert out_path == "/users/alice/.claude/agent-abc123-sess-1.json"
+    written = json.loads((host_dir / "agent-abc123-sess-1.json").read_text())
     maps = written["mcpServers"]["google-maps"]
     disp = written["mcpServers"]["display"]
 
@@ -51,7 +51,7 @@ def test_claude_injects_token_and_wraps_only_bundle_mcp(tmp_path):
     assert mcp_broker.verify_token(tok) == ("sess-1", "google-maps")
     assert maps["command"] == "python3"
     assert maps["args"] == [
-        "/users/alice/.claude/stdio_path_interceptor.py", "--", "python3", "s.py",
+        "-I", "/users/alice/.claude/stdio_path_interceptor.py", "--", "python3", "s.py",
     ]
     # non-bundle MCP: untouched
     assert "OTO_MCP_FETCH_TOKEN" not in disp["env"]
@@ -69,7 +69,7 @@ def test_claude_no_bundles_is_plain_copy(tmp_path):
         src, host_dir, sandbox_config_dir="/users/alice/.claude",
         session_id="sess-1", secret_bundles={},
     )
-    srv = json.loads((host_dir / "agent.json").read_text())["mcpServers"]["display"]
+    srv = json.loads((host_dir / "agent-sess-1.json").read_text())["mcpServers"]["display"]
     assert "OTO_MCP_FETCH_TOKEN" not in srv["env"]
     assert srv["command"] == "python3" and srv["args"] == ["d.py"]
 
@@ -149,9 +149,9 @@ def test_a_token_file_bundle_gets_the_fetch_token_in_json_and_toml(tmp_path):
         src, host_dir, sandbox_config_dir="/workspace/.claude",
         session_id="sess-9", secret_bundles=bundles,
     )
-    srv = json.loads((host_dir / "agent.json").read_text())["mcpServers"]["gws"]
+    srv = json.loads((host_dir / "agent-sess-9.json").read_text())["mcpServers"]["gws"]
     assert mcp_broker.verify_token(srv["env"]["OTO_MCP_FETCH_TOKEN"]) == ("sess-9", "gws")
-    assert srv["args"][:2] == ["/workspace/.claude/stdio_path_interceptor.py", "--"]
+    assert srv["args"][:3] == ["-I", "/workspace/.claude/stdio_path_interceptor.py", "--"]
 
     toml = '[mcp_servers.gws]\ncommand = "bash"\nargs = ["run.sh"]\nenv = { WS_DIR = "/knowledge/x" }\n'
     out = _inject_fetch_tokens_toml(toml, set(bundles), "sess-9")

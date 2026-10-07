@@ -127,15 +127,48 @@ async def execute_builder(
         )
         return None
 
-    # 3. Inject OAuth bearer header if the target MCP opts in AND the host
-    # is allowlisted AND the user has a bound account. No-op for infra-
-    # credential MCPs (which carry their own auth in the container's env).
-    # ``task_scope`` passed to ``pick_account`` via the helper.
+    # 3. The credential: a bearer MCP's token for the session's identity
+    # (the person's bound account in user scope, the agent's service binding
+    # otherwise), resolved the way the credential gateway resolves it and
+    # added here, since the builder dials the server itself. No-op for
+    # infra-credential MCPs (which carry their own auth in the container's
+    # env); an MCP the gateway would leave out of a session is skipped.
     task_scope = "user" if user_sub else "agent"
-    entry = mcp_registry.maybe_inject_bearer_header(
-        entry, tool_mcp, user_sub or None, agent_name, task_scope,
+    headers = dict(entry.get("headers") or {})
+    # A header-style key's value comes from the values the session bundle
+    # carries (``build_session_mcp_config``): the resolver's per-MCP env
+    # filtered to its pure secrets, then the field values of the
+    # env-delivered instance the agent takes (the instance's winning).
+    bundle_env: dict[str, str] = {}
+    if tool_mcp.credentials.api_key_header:
+        from services.oauth import credential_resolver
+        resolved = await asyncio.to_thread(
+            credential_resolver.resolve_credentials,
+            agent_name, user_sub or None, task_scope=task_scope,
+        )
+        bundle_env = {
+            k: v for k, v in resolved.env_by_mcp.get(tool_mcp.name, {}).items()
+            if k in resolved.secret_keys
+        }
+        bundle_env.update(await asyncio.to_thread(
+            mcp_registry.env_instance_values, tool_mcp, agent_name,
+        ))
+    cred, reason = mcp_registry.gateway_entry(
+        dict(entry), tool_mcp, srv_key=tool_mcp.server_name or tool_mcp.name,
+        user_sub=user_sub or None, agent_name=agent_name, task_scope=task_scope,
+        bundle_env=bundle_env,
     )
-    headers = entry.get("headers") or {}
+    if reason:
+        logger.warning("builder on '%s': %s — skipped", mcp_name, reason)
+        return None
+    if cred is not None:
+        from core.credentials import mcp_gateway
+        res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
+        if isinstance(res, mcp_gateway.Refusal):
+            logger.warning("builder on '%s': %s — skipped", mcp_name, res.detail)
+            return None
+        headers[res.header] = res.value
+        url = f"{res.upstream}{res.path}"
 
     # 4. Substitute ``${ns.key}`` in the args dict — walks strings inside
     # nested dicts/lists, preserves non-string scalars. Result tokens

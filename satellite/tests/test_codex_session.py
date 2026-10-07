@@ -10,6 +10,7 @@ control-request handling.
 """
 
 import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from satellite import config
 from satellite.sessions.codex_session import CodexSession, _write_codex_hooks
 
 
@@ -71,6 +73,18 @@ def _patch_daemon(session, mock_client):
     )
 
 
+def _thread_client(thread_id="thread-1"):
+    """A mock app-server client that answers every request with ``thread_id``."""
+    mock_client = AsyncMock()
+    mock_client.proc = None
+
+    async def fake_request(method, params=None):
+        return {"thread": {"id": thread_id}}
+
+    mock_client.request = fake_request
+    return mock_client
+
+
 class TestWriteCodexHooks:
     def test_writes_hooks_json(self, tmp_path):
         _write_codex_hooks(tmp_path)
@@ -84,7 +98,7 @@ class TestWriteCodexHooks:
         # Hook parity (0.5.121): the same four events the proxy's
         # _build_codex_hooks writes for the local sandbox.
         assert set(events) == {"PreToolUse", "PostToolUse", "SubagentStop", "Stop"}
-        assert events["Stop"][0]["hooks"][0]["timeout"] == 604800
+        assert events["Stop"][0]["hooks"][0]["timeout"] == config.HOOK_WAIT_S == 3 * 24 * 3600 + 3600
         assert "stop_tracker.py" in events["Stop"][0]["hooks"][0]["command"]
         assert "subagent_tracker.py" in events["SubagentStop"][0]["hooks"][0]["command"]
 
@@ -100,7 +114,10 @@ class TestCodexSessionStart:
     @pytest.mark.asyncio
     async def test_creates_config_files(self, tmp_agent_dir, codex_config, sat_config):
         session = CodexSession("sess-1", tmp_agent_dir, codex_config, sat_config)
-        await session.start()
+        c1, c2, c3 = _patch_daemon(session, _thread_client())
+        with c1, c2, c3:
+            await session.start()
+            await session.close()
 
         codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
         assert codex_dir.is_dir()
@@ -123,7 +140,10 @@ class TestCodexSessionStart:
             "auth_json": {"auth_mode": "chatgpt", "tokens": {"id_token": "tok-123"}},
         }
         session = CodexSession("sess-1", tmp_agent_dir, config, sat_config)
-        await session.start()
+        c1, c2, c3 = _patch_daemon(session, _thread_client())
+        with c1, c2, c3:
+            await session.start()
+            await session.close()
 
         codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
         auth = json.loads((codex_dir / "auth.json").read_text())
@@ -298,6 +318,54 @@ class TestRunTurnSerialization:
             session._turn_lock.release()
 
 
+class TestConnectReportAndRevive:
+    """What the connect report reads off a Codex session, and a revive that
+    had to open a new thread telling the platform before the turn's events
+    (it routes them by thread)."""
+
+    @pytest.mark.asyncio
+    async def test_the_report_properties(self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-r", tmp_agent_dir, codex_config, sat_config)
+        assert session.resume_handle == ""
+        session.thread_id = "thread-7"
+        session._mcp_server_names = ["file-tools"]
+        assert session.resume_handle == "thread-7"
+        assert session.mcp_server_names == ["file-tools"]
+        assert session.turn_active is False
+        async with session._turn_lock:
+            assert session.turn_active is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("new_thread, told", [("thread-new", True), ("thread-old", False)])
+    async def test_a_revive_on_a_new_thread_is_announced_first(
+            self, tmp_agent_dir, codex_config, sat_config, new_thread, told):
+        session = CodexSession("sess-rv", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "thread-old"
+        dead = AsyncMock()
+        dead.is_alive = False
+        session._client = dead
+        forwarded: list[dict] = []
+
+        async def _forward(event):
+            forwarded.append(event)
+        session.set_event_forwarder(_forward)
+
+        class _TurnStarted(Exception):
+            pass
+        fresh = AsyncMock()
+        fresh.is_alive = True
+        fresh.request.side_effect = _TurnStarted()
+
+        async def _start():
+            session._client = fresh
+            session.thread_id = new_thread
+
+        with patch.object(session, "start", side_effect=_start):
+            with pytest.raises(_TurnStarted):
+                await session._run_turn_locked("go on")
+        assert forwarded == ([{"type": "_resume_handle", "handle": "thread-new"}] if told else [])
+
+
 class TestAskQuestionRemote:
     """The remote request_user_input bridge: POST the questions to the proxy's
     /v1/hooks/codex-question and return the answers MAP; fail-closed to empty
@@ -317,7 +385,7 @@ class TestAskQuestionRemote:
 
         class _Resp:
             status = 200
-            async def json(self): return {"answers": answers}
+            async def text(self): return json.dumps({"answers": answers})
             async def __aenter__(self): return self
             async def __aexit__(self, *a): return False
 
@@ -354,7 +422,11 @@ class TestAskQuestionRemote:
             assert await session._ask_question_remote([{"id": "x"}]) == {}
 
     @pytest.mark.asyncio
-    async def test_transport_error_returns_empty(self, tmp_agent_dir, codex_config, sat_config):
+    async def test_transport_error_returns_empty(self, tmp_agent_dir, codex_config, sat_config,
+                                                 monkeypatch):
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_HOOK_BACKOFF", (0.01,))
+        monkeypatch.setattr(cs, "_HOOK_HOLD_S", 0.05)  # held, then empty
         session = self._session(tmp_agent_dir, codex_config, sat_config)
 
         class _Http:
@@ -823,3 +895,152 @@ def test_features_table_shapes():
     # A key the proxy already set is not repeated.
     block, _ = features_table(True, "[features]\nplugins = false\nhooks = true\n\n" + mcp)
     assert block == "[features]\nplugins = false\nhooks = true"
+
+
+class TestRetriedErrorKeepsTheTurn:
+    """An ``error`` notification Codex retries (``willRetry`` at the params'
+    top level, app-server 0.156.1) does not end the main turn; a final one
+    does. Older builds nested the flag in ``error``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("params,ends", [
+        ({"error": {"message": "stream disconnected"}, "threadId": "t1", "turnId": "u1",
+          "willRetry": True}, False),
+        ({"error": {"message": "stream disconnected", "willRetry": True}}, False),
+        ({"error": {"message": "usage limit", "codexErrorInfo": "usageLimitExceeded"},
+          "threadId": "t1", "turnId": "u1", "willRetry": False}, True),
+    ])
+    async def test_only_a_final_error_ends_the_main_turn(
+            self, tmp_agent_dir, codex_config, sat_config, params, ends):
+        session = CodexSession("sess-r", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "t1"
+        forwarded: list = []
+
+        async def forward(event):
+            forwarded.append(event)
+
+        session._forward = forward
+
+        class Client:
+            def __init__(self):
+                self.notif_queue: asyncio.Queue = asyncio.Queue()
+
+        session._client = Client()
+        session._client.notif_queue.put_nowait(("error", params))
+        task = asyncio.create_task(session._run_forwarder())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert forwarded and forwarded[0]["method"] == "error"
+        assert session._main_turn_done.is_set() is ends
+
+
+class TestBridgeHold:
+    """The approval and question bridges hold a call while the platform
+    cannot be reached (the tunnel's 502/503, a connection error, a stream
+    that ends before its JSON), read a streamed answer of keepalives and
+    JSON, and deny at once on a definitive refusal."""
+
+    async def _serve(self, answers):
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        calls = {"n": 0}
+
+        async def handler(request):
+            i = min(calls["n"], len(answers) - 1)
+            calls["n"] += 1
+            status, body, *delay = answers[i]
+            if delay:
+                await asyncio.sleep(delay[0])
+            if status == 200 and body.startswith(b" "):
+                resp = web.StreamResponse(status=200, headers={"Content-Type": "application/json"})
+                await resp.prepare(request)
+                await resp.write(body)
+                await resp.write_eof()
+                return resp
+            return web.Response(status=status, body=body, content_type="application/json")
+
+        app = web.Application()
+        app.router.add_post("/v1/hooks/permission", handler)
+        app.router.add_post("/v1/hooks/codex-question", handler)
+        server = TestServer(app)
+        await server.start_server()
+        return server, calls
+
+    def _session(self, tmp_agent_dir, codex_config, sat_config, server):
+        session = CodexSession("sess-b", tmp_agent_dir, codex_config, sat_config)
+        session._proxy_url = str(server.make_url("")).rstrip("/")
+        session._proxy_api_key = "tok"
+        return session
+
+    @pytest.mark.asyncio
+    async def test_held_through_the_outage_then_the_streamed_answer(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_HOOK_BACKOFF", (0.01,))
+        server, calls = await self._serve([
+            (503, b'{"error": "tunnel-not-connected"}'), (502, b"{}"),
+            (200, b"     "),  # a stream that dropped before its JSON
+            (200, b'   {"decision": "allow"}'),
+        ])
+        try:
+            session = self._session(tmp_agent_dir, codex_config, sat_config, server)
+            assert await session._decide_permission_remote("Bash", {}) == {"decision": "allow"}
+            assert calls["n"] == 4
+        finally:
+            await server.close()
+
+    @pytest.mark.asyncio
+    async def test_a_definitive_refusal_denies_at_once(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_HOOK_BACKOFF", (0.01,))
+        server, calls = await self._serve([(403, b'{"detail": "no"}')])
+        try:
+            session = self._session(tmp_agent_dir, codex_config, sat_config, server)
+            assert await session._decide_permission_remote("Bash", {}) == {"decision": "deny"}
+            assert await session._ask_question_remote([{"id": "q"}]) == {}
+            assert calls["n"] == 2
+        finally:
+            await server.close()
+
+    @pytest.mark.asyncio
+    async def test_the_hold_ends(self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_HOOK_BACKOFF", (0.01,))
+        monkeypatch.setattr(cs, "_HOOK_HOLD_S", 0.05)
+        server, calls = await self._serve([(503, b"{}")])
+        try:
+            session = self._session(tmp_agent_dir, codex_config, sat_config, server)
+            assert await session._decide_permission_remote("Bash", {}) == {"decision": "deny"}
+            assert calls["n"] >= 2
+        finally:
+            await server.close()
+
+    @pytest.mark.asyncio
+    async def test_the_hold_counts_from_the_first_failure(
+            self, tmp_agent_dir, codex_config, sat_config, monkeypatch):
+        """A prompt answered slowly and then dropped is still held: the hold
+        starts at the failure, not at the first call."""
+        from satellite.sessions import codex_session as cs
+        monkeypatch.setattr(cs, "_HOOK_BACKOFF", (0.01,))
+        monkeypatch.setattr(cs, "_HOOK_HOLD_S", 0.05)
+        server, calls = await self._serve([(503, b"{}", 0.2), (200, b' {"decision": "allow"}')])
+        try:
+            session = self._session(tmp_agent_dir, codex_config, sat_config, server)
+            assert await session._decide_permission_remote("Bash", {}) == {"decision": "allow"}
+            assert calls["n"] == 2
+        finally:
+            await server.close()
+
+    @pytest.mark.asyncio
+    async def test_the_question_bridge_reads_its_answers(
+            self, tmp_agent_dir, codex_config, sat_config):
+        server, _ = await self._serve([(200, b' {"answers": {"q": {"answers": ["yes"]}}}')])
+        try:
+            session = self._session(tmp_agent_dir, codex_config, sat_config, server)
+            assert await session._ask_question_remote([{"id": "q"}]) == {"q": {"answers": ["yes"]}}
+        finally:
+            await server.close()

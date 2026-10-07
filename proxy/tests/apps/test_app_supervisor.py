@@ -246,6 +246,11 @@ def test_launcher_takes_the_inbound_splice_and_egress_deny():
     assert "_EGRESS_DENY = True" in shim and "0.0.0.0/1" in shim and "128.0.0.0/1" in shim
     assert "203.0.113.5" in shim
     assert "_EGRESS_DENY = False" in mod._build_pyshim(["8400"], [], "", True, False)
+    # The namespace loses ::1 (address off, then the unreachable route).
+    assert shim.index('"addr", "del", "::1/128"') < shim.index('"unreachable", "::1/128"')
+    # A failed route puts the address back, or the launch stops.
+    restore = shim.index('"addr", "add", "::1/128"')
+    assert 0 < shim.index("os._exit(41)", restore) - restore < 200
 
 
 def test_the_pump_keeps_reading_past_a_line_over_the_limit(agent_tree, tmp_path):

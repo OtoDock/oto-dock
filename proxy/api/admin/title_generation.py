@@ -13,12 +13,13 @@ import logging
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_admin
+from auth.providers import UserContext, get_current_user, require_admin, require_user
 from services import title_generator
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 @router.get("/v1/admin/title-generation")

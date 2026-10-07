@@ -83,6 +83,17 @@ def test_npm_install_falls_back_to_user_prefix(fake_npm, monkeypatch, tmp_path):
     assert str(tmp_path / ".npm-global") in fake_npm.calls[1]
 
 
+def test_npm_install_allows_the_cli_s_own_install_scripts(fake_npm, monkeypatch, tmp_path):
+    # npm 12 skips install scripts unless allowed, which leaves Claude Code's
+    # native binary uninstalled: both attempts name the package as allowed.
+    monkeypatch.setattr(cli_versions, "_USER_NPM_PREFIX", tmp_path / ".npm-global")
+    fake_npm.codes[:] = [243, 0]
+    assert cli_versions._npm_install("@anthropic-ai/claude-code", "2.1.289") is True
+    for cmd in fake_npm.calls:
+        assert "--allow-scripts=@anthropic-ai/claude-code" in cmd
+        assert cmd[-1] == "@anthropic-ai/claude-code@2.1.289"
+
+
 def test_npm_install_both_attempts_fail(fake_npm):
     fake_npm.codes[:] = [243, 243]
     assert cli_versions._npm_install("@openai/codex", "0.142.5") is False

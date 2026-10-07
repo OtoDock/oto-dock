@@ -136,6 +136,8 @@ async def purge(row: dict) -> dict:
     audience.forget(row["id"])
     await asyncio.to_thread(releases.remove_release_dir, row)
     await asyncio.to_thread(releases.remove_data_dir, row)
+    from services.apps import viewer_data
+    await asyncio.to_thread(viewer_data.remove, row)
     removed_files = 0
     agent_dir = config.get_agent_dir(row["agent"])
     folder = agent_dir / (row.get("rel_path") or "")
@@ -159,30 +161,43 @@ async def purge(row: dict) -> dict:
 
 
 async def remove_user_app_dirs(sub: str) -> int:
-    """A user delete: the release copies and the databases of every
-    personal app they own go with the rows (the rows cascade with the users
-    row; the directories would not)."""
+    """A user delete: the release copies, the databases and the viewers'
+    documents of every personal app they own go with the rows (the rows
+    cascade with the users row; the directories would not)."""
+    from services.apps import viewer_data
     rows = await run_db(_personal_rows_of_user, sub)
     for row in rows:
         await asyncio.to_thread(releases.remove_release_dir, row)
         await asyncio.to_thread(releases.remove_data_dir, row)
+        await asyncio.to_thread(viewer_data.remove, row)
     return len(rows)
 
 
 async def _remove_workspace_folder(agent: str, agent_dir: Path, folder: Path) -> int:
     """The files-API delete sequence per file (recover-bin capture,
-    tombstone, delete push), then the empty directories."""
+    tombstone, delete push), then the empty directories. The files come
+    from a walk beneath the agents tree that lists no link and enters none
+    (a folder that is a link lists nothing), and each is deleted by the
+    path it was walked at."""
     from services.infra import file_bookkeeping
     count = 0
-    if await asyncio.to_thread(folder.is_symlink):
-        # The walk below would follow it into another folder's files.
-        logger.warning("App purge: %s is a link and was left in place", folder.name)
+    rel = folder.relative_to(agent_dir).as_posix()
+
+    def _walk() -> list[str]:
+        try:
+            return sorted(file_bookkeeping.walk_files_beneath(agent_dir, rel))
+        except FileNotFoundError:
+            return []
+
+    try:
+        files = await asyncio.to_thread(_walk)
+    except OSError as e:
+        # A link above the folder: nothing beneath it is walked or removed.
+        logger.warning("App purge: %s was left in place (%s)", folder.name, e.strerror or e)
         return 0
-    files = await asyncio.to_thread(
-        lambda: sorted(p for p in folder.rglob("*") if p.is_file() and not p.is_symlink()))
     for f in files:
         try:
-            await file_bookkeeping.delete_platform_file(agent, agent_dir, f.resolve())
+            await file_bookkeeping.delete_platform_file(agent, agent_dir, agent_dir / f)
             count += 1
         except Exception:
             logger.exception("App purge: could not delete %s", f)
@@ -193,8 +208,8 @@ async def _remove_workspace_folder(agent: str, agent_dir: Path, folder: Path) ->
 
     def _rmtree() -> bool:
         try:
-            root, rel = releases.agents_rel(folder)
-            safe_fs.rmtree_beneath(root, rel, missing_ok=True)
+            root, under_root = releases.agents_rel(folder)
+            safe_fs.rmtree_beneath(root, under_root, missing_ok=True)
             return True
         except OSError as e:
             logger.warning("App purge: %s was left in place (%s)", folder.name, e.strerror or e)
@@ -202,7 +217,6 @@ async def _remove_workspace_folder(agent: str, agent_dir: Path, folder: Path) ->
 
     if await asyncio.to_thread(_rmtree):
         try:
-            rel = folder.relative_to(agent_dir).as_posix()
             await file_bookkeeping.push_file_delete(agent, rel)
         except Exception:
             logger.exception("App purge: delete push failed for %s", folder)

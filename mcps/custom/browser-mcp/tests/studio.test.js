@@ -12,6 +12,7 @@ const {
   buildHandshake, parseSetup, buildQueryExtension, buildGetKeyboardMapping,
   buildGetInputFocus, buildFakeInput, overlayScript,
   ownsTool, toolDefinitions, ZOOM_LADDER, POINTER_STYLES,
+  assertStudioUrlAllowed, originEntryRegex,
 } = require("../studio.js");
 const { classifyClientLine } = require("../index.js");
 
@@ -263,6 +264,57 @@ assert.strictEqual(sanitizeTakeName(".."), "take");
     classifyClientLine('{"jsonrpc":"2.0","method":"tools/call","params":{"name":"studio_stop"}}', owns).kind,
     "forward"
   );
+}
+
+// --- studio_goto origin limits -----------------------------------------------------
+// The studio honours the two @playwright/mcp lists with the same entry
+// semantics (origin, bare host[:port] on any scheme, `https://host:*`).
+{
+  const withEnv = (vars, fn) => {
+    const saved = {};
+    for (const k of ["PLAYWRIGHT_MCP_ALLOWED_ORIGINS", "PLAYWRIGHT_MCP_BLOCKED_ORIGINS"]) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    Object.assign(process.env, vars);
+    try { fn(); } finally {
+      for (const k of Object.keys(saved)) {
+        if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+      }
+    }
+  };
+  const ok = (url) => assert.doesNotThrow(() => assertStudioUrlAllowed(url), url);
+  const refused = (url, re) => assert.throws(() => assertStudioUrlAllowed(url), re, url);
+
+  // entry → URL-glob regex, mirroring originOrHostGlob + globToRegex
+  assert.ok(originEntryRegex("https://example.com:*").test("https://example.com:8443/p"));
+  assert.ok(!originEntryRegex("https://example.com:*").test("https://example.com/p"));
+  assert.ok(originEntryRegex("https://example.com:443").test("https://example.com/"), "default port normalised");
+  assert.ok(originEntryRegex("example.com").test("http://example.com/x") &&
+            originEntryRegex("example.com").test("https://example.com/x"), "bare host, any scheme");
+  assert.ok(!originEntryRegex("example.com").test("https://sub.example.com/"), "no subdomain creep");
+  assert.ok(!originEntryRegex("localhost:3000").test("http://localhost:3001/"));
+
+  // no lists: whatever the machine reaches, loopback included (F46)
+  withEnv({}, () => {
+    ok("http://localhost:8400/");
+    ok("https://example.com/");
+    refused("file:///etc/passwd", /http\(s\) URLs only/);
+  });
+  // allow-list: everything outside it refuses, inside it opens (loopback too)
+  withEnv({ PLAYWRIGHT_MCP_ALLOWED_ORIGINS: "https://docs.example.com; http://localhost:8400" }, () => {
+    ok("https://docs.example.com/guide?x=1");
+    ok("http://localhost:8400/login");
+    refused("https://example.com/", /outside this agent's allowed origins/);
+    refused("http://localhost:8401/", /outside this agent's allowed origins/);
+  });
+  // blocked list: a match refuses even when the allow-list names it (deny wins)
+  withEnv({ PLAYWRIGHT_MCP_BLOCKED_ORIGINS: "localhost:*;https://internal.example.com",
+            PLAYWRIGHT_MCP_ALLOWED_ORIGINS: "https://internal.example.com;https://example.com" }, () => {
+    refused("https://internal.example.com/", /blocked origins list/);
+    refused("http://localhost:8400/", /blocked origins list/);
+    ok("https://example.com/");
+  });
 }
 
 // --- non-Linux gating ---------------------------------------------------------------

@@ -35,6 +35,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+from uvicorn.protocols.utils import ClientDisconnected
+from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 
 import config
 from auth import lan_check
@@ -240,6 +242,92 @@ class _HeaderDeadlineProtocol(HttpToolsProtocol):
             self.transport.close()
 
 
+class _BoundedWebSocketProtocol(WebSocketsSansIOProtocol):
+    """uvicorn's sans-I/O WebSocket protocol plus a bound on what a slow
+    reader may hold.
+
+    The base protocol writes every frame straight into the transport and
+    never pauses a sender, so a reader that stops draining grows the
+    buffer without limit. Here the transport's write-buffer limits are
+    set (``WS_WRITE_BUFFER_MAX_BYTES``), uvloop's ``pause_writing`` clears
+    the ``writable`` event every ``send`` awaits (a frame of any size still
+    goes out whole: the check runs before the write), and a pause arms a
+    stall check: a buffer that shrank since is progress and is checked
+    again; one that did not shrink in ``WS_WRITE_STALL_S`` is aborted,
+    never closed (uvloop's close waits for the buffer to drain, the one
+    thing a dead reader never does; the keepalive's pong timeout starts
+    such a close first, and the stall check aborts it when it cannot
+    drain). uvloop counts the buffered bytes down as the kernel takes
+    them, in the kernel's own chunks, so a reader slower than the buffer
+    per stall window (about 70 KiB/s at the defaults) can read as
+    stalled. A close while paused aborts at once
+    so nothing that closes sockets under a lock waits on a dead reader,
+    and a sender woken by the connection's loss sees a disconnect instead
+    of a write to a closed handle. uvicorn is pinned
+    (proxy/requirements.in)."""
+
+    _stall_timer = None
+    _paused_at_bytes = 0
+    _lost = False
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        high = config.WS_WRITE_BUFFER_MAX_BYTES
+        transport.set_write_buffer_limits(high=high, low=high // 4)
+
+    def pause_writing(self):
+        self.writable.clear()
+        self._paused_at_bytes = self.transport.get_write_buffer_size()
+        self._arm_stall_check()
+
+    def resume_writing(self):
+        self._cancel_stall_check()
+        self.writable.set()
+
+    def connection_lost(self, exc):
+        self._cancel_stall_check()
+        self._lost = True
+        self.writable.set()
+        super().connection_lost(exc)
+
+    async def send(self, message):
+        if not self.writable.is_set():
+            if message["type"] == "websocket.close":
+                self.close_sent = True
+                self.queue.put_nowait({"type": "websocket.disconnect",
+                                       "code": message.get("code", 1000)})
+                self.transport.abort()
+                return
+            await self.writable.wait()
+            if self._lost:
+                raise ClientDisconnected()
+        await super().send(message)
+
+    def _arm_stall_check(self):
+        self._cancel_stall_check()
+        self._stall_timer = self.loop.call_later(config.WS_WRITE_STALL_S, self._stall_check)
+
+    def _cancel_stall_check(self):
+        if self._stall_timer is not None:
+            self._stall_timer.cancel()
+            self._stall_timer = None
+
+    def _stall_check(self):
+        self._stall_timer = None
+        if self.transport is None or self._lost or self.writable.is_set():
+            return
+        size = self.transport.get_write_buffer_size()
+        if size < self._paused_at_bytes:
+            self._paused_at_bytes = size
+            self._arm_stall_check()
+            return
+        logger.warning(
+            "WebSocket %s read nothing for %.0fs with %d bytes waiting; dropping it",
+            "%s:%s" % self.client if self.client else "?", config.WS_WRITE_STALL_S, size,
+        )
+        self.transport.abort()
+
+
 class _ClientAddressShim:
     """The outermost ASGI layer: the one resolver of the client address
     (``auth.lan_check``) runs once per connection and puts the resolved
@@ -304,7 +392,7 @@ def _build_server(asgi_app):
         # it also caused sporadic dashboard drops. The sans-I/O impl serializes
         # writes correctly and is the maintained path (legacy is deprecated).
         # Requires uvicorn>=0.35; we pin 0.49.
-        ws="websockets-sansio",
+        ws=_BoundedWebSocketProtocol,
         ws_ping_interval=WS_PING_INTERVAL_S,
         # Generous pong timeout (30s, not 10s) so a slow/busy satellite (e.g. a
         # laptop mid-spawn that briefly starves its event loop) isn't dropped with
@@ -365,6 +453,7 @@ from api.agents import chats as chats_router
 from api.departments import departments as departments_router
 from api.notifications import notifications as notifications_router
 from api.mcp import credentials as credentials_router
+from api.mcp import gateway as mcp_gateway_router
 from api.auth import oauth as oauth_router
 from api.mcp import mcps as mcps_router
 from api.mcp import community as community_router
@@ -430,6 +519,7 @@ app.include_router(chats_router.router)
 app.include_router(departments_router.router)
 app.include_router(notifications_router.router)
 app.include_router(credentials_router.router)
+app.include_router(mcp_gateway_router.router)
 # claude_oauth and openai_oauth use the same `/v1/oauth/{provider}/*` prefix
 # as the generic MCP OAuth router; FastAPI routing is first-match-wins, so
 # they MUST register before `oauth_router` to keep `/v1/oauth/claude/*`
@@ -538,7 +628,9 @@ def _safe_dashboard_file(path: str):
     return None
 
 
-@app.get("/dashboard/{path:path}", include_in_schema=False)
+# GET and HEAD on the pages: a HEAD the catch-all below takes must find the
+# same route the GET finds.
+@app.api_route("/dashboard/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def dashboard_legacy_redirect(path: str):
     """Redirect old /dashboard/* URLs to the new subdomain root."""
     if config.DASHBOARD_PUBLIC_URL:
@@ -558,17 +650,20 @@ _RETIRED_API_DOCS = frozenset({"docs", "docs/oauth2-redirect", "redoc", "openapi
 
 
 # SPA catch-all: serve index.html for all paths that don't match API/auth/ws routes.
-# This MUST be registered last so it doesn't shadow other routes.
-@app.get("/{path:path}", include_in_schema=False)
+# This MUST be registered last so it doesn't shadow other routes. HEAD is
+# answered as GET with no body (uptime probes); a HEAD on a GET-only API route
+# also lands here and meets the reserved prefixes' 404.
+@app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def spa_catchall(path: str, request: Request):
     """Serve the React SPA for client-side routing on the subdomain."""
     # kws-assets/ included: a worker importScripts miss must 404 loudly, never
     # serve index.html-as-JS (same discipline as ui-kit below).
+    # ``.well-known/oauth-*``: an MCP client's OAuth discovery against the
+    # credential gateway's origin must fail fast, never find the SPA.
     if path.startswith(("v1/", "auth/", "ws/", "api/", "assets/", "wopi/",
-                        "collabora/", "kws-assets/", "s/")) or path in _RETIRED_API_DOCS:
+                        "collabora/", "kws-assets/", "s/", ".well-known/oauth-")) \
+            or path in _RETIRED_API_DOCS:
         raise HTTPException(status_code=404, detail="Not found")
-    if path == "health":
-        return JSONResponse({"status": "ok", "service": "otodock"})
     if not config.DASHBOARD_ENABLED or not config.DASHBOARD_DIST.exists():
         raise HTTPException(status_code=404, detail="Dashboard not enabled")
     # Serve actual files from dist/ (favicon, APK downloads, etc.)

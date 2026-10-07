@@ -24,9 +24,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_admin
 from services.billing import hosted_instances, relay_client
 from storage import database as db
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.account-api")
 router = APIRouter()
@@ -43,16 +44,9 @@ class ConnectStartRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_admin(user: UserContext | None) -> None:
-    user = require_auth(user)
-    if user.is_service:
-        return  # the trusted master key is admin-equivalent (service-to-service)
-    if not user.is_admin:
-        raise HTTPException(403, "Admin only")
-
-
 def _require_relay_settable() -> None:
-    """Connect/disconnect require an online, operator-unmanaged install."""
+    """Connect/disconnect require an online, operator-unmanaged install.
+    Reads the license from the store: call it inside a ``run_db`` job."""
     if not relay_client.relay_offered():
         raise HTTPException(409, "This install is air-gapped — hosted relay is unavailable.")
     if _RELAY_TOGGLE_KEY in config.forced_settings():
@@ -141,10 +135,14 @@ h2{{color:#333;margin:0 0 .5rem;font-size:1.1rem}}p{{color:#da3536;font-size:.9r
 async def connect_start(body: ConnectStartRequest, user: UserContext = Depends(get_current_user)):
     """Begin the connect handshake (admin). Returns ``{url, pairing_code}`` — the
     dashboard DISPLAYS the pairing code and opens ``url`` in a browser."""
-    _require_admin(user)
-    _require_relay_settable()
+    require_admin(user)
     state = secrets.token_urlsafe(32)
-    _set_state(state, body.mobile)
+
+    def _job() -> None:
+        _require_relay_settable()
+        _set_state(state, body.mobile)
+
+    await run_db(_job)
     try:
         data = await relay_client.account_connect_authorize_url(
             state=state, install_callback=_callback_uri(),
@@ -168,7 +166,7 @@ async def connect_callback(
         return HTMLResponse(_error_html(f"OtoDock returned: {error}"))
     if not code or not state:
         return HTMLResponse(_error_html("Missing code or state parameter"))
-    valid, mobile = _check_and_clear_state(state)
+    valid, mobile = await run_db(_check_and_clear_state, state)
     if not valid:
         return HTMLResponse(_error_html("Invalid or expired connect request"))
     try:
@@ -183,13 +181,17 @@ async def connect_callback(
         ))
     if not token:
         return HTMLResponse(_error_html("OtoDock returned no account token"))
-    _enable_and_reconcile()
+
+    def _job() -> str:
+        _enable_and_reconcile()
+        return relay_client.get_install_id() if mobile else ""
+
+    install_id = await run_db(_job)
     if mobile:
         # Tag the source install so the multi-installation Android app routes the
         # callback back to the server that started the flow.
-        from services.billing.relay_client import get_install_id
         return RedirectResponse(
-            f"otodock://oauth/connect/complete?install={get_install_id()}"
+            f"otodock://oauth/connect/complete?install={install_id}"
         )
     return HTMLResponse(_success_html())
 
@@ -199,11 +201,17 @@ async def relay_enable(user: UserContext = Depends(get_current_user)):
     """Turn the hosted relay ON for an ALREADY-connected install (e.g. a paid
     install auto-linked at activation, or after a disable). Returns 409 if the
     install isn't connected yet — the dashboard then runs the connect handshake."""
-    _require_admin(user)
-    _require_relay_settable()
-    if not relay_client.is_connected():
+    require_admin(user)
+
+    def _job() -> bool:
+        _require_relay_settable()
+        if not relay_client.is_connected():
+            return False
+        _enable_and_reconcile()
+        return True
+
+    if not await run_db(_job):
         raise HTTPException(409, "not_connected")
-    _enable_and_reconcile()
     return {"status": "enabled"}
 
 
@@ -211,9 +219,13 @@ async def relay_enable(user: UserContext = Depends(get_current_user)):
 async def relay_disable(user: UserContext = Depends(get_current_user)):
     """Turn the hosted relay OFF but KEEP the connection (the account_token
     persists, so re-enabling is instant). Removes the system MCP instances."""
-    _require_admin(user)
-    _require_relay_settable()
-    _disable_and_reconcile()
+    require_admin(user)
+
+    def _job() -> None:
+        _require_relay_settable()
+        _disable_and_reconcile()
+
+    await run_db(_job)
     return {"status": "disabled"}
 
 
@@ -222,9 +234,9 @@ async def disconnect(user: UserContext = Depends(get_current_user)):
     """Fully disconnect: revoke the link at the relay (best-effort) + clear the
     local token + toggle off + remove the system instances. Use this to switch the
     install to a different OtoDock account."""
-    _require_admin(user)
+    require_admin(user)
     if _RELAY_TOGGLE_KEY in config.forced_settings():
         raise HTTPException(409, "Hosted relay is managed by OtoDock for this install.")
     await relay_client.account_disconnect()   # best-effort revoke + always clears locally
-    _disable_and_reconcile()
+    await run_db(_disable_and_reconcile)
     return {"status": "disconnected"}

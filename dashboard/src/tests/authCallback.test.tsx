@@ -48,6 +48,7 @@ beforeEach(() => {
   auth.user = { sub: 'u-me' }
   auth.loading = false
   localStorage.clear()
+  sessionStorage.clear()
 })
 
 describe('AuthCallback', () => {
@@ -89,7 +90,8 @@ describe('AuthCallback', () => {
     renderAt('?code=c&state=s')
     await flush()
     expect(screen.getByTestId('loc').textContent).toBe('/apps/app-1?share=1&tab=link')
-    expect(JSON.parse(localStorage.getItem('otodock-confirm:u-me') || '{}').token).toBe('oc-9')
+    expect(JSON.parse(sessionStorage.getItem('otodock-confirm:u-me') || '{}').token).toBe('oc-9')
+    expect(localStorage.getItem('otodock-confirm:u-me')).toBeNull()
     expect(auth.setUser).not.toHaveBeenCalled()
   })
 
@@ -126,6 +128,8 @@ describe('AuthCallback', () => {
     unmount()
     // Nothing pending (the popover consumed it, or there never was one).
     localStorage.clear()
+    sessionStorage.clear()
+  sessionStorage.clear()
     renderAt('')
     await flush()
     expect(screen.getByTestId('loc').textContent).toBe('/')
@@ -160,6 +164,16 @@ describe('AuthCallback', () => {
     renderAt('?code=c&state=s')
     await flush()
     expect(screen.getByText('Authentication Failed')).toBeTruthy()
+    expect(screen.getByText(/not a member of any OtoDock group/)).toBeTruthy()
+  })
+
+  it('a refused sign-in shows the reason the server gave', async () => {
+    const err = new Error('ACCESS_DENIED') as Error & { detail?: string }
+    err.detail = "The sign-in's signature did not verify."
+    exchange.handle.mockRejectedValueOnce(err)
+    renderAt('?code=c&state=s')
+    await flush()
+    expect(screen.getByText("The sign-in's signature did not verify.")).toBeTruthy()
   })
 
   it('a login under StrictMode still lands (the remount revives the page)', async () => {

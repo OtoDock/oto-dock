@@ -32,6 +32,9 @@ def test_the_members_and_the_frozen_spellings():
     assert roles.EDITOR_TIER == (roles.MANAGER, roles.EDITOR, roles.ADMIN)
     assert roles.WORKSPACE_TIER == (roles.MANAGER, roles.EDITOR, roles.CONTRIBUTOR, roles.ADMIN)
     assert roles.CREATOR_TIER == (roles.ADMIN, roles.CREATOR)
+    assert roles.SHARED_ONLY_ROLES == (roles.MANAGER, roles.EDITOR)
+    assert [r for r in roles.AGENT_ROLES if roles.allowed_on_shared_only(r)] == ["manager", "editor"]
+    assert not roles.allowed_on_shared_only(None) and not roles.allowed_on_shared_only("admin")
     assert roles.RANK == {"viewer": 0, "contributor": 1, "editor": 2, "manager": 3, "admin": 4}
     assert roles.PLATFORM_RANK == {"member": 0, "creator": 1, "admin": 2}
     # The DB CHECKs are the frozen spellings: the constants are built from
@@ -44,6 +47,8 @@ def test_the_members_and_the_frozen_spellings():
     assert "CHECK (role IN ('viewer', 'editor', 'manager'))" in phone
     agents = (PROXY_DIR / "storage" / "agents" / "schema.py").read_text(encoding="utf-8")
     assert "CHECK (default_for_new_users_role IN ('', 'viewer', 'contributor', 'editor', 'manager'))" in agents
+    sharing = (PROXY_DIR / "storage" / "sharing" / "schema.py").read_text(encoding="utf-8")
+    assert "role_cap IN ('manager', 'editor', 'contributor', 'viewer')" in sharing
     # The validators read the authority, never a literal set of their own.
     from storage.agents import agent_store, community_agent_template_store
     assert community_agent_template_store.VALID_DEFAULT_USER_ROLES == set(roles.AGENT_ROLES)
@@ -53,6 +58,7 @@ def test_the_members_and_the_frozen_spellings():
     by_name = {name: words for _t, name, _c, words in pg_schema._ROLE_CHECKS}
     assert by_name["user_agents_agent_role_check"] == roles.AGENT_ROLES
     assert by_name["agents_default_for_new_users_role_check"] == ("", "viewer", "contributor", "editor", "manager")
+    assert by_name["shares_role_cap_check"] == roles.AGENT_ROLES
 
 
 def test_the_questions():
@@ -198,10 +204,11 @@ def test_the_dashboard_mirror_equals_the_authority():
     assert _ts_const_strings(text, "EDITOR_TIER") == list(roles.EDITOR_TIER)
     assert _ts_const_strings(text, "WORKSPACE_TIER") == list(roles.WORKSPACE_TIER)
     assert _ts_const_strings(text, "CREATOR_TIER") == list(roles.CREATOR_TIER)
+    assert _ts_const_strings(text, "SHARED_ONLY_ROLES") == list(roles.SHARED_ONLY_ROLES)
     assert _ts_union(text, "PlatformRole") == list(roles.PLATFORM_ROLES)
     assert _ts_union(text, "AgentRole") == list(roles.AGENT_ROLES)
     for fn in ("isAdmin", "isCreatorOrAbove", "canManageAgent", "canEditAgent", "canWriteWorkspace",
-               "actingRole", "meetsFloor", "roleBadge", "roleLabel"):
+               "actingRole", "meetsFloor", "roleBadge", "roleLabel", "allowedOnSharedOnly"):
         assert f"export function {fn}(" in text, fn
 
 

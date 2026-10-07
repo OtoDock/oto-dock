@@ -1,7 +1,8 @@
 """Anti-brute-force state for the inbound PIN gate.
 
-Two sliding 15-minute windows over wrong-PIN attempts, both in-memory (a
-daemon restart clears them — accepted v1 trade-off, documented):
+Two sliding 15-minute windows over wrong-PIN attempts, in memory and rebuilt
+after a restart from the proxy's call log (``seed``: each inbound call's
+outcome and attempt count, never a digit):
 
 - Per caller number: ≥5 failures → that number is in cooldown until 15
   minutes after its last failure. Deliberately NOT a permanent ban — caller
@@ -24,6 +25,7 @@ digit, never a PIN.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 from config_manager import normalize_did
 
@@ -31,16 +33,56 @@ WINDOW_S = 15 * 60.0
 NUMBER_LIMIT = 5
 ROUTE_LIMIT = 20
 _CAP = 10_000
+#: Outcomes that end the call at the gate: every attempt failed (a timeout
+#: counts the attempt it cut), stamped when the call ended.
+_REFUSED = frozenset({"pin_failed", "pin_timeout"})
+
+
+def _wall(stamp) -> float | None:
+    try:
+        return datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _replayed(call: dict) -> tuple[float, float, str, str, int, bool] | None:
+    """``(start, at, number, route, failures, verified)`` of one logged call
+    on the wall clock, as the gate recorded it: a refused call failed every
+    attempt it reached and ended at the gate; any other call failed all but
+    its last attempt near its start (a hangup mid-entry, an error), and a
+    completed one passed the gate."""
+    try:
+        attempts = int(call.get("pin_attempts") or 0)
+    except (TypeError, ValueError):
+        return None
+    start = _wall(call.get("started_at"))
+    if attempts <= 0 or start is None:
+        return None
+    outcome = call.get("outcome") or ""
+    if outcome in _REFUSED:
+        at = _wall(call.get("ended_at")) or start
+        failures = attempts
+    else:
+        at, failures = start, attempts - 1
+    return (start, at, call.get("from_number") or "", call.get("route_id") or "",
+            failures, outcome == "completed")
 
 
 class PinFailureStore:
     """Sliding-window failure counters for the PIN gate (asyncio
     single-threaded — no lock needed; only the gate touches this)."""
 
-    def __init__(self, *, now=time.monotonic):
+    def __init__(self, *, now=time.monotonic, wall=time.time):
         self._now = now
+        self._wall = wall
         self._numbers: dict[str, list[float]] = {}
         self._routes: dict[str, list[float]] = {}
+        #: This process's start: a call that started later is in memory.
+        self.started_wall = wall()
+        self.seeded = False
+        # Callers this process cleared before the seed landed: their
+        # earlier failures are not replayed over the clear.
+        self._cleared: set[str] = set()
 
     # -- queries --------------------------------------------------------------
 
@@ -69,7 +111,44 @@ class PinFailureStore:
     def clear_number(self, number: str) -> None:
         """A correct PIN clears the caller's slate (route window stays —
         one success mustn't reset an in-progress route-wide attack)."""
-        self._numbers.pop(normalize_did(number), None)
+        key = normalize_did(number)
+        self._numbers.pop(key, None)
+        if not self.seeded and key:
+            self._cleared.add(key)
+
+    def seed(self, calls: list[dict]) -> int:
+        """Replay the proxy's recent PIN-gate calls (``GET
+        /v1/phone/pin-failures``) into the windows, once per process: only
+        the calls that started before this process did, oldest first, each
+        failure moved onto this clock, a verified call clearing its caller
+        as the gate did. Built apart and merged, so a clear never touches
+        what this process recorded itself. Returns the failures replayed."""
+        offset = self._now() - self._wall()
+        cutoff = self._now() - WINDOW_S
+        numbers: dict[str, list[float]] = {}
+        routes: dict[str, list[float]] = {}
+        events = [e for e in map(_replayed, calls) if e and e[0] < self.started_wall]
+        replayed = 0
+        for _start, at, number, route_id, failures, verified in sorted(events, key=lambda e: e[1]):
+            t = at + offset
+            key = normalize_did(number)
+            if failures and t > cutoff:
+                if key:
+                    numbers.setdefault(key, []).extend([t] * failures)
+                if route_id:
+                    routes.setdefault(route_id, []).extend([t] * failures)
+                replayed += failures
+            if verified and key:
+                numbers.pop(key, None)
+        for key in self._cleared:
+            numbers.pop(key, None)
+        self._cleared.clear()
+        for table, seeded in ((self._numbers, numbers), (self._routes, routes)):
+            for key, stamps in seeded.items():
+                table[key] = sorted(stamps + table.get(key, []))
+        self._evict_if_needed()
+        self.seeded = True
+        return replayed
 
     # -- internals ------------------------------------------------------------
 

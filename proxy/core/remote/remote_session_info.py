@@ -66,3 +66,13 @@ class RemoteSessionInfo:
     # the satellite box leaves the CLI alive and working with zero stream
     # events for many minutes (the Mode D incident).
     turn_active: bool = False
+    # The turn's own silence clock: the last stream event of THIS turn
+    # (``last_activity`` also moves on a steer, which must not restart it),
+    # and whether the turn is a task run's (its ceiling is the turn
+    # ceiling). Read by ``core/events/turn_life`` through the adapters.
+    last_event_at: float = field(default_factory=time.monotonic)
+    task_turn: bool = False
+    # The proxy ended the CLI itself this turn (a Stop's hard path, the
+    # watchdog, a typed ending's kill): the session end that follows is
+    # that kill, not a lost machine.
+    proxy_killed: bool = False

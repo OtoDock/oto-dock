@@ -151,11 +151,14 @@ async def test_update_push_4007_and_rollback_bookkeeping(loop_db_guard, monkeypa
     monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
     mid, secret = await _make_machine()
 
-    # 1. Old satellite → tarball push + close 4007, target remembered.
+    # 1. Old satellite → auth ok first (its 5 s wait is over before the
+    #    tarball goes), then the tarball push + close 4007, target remembered.
     ws = FakeSatelliteWS(_auth(mid, secret, version=sat_ws.MIN_SATELLITE_VERSION))
     with loop_db_guard.active():
         await sat_ws.ws_satellite_handler(ws)
-    assert ws.sent[-1]["type"] == "update_required"
+    assert [f["type"] for f in ws.sent] == ["auth_result", "update_required"]
+    assert ws.sent[0]["status"] == "ok" and ws.sent[0]["cli_pins"] == {}
+    assert ws.sent[0]["policy"] == sat_ws._auth_ok(await _row(mid))["policy"]
     assert ws.sent[-1]["target_version"] == sat_ws.SATELLITE_VERSION_LATEST
     assert ws.closed == (4007, "updating")
     assert sat_ws._pending_pushed_updates[mid] == sat_ws.SATELLITE_VERSION_LATEST

@@ -144,7 +144,7 @@ def test_create_with_a_pin_rolls_back_when_the_pin_cannot_be_stored(cascade, mon
         raise RuntimeError("store down")
     monkeypatch.setattr(phone_route_store, "set_route_pin", _boom)
     r = client.post("/v1/admin/phone/routes", json={
-        "direction": "inbound", "did": "+30232", "phone_server_id": s["id"], "pin": "1234"})
+        "direction": "inbound", "did": "+30232", "phone_server_id": s["id"], "pin": "123456"})
     assert r.status_code == 500 and "PIN" in r.json()["detail"]
     assert state.calls == [] and _routes(client) == []
 
@@ -161,7 +161,7 @@ def test_provision_failure_with_a_pin_drops_the_credential(cascade, monkeypatch)
         real_set(route_id, pin)
     monkeypatch.setattr(phone_route_store, "set_route_pin", _record)
     r = client.post("/v1/admin/phone/routes", json={
-        "direction": "inbound", "did": "+30233", "phone_server_id": s["id"], "pin": "1234"})
+        "direction": "inbound", "did": "+30233", "phone_server_id": s["id"], "pin": "123456"})
     assert r.status_code == 502
     assert _routes(client) == []
     assert stored and phone_route_store.get_route_pin(stored[0]) == ""
@@ -171,7 +171,7 @@ def test_create_refuses_a_pin_on_outbound_and_an_unknown_direction(cascade):
     client, state = cascade
     s = _verified_server(client)
     r = client.post("/v1/admin/phone/routes", json={
-        "direction": "outbound", "phone_server_id": s["id"], "pin": "1234"})
+        "direction": "outbound", "phone_server_id": s["id"], "pin": "123456"})
     assert r.status_code == 400 and "inbound" in r.json()["detail"]
     r = client.post("/v1/admin/phone/routes", json={
         "direction": "sideways", "did": "+30234", "phone_server_id": s["id"]})

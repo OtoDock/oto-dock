@@ -19,7 +19,7 @@
  */
 import type { AgentSummary } from '../../api/agents'
 import type { Department } from '../../api/departments'
-import { MODE_LABEL, modeOfAgent } from '../../lib/visibility'
+import { MODE_LABEL, isSharedOnly, modeOfAgent } from '../../lib/visibility'
 
 export interface MapNode {
   slug: string
@@ -37,6 +37,9 @@ export interface MapNode {
    * second line. Undefined for grayed dept-mates outside the caller's
    * agents payload (modeOfAgent would soft-default, mislabeling them). */
   modeLabel?: string
+  /** A Shared-only agent (its rows take editor or manager); undefined when
+   * the mode is unknown, as for `modeLabel`. */
+  sharedOnly?: boolean
   /** Inaccessible dept-mate: grayed, info-popup only, never enterable. */
   grayed: boolean
 }
@@ -187,6 +190,7 @@ export function computeMapLayout(
           levelRank: rank,
           levelName: nameOfRank.get(rank) ?? '',
           modeLabel: summary ? MODE_LABEL[modeOfAgent(summary)] : undefined,
+          sharedOnly: summary ? isSharedOnly(modeOfAgent(summary)) : undefined,
           grayed: !memberSet.has(m.name),
         })
       })
@@ -260,6 +264,7 @@ export function computeMapLayout(
         levelRank: -1,
         levelName: '',
         modeLabel: MODE_LABEL[modeOfAgent(a)],
+        sharedOnly: isSharedOnly(modeOfAgent(a)),
         grayed: !memberSet.has(a.name),
       })
     })

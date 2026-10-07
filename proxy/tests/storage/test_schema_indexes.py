@@ -194,6 +194,26 @@ def test_the_single_column_agent_index_is_gone():
     assert "idx_runs_agent_started" in names and "idx_runs_agent" not in names
 
 
+def test_the_single_column_chats_agent_index_is_dropped_by_the_migration():
+    """A 1.7.0 database carries idx_chats_agent; the composite
+    idx_chats_agent_updated serves the agent lookups by its prefix, so the
+    migration drops it, once, and does nothing where it is absent."""
+    with psycopg.connect(config.DATABASE_URL, autocommit=True) as c:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_chats_agent ON chats(agent)")
+    with pg.get_conn() as conn:
+        schema.init_schema(conn)
+        schema.run_migrations(conn)
+        conn.commit()
+        names = {r["indexname"] for r in conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'chats'").fetchall()}
+        assert "idx_chats_agent" not in names and "idx_chats_agent_updated" in names
+        schema.run_migrations(conn)   # absent now: a no-op
+        conn.commit()
+        plan = "\n".join(r["QUERY PLAN"] for r in conn.execute(
+            "EXPLAIN SELECT id FROM chats WHERE agent = %s", ("a",)).fetchall())
+    assert "idx_chats_agent_updated" in plan or "Seq Scan" in plan
+
+
 def test_an_invalid_index_is_rebuilt_at_boot():
     """An interrupted CREATE INDEX CONCURRENTLY leaves an INVALID index that
     CREATE INDEX IF NOT EXISTS would skip forever."""

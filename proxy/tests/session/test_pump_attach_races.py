@@ -82,7 +82,9 @@ async def test_attach_fans_out_to_all_viewers(temp_db):
     temp_db.create_chat("pc1", "user-admin", "a1")
     pump = _mk_pump("pc1")
     try:
+        assert pump.has_viewers is False
         q1 = pump.attach()
+        assert pump.has_viewers is True
         q2 = pump.attach()  # a second viewer joins — q1 keeps streaming
         assert _drain(q1) == []  # no steal sentinel
 
@@ -96,7 +98,9 @@ async def test_attach_fans_out_to_all_viewers(temp_db):
         assert len(_drain(q2)) == 1
 
         pump.detach(q1)  # double-detach of a gone queue is a no-op
+        assert pump.has_viewers is True
         pump.detach(q2)
+        assert pump.has_viewers is False
         await pump._forward({"pump_type": "ws_event", "event": {"type": "text"}})
         assert _drain(q2) == []
     finally:

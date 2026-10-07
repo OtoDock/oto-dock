@@ -10,11 +10,11 @@ import stat
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 import config
 from core import host_os
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_admin, require_user
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_registry
@@ -22,13 +22,7 @@ from storage.mcp import mcp_store
 from auth import roles
 
 logger = logging.getLogger("claude-proxy.mcp-api")
-router = APIRouter()
-
-
-def _require_admin(user: UserContext | None) -> UserContext:
-    if not user or not user.is_admin:
-        raise HTTPException(403, "Admin only")
-    return user
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 def _require_manage(user: UserContext | None, agent: str | None = None) -> UserContext:
@@ -51,11 +45,22 @@ def _icon_flags(manifests) -> dict[str, bool]:
     return out
 
 
+def _capability_flags(manifests) -> dict[str, bool]:
+    """``{name: required capability configured}`` for the rows (a provider
+    read per MCP that declares one: call off the loop)."""
+    return {m.name: mcp_registry.manifest_capability_available(m) for m in manifests}
+
+
 # Core MCPs an admin MAY platform-disable: the parallelism features. Their
 # backends gate on mcp_state (delegation spawns, meeting creation), so the
 # toggle is a real kill-switch, not just a config hide. Everything else in
 # core is load-bearing plumbing.
 _PLATFORM_DISABLEABLE_CORE = frozenset({"meetings-mcp", "delegation-mcp"})
+
+# This module's registry rescans run in a worker thread, one at a time: two
+# scans never finish out of order, so an older scan never replaces the
+# registry a newer one built.
+_scan_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +70,7 @@ _PLATFORM_DISABLEABLE_CORE = frozenset({"meetings-mcp", "delegation-mcp"})
 @router.get("/v1/admin/mcps")
 async def list_mcps(user: UserContext = Depends(get_current_user)):
     """Return full MCP inventory for the admin dashboard."""
-    _require_admin(user)
+    require_admin(user)
 
     manifests = mcp_registry.get_all_manifests()
     states = await asyncio.to_thread(mcp_store.get_all_mcp_states)
@@ -86,6 +91,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
 
     mcp_agents = await asyncio.to_thread(_enabled_agents_by_mcp)
     icon_flags = await asyncio.to_thread(_icon_flags, manifests.values())
+    capability_flags = await asyncio.to_thread(_capability_flags, manifests.values())
 
     # Docker status (async). Containerized installs: an image-less docker MCP
     # (core file-tools) runs as an OPERATOR-MANAGED compose sibling there — the
@@ -145,7 +151,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
                 for f in m.config
             ],
             "assignment_mode": m.assignment_mode,
-            "capability_available": mcp_registry.manifest_capability_available(m),
+            "capability_available": capability_flags.get(name, False),
             "agents": sorted(mcp_agents.get(name, [])),
         }
 
@@ -276,7 +282,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
 
 @router.patch("/v1/admin/mcps/{name}/enable")
 async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     if not mcp_registry.get_manifest(name):
         raise HTTPException(404, f"MCP '{name}' not found")
     await asyncio.to_thread(mcp_store.set_mcp_enabled, name, True)
@@ -318,7 +324,7 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
 
 @router.patch("/v1/admin/mcps/{name}/disable")
 async def disable_mcp(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     if not mcp_registry.get_manifest(name):
         raise HTTPException(404, f"MCP '{name}' not found")
 
@@ -365,7 +371,7 @@ async def set_mcp_tool_filter(
     effect immediately (the container's ENTRYPOINT reads
     ``$ENABLED_TOOLS_FLAG`` at startup, not per-request).
     """
-    _require_admin(user)
+    require_admin(user)
     m = mcp_registry.get_manifest(name)
     if m is None:
         raise HTTPException(404, f"MCP '{name}' not found")
@@ -413,7 +419,7 @@ class McpConfigRequest(BaseModel):
 
 @router.get("/v1/admin/mcps/{name}/config")
 async def get_mcp_config(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     if not mcp_registry.get_manifest(name):
         raise HTTPException(404, f"MCP '{name}' not found")
     values = await asyncio.to_thread(mcp_store.get_mcp_config_values, name)
@@ -424,7 +430,7 @@ async def get_mcp_config(name: str, user: UserContext = Depends(get_current_user
 async def set_mcp_config(
     name: str, req: McpConfigRequest, user: UserContext = Depends(get_current_user)
 ):
-    _require_admin(user)
+    require_admin(user)
     if not mcp_registry.get_manifest(name):
         raise HTTPException(404, f"MCP '{name}' not found")
     await asyncio.to_thread(mcp_store.set_mcp_config_values, name, req.values)
@@ -452,7 +458,7 @@ async def set_hosted_service_mode(
     their own OAuth app credentials. Applies only to MCPs declaring
     ``hosted.oauth_app``.
     """
-    _require_admin(user)
+    require_admin(user)
     manifest = mcp_registry.get_manifest(name)
     if not manifest or not (manifest.hosted and manifest.hosted.oauth_app):
         raise HTTPException(400, f"MCP '{name}' does not support hosted OAuth")
@@ -480,7 +486,7 @@ async def set_network_access(
     toggle would have no effect — fail loud, like the tool-filter endpoint).
     Unavailable on hosted OtoDock (no operator LAN).
     """
-    _require_admin(user)
+    require_admin(user)
     manifest = mcp_registry.get_manifest(name)
     if manifest is None:
         raise HTTPException(404, f"MCP '{name}' not found")
@@ -504,7 +510,7 @@ async def set_network_access(
 
 @router.post("/v1/admin/mcps/{name}/docker/start")
 async def docker_start(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
@@ -517,7 +523,7 @@ async def docker_start(name: str, user: UserContext = Depends(get_current_user))
 
 @router.post("/v1/admin/mcps/{name}/docker/stop")
 async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
@@ -530,7 +536,7 @@ async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
 
 @router.post("/v1/admin/mcps/{name}/docker/restart")
 async def docker_restart(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
@@ -543,7 +549,7 @@ async def docker_restart(name: str, user: UserContext = Depends(get_current_user
 
 @router.get("/v1/admin/mcps/{name}/docker/status")
 async def docker_status(name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
@@ -716,17 +722,25 @@ async def set_agent_mcps(
 
 
 def _require_session_editor_tier(user: UserContext, agent: str) -> None:
-    """A session principal reads the agent's SSH hosts only at the tier that
-    holds the keys (``session_config_dir.session_takes_ssh_keys``): a person
-    by their acting role, an agent-scope session by its live context."""
+    """A session principal reads the agent's SSH hosts only when the session
+    takes the keys (``session_config_dir.session_takes_ssh_keys``): its live
+    context exists and is neither a check's judge (read-only) nor an external
+    caller's; then a person is judged by their live acting role, an
+    agent-scope session by its context's role."""
     from auth import roles
+    from core.sandbox.session_config_dir import session_takes_ssh_keys
+    from core.session.external_identity import is_external_ctx
+    from core.session.session_state import get_session_security
+    ctx = get_session_security(user.session_id or "")
+    if (ctx is None or getattr(ctx, "read_only", False) is True
+            or is_external_ctx(ctx)):
+        raise HTTPException(403, "This session is not handed the agent's SSH hosts")
     if user.is_no_user_session:
-        from core.session.session_state import get_session_security
-        ctx = get_session_security(user.session_id or "")
-        role = getattr(ctx, "role", "") if ctx is not None else ""
+        allowed = session_takes_ssh_keys(ctx)
     else:
         role = user.acting_role(agent)
-    if not isinstance(role, str) or not roles.can_edit(role):
+        allowed = isinstance(role, str) and roles.can_edit(role)
+    if not allowed:
         raise HTTPException(
             403, "The editor role or above on this agent is required to list SSH hosts")
 
@@ -746,10 +760,11 @@ async def get_agent_ssh_hosts(
     options in ``command`` (no unix-socket mux on Windows).
 
     Auth: the agent's OWN session JWT (the tool path) at the editor tier,
-    the tier that holds the keys and the prompt block: a person's session by
-    its acting role on the agent, an agent-scope session by the role of its
-    live SecurityContext (none live: refused); or manage rights on the agent
-    (dashboard/debug callers).
+    the tier that holds the keys and the prompt block: the session's live
+    SecurityContext must exist and be neither a check's judge nor an
+    external caller's, then a person's session is judged by its acting role
+    on the agent, an agent-scope session by its context's role; or manage
+    rights on the agent (dashboard/debug callers).
     """
     if user and user.is_session and user.agent == name:
         _require_session_editor_tier(user, name)
@@ -810,14 +825,19 @@ async def get_agent_skills(name: str, user: UserContext = Depends(get_current_us
     """
     _require_manage(user, name)
 
-    db_skills = await asyncio.to_thread(mcp_store.get_agent_skills, name)
+    def _job():
+        return (
+            mcp_store.get_agent_skills(name),
+            mcp_registry.get_agent_mcps_all_placements(name),
+            mcp_registry.get_visible_mcps_for_agent(name),
+        )
+
+    db_skills, assigned, visible = await asyncio.to_thread(_job)
     skill_map = {s["skill_id"]: s for s in db_skills}
 
-    assigned = mcp_registry.get_agent_mcps_all_placements(name)
     assigned_names = {m.name for m in assigned}
     visible_skill_pkgs = [
-        m for m in await asyncio.to_thread(
-            mcp_registry.get_visible_mcps_for_agent, name)
+        m for m in visible
         if m.category == "skill" and m.name not in assigned_names
     ]
 
@@ -903,7 +923,7 @@ def _ssh_keys_dir():
 
 @router.get("/v1/admin/ssh/keys")
 async def list_ssh_keys(user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     keys_dir = _ssh_keys_dir()
     keys_dir.mkdir(parents=True, exist_ok=True)
     keys = []
@@ -918,7 +938,7 @@ async def upload_ssh_key(
     file: UploadFile = File(...),
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     if not file.filename:
         raise HTTPException(400, "No filename")
     # Sanitize filename
@@ -937,7 +957,7 @@ async def upload_ssh_key(
 
 @router.delete("/v1/admin/ssh/keys/{key_name}")
 async def delete_ssh_key(key_name: str, user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     import re
     safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', key_name)
     key_path = _ssh_keys_dir() / safe_name
@@ -973,7 +993,7 @@ class McpInstanceRequest(BaseModel):
 @router.get("/v1/admin/mcps/{name}/instances")
 async def list_mcp_instances(name: str, user: UserContext = Depends(get_current_user)):
     """List all instances for an MCP with field schema."""
-    _require_admin(user)
+    require_admin(user)
     manifest = mcp_registry.get_manifest(name)
     if not manifest or not manifest.instances:
         raise HTTPException(400, f"MCP '{name}' does not use instances")
@@ -1099,7 +1119,7 @@ async def create_mcp_instance(
     admin creates instance → request stays failed until manual retry"
     flow.
     """
-    _require_admin(user)
+    require_admin(user)
     manifest = mcp_registry.get_manifest(name)
     if not manifest or not manifest.instances:
         raise HTTPException(400, f"MCP '{name}' does not use instances")
@@ -1146,7 +1166,7 @@ async def update_mcp_instance(
     bare instance, then later adds an agent to it (this PUT triggers the
     retry just like the agent-on-create path does).
     """
-    _require_admin(user)
+    require_admin(user)
     manifest = mcp_registry.get_manifest(name)
     if not manifest or not manifest.instances:
         raise HTTPException(400, f"MCP '{name}' does not use instances")
@@ -1233,7 +1253,7 @@ async def delete_mcp_instance(
     gone), so they're rejected here; admins rename/re-scope instead.
     Admin-created instances delete normally.
     """
-    _require_admin(user)
+    require_admin(user)
     sys_inst = await asyncio.to_thread(mcp_store.get_system_instance, name)
     if sys_inst and sys_inst.get("id") == instance_id:
         raise HTTPException(
@@ -1254,10 +1274,19 @@ async def delete_mcp_instance(
 
 @router.delete("/v1/admin/mcps/{name}")
 async def delete_mcp(name: str, user: UserContext = Depends(get_current_user)):
-    """Delete an MCP — removes DB data, credentials, and folder."""
-    import shutil
+    """Delete an MCP — removes DB data, credentials, and folder. An admin at
+    the keyboard only; holds the per-MCP install lock, so it waits for a
+    running install, update or switch and removes the MCP after it (an
+    interrupted switch's row goes with the rest)."""
+    require_admin(user)
+    from core.credentials import catalog_install_registry
 
-    _require_admin(user)
+    async with catalog_install_registry.lock_for(name):
+        return await _delete_mcp_locked(name)
+
+
+async def _delete_mcp_locked(name: str) -> dict:
+    import shutil
 
     manifest = mcp_registry.get_manifest(name)
     if not manifest:
@@ -1282,6 +1311,11 @@ async def delete_mcp(name: str, user: UserContext = Depends(get_current_user)):
     from storage.identity import credential_store
     await asyncio.to_thread(credential_store.delete_all_mcp_credentials, name)
 
+    # The last check's row and a pending or finished source change belong to
+    # the install that is going away.
+    from storage.mcp import mcp_update_state_store
+    await asyncio.to_thread(mcp_update_state_store.delete_mcp_rows, name)
+
     # Self-host (T1/T2): tear the Docker container + its named volumes down
     # before removing the folder — otherwise a delete orphans a running
     # container and its data volumes (the compose file lives in the folder we
@@ -1303,7 +1337,8 @@ async def delete_mcp(name: str, user: UserContext = Depends(get_current_user)):
         shutil.rmtree(mcp_dir, ignore_errors=True)
 
     # Re-scan manifests
-    mcp_registry.scan_manifests()
+    async with _scan_lock:
+        await asyncio.to_thread(mcp_registry.scan_manifests)
 
     return {"status": "deleted", "name": name}
 
@@ -1317,11 +1352,24 @@ async def check_mcp_updates(user: UserContext = Depends(get_current_user)):
     """Check npm/pypi + the community catalog for newer MCP versions (admin).
 
     Detection lives in ``services/mcp/mcp_updater`` so the manual button and the
-    weekly automatic-update job share one implementation.
+    weekly automatic-update job share one implementation. The check persists
+    its results; the answer is the same shape ``update-state`` reads back.
     """
-    _require_admin(user)
+    require_admin(user)
     from services.mcp import mcp_updater
     return await mcp_updater.detect_available_updates()
+
+
+@router.get("/v1/admin/mcps/update-state")
+async def get_mcp_update_state(user: UserContext = Depends(get_current_user)):
+    """The last update check as persisted (admin): its ordinary results, the
+    pending source changes and the switched ones not yet dismissed, so the
+    MCP Servers page shows them on load without a new check.
+    ``{updates: {name: info}, checked, checked_at}``; ``checked_at`` is empty
+    when no check has run yet."""
+    require_admin(user)
+    from services.community import mcp_source_swap
+    return await asyncio.to_thread(mcp_source_swap.build_update_state)
 
 
 @router.post("/v1/admin/mcps/{name}/update")
@@ -1335,9 +1383,53 @@ async def update_mcp_version(name: str, user: UserContext = Depends(get_current_
     ``services/mcp/mcp_updater.update_one`` (shared with the weekly automatic-update
     job), which holds the per-MCP install lock for the duration.
     """
-    _require_admin(user)
+    require_admin(user)
     from services.mcp import mcp_updater
     return await mcp_updater.update_one(name)
+
+
+class AcceptSourceRequest(BaseModel):
+    """Exactly what the page showed: the old and the new source as the
+    dialog displayed them (a repo URL, an image reference or a host) and the
+    hash of the catalog manifest the card described."""
+    model_config = ConfigDict(populate_by_name=True)
+    from_url: str = Field(alias="from")
+    to: str
+    manifest_hash: str
+
+
+@router.post("/v1/admin/mcps/{name}/accept-source")
+async def accept_mcp_source(
+    name: str, body: AcceptSourceRequest,
+    user: UserContext = Depends(get_current_user),
+):
+    """Switch an installed community MCP to the catalog source its pending
+    change names, keeping its rows, credentials, assignments and settings.
+    An admin at the keyboard only (``require_admin``: no session token, no
+    API key); the body must name exactly the pending pair and the catalog
+    manifest the card showed. The work is
+    ``services/community/mcp_source_swap.switch``, under the per-MCP install
+    lock; it answers 409 when nothing is pending, the pair or the manifest
+    differs, the catalog moved again since the check, or a switch is already
+    running."""
+    require_admin(user)
+    from services.community import mcp_source_swap
+    return await mcp_source_swap.switch(
+        name, from_url=body.from_url, to_url=body.to, manifest_hash=body.manifest_hash,
+        admin_sub=user.sub,
+    )
+
+
+@router.delete("/v1/admin/mcps/{name}/source-change")
+async def dismiss_mcp_source_change(
+    name: str, user: UserContext = Depends(get_current_user),
+):
+    """Dismiss the record of a finished switch (admin at the keyboard). A
+    pending or running change is never dismissed (409)."""
+    require_admin(user)
+    from services.community import mcp_source_swap
+    await mcp_source_swap.dismiss(name)
+    return {"status": "dismissed", "name": name}
 
 
 @router.get("/v1/admin/mcps/auto-update-log")
@@ -1348,7 +1440,7 @@ async def get_mcp_auto_update_log(user: UserContext = Depends(get_current_user))
     ``run_id``) plus the last-run timestamp — which is set even when a run found
     nothing to update, so the status line can show "last run … — up to date".
     """
-    _require_admin(user)
+    require_admin(user)
     from storage import database as _db
     from storage.mcp import mcp_autoupdate_store
     from services.mcp import mcp_autoupdate
@@ -1444,12 +1536,14 @@ async def install_mcp(
     in ``services.community.community_installer`` handles validation, copy, dependency
     install, rollback, and .env regeneration.
     """
+    import json
     import shutil
     import tempfile
     from pathlib import Path
+    from core.credentials import catalog_install_registry
     from services.community import community_installer
 
-    _require_admin(user)
+    require_admin(user)
 
     tmp = Path(tempfile.mkdtemp(prefix="mcp-install-"))
     try:
@@ -1458,6 +1552,17 @@ async def install_mcp(
         if mcp_root is None:
             raise HTTPException(400, "No manifest.json found in zip")
 
+        # The per-MCP install lock the catalog paths hold, so an upload never
+        # runs under an update, a switch or a delete of the same name. The
+        # installer judges the manifest itself; an unreadable name is its
+        # 400, taken under no lock.
+        try:
+            uploaded_name = json.loads((mcp_root / "manifest.json").read_text()).get("name")
+        except Exception:
+            uploaded_name = None
+        if isinstance(uploaded_name, str) and uploaded_name:
+            async with catalog_install_registry.lock_for(uploaded_name):
+                return await community_installer.install_from_extracted_folder(mcp_root)
         return await community_installer.install_from_extracted_folder(mcp_root)
 
     finally:
@@ -1485,7 +1590,7 @@ async def install_skill_zip(
     from pathlib import Path
     from services.community import skills_installer
 
-    _require_admin(user)
+    require_admin(user)
 
     tmp = Path(tempfile.mkdtemp(prefix="skill-install-"))
     try:

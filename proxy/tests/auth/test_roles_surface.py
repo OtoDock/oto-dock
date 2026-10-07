@@ -50,7 +50,7 @@ KNOWN_SITES: dict[str, tuple[str, int]] = {
     "proxy/services/notifications/notification_manager.py": (
         "the notification scope (user | agent | global | admin), not a role", 1),
     "proxy/api/apps/app_proxy.py": (
-        "the app token basis (viewer | external | agent | app | step), not a role", 2),
+        "the app token basis (viewer | external | agent | app | step), not a role", 3),
 }
 
 

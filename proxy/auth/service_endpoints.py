@@ -20,8 +20,9 @@ Contributor contract — when do you add an entry here?
     HTTP method(s) actually used.
 
 The ``/ws/phone`` and ``/ws/phone-management`` WebSocket endpoints also carry
-the master key (as a ``?key=`` query) but are a separate ASGI scope that HTTP
-middleware does not wrap; they are gated inline by their own key check.
+the master key, read from the ``Authorization`` bearer only (a ``?key=`` query
+is ignored with a WARNING), but are a separate ASGI scope that HTTP middleware does not wrap; they are
+gated inline by their own key check.
 """
 
 import re
@@ -37,6 +38,7 @@ _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
     (re.compile(r"^/v1/sessions/[^/]+$"), frozenset({"DELETE"})),  # close session
     (re.compile(r"^/v1/phone/usage/turn-classifier$"), frozenset({"POST"})),
     (re.compile(r"^/v1/phone/calls/report$"), frozenset({"POST"})),  # call-log rows at teardown
+    (re.compile(r"^/v1/phone/pin-failures$"), frozenset({"GET"})),  # the PIN lockout after a restart
 ]
 
 

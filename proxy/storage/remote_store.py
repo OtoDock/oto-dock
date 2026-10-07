@@ -327,7 +327,8 @@ def set_device_grants(machine_id: str, grants: list[str]) -> None:
             # default instead of silently reviving the user's-browser choice.
             conn.execute(
                 "UPDATE remote_machines SET device_grants = %s, "
-                "browser_mode = 'dedicated', browser_extension_token_enc = NULL "
+                "browser_mode = 'dedicated', browser_extension_token_enc = NULL, "
+                "browser_unattended = FALSE "
                 "WHERE id = %s",
                 (json.dumps(cleaned), machine_id),
             )
@@ -349,6 +350,9 @@ class BrowserTargetSettings:
 
     mode: str = "dedicated"
     extension_token: str | None = None
+    #: Whether an unattended session (a task, a call, a meeting) may use the
+    #: token; off, only a session a person drives gets it.
+    unattended: bool = False
 
 
 def _parse_browser_mode(raw) -> str:
@@ -374,13 +378,29 @@ def set_browser_mode(machine_id: str, mode: str) -> None:
 def set_browser_extension_token(machine_id: str, token: str | None) -> None:
     """Store (Fernet, credential-store key) or clear (None) the machine's
     Playwright Extension token. The endpoint validates the token shape and
-    the mode; the store persists verbatim."""
+    the mode; the store persists verbatim. Clearing it clears the
+    unattended permission too, so a new token starts attended-only."""
     from storage.identity import credential_store
     enc = credential_store.encrypt_secret(token) if token else None
     with get_conn() as conn:
+        if enc is None:
+            conn.execute(
+                "UPDATE remote_machines SET browser_extension_token_enc = NULL, "
+                "browser_unattended = FALSE WHERE id = %s", (machine_id,))
+        else:
+            conn.execute(
+                "UPDATE remote_machines SET browser_extension_token_enc = %s WHERE id = %s",
+                (enc, machine_id),
+            )
+        conn.commit()
+
+
+def set_browser_unattended(machine_id: str, enabled: bool) -> None:
+    """Whether unattended sessions get the machine's own-browser token."""
+    with get_conn() as conn:
         conn.execute(
-            "UPDATE remote_machines SET browser_extension_token_enc = %s WHERE id = %s",
-            (enc, machine_id),
+            "UPDATE remote_machines SET browser_unattended = %s WHERE id = %s",
+            (bool(enabled), machine_id),
         )
         conn.commit()
 
@@ -397,7 +417,7 @@ def get_target_browser_settings(target: placement.PlacementCapabilities) -> Brow
         return BrowserTargetSettings()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT browser_mode, browser_extension_token_enc "
+            "SELECT browser_mode, browser_extension_token_enc, browser_unattended "
             "FROM remote_machines WHERE id = %s",
             (target.machine_id,),
         ).fetchone()
@@ -415,7 +435,8 @@ def get_target_browser_settings(target: placement.PlacementCapabilities) -> Brow
                 "(key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
                 target.machine_id[:8],
             )
-    return BrowserTargetSettings(mode="own", extension_token=token)
+    return BrowserTargetSettings(mode="own", extension_token=token,
+                                 unattended=bool(row["browser_unattended"]))
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ All functions are synchronous (call via asyncio.to_thread).
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
 import dataclasses
 import logging
@@ -169,6 +170,15 @@ _throttled_until: dict[str, float] = {}
 # pure churn). Entries clear with their _throttled_until expiry.
 _throttled_hard: set[str] = set()
 _THROTTLE_COOLDOWN_S = 900  # 15 min — a genuine account rate/usage/quota limit
+# A usage-limit ending that names its reached window and a future reset rests
+# the account until that reset (``rest_after_limit``), bounded by the window's
+# declared length. An account-wide window rests in _throttled_until (the hard
+# class) with its key here, sub_id → (window key, rested at); a model family's
+# window rests only spawns of that scope, (sub_id, scope key) → (until,
+# rested at). A later reading of the window with headroom ends either early
+# (``clear_rests_with_headroom``). In-memory, like every rest.
+_window_rests: dict[str, tuple[str, float]] = {}
+_scoped_rests: dict[tuple[str, str], tuple[float, float]] = {}
 # A transient, server-side overload (Anthropic 529 "Overloaded") is NOT an account
 # limit: the account is fine, the provider is momentarily busy, and the CLI already
 # retries. So it gets a tiny cooldown — a one-turn failover nudge for multi-account
@@ -203,7 +213,38 @@ def _is_throttled(sub_id: str) -> bool:
     if time.time() >= until:
         _throttled_until.pop(sub_id, None)
         _throttled_hard.discard(sub_id)
+        _window_rests.pop(sub_id, None)
         return False
+    return True
+
+
+def _scope_resting(sub_id: str, scope_key: str) -> bool:
+    """Is the account resting for spawns of this model scope (a usage limit
+    on that family's own window)? "" (no per-model window) never is."""
+    if not scope_key:
+        return False
+    entry = _scoped_rests.get((sub_id, scope_key))
+    if entry is None:
+        return False
+    if time.time() >= entry[0]:
+        _scoped_rests.pop((sub_id, scope_key), None)
+        return False
+    return True
+
+
+def _rest_account(sub_id: str, until: float, *, window: str = "") -> bool:
+    """Rest the account until ``until`` unless it already rests longer (a
+    short cooldown never shortens a window's rest). ``window`` names the
+    window the rest waits on, which a reading with headroom may end early;
+    a rest that outlasts a window's drops the key (no reading ends it).
+    Returns whether the rest was set or extended."""
+    if until <= _throttled_until.get(sub_id, 0.0):
+        return False
+    _throttled_until[sub_id] = until
+    if window:
+        _window_rests[sub_id] = (window, time.time())
+    else:
+        _window_rests.pop(sub_id, None)
     return True
 
 
@@ -272,11 +313,133 @@ def mark_subscription_throttled(session_id: str, *, cooldown_s: int = _THROTTLE_
     sub_id = get_session_subscription(session_id)
     if not sub_id:
         return
-    _throttled_until[sub_id] = time.time() + cooldown_s
-    logger.info(f"Pool: throttled subscription {sub_id[:8]} for {cooldown_s}s (limit hit)")
+    if _rest_account(sub_id, time.time() + cooldown_s):
+        logger.info(f"Pool: throttled subscription {sub_id[:8]} for {cooldown_s}s (limit hit)")
     if cooldown_s >= _THROTTLE_COOLDOWN_S:
         _throttled_hard.add(sub_id)
         schedule_rebalance("provider limit")
+
+
+def rest_after_limit(session_id: str, ending, err_msg: str = "") -> None:
+    """Rest the subscription a failed turn ran on, by what ended it (the
+    stream pump's ERROR branch):
+
+    * a typed usage-limit ending that names its reached window and a reset
+      still ahead: until that reset, bounded by the window's declared length.
+      An account-wide window (the session or the weekly window) rests the
+      account; a model family's window (``scoped:<scope key>``) rests it for
+      spawns of that scope only (``usage_scope_key``), other models keep
+      using it;
+    * any other typed limit ending (no window, no reset, an unknown window):
+      the usual cooldown (``_THROTTLE_COOLDOWN_S``);
+    * no typed ending: the error text's class (``throttle_cooldown_for``: a
+      limit the usual cooldown, a transient overload the brief nudge).
+
+    Every eligible account resting still falls back to the one that frees
+    first (``_select``), so a single-account install shows the vendor's own
+    limit message rather than "no subscription"."""
+    from core.events import turn_ending
+    if ending is not None and ending.reason == turn_ending.LIMIT:
+        if not _rest_until_reset(session_id, ending):
+            mark_subscription_throttled(session_id)
+        return
+    cooldown = throttle_cooldown_for(err_msg)
+    if cooldown:
+        mark_subscription_throttled(session_id, cooldown_s=cooldown)
+
+
+def _iso_epoch(value: str) -> float | None:
+    from datetime import datetime, timezone
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _window_length_s(session_id: str, window: str) -> float | None:
+    """The declared length of the window a limit ending names: the session's
+    engine's declaration (its binding's acquisition context), else the
+    longest any registered engine declares under that key. A model family's
+    window settles by the quota window's length, as the readings do. None
+    for a window nobody declares."""
+    ctx = _session_binding_ctx.get(session_id)
+    if ctx and ctx[0]:
+        declared = [_windows.window_specs(ctx[0])]
+    else:
+        from core.session.session_manager import get_all_layers
+        declared = [_windows.window_specs(name) for name in get_all_layers()]
+    lengths: list[float] = []
+    for specs in declared:
+        if window.startswith("scoped:"):
+            quota = _windows.quota_spec(specs)
+            if quota is not None:
+                lengths.append(float(quota.length_s))
+        elif window in specs:
+            lengths.append(float(specs[window].length_s))
+    return max(lengths) if lengths else None
+
+
+def _rest_until_reset(session_id: str, ending) -> bool:
+    """The window rest of ``rest_after_limit``; False when the ending cannot
+    carry one (no window, no future reset, a window nobody declares) or the
+    session has no account."""
+    window = getattr(ending, "window", "") or ""
+    reset = _iso_epoch(getattr(ending, "resets_at", "") or "")
+    now = time.time()
+    if not window or reset is None or reset <= now:
+        return False
+    length = _window_length_s(session_id, window)
+    if length is None:
+        return False
+    sub_id = get_session_subscription(session_id)
+    if not sub_id:
+        return False
+    until = min(reset, now + length)
+    if window.startswith("scoped:"):
+        scope = window[len("scoped:"):]
+        if not scope:
+            return False
+        held = _scoped_rests.get((sub_id, scope))
+        if held is None or held[0] < until:
+            _scoped_rests[(sub_id, scope)] = (until, now)
+        logger.info(f"Pool: subscription {sub_id[:8]} rests for {scope} until its window "
+                    f"resets ({int(until - now)}s, usage limit)")
+    else:
+        if _rest_account(sub_id, until, window=window):
+            logger.info(f"Pool: subscription {sub_id[:8]} rests until its {window} window "
+                        f"resets ({int(until - now)}s, usage limit)")
+        _throttled_hard.add(sub_id)
+    schedule_rebalance("provider limit")
+    return True
+
+
+def clear_rests_with_headroom(sub_id: str, reading) -> None:
+    """A window reading of the account (the poll or an in-band sample) that
+    was observed after a window rest began and shows the rested window below
+    its spill mark and not reached ends that rest early, account-wide or for
+    one model scope. A plain cooldown waits on no window and is left alone.
+    Safe from worker threads."""
+    observed = reading.observed_at.timestamp()
+    entry = _window_rests.get(sub_id)
+    if entry is not None:
+        window, rested_at = entry
+        if observed > rested_at and _windows.has_headroom(reading, window):
+            _throttled_until.pop(sub_id, None)
+            _throttled_hard.discard(sub_id)
+            _window_rests.pop(sub_id, None)
+            logger.info(f"Pool: subscription {sub_id[:8]} has {window} headroom again "
+                        f"(rest ended)")
+    for (rested_sub, scope), (_until, rested_at) in list(_scoped_rests.items()):
+        if (rested_sub == sub_id and observed > rested_at
+                and _windows.has_headroom(reading, f"scoped:{scope}")):
+            _scoped_rests.pop((rested_sub, scope), None)
+            logger.info(f"Pool: subscription {sub_id[:8]} has {scope} headroom again "
+                        f"(rest ended)")
 
 
 def throttle_from_cli_error(session_id: str, error_text: str) -> None:
@@ -297,7 +460,7 @@ def throttle_from_cli_error(session_id: str, error_text: str) -> None:
 # the full cooldown so the next turn fails over to a fresh account.
 _LIMIT_ERROR_MARKERS = (
     "rate_limit", "rate limit", "ratelimit", "429", "too many requests",
-    "usage limit", "quota", "insufficient_quota",
+    "usage limit", "usage credits", "quota", "insufficient_quota",
 )
 # Transient, server-side overload (Anthropic 529 "Overloaded") — NOT the account's
 # fault. Kept separate so it gets the short nudge, not the 15-minute lockout.
@@ -408,6 +571,14 @@ def _window_exhausted_for(row: dict, model: str) -> bool:
         reading, _scope_key(row.get("layer"), model))
 
 
+def _out_for(row: dict, model: str) -> bool:
+    """Out of service for a spawn of ``model``: its windows exhausted for it,
+    or resting for the model's scope after a usage limit on that family's
+    own window (``rest_after_limit``)."""
+    return (_window_exhausted_for(row, model)
+            or _scope_resting(str(row.get("id") or ""), _scope_key(row.get("layer"), model)))
+
+
 def _group_model(session_ids: list[str]) -> str:
     """The model the sessions of one credential scope run (the chat rows
     carry it; the binding context does not), so a scope is judged and
@@ -430,6 +601,20 @@ _FAR_FUTURE = float("inf")
 
 def _epoch_or_inf(dt) -> float:
     return dt.timestamp() if dt is not None else _FAR_FUTURE
+
+
+def _rest_end(sub_id: str, scope_key: str) -> float | None:
+    """When the account's rests for a spawn of this scope end (the later of
+    an account-wide rest and the scope's own), or None when it rests for
+    neither."""
+    ends = []
+    if _is_throttled(sub_id):
+        ends.append(_throttled_until.get(sub_id, 0.0))
+    if _scope_resting(sub_id, scope_key):
+        entry = _scoped_rests.get((sub_id, scope_key))
+        if entry is not None:
+            ends.append(entry[0])
+    return max(ends) if ends else None
 
 
 def _select(
@@ -458,10 +643,11 @@ def _select(
     LEAST-CONSUMED key — recent burn (~5h) first, the 7-day total as tiebreak —
     so accounts that reset together still spread. The store's least-active
     order breaks remaining ties (stable sort). Subscriptions currently
-    throttled (a recent provider limit) or EXHAUSTED for this spawn's
-    ``model`` (a window past its spill mark, the vendor's reached flag, or the
-    model family's own weekly window) are skipped so the spawn fails over to
-    an account with headroom.
+    resting (a recent provider limit, account-wide or for this spawn's model
+    scope: ``rest_after_limit``) or EXHAUSTED for this spawn's ``model`` (a
+    window past its spill mark, the vendor's reached flag, or the model
+    family's own weekly window) are skipped so the spawn fails over to an
+    account with headroom.
     """
     auth_ok = [
         c for c in candidates
@@ -475,8 +661,12 @@ def _select(
         if c["id"] in readings
         and _windows.exhausted(readings[c["id"]], _scope_key(c.get("layer"), model))
     }
-    pool = [c for c in auth_ok
-            if not _is_throttled(c["id"]) and c["id"] not in exhausted]
+    resting = {
+        c["id"] for c in auth_ok
+        if _is_throttled(c["id"])
+        or _scope_resting(c["id"], _scope_key(c.get("layer"), model))
+    }
+    pool = [c for c in auth_ok if c["id"] not in resting and c["id"] not in exhausted]
     fallback = False
     if not pool:
         # Every eligible sub is briefly resting (recent provider limit/overload)
@@ -514,11 +704,18 @@ def _select(
 
         def _instant(s: dict) -> float:
             reading = readings.get(s["id"])
+            if fallback:
+                # When the account frees: the end of its rest and the reset
+                # of the windows that exhaust it, whichever comes later.
+                scope = _scope_key(s.get("layer"), model)
+                known = [end for end in (_rest_end(s["id"], scope),) if end is not None]
+                if reading is not None:
+                    frees = _windows.frees_at(reading, scope)
+                    if frees is not None:
+                        known.append(frees.timestamp())
+                return max(known) if known else _FAR_FUTURE
             if reading is None:
                 return _FAR_FUTURE
-            if fallback:
-                return _epoch_or_inf(
-                    _windows.frees_at(reading, _scope_key(s.get("layer"), model)))
             return _epoch_or_inf(_windows.quota_reset(reading))
 
         pool.sort(key=lambda s: (s.get("auth_type") == "relay",
@@ -599,14 +796,11 @@ def _sticky_subscription_id(scope_key: str) -> str | None:
     for row in rows:  # newest first
         sid = row.get("session_id") or ""
         if sid and _session_registered_live(sid) is False:
-            try:
-                subscription_store.delete_session_binding(sid)
-                logger.info(
-                    f"Pool: dropped ghost binding of dead session {sid[:8]} "
-                    f"(scope no longer pinned by it)"
-                )
-            except Exception:
-                pass
+            _queue_write("dropping a ghost binding", subscription_store.delete_session_binding, sid)
+            logger.info(
+                f"Pool: dropped ghost binding of dead session {sid[:8]} "
+                f"(scope no longer pinned by it)"
+            )
             continue
         sub = row.get("subscription_id")
         if isinstance(sub, str) and sub:
@@ -627,11 +821,13 @@ def _select_sticky(
     re-homes the scope's live sessions in that case). Throttling is
     deliberately NOT honored here: the shared-file constraint dominates a
     briefly resting account (``rebalance_scopes`` moves the whole scope).
-    Window EXHAUSTION for the spawn's model is: a pin the vendor will refuse
-    is no pin — when another candidate can serve the model, the spawn goes
-    there and a rebalance pass is scheduled so the scope's other sessions
-    follow onto the same account (the new spawn's credential file already
-    points them there; the pass formalizes the bindings). Live-observed
+    Window EXHAUSTION for the spawn's model is, and so is a rest for the
+    model's scope after a usage limit on that family's window: a pin the
+    vendor will refuse is no pin. When another candidate can serve the
+    model, the spawn goes there and a rebalance pass is scheduled so the
+    scope's other sessions follow onto the same account (the new spawn's
+    credential file already points them there; the pass formalizes the
+    bindings). Live-observed
     2026-09-11: sessions kept spawning onto an account at 96 % of its
     session window for a tick while the other account had headroom."""
     if not sticky_scope:
@@ -642,11 +838,11 @@ def _select_sticky(
     match = [c for c in candidates if c["id"] == pinned]
     if not match:
         return None
-    if _window_exhausted_for(match[0], model):
+    if _out_for(match[0], model):
         others = [
             c for c in candidates
             if c["id"] != pinned and (allowed_auth is None or c.get("auth_type") in allowed_auth)
-            and not _window_exhausted_for(c, model)
+            and not _out_for(c, model)
         ]
         if others:
             logger.info(
@@ -691,7 +887,9 @@ def acquire_subscription(
     model: str = "",
     enforce_caps: bool = True,
 ) -> SubscriptionHandle | None:
-    """Select and acquire a subscription for a new session.
+    """Select and acquire a subscription for a new session. Off the loop
+    (``asyncio.to_thread``): the queued seat releases are flushed first so
+    the counts it reads are current.
 
     USER-SCOPE (``user_sub`` truthy): the user's own accounts (``use_personal``)
     first; then — only if Platform Auth is on — the admin pool restricted to
@@ -723,6 +921,7 @@ def acquire_subscription(
     Returns None when nothing is available (caller surfaces the block; see
     ``user_scope_block_reason`` for the user-facing reason).
     """
+    flush_binding_writes()
     user_sub = user_sub or None  # treat "" as agent-scope; never match owner_sub='' infra
 
     drop_oauth = False
@@ -960,6 +1159,113 @@ def default_execution_layer_for_creator(user_sub: str) -> str:
     return DEFAULT_EXECUTION_PATH
 
 
+# --- the binding writer ------------------------------------------------------
+# One worker carries every write of the persisted mirror and the seat
+# counters, in order: a bind's upsert lands before its release's delete (the
+# orphan row a deferred write once left behind cannot happen), a release's
+# two statements leave the loop, and a reaper's burst is a queue, not a
+# stall. A job is a pure store call: it never takes _session_maps_lock and
+# never acquires. The spawn flows await a bind's future before they proceed,
+# so the row is durable before the session runs; releases are fire-and-
+# forget. After the shutdown drain every write runs inline (the pools close
+# right after).
+_binding_writer: ThreadPoolExecutor | None = None
+_binding_writer_lock = threading.Lock()
+_binding_writes_closed = False
+# The shutdown drain's bound: a database stall must not hold the shutdown.
+# What is still queued then is dropped; the next boot's counter reset
+# (``reset_active_sessions``) and binding prune repair it.
+_BINDING_DRAIN_TIMEOUT_S = 30.0
+
+
+def _writer() -> ThreadPoolExecutor:
+    global _binding_writer
+    if _binding_writer is None:
+        with _binding_writer_lock:
+            if _binding_writer is None:
+                _binding_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sub-bind")
+    return _binding_writer
+
+
+def _guarded(label: str, fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        logger.exception("Pool: %s failed (the in-memory state stands)", label)
+        return None
+
+
+def _queue_write(label: str, fn, *args) -> Future:
+    """Queue one store write on the binding writer; its future resolves when
+    the row landed (None when the write failed, logged)."""
+    if _binding_writes_closed:
+        done: Future = Future()
+        done.set_result(_guarded(label, fn, *args))
+        return done
+    return _writer().submit(_guarded, label, fn, *args)
+
+
+def flush_binding_writes(timeout: float | None = 30.0) -> None:
+    """Wait for every queued write: a seat acquire before it reads the
+    counts, a reconcile, the tests, the shutdown. Never on the loop thread
+    (a running loop skips it: the counts may then read a write behind)."""
+    if _binding_writer is None or _binding_writes_closed:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            _writer().submit(lambda: None).result(timeout)
+        except TimeoutError:
+            # A wedged writer (a database stall) must not fail the caller's
+            # spawn: the counts may then read a write behind.
+            logger.warning("Pool: binding writes not flushed within %ss; counts may read a write behind",
+                           timeout)
+    else:
+        logger.debug("Pool: flush_binding_writes on the loop thread skipped")
+
+
+def close_binding_writes(timeout: float | None = None) -> bool:
+    """The shutdown, off the loop (the lifespan runs it in a worker thread):
+    wait at most ``timeout`` (``_BINDING_DRAIN_TIMEOUT_S``, 30 s) for the
+    queued writes, then every later write runs inline. Returns False when
+    the writer did not drain in time (a database stall): it is then shut
+    down without waiting, the writes still queued are dropped (the next
+    boot's ``reset_active_sessions`` and binding prune repair what they
+    would have written) and the one in progress finishes on its own thread."""
+    global _binding_writes_closed
+    limit = _BINDING_DRAIN_TIMEOUT_S if timeout is None else timeout
+    writer = _binding_writer
+    drained = True
+    if writer is not None and not _binding_writes_closed:
+        try:
+            writer.submit(lambda: None).result(limit)
+        except TimeoutError:
+            drained = False
+            logger.warning(
+                "Pool: binding writes not drained within %ss at shutdown; "
+                "the queued ones are dropped", limit,
+            )
+    _binding_writes_closed = True
+    if writer is not None:
+        writer.shutdown(wait=drained, cancel_futures=not drained)
+    return drained
+
+
+def _reopen_binding_writes() -> None:
+    """Tests: a fresh writer after a close."""
+    global _binding_writer, _binding_writes_closed
+    _binding_writer = None
+    _binding_writes_closed = False
+
+
+def _release_rows(session_id: str, sub_id: str | None) -> None:
+    # Each statement on its own: a failed delete must not keep the seat.
+    _guarded("deleting a session binding", subscription_store.delete_session_binding, session_id)
+    if sub_id:
+        subscription_store.decrement_active_sessions(sub_id)
+
+
 def release_subscription(session_id: str) -> None:
     """Release the subscription held by a session."""
     from services.engines import token_fanout
@@ -969,13 +1275,10 @@ def release_subscription(session_id: str) -> None:
         _session_binding_ctx.pop(session_id, None)
         _session_scope_keys.pop(session_id, None)
         sub_id = _session_subscriptions.pop(session_id, None)
-    try:
-        subscription_store.delete_session_binding(session_id)
-    except Exception as e:
-        # persisted mirror only — the startup TTL prune is the backstop
-        logger.debug("session binding delete: %s", e)
+    # The persisted mirror and the seat: queued behind the bind's own write
+    # (the startup TTL prune is the backstop for a write that fails).
+    _queue_write("releasing a session binding", _release_rows, session_id, sub_id)
     if sub_id:
-        subscription_store.decrement_active_sessions(sub_id)
         logger.info(f"Pool: released subscription {sub_id[:8]} for session {session_id[:8]}")
 
 
@@ -997,7 +1300,8 @@ def release_unbound_seat(subscription_id: str, sticky_scope: str = "") -> None:
         claim = _scope_recent.get(sticky_scope) if sticky_scope else None
         if claim and claim[0] == subscription_id:
             _scope_recent.pop(sticky_scope, None)
-    subscription_store.decrement_active_sessions(subscription_id)
+    _queue_write("releasing an unbound seat", subscription_store.decrement_active_sessions,
+                 subscription_id)
     logger.info(
         f"Pool: released unbound seat on subscription {subscription_id[:8]} "
         f"(spawn abandoned before bind)"
@@ -1044,6 +1348,7 @@ def reconcile_active_sessions(sub_id: str) -> tuple[int, int]:
     after a restart — is re-taken by ``restore_session_binding`` itself).
     Returns ``(stored, live)``. Used where a stale counter would otherwise
     refuse an admin action (the subscription delete)."""
+    flush_binding_writes()   # the queued releases count before the stored value is read
     row = subscription_store.get_subscription(sub_id) or {}
     stored = int(row.get("active_sessions") or 0)
     live = live_session_count(sub_id)
@@ -1062,7 +1367,7 @@ def bind_session(
     layer: str = "",
     user_sub: str | None = None,
     scope_key: str = "",
-) -> None:
+) -> Future:
     """Track which subscription a session is using (for cleanup + fan-out).
 
     ``layer`` + ``user_sub`` record the ACQUISITION context — the arguments
@@ -1104,18 +1409,11 @@ def bind_session(
             _session_token_expiry.pop(session_id, None)
     # Persisted mirror: survives restarts so usage attribution
     # (get_session_subscription read-through) and the scope-sticky lookup keep
-    # working for sessions that outlive the proxy process. Written INLINE (a
-    # single upsert, same weight as release's decrement_active_sessions on the
-    # same paths) — deferring it raced a quick bind→release, leaving an orphan
-    # row that could pin the scope's sticky selection. Best-effort: the
-    # in-memory binding stands either way.
-    try:
-        subscription_store.upsert_session_binding(
-            session_id, subscription_id,
-            layer=layer, user_sub=user_sub, scope_key=scope_key,
-        )
-    except Exception:
-        logger.exception("Pool: persisting session binding failed (in-memory binding stands)")
+    # working for sessions that outlive the proxy process. Queued on the
+    # binding writer, which keeps it ahead of this session's release (the
+    # orphan a deferred write once left behind cannot happen); the spawn
+    # flows await the returned future so the row is durable before the
+    # session runs. Best-effort: the in-memory binding stands either way.
     # Re-bind of a live session (start_session reusing a warm process): the
     # spawn flow acquired a FRESH seat for this round, so the replaced
     # binding's seat must be released — same-sub included (two increments,
@@ -1125,12 +1423,21 @@ def bind_session(
     # stays warm across rounds. Only the layer spawn flows re-bind live
     # sessions: restore_session_binding no-ops on a live binding and the
     # selection rebind moves seats itself without bind_session.
+    def _persist() -> None:
+        # Each statement on its own: a failed upsert must not keep the
+        # replaced seat.
+        _guarded("persisting a session binding", subscription_store.upsert_session_binding,
+                 session_id, subscription_id,
+                 layer=layer, user_sub=user_sub, scope_key=scope_key)
+        if prior_sub:
+            subscription_store.decrement_active_sessions(prior_sub)
+
     if prior_sub:
-        subscription_store.decrement_active_sessions(prior_sub)
         logger.info(
             f"Pool: re-bound session {session_id[:8]} "
             f"{prior_sub[:8]} → {subscription_id[:8]} (replaced seat released)"
         )
+    return _queue_write("persisting a session binding", _persist)
 
 
 def get_session_subscription(session_id: str) -> str | None:
@@ -1206,10 +1513,7 @@ def restore_session_binding(session_id: str) -> str | None:
         user_sub=row.get("user_sub"),
         scope_key=row.get("scope_key") or "",
     )
-    try:
-        subscription_store.increment_active_sessions(sub_id)
-    except Exception:
-        logger.exception("Pool: re-taking seat on restore failed (continuing)")
+    _queue_write("re-taking a seat on restore", subscription_store.increment_active_sessions, sub_id)
     logger.info(
         "Pool: restored binding for re-adopted session %s -> %s",
         session_id[:8], sub_id[:8],
@@ -1384,8 +1688,9 @@ def _move_seat(old_sub: str, new_sub: str, session_id: str = "") -> None:
     """Move one ``active_sessions`` seat between subscriptions (and swap the
     session's persisted binding row when ``session_id`` is given). The rebind's
     ``on_written`` runs on the EVENT LOOP for satellite acks (like the rotation
-    fan-out's) — keep the loop non-blocking by pushing the DB updates to a
-    thread there; local (pool-thread) acks run them inline."""
+    fan-out's) and on a pool thread for local ones; either way the store
+    writes are queued on the binding writer (``_queue_write``), in order with
+    the session's bind and release, and never run on the caller's thread."""
     def _apply() -> None:
         subscription_store.increment_active_sessions(new_sub)
         subscription_store.decrement_active_sessions(old_sub)
@@ -1395,14 +1700,8 @@ def _move_seat(old_sub: str, new_sub: str, session_id: str = "") -> None:
             except Exception as e:
                 # persisted mirror only; memory is authoritative live
                 logger.debug("session binding rebind: %s", e)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        _apply()
-        return
-    task = loop.create_task(asyncio.to_thread(_apply))
-    _rebind_tasks.add(task)
-    task.add_done_callback(_rebind_tasks.discard)
+    # The writer keeps it in order with the session's bind and release.
+    _queue_write("moving a seat", _apply)
 
 
 def _move_scope_group(
@@ -1463,7 +1762,7 @@ def _move_scope_group(
                 handle = None
             elif require_unthrottled and (
                 _is_throttled(handle.subscription_id)
-                or _window_exhausted_for(
+                or _out_for(
                     {"id": handle.subscription_id, "layer": handle.layer,
                      "auth_type": handle.auth_type},
                     model,
@@ -1596,8 +1895,9 @@ def rebalance_scopes(*, reason: str = "") -> int:
     that are still SELECTED but shouldn't keep serving a scope:
 
       - REACTIVE: the account is resting on a real provider rate/usage limit
-        (``_throttled_hard``), or the vendor's own window reading says it is
-        exhausted (``subscription_windows``) — without this, scope-stickiness
+        (``_throttled_hard``, or a rest for the scope's model after a limit
+        on that family's window), or the vendor's own window reading says it
+        is exhausted (``subscription_windows``); without this, scope-stickiness
         deliberately keeps reusing the limited account (the shared-file
         constraint beats a resting account for NEW spawns) and every session
         in the scope errors until the provider window resets.
@@ -1667,6 +1967,8 @@ def _rebalance_scopes(*, reason: str) -> int:
             model = _group_model(sids)
             if old_sub in _throttled_hard and _is_throttled(old_sub):
                 cause = "rate-limited"
+            elif _scope_resting(old_sub, _scope_key(layer, model)):
+                cause = f"rate-limited for {model}"
             elif _window_exhausted_for(
                 {"id": old_sub, "layer": layer, "auth_type": "oauth"}, model,
             ):
@@ -1683,7 +1985,7 @@ def _rebalance_scopes(*, reason: str) -> int:
                 candidates = [
                     c for c in _eligible_candidates(layer, scope_sub, provider)
                     if c["id"] != old_sub and not _is_throttled(c["id"])
-                    and not _window_exhausted_for(c, model)
+                    and not _out_for(c, model)
                 ]
                 if not candidates:
                     continue
@@ -1873,7 +2175,7 @@ def _log_refresh_failure(sub_id: str, vendor: str, out) -> None:
         first, count = _auth_fail_streaks.get(sub_id) or (time.time(), 0)
         _auth_fail_streaks[sub_id] = (first, count + 1)
     if out.status == 429:
-        _throttled_until[sub_id] = time.time() + _REFRESH_RATELIMIT_COOLDOWN_S
+        _rest_account(sub_id, time.time() + _REFRESH_RATELIMIT_COOLDOWN_S)
 
 
 def _sustained_auth_dead(sub_id: str) -> bool:

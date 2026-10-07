@@ -20,9 +20,11 @@ class AuthResult:
     requires_2fa: bool = False
     totp_session_token: str = ""  # short-lived JWT for 2FA step
     must_change_password: bool = False
-    # The ID token's claims when the provider returned one (OIDC): the
-    # confirm flow reads ``auth_time``, ``aud`` and ``sub`` from them.
+    # The ID token's verified claims (OIDC): the confirm flow reads
+    # ``auth_time`` and ``sub`` from them.
     id_claims: dict = field(default_factory=dict)
+    # Whether the provider vouches for the email (OIDC ``email_verified``).
+    email_verified: bool = False
 
 
 class AuthProvider(ABC):

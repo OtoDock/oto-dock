@@ -18,6 +18,8 @@ import type { QueuedMessage } from '../../../store/types'
 import type { ChatInputVoice } from '../../../components/chat/ChatInput'
 import TerminalControlBar from '../../../components/chat/terminal/TerminalControlBar'
 import { describeLimitReached, describeLimitWarning } from '../../../components/usage/poolCap'
+import { usePrimaryPointerCoarse } from '../../../hooks/usePrimaryPointerCoarse'
+import { withSendHint } from '../../../lib/composerKeys'
 
 type Stream = ReturnType<typeof useChatStream>
 
@@ -45,6 +47,9 @@ interface Props {
   interactiveAvailable: boolean
   interactive: ReturnType<typeof useInteractiveChat>
   interactiveLocked: boolean
+  /** Non-empty on a chat that runs as the agent this person may not drive:
+   *  locks the mode, model and terminal pickers, with this as the reason. */
+  pickersLockReason: string
   handleInteractiveToggle: (next: boolean) => void
   handleToggleRichView: () => void
   isTaskChat: boolean
@@ -95,13 +100,15 @@ interface Props {
   setProjectsOpen: Dispatch<SetStateAction<boolean>>
   // ChatInput's duplex voice controls — built by pages/agent/chat/useChatDuplexVoice.ts
   voice: ChatInputVoice
+  /** Animate the composer's shrink and regrow (ChatInput `animateHeight`). */
+  composerAnimates: boolean
 }
 
 export default function ChatComposerBar({
   viewedStreaming, warming, turnStartTime, thinkingActive, compressingActive, activeAgents,
   mode, pendingEngineSwitch, model, modelCompound, totalCost, costBilled, contextUsed,
   contextMax, cacheStats, meetingActive, permissionModes, agentLayerModels, modelGroups,
-  interactiveAvailable, interactive, interactiveLocked, handleInteractiveToggle,
+  interactiveAvailable, interactive, interactiveLocked, pickersLockReason, handleInteractiveToggle,
   handleToggleRichView, isTaskChat, chatId, agentName, ws, handleModeChange, handleModelChange,
   chatActiveLayer, effectiveLayer, supportsCompact,
   limitReached, limitReachedInfo, limitWarning, setLimitWarning, engineLabels,
@@ -110,10 +117,11 @@ export default function ChatComposerBar({
   pendingImages, draftKey, pendingFiles, handleAddFiles, handleRemoveFile, handleRetryFile,
   workspace, appsActive, toggleApps, setAppsOpen,
   projectsActive, isProjectChat, dockAvailable, setProjectsOpen,
-  voice,
+  voice, composerAnimates,
 }: Props) {
+  const touchPrimary = usePrimaryPointerCoarse()
   return (
-    <div className="shrink-0 relative bg-p-bg">
+    <div data-composer-bar className="shrink-0 relative bg-p-bg">
       {/* Gradient fade overlay — extends above into chat scroll area */}
       <div className="absolute left-0 right-0 bottom-full h-4 bg-linear-to-t from-p-bg to-transparent pointer-events-none" />
       <div className="max-w-4xl mx-auto">
@@ -144,7 +152,7 @@ export default function ChatComposerBar({
           modelGroups={modelGroups}
           interactiveAvailable={interactiveAvailable}
           interactiveOn={interactive.interactiveMode}
-          interactiveDisabled={interactiveLocked}
+          interactiveDisabled={interactiveLocked || !!pickersLockReason}
           onInteractiveToggle={handleInteractiveToggle}
           richViewAvailable={interactive.sessionInteractive}
           richViewActive={interactive.showRichView}
@@ -160,8 +168,9 @@ export default function ChatComposerBar({
           // model/engine from the chat row, so the pick governs
           // exactly those. Interactive PTY sessions stay locked (the
           // terminal owns its process).
-          modelLocked={interactive.sessionInteractive}
-          modeLocked={isTaskChat}
+          modelLocked={interactive.sessionInteractive || !!pickersLockReason}
+          modeLocked={isTaskChat || !!pickersLockReason}
+          lockReason={pickersLockReason || undefined}
           leftSlot={interactive.sessionInteractive && chatId
             ? <TerminalControlBar className="flex-1 min-w-0" send={(seq) => ws.sendPtyInput(chatId, utf8ToB64(seq))} />
             : undefined}
@@ -220,10 +229,12 @@ export default function ChatComposerBar({
         disabled={!ws.connected || limitReached}
         sendDisabled={!!pendingEngineSwitch}
         streaming={(viewedStreaming && !permissionPending) || warmingUp}
+        queueable={viewedStreaming && !permissionPending && !warmingUp}
         aborting={aborting}
         placeholder={pendingEngineSwitch
           ? 'Confirm or cancel the engine switch first…'
-          : limitReached ? 'Usage limit reached' : viewedStreaming ? 'Type to queue a message...' : 'Type a message...'}
+          : limitReached ? 'Usage limit reached'
+            : withSendHint(viewedStreaming ? 'Type to queue a message' : 'Type a message', touchPrimary)}
         queuedCount={queuedMessages.length}
         editText={editText}
         onClearEditText={() => setEditText(null)}
@@ -249,6 +260,7 @@ export default function ChatComposerBar({
           setProjectsOpen(true)
         } : undefined}
         voice={voice}
+        animateHeight={composerAnimates}
       />
     </div>
   )

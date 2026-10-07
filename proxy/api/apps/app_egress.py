@@ -25,7 +25,7 @@ from starlette.background import BackgroundTask
 from api.apps import app_proxy
 from api.apps import manifest as _mf
 from auth.request_path import has_traversal
-from services.apps import app_secrets
+from services.apps import app_secrets, app_supervisor
 from services.infra.outbound_url import validate_outbound_url
 from storage import database as task_store
 
@@ -86,7 +86,7 @@ async def app_egress(app_id: str, host: str, path: str, request: Request):
         raise app_proxy._refuse(403, "the app's own launch token is required")
     # The preview copy runs code nobody approved: it never spends the app's
     # keys (APPS.md "Secrets").
-    if caller.instance != "live":
+    if caller.instance != app_supervisor.LIVE:
         raise app_proxy._refuse(403, "the preview copy cannot call vendors with the app's keys: "
                                      "deploy the app to use its egress")
     # The deploy writes a changed manifest onto the row before anyone

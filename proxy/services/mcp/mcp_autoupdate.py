@@ -13,14 +13,15 @@ window this applies every available **community-MCP** update:
     ``skipped_in_use``, retried next week — never a failure).
 
 Every per-MCP result is logged (``storage/mcp/mcp_autoupdate_store``) for the admin
-run-history card; admins get ONE notification only if something failed. On T3
+run-history card; admins get ONE notification only if something failed, plus
+one notice per new source change (``_record_source_change``). On T3
 (cloud) docker MCPs are managed centrally and excluded by
 ``mcp_updater.community_targets`` — the job is a clean no-op for them.
 
 An MCP whose install dir carries ``mcp_updater.HOLD_MARKER`` (``.hold``) is
-skipped entirely (logged + recorded ``held``) — the opt-out for out-of-band
-deploys running ahead of the catalog, which the docker ``!=`` converge would
-otherwise silently DOWNGRADE (unheld downgrades still apply, but warn loudly).
+skipped entirely (logged + recorded ``held``). An install AHEAD of the catalog
+(detection ``reason: ahead``) is left alone without a marker: the job never
+moves an install backwards; the admin reverts one on purpose from the page.
 
 Scheduling: ``maybe_run_weekly`` is polled every 60s by app.py's registry sweep
 loop. It gates on a PERSISTED wall-clock last-run (not an in-memory monotonic
@@ -60,6 +61,11 @@ DEFER_TIMEOUT_S = 4 * 3600         # give up after 4h → skipped_in_use
 
 # Serializes a run against itself (a second weekly tick, or a manual trigger).
 _run_lock = asyncio.Lock()
+
+# The first tick after a start settles what a restart interrupted (a source
+# switch left in ``switching``, an install backup left beside its folder),
+# whatever the auto-update setting says.
+_reconciled = False
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +124,14 @@ async def maybe_run_weekly() -> None:
     are store calls, so they run off the loop (run_db): this is a periodic
     drumbeat, exactly the class that froze the proxy on 2026-09-03."""
     from storage.pg import run_db
+    global _reconciled
+    if not _reconciled:
+        from services.community import mcp_source_swap
+        try:
+            await mcp_source_swap.reconcile_interrupted()
+            _reconciled = True
+        except Exception:
+            logger.exception("mcp autoupdate: the start reconcile failed; retried next tick")
     if _run_lock.locked():
         return
     if not await run_db(mcp_updater.auto_update_enabled):
@@ -170,13 +184,23 @@ async def run_auto_update(trigger: str = "auto") -> dict:
         counts = {
             log_store.STATUS_UPDATED: 0, log_store.STATUS_NO_CHANGE: 0,
             log_store.STATUS_SKIPPED_IN_USE: 0, log_store.STATUS_FAILED: 0,
-            log_store.STATUS_HELD: 0,
+            log_store.STATUS_HELD: 0, log_store.STATUS_NEEDS_APPROVAL: 0,
         }
         failed: list[tuple[str, str]] = []  # (mcp_name, error)
 
         # stdio (npm/pypi) MCPs — update immediately, no defer.
         pending_docker: list[str] = []
         for name, info in updates.items():
+            reason = info.get("reason")
+            if reason == "source":
+                # The catalog source changed: the job never applies it. It is
+                # recorded for the run history and the admins are told once
+                # per pair; the switch is theirs (mcp_source_swap).
+                await _record_source_change(run_id, name, info, targets[name], trigger)
+                counts[log_store.STATUS_NEEDS_APPROVAL] += 1
+                continue
+            if reason == "switched":
+                continue
             # A local hold marker excludes the MCP from the automatic converge
             # (out-of-band deploy running ahead of the catalog); recorded in the
             # run history so a forgotten hold stays visible week after week.
@@ -191,14 +215,13 @@ async def run_auto_update(trigger: str = "auto") -> dict:
                         log_store.STATUS_HELD, "", trigger)
                 counts[log_store.STATUS_HELD] += 1
                 continue
-            if info.get("downgrade"):
-                logger.warning(
-                    "mcp autoupdate: DOWNGRADING %s from %s to catalog %s "
-                    "(installed version was ahead — touch %s in the MCP dir "
-                    "to hold out-of-band deploys)", name,
-                    info.get("current", "?"), info.get("latest", "?"),
-                    mcp_updater.HOLD_MARKER,
+            if info.get("reason") == "ahead":
+                logger.info(
+                    "mcp autoupdate: %s installed %s is ahead of the catalog %s; "
+                    "left alone", name, info.get("current", "?"),
+                    info.get("latest", "?"),
                 )
+                continue
             if _mt.is_container(targets[name].server):
                 pending_docker.append(name)
                 continue
@@ -218,11 +241,70 @@ async def run_auto_update(trigger: str = "auto") -> dict:
 
         logger.info(
             "mcp autoupdate run %s done: %s updated, %s failed, %s skipped(in-use), "
-            "%s held, %s no-change", run_id, counts[log_store.STATUS_UPDATED],
-            counts[log_store.STATUS_FAILED], counts[log_store.STATUS_SKIPPED_IN_USE],
-            counts[log_store.STATUS_HELD], counts[log_store.STATUS_NO_CHANGE],
+            "%s held, %s needing approval, %s no-change", run_id,
+            counts[log_store.STATUS_UPDATED], counts[log_store.STATUS_FAILED],
+            counts[log_store.STATUS_SKIPPED_IN_USE], counts[log_store.STATUS_HELD],
+            counts[log_store.STATUS_NEEDS_APPROVAL], counts[log_store.STATUS_NO_CHANGE],
         )
         return {"run_id": run_id, "counts": counts}
+
+
+async def _record_source_change(run_id, name, info, manifest, trigger) -> None:
+    """Record a pending source change as ``needs_approval`` and tell the
+    admins once per pair: the row carries the mark, and a new pair clears it
+    (``mcp_update_state_store.upsert_pending_source_change``). The row is
+    taken from the store; when the detection result carries a change the
+    store does not (a faked detection, a dismiss racing the run), the row is
+    written from it first."""
+    from storage.mcp import mcp_update_state_store as state_store
+    change = info.get("source_change") or {}
+    to_url = (change.get("to") or {}).get("url") or info.get("latest", "")
+    _record(run_id, name, manifest.server.runtime, info.get("current", ""),
+            to_url, log_store.STATUS_NEEDS_APPROVAL, "", trigger)
+    try:
+        row = await asyncio.to_thread(state_store.get_source_change, name)
+        if row is None:
+            src, dst = change.get("from") or {}, change.get("to") or {}
+            row = await asyncio.to_thread(state_store.upsert_pending_source_change, name, {
+                "from_kind": src.get("kind", ""), "from_identity": src.get("identity", ""),
+                "from_url": src.get("url", ""), "from_runtime": src.get("runtime", ""),
+                "to_kind": dst.get("kind", ""), "to_identity": dst.get("identity", ""),
+                "to_url": dst.get("url", ""), "to_runtime": dst.get("runtime", ""),
+                "to_version": dst.get("version", ""),
+                "to_manifest_hash": change.get("to_manifest_hash", ""),
+                "declared": bool(change.get("declared")), "plan": change.get("plan") or {},
+            })
+        if row.get("status") != state_store.STATUS_PENDING or row.get("notified_at"):
+            return
+        await _notify_source_change(name, row)
+        await asyncio.to_thread(state_store.mark_source_change_notified, name)
+    except Exception:
+        logger.exception("mcp autoupdate: the source-change notification of %s failed", name)
+
+
+async def _notify_source_change(name: str, row: dict) -> None:
+    from services.notifications import notification_manager
+    declared = bool(row.get("declared"))
+    body = (
+        f"The catalog source of **{name}** changed from `{row.get('from_url', '')}` "
+        f"to `{row.get('to_url', '')}`. "
+    )
+    body += (
+        "The catalog entry declares that it replaces the installed source. "
+        if declared else
+        "The catalog entry does not say it replaces the installed source: treat "
+        "it as a possible compromise and verify the new source before switching. "
+    )
+    body += ("Automatic updates never apply a source change; review it and switch "
+             "from Admin → MCP Servers.")
+    await notification_manager.fire_notification(
+        title="An MCP's catalog source changed",
+        body=body,
+        severity="info" if declared else "warning",
+        scope="admin",
+        source="mcp",
+        source_id=f"source-change:{name}",
+    )
 
 
 async def _process_docker_with_defer(

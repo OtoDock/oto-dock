@@ -57,6 +57,25 @@ def _verified_literal_path(root_real: Path, *parts: str) -> Path | None:
         return None
     return expected
 
+
+def _mkdirs_held(root_real: Path, *parts: str) -> Path:
+    """Create ``root_real/parts...`` with no link followed below the root
+    (``safe_fs.mkdirs_beneath``) and return the literal path. A component
+    swapped for a link after the caller's ``_verified_literal_path`` check
+    refuses the build here instead of creating directories at the link's
+    target on the host. ``root_real`` is the agent's resolved folder, which
+    no sandbox can rename (it is never bound)."""
+    from services.infra import safe_fs
+    root_real.mkdir(parents=True, exist_ok=True)
+    try:
+        safe_fs.mkdirs_beneath(root_real, "/".join(parts))
+    except safe_fs.SafeFsError as exc:
+        raise RuntimeError(
+            f"Refusing sandbox build: {'/'.join(parts)} changed underneath the "
+            "build (possible tampering)"
+        ) from exc
+    return root_real.joinpath(*parts)
+
 # System paths to mount read-only into every sandbox
 _SYSTEM_RO_BINDS = [
     "/usr",
@@ -586,7 +605,7 @@ class SandboxConfig:
     knowledge_rw: bool = False
     # The judge profile (CHECKS.md "The judge profile"): every row of the
     # table this identity would get, flipped read-only after it is built —
-    # the CLI's own state dirs (.claude / .codex / .credentials) excepted,
+    # the CLI's own state dirs (.claude / .codex) excepted,
     # since the CLI writes its session there. /config never mounts for a
     # judge (config_visible is False). Kernel-enforced locally; the gate's
     # ``judge`` mode is the same rule on a machine.
@@ -689,6 +708,13 @@ class SandboxBuilder:
         self.cfg = cfg
         self._agent_dir = cfg.host_agents_dir / cfg.agent_name
 
+    def _agent_root_real(self) -> Path:
+        """The agent's folder resolved: the one spelling every bind source
+        of the role table and the launcher's ``--beneath`` use. The folder
+        itself is platform-owned and never bound, so a link there (a folder
+        moved to another disk) is the operator's and is followed once here."""
+        return Path(os.path.realpath(self._agent_dir))
+
     def build_command_prefix(self, inner_cmd: list[str]) -> list[str]:
         """Wrap inner_cmd with bwrap (+ the netns launcher when enabled)."""
         args = ["bwrap"]
@@ -732,7 +758,13 @@ class SandboxBuilder:
         NAT. The generated-resolv.conf check mirrors `_system_mounts` (same
         single signal — file existence).
         """
-        prefix = [str(_NETNS_LAUNCHER), "--block-private"]
+        prefix = [str(_NETNS_LAUNCHER)]
+        if self.cfg.app_mounts is None:
+            # The role table's sources all sit in the agent's resolved
+            # folder: the shim hands each to bwrap as a descriptor it opened
+            # with no link followed below it (an app's table is its own).
+            prefix.extend(["--beneath", str(self._agent_root_real())])
+        prefix.append("--block-private")
         # The proxy-port forward lands on the internal listener when the app
         # bound one (``config.INTERNAL_LISTENER_PORT``, 0 when it did not):
         # pasta's ``-T <namespace port>:<host port>`` splices the sandbox's
@@ -942,6 +974,67 @@ class SandboxBuilder:
         return args
 
     def workspace_mount_table(self) -> list[Mount]:
+        """The role mount table (``_role_mount_table``) with the session's
+        hook scripts and stdio interceptor bound read-only over their copies
+        (``_hook_file_binds``)."""
+        mounts = self._role_mount_table()
+        return mounts + self._hook_file_binds(mounts)
+
+    def _hook_file_binds(self, mounts: list[Mount]) -> list[Mount]:
+        """A read-only bind of each hook script and the stdio interceptor
+        (``session_config_dir.HOOK_SCRIPTS``) over its copy in every CLI
+        state dir the table leaves read-write: the session's own
+        ``.claude``/``.codex`` (a user's, an external caller's, or the agent
+        scope's inside ``/workspace``). The copies sit in a writable tree, so
+        without this a session could rewrite the hook that judges its own
+        tools (the path policy refused it, the kernel did not). A dir the
+        table masks or binds read-only takes none; a file that is missing, a
+        link, or under a linked path is skipped. A state dir that is not a
+        mount of its own (the agent scope's, inside ``/workspace``) is first
+        bound onto itself read-write: a mountpoint cannot be renamed away, so
+        the session cannot swap in a dir of its own around the binds.
+        Satellites run no bwrap."""
+        from core.sandbox.session_config_dir import _INTERCEPTOR_SRC, HOOK_SCRIPTS
+
+        def cover(path: str) -> Mount | None:
+            best = None
+            for m in mounts:
+                if path == m.sandbox or path.startswith(m.sandbox.rstrip("/") + "/"):
+                    if best is None or len(m.sandbox) >= len(best.sandbox):
+                        best = m
+            return best
+
+        state = (".claude", ".codex")
+        dirs: list[str] = []
+        for m in mounts:
+            if m.sandbox.rsplit("/", 1)[-1] in state:
+                dirs.append(m.sandbox)
+            elif m.sandbox == layout.V_WORKSPACE:
+                dirs.extend(f"{m.sandbox}/{sub}" for sub in state)
+        names = (*HOOK_SCRIPTS, _INTERCEPTOR_SRC.name)
+        binds: list[Mount] = []
+        for d in dict.fromkeys(dirs):
+            c = cover(d)
+            if c is None or not c.rw:
+                continue
+            # The mount's own source was vetted by the table; nothing below
+            # it may be a link (the tree is writable from inside).
+            root = Path(os.path.realpath(c.host))
+            rel = d[len(c.sandbox):].lstrip("/")
+            host_dir = root.joinpath(*rel.split("/")) if rel else root
+            if os.path.realpath(host_dir) != str(host_dir):
+                continue
+            files = [host_dir / name for name in names]
+            files = [f for f in files
+                     if f.is_file() and not f.is_symlink() and os.path.realpath(f) == str(f)]
+            if not files:
+                continue
+            if c.sandbox != d:
+                binds.append(Mount(str(host_dir), d, True))
+            binds.extend(Mount(str(f), f"{d}/{f.name}", False) for f in files)
+        return binds
+
+    def _role_mount_table(self) -> list[Mount]:
         """Role-dependent workspace mounts (3-tier per-agent model), as the
         ordered list of :class:`Mount` decisions.
 
@@ -983,19 +1076,21 @@ class SandboxBuilder:
             return list(self.cfg.app_mounts)
         role = self.cfg.role
         username = self.cfg.username
-        agent_dir_path = self._agent_dir
+        # Every source below is spelled from the agent's resolved folder, the
+        # root the launcher's --beneath names. The folder itself is
+        # platform-owned (safe to resolve); everything BELOW it that we bind
+        # from an agent-writable subtree must additionally prove it carries
+        # no symlinked component (_verified_literal_path), is created with
+        # no link followed (_mkdirs_held), and reaches bwrap as a descriptor.
+        agent_root_real = self._agent_root_real()
+        agent_dir_path = agent_root_real
         agent_dir = str(agent_dir_path)
-        # Anchor for symlink-refusing bind-source checks below. The agent
-        # root itself is platform-owned (safe to resolve); everything BELOW
-        # it that we bind from an agent-writable subtree must additionally
-        # prove it carries no symlinked component (_verified_literal_path).
-        agent_root_real = Path(os.path.realpath(agent_dir_path))
 
         # Defensive: bwrap --bind fails if source doesn't exist. The agent
         # template creation (agent_store.create_agent) now creates knowledge/
         # up front, but legacy agents won't have it until the one-shot
-        # role_v2 migration runs. mkdir(exist_ok=True) is cheap insurance.
-        (agent_dir_path / layout.KNOWLEDGE).mkdir(parents=True, exist_ok=True)
+        # role_v2 migration runs. Creating it here is cheap insurance.
+        _mkdirs_held(agent_root_real, layout.KNOWLEDGE)
 
         # Belt-and-braces: bind this agent's quota scopes to their XFS project
         # IDs before the RW bind mounts below expose the tree to writes. Free
@@ -1025,26 +1120,19 @@ class SandboxBuilder:
             # Symlink-refusing: the mirror chain lives under the RW-bindable
             # /knowledge, so an owner-tier agent could have replaced a
             # component with a symlink (detach/re-attach leaves plain dirs
-            # behind). Verify BEFORE mkdir — mkdir(parents=True) through a
-            # symlinked component would create dirs at the TARGET — and fail
-            # the build loudly on tampering rather than bind the target.
+            # behind). Refused early here, then created with no link
+            # followed, so a swap after the check fails the build loudly
+            # rather than create dirs at, or bind, the target.
             parts = [layout.KNOWLEDGE, "shared", *Path(src).parts]
             if subdir:
                 parts += Path(subdir).parts
-            p = _verified_literal_path(agent_root_real, *parts)
-            if p is None:
+            if _verified_literal_path(agent_root_real, *parts) is None:
                 raise RuntimeError(
                     f"Refusing sandbox build: knowledge mirror path "
                     f"knowledge/shared/{src}{'/' + subdir if subdir else ''} "
                     f"contains a symlinked component (possible tampering)"
                 )
-            p.mkdir(parents=True, exist_ok=True)
-            if os.path.realpath(p) != str(p):
-                raise RuntimeError(
-                    f"Refusing sandbox build: knowledge mirror path {p} "
-                    f"changed underneath the build (possible tampering)"
-                )
-            return str(p)
+            return str(_mkdirs_held(agent_root_real, *parts))
 
         def _mirror_dest(src: str, subdir: str) -> str:
             return (f"{layout.V_KNOWLEDGE}/shared/{src}/{subdir}" if subdir
@@ -1128,7 +1216,7 @@ class SandboxBuilder:
         # Unknown future subdirs stay visible (RO) — a clean EROFS beats a
         # silent stray. Mirrored by the path-policy write allowlist
         # (auth/path_policy.py::_USER_DIR_WRITABLE_SUBDIRS).
-        user_dir = layout.user_dir(agent_dir_path, username)
+        user_dir = layout.user_dir(agent_root_real, username)
         # Codex's own Linux sandbox (a nested bwrap) mounts read-only tmpfs
         # over <writable-root>/{.git,.agents,.codex} for every writable root,
         # cwd included — and bwrap must CREATE a missing mountpoint, which
@@ -1139,11 +1227,11 @@ class SandboxBuilder:
         # treats a bare .git dir as "not a git repository" and walks past;
         # .codex is session_config_dir's job and is RW-bound below.
         for sub in (".git", ".agents"):
-            (user_dir / sub).mkdir(parents=True, exist_ok=True)
+            _mkdirs_held(agent_root_real, layout.USERS, username, sub)
         v_user = layout.virtual_user_root(username)
         mounts.append(Mount(str(user_dir), v_user, False))
         for sub in layout.USER_SUBDIRS:
-            (user_dir / sub).mkdir(parents=True, exist_ok=True)
+            _mkdirs_held(agent_root_real, layout.USERS, username, sub)
             mounts.append(Mount(str(user_dir / sub), f"{v_user}/{sub}", True))
         # CLI state dirs (session's own is pre-created by the layer).
         for sub in (".claude", ".codex"):
@@ -1243,13 +1331,12 @@ class SandboxBuilder:
         refuses the build."""
         masks: list[Mount] = []
         for sub in (".claude", ".codex"):
-            state_dir = _verified_literal_path(agent_root_real, layout.WORKSPACE, sub)
-            if state_dir is None:
+            if _verified_literal_path(agent_root_real, layout.WORKSPACE, sub) is None:
                 raise RuntimeError(
                     f"Refusing sandbox build: workspace/{sub} contains a "
                     "symlinked component (possible tampering)"
                 )
-            state_dir.mkdir(exist_ok=True)
+            _mkdirs_held(agent_root_real, layout.WORKSPACE, sub)
             masks.append(Mount(str(empty_mount_dir()), f"{layout.V_WORKSPACE}/{sub}", False))
         return masks
 
@@ -1299,18 +1386,12 @@ class SandboxBuilder:
             )
         rel_parts = home_real.relative_to(agent_root_real).parts
         for sub in layout.USER_SUBDIRS:
-            p = _verified_literal_path(agent_root_real, *rel_parts, sub)
-            if p is None:
+            if _verified_literal_path(agent_root_real, *rel_parts, sub) is None:
                 raise RuntimeError(
                     f"Refusing sandbox build: external home subdir {home / sub} "
                     "contains a symlinked component (possible tampering)"
                 )
-            p.mkdir(parents=True, exist_ok=True)
-            if os.path.realpath(p) != str(p):
-                raise RuntimeError(
-                    f"Refusing sandbox build: external home subdir {p} "
-                    "changed underneath the build (possible tampering)"
-                )
+            _mkdirs_held(agent_root_real, *rel_parts, sub)
         mounts.append(Mount(str(home), EXTERNAL_SANDBOX_HOME, False))
         for sub in layout.USER_SUBDIRS:
             mounts.append(Mount(str(home / sub), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))

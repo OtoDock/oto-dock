@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_auth, require_admin, UserContext
+from auth.providers import get_current_user, require_auth, require_admin, UserContext, require_user
 from services.billing import pool_caps, usage_service
 from storage import database as task_store
 from storage.billing import subscription_store
@@ -11,7 +11,8 @@ from storage.billing import subscription_store
 import asyncio
 from auth import roles
 
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 def _require_dashboard_user(user: UserContext | None) -> UserContext:

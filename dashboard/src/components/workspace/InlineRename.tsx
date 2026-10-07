@@ -68,7 +68,7 @@ export default function InlineRename({ initial, validate, onCommit, onCancel }: 
           if (e.key === 'Enter') { e.preventDefault(); submit() }
         }}
         onBlur={submit}
-        className={`w-full text-xs px-1.5 py-0.5 rounded-sm border bg-white dark:bg-p-surface text-p-text ${
+        className={`w-full text-xs pointer-coarse:text-base px-1.5 py-0.5 rounded-sm border bg-white dark:bg-p-surface text-p-text ${
           error ? 'border-red-400' : 'border-brand'
         }`}
       />

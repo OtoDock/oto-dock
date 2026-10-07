@@ -24,6 +24,7 @@ config.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -39,7 +41,8 @@ from typing import Awaitable, Callable
 
 logger = logging.getLogger("mcp-installer")
 
-# Default timeout for pip/npm install invocations. Can be overridden per call.
+# Default timeout for one install subprocess (its whole run, not its spawn).
+# Can be overridden per call.
 DEFAULT_INSTALL_TIMEOUT = 300  # seconds
 
 # Cross-platform venv layout. Inlined here (instead of imported from
@@ -62,6 +65,21 @@ _PY_FLOOR_RE = re.compile(
 # A distro package name (dpkg, rpm, pacman and brew all fit).
 _SYSTEM_PKG_RE = re.compile(r"[a-z0-9][a-z0-9+.@_-]*")
 
+# A distribution name as it appears in a resolver's message.
+_DIST_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _pep503(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _source_builds_named(log: str, allowed: list[str]) -> list[str]:
+    """The ``allowed`` (``source_build``) packages a failed resolve's output
+    names, in list order, names compared in their PEP 503 form. Read from the
+    names alone, so neither pip's nor uv's wording is relied on."""
+    named = {_pep503(t.strip("._-")) for t in _DIST_TOKEN_RE.findall(log)}
+    return [p for p in allowed if _pep503(p) in named]
+
 
 def _shell_argv(cmd: list[str]) -> list[str]:
     """Wrap an argv for cross-platform ``asyncio.create_subprocess_exec``.
@@ -78,6 +96,88 @@ def _shell_argv(cmd: list[str]) -> list[str]:
     if sys.platform == "win32":
         return ["cmd", "/c", *cmd]
     return cmd
+
+
+def _label(cmd: list[str]) -> str:
+    """``npm install``, ``uv pip``, ``git apply``: the program and its first
+    argument, for a timeout message (a leading ``cmd /c`` skipped)."""
+    words = list(cmd[2:] if cmd[:2] == ["cmd", "/c"] else cmd)
+    return " ".join([Path(words[0]).name, *words[1:2]]) if words else "subprocess"
+
+
+async def _reap_group(pgid: int) -> None:
+    """Reap what is left of a killed process group among this process's own
+    children: the killed child's children become ours once it dies when this
+    process is their reaper of last resort (PID 1 of a container with no init).
+    Anywhere else the first wait answers that no such child exists."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1.0
+    while True:
+        try:
+            pid, _ = os.waitpid(-pgid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            if loop.time() >= deadline:
+                return
+            await asyncio.sleep(0.05)
+
+
+async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
+    """Kill ``proc`` and every process it started, then reap it.
+
+    POSIX: the child leads its own process group (``start_new_session``), so
+    the group is killed whole. Windows: ``taskkill /T`` walks the tree while
+    the child is still there to walk from (killing ``cmd /c npm`` alone leaves
+    npm running), then the child itself is killed. The second ``communicate``
+    drains what the cancelled one left, so the pipes reach EOF; it is bounded
+    because a process that left the group can still hold them."""
+    windows = sys.platform == "win32"
+    if windows:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            await asyncio.to_thread(
+                subprocess.run, ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=30,
+            )
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+    else:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(proc.communicate(), 10)
+    # Only once asyncio's own watcher has reaped the child: the group wait
+    # must never take the child from it.
+    if not windows and proc.returncode is not None:
+        await _reap_group(proc.pid)
+
+
+async def _run_bounded(
+    cmd: list[str], *, cwd: str | None, env: dict[str, str], timeout: float,
+) -> tuple[int, str]:
+    """Run an install subprocess to its end within ``timeout`` seconds and
+    return its exit code and its combined output.
+
+    The bound covers the whole run, not only the spawn. When it passes, or the
+    caller is cancelled, the child and every process it started are killed
+    and reaped (``_kill_tree``); the timeout is raised as
+    ``asyncio.TimeoutError`` naming the command, for the caller's rollback."""
+    kwargs = {} if sys.platform == "win32" else {"start_new_session": True}
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        **kwargs,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        await _kill_tree(proc)
+        raise asyncio.TimeoutError(
+            f"{_label(cmd)} did not finish within {timeout} s") from None
+    except asyncio.CancelledError:
+        await _kill_tree(proc)
+        raise
+    return proc.returncode, (out or b"").decode(errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +202,11 @@ _INSTALL_ENV_NAMES = frozenset(name.upper() for name in (
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO",
-    # package managers, by exact name
-    "UV_CACHE_DIR", "UV_INDEX_URL", "UV_EXTRA_INDEX_URL", "UV_OFFLINE",
-    "UV_NATIVE_TLS", "UV_HTTP_TIMEOUT",
+    # package managers, by exact name; the uv mirror names say where an
+    # interpreter or a package comes from, never what runs
+    "UV_CACHE_DIR", "UV_INDEX_URL", "UV_EXTRA_INDEX_URL", "UV_DEFAULT_INDEX",
+    "UV_INDEX", "UV_OFFLINE", "UV_NATIVE_TLS", "UV_HTTP_TIMEOUT",
+    "UV_PYTHON_INSTALL_MIRROR", "UV_PYPY_INSTALL_MIRROR", "UV_PYTHON_DOWNLOADS",
     "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST", "PIP_CACHE_DIR",
     "NPM_CONFIG_REGISTRY", "NPM_CONFIG_CACHE", "NPM_CONFIG_CAFILE",
     "NPM_CONFIG_STRICT_SSL", "XDG_CACHE_HOME",
@@ -145,15 +247,9 @@ async def _apply_patches(
     log: list[str] = []
 
     async def _git(*args: str) -> tuple[int, str]:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                git, "apply", *args, cwd=str(mcp_dir), env=git_env,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            ),
-            timeout=timeout,
+        return await _run_bounded(
+            [git, "apply", *args], cwd=str(mcp_dir), env=git_env, timeout=timeout,
         )
-        out, _ = await proc.communicate()
-        return proc.returncode, out.decode(errors="replace")
 
     for patch in patches:
         rel = f"patches/{patch.name}"
@@ -600,15 +696,21 @@ async def install_mcp(
     - Python: recreates `venv/` and installs via `uv pip install` (preferred)
       or `venv/bin/pip` (fallback). A `pypi:` source installs wheels only;
       `source_build` names the packages the manifest allows to build from
-      source. When uv needs to fetch a Python version that differs from
-      system Python, it installs it under the platform's `mcps/.uv-python/`
-      (via ``UV_PYTHON_INSTALL_DIR``) so the interpreter lives inside the
-      already-sandbox-mounted `mcps/` tree, keeping every MCP
-      self-contained and the sandbox free of any user-home leakage.
+      source, and only when a wheels-only resolve fails naming one is it
+      retried with `--no-binary` for the named ones (a listed package with a
+      wheel for this machine installs from the wheel). When uv needs to fetch
+      a Python version that differs from system Python, it installs it under
+      the platform's `mcps/.uv-python/` (via ``UV_PYTHON_INSTALL_DIR``) so the
+      interpreter lives inside the already-sandbox-mounted `mcps/` tree,
+      keeping every MCP self-contained and the sandbox free of any user-home
+      leakage.
     - Docker: returns success with a note (build/run is a separate flow).
 
     Every subprocess runs under ``_install_env``: the parent's secrets never
-    reach a package manager or a build backend.
+    reach a package manager or a build backend. ``timeout`` bounds each
+    subprocess's whole run; past it the subprocess and everything it started
+    are killed and ``asyncio.TimeoutError`` reaches the caller (the community
+    installer rolls back, a satellite keeps the old version).
 
     `progress_cb` receives `{phase, pct, message}` dicts (both sync and
     async callables supported) so the satellite can stream them over WS.
@@ -660,19 +762,11 @@ async def install_mcp(
         # classic npm supply-chain RCE. We refuse to run them. (An MCP that
         # genuinely needs a native build step should ship prebuilt artifacts or
         # run as a Docker MCP, which is isolated.)
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                *_shell_argv(["npm", "install", "--omit=dev", "--ignore-scripts"]),
-                cwd=str(mcp_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            ),
-            timeout=timeout,
+        rc, log = await _run_bounded(
+            _shell_argv(["npm", "install", "--omit=dev", "--ignore-scripts"]),
+            cwd=str(mcp_dir), env=env, timeout=timeout,
         )
-        stdout, _ = await proc.communicate()
-        log = stdout.decode(errors="replace")
-        if proc.returncode != 0:
+        if rc != 0:
             await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "npm install failed", "error": log})
             return InstallResult(ok=False, log=log)
 
@@ -723,14 +817,12 @@ async def install_mcp(
             upgrade = "==" not in pip_pkg
         venv_dir = mcp_dir / "venv"
         # A catalog package installs from wheels only: no build backend of a
-        # source distribution ever runs here, except for the packages the
-        # manifest names in ``source_build``. A git source builds by
-        # definition (an explicit admin install; never the weekly job).
-        binary_flags: list[str] = []
-        if source.startswith("pypi:"):
-            binary_flags.append("--only-binary=:all:")
-            for allowed in source_build or []:
-                binary_flags.extend(["--no-binary", allowed])
+        # source distribution ever runs here, except for a package the
+        # manifest names in ``source_build`` once a wheels-only resolve has
+        # failed on it (``--no-binary`` forces the source build, so it is
+        # never passed up front). A git source builds by definition (an
+        # explicit admin install; never the weekly job).
+        wheels_only = source.startswith("pypi:")
 
         async def _create_venv(python_spec: str | None) -> tuple[bool, str]:
             """Create venv. ``python_spec`` like ``>=3.13`` or ``None`` for default."""
@@ -746,23 +838,18 @@ async def install_mcp(
                     return False, f"python {python_spec} required but uv not available"
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10, "message": "python -m venv"})
                 cmd = [python_bin, "-m", "venv", str(venv_dir)]
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *cmd, cwd=str(mcp_dir),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                    env=env,
-                ),
-                timeout=timeout,
-            )
-            out, _ = await proc.communicate()
-            return proc.returncode == 0, out.decode(errors="replace")
+            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
+            return rc == 0, out
 
-        async def _pip_install() -> tuple[bool, str]:
+        async def _pip_install(no_binary: list[str]) -> tuple[bool, str]:
             # Prefer uv (much faster). UV_PYTHON_INSTALL_DIR ensures any Python
             # uv fetches lands in the platform tree (under mcps/.uv-python/),
             # which the session sandbox already mounts — keeping every MCP
             # self-contained and the sandbox free of user-home leakage.
             upgrade_flag = ["--upgrade"] if upgrade else []
+            binary_flags = ["--only-binary=:all:"] if wheels_only else []
+            for pkg in no_binary:
+                binary_flags.extend(["--no-binary", pkg])
             if uv_bin and os.path.isfile(uv_bin):
                 cmd = [uv_bin, "pip", "install",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
@@ -770,16 +857,26 @@ async def install_mcp(
             else:
                 cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
                        "install", "--isolated", *binary_flags, *upgrade_flag, pip_pkg]
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *cmd, cwd=str(mcp_dir),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                    env=env,
-                ),
-                timeout=timeout,
-            )
-            out, _ = await proc.communicate()
-            return proc.returncode == 0, out.decode(errors="replace")
+            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
+            return rc == 0, out
+
+        async def _install_package() -> tuple[bool, str]:
+            # Wheels only first. A resolve that fails naming a source_build
+            # package (and no Python floor, which the venv retry below owns)
+            # is tried again with that package from source; each listed
+            # package is added once at most.
+            built: list[str] = []
+            ok, log = await _pip_install(built)
+            while not ok and wheels_only and not _PY_FLOOR_RE.search(log):
+                more = [p for p in _source_builds_named(log, source_build or [])
+                        if p not in built]
+                if not more:
+                    break
+                built.extend(more)
+                await _emit(progress_cb, {"mcp": name, "phase": "pip", "pct": 60,
+                                          "message": f"build from source: {', '.join(more)}"})
+                ok, log = await _pip_install(built)
+            return ok, log
 
         # Always a fresh venv: the package manager probes the venv's
         # interpreter, and a preserved venv would run the previous install's
@@ -794,7 +891,7 @@ async def install_mcp(
             return InstallResult(ok=False, log=log)
 
         await _emit(progress_cb, {"mcp": name, "phase": "pip", "pct": 50, "message": f"pip install {pip_pkg}"})
-        ok, log = await _pip_install()
+        ok, log = await _install_package()
 
         # If the package requires a Python version this venv doesn't satisfy,
         # uv reports it as `Python>=3.13,<3.14`. Recreate the venv with that
@@ -808,7 +905,7 @@ async def install_mcp(
                 await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
                 ok, venv_log = await _create_venv(python_spec)
                 if ok:
-                    ok, log = await _pip_install()
+                    ok, log = await _install_package()
                 else:
                     log = f"venv creation with Python{python_spec} failed:\n{venv_log}"
         # Read back the concrete version for pypi installs so the caller can pin
@@ -865,18 +962,9 @@ async def install_mcp(
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
                                            "message": "python -m venv"})
                 cmd = [python_bin, "-m", "venv", str(venv_dir)]
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *cmd, cwd=str(mcp_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=env,
-                ),
-                timeout=timeout,
-            )
-            out, _ = await proc.communicate()
-            if proc.returncode != 0:
-                log = "venv creation failed:\n" + out.decode(errors="replace")
+            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
+            if rc != 0:
+                log = "venv creation failed:\n" + out
                 await _emit(progress_cb, {"mcp": name, "phase": "failed",
                                            "pct": 100, "message": "venv failed",
                                            "error": log})
@@ -890,17 +978,8 @@ async def install_mcp(
             else:
                 cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
                        "install", "--isolated", "-r", str(req_file)]
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *cmd, cwd=str(mcp_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=env,
-                ),
-                timeout=timeout,
-            )
-            out, _ = await proc.communicate()
-            return proc.returncode == 0, out.decode(errors="replace")
+            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
+            return rc == 0, out
 
         await _emit(progress_cb, {"mcp": name, "phase": "pip", "pct": 50,
                                    "message": "pip install -r requirements.txt"})
@@ -919,22 +998,14 @@ async def install_mcp(
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30,
                                            "message": f"retry with Python{python_spec}"})
                 await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
-                proc = await asyncio.wait_for(
-                    asyncio.create_subprocess_exec(
-                        uv_bin, "venv", "--python", python_spec, str(venv_dir),
-                        cwd=str(mcp_dir),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        env=env,
-                    ),
-                    timeout=timeout,
+                rc, out = await _run_bounded(
+                    [uv_bin, "venv", "--python", python_spec, str(venv_dir)],
+                    cwd=str(mcp_dir), env=env, timeout=timeout,
                 )
-                out, _ = await proc.communicate()
-                if proc.returncode == 0:
+                if rc == 0:
                     ok, log = await _req_install()
                 else:
-                    log = (f"venv creation with Python{python_spec} failed:\n"
-                           + out.decode(errors="replace"))
+                    log = f"venv creation with Python{python_spec} failed:\n" + out
         if not ok:
             await _emit(progress_cb, {"mcp": name, "phase": "failed",
                                        "pct": 100, "message": "pip install failed",

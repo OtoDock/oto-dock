@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import psycopg
+
 from core.session import session_kind
 from storage.pg import get_conn
 
@@ -133,14 +135,15 @@ def _warn_rebuild_failed(chat_id: str, exc: BaseException) -> None:
 
 def rebuild_chat_search(chat_id: str) -> None:
     """Rebuild one chat's search row in its own transaction (a caller that
-    wrote rows with ``sync_search=False`` calls this once per batch)."""
-    with get_conn() as conn:
-        try:
+    wrote rows with ``sync_search=False`` calls this once per batch). A
+    failure, the connection's included, is logged and never raised: the rows
+    it indexes have already landed."""
+    try:
+        with get_conn() as conn:
             _rebuild_chat_search_row(conn, chat_id)
             conn.commit()
-        except Exception as e:
-            conn.rollback()
-            _warn_rebuild_failed(chat_id, e)
+    except Exception as e:
+        _warn_rebuild_failed(chat_id, e)
 
 
 _TASK_RUN_JOIN = """
@@ -480,12 +483,40 @@ def claim_pending_history_seed(chat_id: str) -> str:
         return row["pending_history_seed"] if row else ""
 
 
-def append_pending_delegate_wake(chat_id: str, wake_prompt: str) -> bool:
-    """Append an undeliverable delegate-result wake to the chat's durable
-    replay store (``chats.pending_delegate_wake`` — a JSON array of rendered
-    wake prompts). Written when every delivery-ladder rung failed; claimed
-    and injected at the chat's next warmup/turn. Row-locked read-modify-write
-    so two concurrent failed deliveries can't drop each other's wake.
+def wake_records(raw: str) -> list[dict]:
+    """The wake records of a ``pending_delegate_wake`` value, oldest first:
+    ``{"prompt", "person", "role", "by"}`` each. A plain string (the form
+    1.7.0 stored) is a wake with no person; anything else is dropped."""
+    try:
+        items = json.loads(raw or "[]")
+    except ValueError:
+        return []
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for item in items:
+        if isinstance(item, str):
+            item = {"prompt": item}
+        if not isinstance(item, dict):
+            continue
+        prompt = item.get("prompt")
+        if isinstance(prompt, str) and prompt:
+            out.append({"prompt": prompt, "person": str(item.get("person") or ""),
+                        "role": str(item.get("role") or ""), "by": str(item.get("by") or "")})
+    return out
+
+
+def append_pending_delegate_wake(chat_id: str, wake_prompt: str, *,
+                                 person: str = "", role: str = "", by: str = "") -> bool:
+    """Append an undeliverable wake to the chat's durable replay store
+    (``chats.pending_delegate_wake``: a JSON array of ``{"prompt", "person",
+    "role", "by"}``: the person and role the delivery ran as, "" for no
+    person, and for a wake that runs as nobody at its creator's role, that
+    creator, so a replay reads their role again).
+    Written when every delivery-ladder rung failed; claimed and injected at
+    the chat's next warmup/turn, or redelivered by the sweep as its person.
+    Row-locked read-modify-write so two concurrent failed deliveries can't
+    drop each other's wake.
     """
     if not wake_prompt:
         return False
@@ -497,13 +528,9 @@ def append_pending_delegate_wake(chat_id: str, wake_prompt: str) -> bool:
         if row is None:
             conn.commit()
             return False
-        try:
-            wakes = json.loads(row["pending_delegate_wake"] or "[]")
-            if not isinstance(wakes, list):
-                wakes = []
-        except Exception:
-            wakes = []
-        wakes.append(wake_prompt)
+        wakes = wake_records(row["pending_delegate_wake"])
+        wakes.append({"prompt": wake_prompt, "person": person or "", "role": role or "",
+                      "by": by or ""})
         conn.execute(
             "UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
             (json.dumps(wakes), chat_id),
@@ -512,12 +539,11 @@ def append_pending_delegate_wake(chat_id: str, wake_prompt: str) -> bool:
         return True
 
 
-def claim_pending_delegate_wake(chat_id: str) -> list[str]:
-    """Atomically claim-and-clear the chat's pending delegate wakes.
-
-    Returns the list of rendered wake prompts (oldest first) or ``[]``. Same
-    single-statement claim shape as ``claim_pending_history_seed`` — exactly
-    one of two racing turns gets the wakes.
+def claim_pending_wake_records(chat_id: str) -> list[dict]:
+    """Atomically claim-and-clear the chat's pending wakes, each with the
+    person and role it was stored for (oldest first; ``[]`` when none). Same
+    single-statement claim shape as ``claim_pending_history_seed``: exactly
+    one of two racing claimers gets the wakes.
     """
     with get_conn() as conn:
         row = conn.execute(
@@ -529,31 +555,85 @@ def claim_pending_delegate_wake(chat_id: str) -> list[str]:
             (chat_id,),
         ).fetchone()
         conn.commit()
-        if not row:
-            return []
-        try:
-            wakes = json.loads(row["pending_delegate_wake"] or "[]")
-            return [w for w in wakes if isinstance(w, str) and w] \
-                if isinstance(wakes, list) else []
-        except Exception:
-            return []
+    return wake_records(row["pending_delegate_wake"]) if row else []
 
 
-def list_chats_with_pending_wakes(execution_target: str | None = None) -> list[dict]:
+def claim_pending_delegate_wake(chat_id: str) -> list[str]:
+    """The prompts of :func:`claim_pending_wake_records`, for a claimer whose
+    own turn carries them (it runs as its own person)."""
+    return [w["prompt"] for w in claim_pending_wake_records(chat_id)]
+
+
+def _wake_of(wake: dict, person: str) -> bool:
+    return person in (wake["person"], wake["by"])
+
+
+def pending_wake_agents_of(person: str) -> list[str]:
+    """The agents whose chats hold a stored wake ``person`` runs as or
+    scheduled."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT agent, pending_delegate_wake FROM chats WHERE pending_delegate_wake <> ''"
+        ).fetchall()
+    return sorted({r["agent"] for r in rows
+                   if any(_wake_of(w, person) for w in wake_records(r["pending_delegate_wake"]))})
+
+
+def drop_pending_wakes_of(person: str, agents: list[str] | None) -> int:
+    """Remove the stored wakes ``person`` runs as or scheduled from the chats
+    of ``agents`` (every agent for None), the other wakes kept in order.
+    Returns how many went."""
+    q = "SELECT id, pending_delegate_wake FROM chats WHERE pending_delegate_wake <> ''"
+    params: tuple = ()
+    if agents is not None:
+        q += " AND agent = ANY(%s)"
+        params = (list(agents),)
+    dropped = 0
+    with get_conn() as conn:
+        for r in conn.execute(q + " FOR UPDATE", params).fetchall():
+            wakes = wake_records(r["pending_delegate_wake"])
+            kept = [w for w in wakes if not _wake_of(w, person)]
+            if len(kept) == len(wakes):
+                continue
+            dropped += len(wakes) - len(kept)
+            conn.execute("UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
+                         (json.dumps(kept) if kept else "", r["id"]))
+        conn.commit()
+    return dropped
+
+
+def list_chats_with_pending_wakes(execution_target: str | None = None,
+                                  session_ids: list[str] | tuple[str, ...] = ()) -> list[dict]:
     """Chats holding undelivered delegate wakes (see
     ``append_pending_delegate_wake``). ``execution_target`` scopes the list to
-    one machine's pinned chats (satellite-reconnect redelivery); None = all —
-    the startup sweep. Claiming stays per-chat and atomic, so this list is a
-    candidate set, not a lock."""
+    one machine's chats (satellite-reconnect redelivery): pinned to it, or
+    running one of ``session_ids`` (the sessions the platform holds there; a
+    chat with an empty target). None = all — the startup sweep. Claiming
+    stays per-chat and atomic, so this list is a candidate set, not a lock."""
     q = ("SELECT id, agent, user_sub, session_id, execution_target "
          "FROM chats WHERE pending_delegate_wake <> ''")
     params: tuple = ()
     if execution_target:
-        q += " AND execution_target = %s"
-        params = (execution_target,)
+        q += " AND (execution_target = %s OR session_id = ANY(%s))"
+        params = (execution_target, list(session_ids))
     with get_conn() as conn:
         rows = conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
+
+
+def list_chats_with_waiting_input(execution_target: str,
+                                  session_ids: list[str] | tuple[str, ...] = ()) -> list[str]:
+    """Chats holding messages in ``chat_input_queue`` that run on one machine:
+    pinned to it by ``execution_target``, or running one of ``session_ids``
+    (the sessions the platform holds there; a chat with an empty target).
+    A candidate set for the reconnect pass, not a claim."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT c.id FROM chat_input_queue q JOIN chats c ON c.id = q.chat_id "
+            "WHERE c.execution_target = %s OR c.session_id = ANY(%s)",
+            (execution_target, list(session_ids)),
+        ).fetchall()
+        return sorted(r["id"] for r in rows)
 
 
 def claim_title_generation(chat_id: str) -> tuple[bool, str | None]:
@@ -867,14 +947,29 @@ def _stamp_task_title(conn, chat_id: str, first_prompt: str) -> None:
         logger.debug("task title stamp failed for %s", chat_id, exc_info=True)
 
 
+def _row_refused(exc: Exception) -> bool:
+    """A failure one row can cause: a value the database refuses (a NUL byte
+    is refused by the client with no SQLSTATE, a lone surrogate cannot be
+    encoded at all) or a constraint the row breaks. Never the connection,
+    the pool, a cancel or the commit, whose outcome may be unknown, and never
+    a deleted chat, whose foreign key every row breaks alike."""
+    if isinstance(exc, (psycopg.DataError, UnicodeEncodeError)):
+        return True
+    return (isinstance(exc, psycopg.IntegrityError)
+            and not isinstance(exc, psycopg.errors.ForeignKeyViolation))
+
+
 def add_chat_messages_batch(chat_id: str,
                             rows: list[tuple[str, str, str, str]]) -> int:
     """Persist a turn's rows, ``(role, content, event_type, event_data)``
     each, in order: one transaction for the inserts and ``updated_at``, then
     ONE search-row rebuild for the lot (not one per text row). When the
-    insert transaction fails (one row the database refuses), it is rolled
-    back and the rows go in one by one, so a bad row costs only itself.
-    Returns the last inserted id (0 when nothing landed)."""
+    insert transaction fails on a row the database refuses, it is rolled
+    back and the rows go in one by one, so a bad row costs only itself. A
+    connection or pool failure before the commit sends the batch once more
+    (nothing was committed; a cancel or a server shutdown is the server's
+    answer and is not); any other failure is raised, with nothing written
+    again. Returns the last inserted id (0 when nothing landed)."""
     if not rows:
         return 0
     now = datetime.now(timezone.utc).isoformat()
@@ -882,11 +977,14 @@ def add_chat_messages_batch(chat_id: str,
                        for role, content, _t, _d in rows)
     first_prompt = next((content for role, content, _t, _d in rows
                          if role == _ROLE_USER and content), "")
-    last_id = 0
-    try:
+    committing = False
+
+    def _write() -> int:
+        nonlocal committing
+        last = 0
         with get_conn() as conn:
             for role, content, event_type, event_data in rows:
-                last_id = conn.execute(
+                last = conn.execute(
                     """INSERT INTO chat_messages (chat_id, role, content, event_type, event_data, author_sub, created_at)
                        VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (chat_id, role, content or "", event_type or "",
@@ -895,22 +993,44 @@ def add_chat_messages_batch(chat_id: str,
             conn.execute("UPDATE chats SET updated_at=%s WHERE id=%s", (now, chat_id))
             if first_prompt and session_kind.is_task_chat_id(chat_id):
                 _stamp_task_title(conn, chat_id, first_prompt)
+            committing = True
             conn.commit()
-    except Exception as e:
-        logger.warning("chat %s: a %d-row batch failed (%s); writing row by row",
-                       chat_id, len(rows), e)
-        last_id = 0
-        for role, content, event_type, event_data in rows:
-            try:
-                last_id = add_chat_message(chat_id, role, content or "",
-                                           event_type=event_type or "",
-                                           event_data=event_data or "",
-                                           sync_search=False)
-            except Exception as row_err:
-                logger.warning("chat %s: a %s row was refused: %s",
-                               chat_id, role, row_err)
+        return last
+
+    last_id = 0
+    for attempt in (1, 2):
+        try:
+            last_id = _write()
+            break
+        except Exception as e:
+            if _row_refused(e):
+                logger.warning("chat %s: a %d-row batch failed (%s); writing row by row",
+                               chat_id, len(rows), e)
+                last_id = _write_rows_one_by_one(chat_id, rows)
+                break
+            if (committing or attempt == 2
+                    or not isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError))
+                    or isinstance(e, (psycopg.errors.QueryCanceled,
+                                      psycopg.errors.AdminShutdown))):
+                raise
+            logger.warning("chat %s: a %d-row batch failed before its commit (%s); "
+                           "sending it once more", chat_id, len(rows), e)
     if needs_search:
         rebuild_chat_search(chat_id)
+    return last_id
+
+
+def _write_rows_one_by_one(chat_id: str, rows: list[tuple[str, str, str, str]]) -> int:
+    last_id = 0
+    for role, content, event_type, event_data in rows:
+        try:
+            last_id = add_chat_message(chat_id, role, content or "",
+                                       event_type=event_type or "",
+                                       event_data=event_data or "",
+                                       sync_search=False)
+        except Exception as row_err:
+            logger.warning("chat %s: a %s row was refused: %s",
+                           chat_id, role, row_err)
     return last_id
 
 
@@ -951,6 +1071,26 @@ def get_chat_messages_page(
     return rows, has_more
 
 
+def get_chat_messages_since(floors: dict[str, int]) -> list[dict]:
+    """The rows of several chats above a per-chat floor, ascending by id:
+    the task chat's delta (``ws/dashboard_chat_resume.py``). One query with
+    each chat's own floor (a sibling run at floor 0 fetches its rows alone,
+    not every chat's since id 0). An empty map answers ``[]`` with no
+    query."""
+    floors = {c: int(f) for c, f in floors.items() if c}
+    if not floors:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT m.* FROM chat_messages m
+               JOIN unnest(%s::text[], %s::bigint[]) AS f(chat_id, floor)
+                 ON m.chat_id = f.chat_id AND m.id > f.floor
+               ORDER BY m.id""",
+            (list(floors), list(floors.values())),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_last_chat_message_id(chat_id: str) -> int:
     """Highest message id in a chat (0 if empty). The pump records this at a turn
     boundary as an id-based cutoff so a *windowed* resume can still withhold the
@@ -977,6 +1117,137 @@ def get_last_user_message_author(chat_id: str) -> str:
             (chat_id,),
         ).fetchone()
     return (row["author_sub"] or "") if row else ""
+
+
+def enqueue_chat_input(chat_id: str, queue_id: str, author_sub: str, *, text: str,
+                       cli_text: str, event_data: str, images: str,
+                       origin_conn: str) -> dict | None:
+    """Insert one waiting message (``chat_input_queue``), or None when the
+    chat already holds that ``queue_id`` (a re-send after a reconnect)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        row = conn.execute(
+            """INSERT INTO chat_input_queue
+                   (chat_id, queue_id, author_sub, text, cli_text, event_data, images,
+                    origin_conn, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (chat_id, queue_id) DO NOTHING
+               RETURNING *""",
+            (chat_id, queue_id, author_sub, text, cli_text, event_data, images,
+             origin_conn, now),
+        ).fetchone()
+        conn.commit()
+    return dict(row) if row else None
+
+
+def list_chat_input_queue(chat_id: str) -> list[dict]:
+    """The chat's waiting messages in queue order."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chat_input_queue WHERE chat_id=%s ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_chat_input(chat_id: str, queue_id: str) -> dict | None:
+    """Remove one waiting message; the row it was, or None when none."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "DELETE FROM chat_input_queue WHERE chat_id=%s AND queue_id=%s RETURNING *",
+            (chat_id, queue_id),
+        ).fetchone()
+        conn.commit()
+    return dict(row) if row else None
+
+
+def delete_chat_inputs_where(*, chat_id: str = "", author_sub: str = "",
+                             origin_conn: str = "") -> list[dict]:
+    """Remove the waiting messages a connection queued (``origin_conn``) or a
+    person queued (``author_sub``), in one chat when ``chat_id`` is given:
+    the rows that went, for the chats' frames. Nothing without a person or
+    a connection to match."""
+    if not (author_sub or origin_conn):
+        return []
+    where, args = [], []
+    for col, val in (("chat_id", chat_id), ("author_sub", author_sub),
+                     ("origin_conn", origin_conn)):
+        if val:
+            where.append(f"{col}=%s")
+            args.append(val)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"DELETE FROM chat_input_queue WHERE {' AND '.join(where)} "
+            "RETURNING chat_id, queue_id",
+            tuple(args),
+        ).fetchall()
+        conn.commit()
+    return [dict(r) for r in rows]
+
+
+def delete_chat_message_ranges(chat_id: str, ranges: list[tuple[int, int]]) -> int:
+    """Delete the assistant and event rows of ``chat_id`` whose id falls in
+    one of ``ranges`` (each ``(after, upto)``: above ``after``, at most
+    ``upto``), user rows kept: the blocks a turn saved early that its replay
+    after a restart writes again. Returns the rows deleted."""
+    if not ranges:
+        return 0
+    deleted = 0
+    with get_conn() as conn:
+        for after, upto in ranges:
+            cur = conn.execute(
+                "DELETE FROM chat_messages WHERE chat_id=%s AND id > %s AND id <= %s "
+                "AND role <> %s",
+                (chat_id, after, upto, _ROLE_USER),
+            )
+            deleted += cur.rowcount or 0
+        if deleted:
+            _rebuild_chat_search_row(conn, chat_id)
+        conn.commit()
+    return deleted
+
+
+def accept_chat_inputs(chat_id: str, rows: list[dict]) -> list[int]:
+    """The turn accepted ``rows``: one transaction deletes their queue rows
+    (a steered message was never queued: no row to delete) and inserts one
+    user message per row, in order, its ``event_data`` carrying the
+    ``queue_id`` with the attachment meta and its ``author_sub`` kept.
+    Returns the message ids. ``rows``: ``{queue_id, text, event_data (a
+    JSON string, "" for none), author_sub}`` each."""
+    if not rows:
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    ids: list[int] = []
+    with get_conn() as conn:
+        for r in rows:
+            qid = r.get("queue_id") or ""
+            if qid:
+                conn.execute(
+                    "DELETE FROM chat_input_queue WHERE chat_id=%s AND queue_id=%s",
+                    (chat_id, qid),
+                )
+            meta = json.loads(r["event_data"]) if r.get("event_data") else {}
+            if qid:
+                meta["queue_id"] = qid
+            ids.append(conn.execute(
+                """INSERT INTO chat_messages (chat_id, role, content, event_type, event_data, author_sub, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (chat_id, _ROLE_USER, r.get("text") or "", "",
+                 json.dumps(meta) if meta else "", r.get("author_sub") or "", now),
+            ).fetchone()["id"])
+        conn.execute("UPDATE chats SET updated_at=%s WHERE id=%s", (now, chat_id))
+        first = next((r.get("text") for r in rows if r.get("text")), "")
+        if first and session_kind.is_task_chat_id(chat_id):
+            _stamp_task_title(conn, chat_id, first)
+        conn.commit()
+        if any(r.get("text") for r in rows):
+            try:
+                _rebuild_chat_search_row(conn, chat_id)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                _warn_rebuild_failed(chat_id, e)
+    return ids
 
 
 def list_tool_names(chat_id: str) -> list[str]:
@@ -1138,119 +1409,6 @@ def sweep_expired_media_tokens() -> int:
         )
         conn.commit()
         return len(rows)
-
-
-def dismiss_document_previews(
-    chat_id: str, file_id: str,
-    snapshot_id: str | None = None, db_message_id: int | None = None,
-) -> tuple[int, list[str]]:
-    """Dismiss document_preview events with the given file_id in a chat.
-
-    Instance scoping: ``snapshot_id`` (or ``db_message_id`` for pre-snapshot
-    rows) narrows the dismissal to ONE preview instance — the dashboard's
-    "previous version" block dismisses only itself. With neither, every
-    instance for the file is dismissed (the live block's close).
-
-    Returns ``(rows updated, snapshot ids of those rows)`` so the caller can
-    delete exactly the newly-unreferenced snapshot files.
-    """
-    import json as _json
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, event_data FROM chat_messages "
-            "WHERE chat_id=%s AND event_type='document_preview'",
-            (chat_id,),
-        ).fetchall()
-        count = 0
-        freed_snapshots: list[str] = []
-        for row in rows:
-            data = _json.loads(row["event_data"] or "{}") if row["event_data"] else {}
-            if data.get("file_id") != file_id or data.get("dismissed"):
-                continue
-            if snapshot_id is not None and data.get("snapshot_id") != snapshot_id:
-                continue
-            if db_message_id is not None and row["id"] != db_message_id:
-                continue
-            data["dismissed"] = True
-            conn.execute(
-                "UPDATE chat_messages SET event_data=%s WHERE id=%s",
-                (_json.dumps(data), row["id"]),
-            )
-            count += 1
-            if data.get("snapshot_id"):
-                freed_snapshots.append(data["snapshot_id"])
-        if count:
-            conn.commit()
-        return count, freed_snapshots
-
-
-def get_preview_event_by_snapshot(chat_id: str, snapshot_id: str) -> dict | None:
-    """The non-dismissed document_preview event data referencing a snapshot,
-    or None. Serving a snapshot requires a live reference — a dismissed row's
-    snapshot is deleted and must not be re-mintable."""
-    import json as _json
-    if not snapshot_id:
-        return None
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT event_data FROM chat_messages "
-            "WHERE chat_id=%s AND event_type='document_preview'",
-            (chat_id,),
-        ).fetchall()
-    for row in rows:
-        try:
-            data = _json.loads(row["event_data"] or "{}")
-        except ValueError:
-            continue
-        if data.get("snapshot_id") == snapshot_id and not data.get("dismissed"):
-            return data
-    return None
-
-
-def get_preview_event_by_file(chat_id: str, file_id: str) -> dict | None:
-    """The non-dismissed document_preview event data for a file_id, or None.
-
-    Re-minting a preview URL at render time requires a live reference in the
-    chat — once every instance of a file's preview is dismissed, its URL must
-    not be re-mintable through the chat."""
-    import json as _json
-    if not file_id:
-        return None
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT event_data FROM chat_messages "
-            "WHERE chat_id=%s AND event_type='document_preview'",
-            (chat_id,),
-        ).fetchall()
-    for row in rows:
-        try:
-            data = _json.loads(row["event_data"] or "{}")
-        except ValueError:
-            continue
-        if data.get("file_id") == file_id and not data.get("dismissed"):
-            return data
-    return None
-
-
-def get_referenced_preview_snapshot_ids(chat_id: str) -> set[str]:
-    """Snapshot ids referenced by NON-dismissed document_preview events in a
-    chat — the keep-set for the reference-driven snapshot GC."""
-    import json as _json
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT event_data FROM chat_messages "
-            "WHERE chat_id=%s AND event_type='document_preview'",
-            (chat_id,),
-        ).fetchall()
-    out: set[str] = set()
-    for row in rows:
-        try:
-            data = _json.loads(row["event_data"] or "{}")
-        except ValueError:
-            continue
-        if not data.get("dismissed") and data.get("snapshot_id"):
-            out.add(data["snapshot_id"])
-    return out
 
 
 def get_chat_message_count(chat_id: str) -> int:

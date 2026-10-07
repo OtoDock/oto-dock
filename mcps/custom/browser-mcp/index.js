@@ -19,7 +19,7 @@
 //
 // Everything else is configured via PLAYWRIGHT_MCP_* env vars that
 // @playwright/mcp reads natively, set upstream of this process:
-//   * PLAYWRIGHT_MCP_BLOCKED_ORIGINS  — manifest `env` (loopback safety default)
+//   * PLAYWRIGHT_MCP_BLOCKED_ORIGINS  — an admin config value (the manifest ships none)
 //   * PLAYWRIGHT_MCP_ALLOWED_ORIGINS  — proxy per-agent injection (optional)
 //   * OTO_BROWSER_CHANNEL             — admin/user config (which browser)
 //
@@ -61,15 +61,30 @@ function computeProfileDir(home, agent, plat) {
   return path.join(home, dirname, "browser-profiles", sanitizeAgent(agent));
 }
 
-// Profiles made by earlier releases on Windows sat under ".oto-dock"; the
-// first start after the change moves them so the signed-in logins survive.
+function legacyProfileDir(home, agent) {
+  return path.join(home, ".oto-dock", "browser-profiles", sanitizeAgent(agent));
+}
+
+// A profile folder no browser has used yet: absent, or an empty directory.
+function isUnusedDir(dir) {
+  try {
+    return fs.lstatSync(dir).isDirectory() && fs.readdirSync(dir).length === 0;
+  } catch (e) {
+    return e.code === "ENOENT";
+  }
+}
+
+// Profiles made by earlier releases on Windows sat under ".oto-dock"; a start
+// moves them so the signed-in logins survive. An empty new folder (an earlier
+// release created it after a failed move) does not block the move.
 function migrateLegacyProfileDir(home, agent, plat) {
   if ((plat === undefined ? process.platform : plat) !== "win32") return false;
-  const legacy = path.join(home, ".oto-dock", "browser-profiles", sanitizeAgent(agent));
+  const legacy = legacyProfileDir(home, agent);
   const current = computeProfileDir(home, agent, "win32");
-  if (legacy === current || !fs.existsSync(legacy) || fs.existsSync(current)) return false;
+  if (legacy === current || !fs.existsSync(legacy) || !isUnusedDir(current)) return false;
   try {
     fs.mkdirSync(path.dirname(current), { recursive: true });
+    if (fs.existsSync(current)) fs.rmdirSync(current);
     fs.renameSync(legacy, current);
     return true;
   } catch (e) {
@@ -78,6 +93,20 @@ function migrateLegacyProfileDir(home, agent, plat) {
     );
     return false;
   }
+}
+
+// The profile this start runs on. On Windows, while the legacy profile has
+// not been moved (a browser of the earlier release still holds it), the start
+// runs on it and the new folder stays uncreated, so a later start moves it.
+function profileDirForStart(home, agent, plat) {
+  const p = plat === undefined ? process.platform : plat;
+  migrateLegacyProfileDir(home, agent, p);
+  const current = computeProfileDir(home, agent, p);
+  if (p === "win32") {
+    const legacy = legacyProfileDir(home, agent);
+    if (legacy !== current && fs.existsSync(legacy) && isUnusedDir(current)) return legacy;
+  }
+  return current;
 }
 
 // npm installs @playwright/mcp into THIS MCP dir's node_modules (a single
@@ -337,9 +366,10 @@ function reapOrphanedBrowser(profileDir) {
 // The endpoint is discovered from Chromium's own DevToolsActivePort file in
 // the profile dir and verified live via /json/version before use. The debug
 // port binds to 127.0.0.1 only (Chromium default) on a dedicated automation
-// profile. Origin blocking (PLAYWRIGHT_MCP_BLOCKED_ORIGINS) is enforced by
-// @playwright/mcp via context.route on the attached context, so it applies in
-// CDP mode too. Firefox/WebKit (no CDP) keep the classic persistent launch.
+// profile. Origin limits (PLAYWRIGHT_MCP_ALLOWED_ORIGINS, and
+// PLAYWRIGHT_MCP_BLOCKED_ORIGINS when an admin sets one) are enforced by
+// @playwright/mcp via context.route on the attached context, so they apply
+// in CDP mode too. Firefox/WebKit (no CDP) keep the classic persistent launch.
 
 function readDevtoolsPort(profileDir) {
   try {
@@ -814,8 +844,7 @@ async function main() {
     );
   }
 
-  migrateLegacyProfileDir(home, process.env.OTO_AGENT_NAME);
-  const profileDir = computeProfileDir(home, process.env.OTO_AGENT_NAME);
+  const profileDir = profileDirForStart(home, process.env.OTO_AGENT_NAME);
   try {
     fs.mkdirSync(profileDir, { recursive: true });
   } catch (e) {
@@ -1567,7 +1596,7 @@ if (require.main === module) {
 } else {
   module.exports = {
     sanitizeAgent, computeProfileDir, platformStateDirname, migrateLegacyProfileDir,
-    resolveCliPath, detectBrowser,
+    profileDirForStart, resolveCliPath, detectBrowser,
     resolveBrowserConfig, isChromiumFamily, channelExecutable,
     profileLooksLocked, findOrphanHolders, readDevtoolsPort, agentDisplayName,
     seedProfileDisplayName,

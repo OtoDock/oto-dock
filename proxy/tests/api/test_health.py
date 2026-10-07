@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import app
 from auth.providers import create_session_jwt
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 
 PUBLIC = {"status", "service", "build"}
 ADMIN_ONLY = {"version", "claude_cli_version", "codex_cli_version", "cli_versions",
@@ -48,6 +48,19 @@ def test_admin_health_refuses_a_member_and_a_session_token(temp_db):
     assert TestClient(app).get("/v1/admin/health").status_code == 401
     # A session token of an admin-owned session is a bearer principal:
     # agent code inside the sandbox never reads the admin's telemetry.
-    token = create_session_token("sid-health", "pa", user_sub="user-admin")
+    token = live_session_token("sid-health", "pa", user_sub="user-admin")
     r = TestClient(app).get("/v1/admin/health", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 403
+
+
+def test_health_answers_head_like_get_with_no_body(temp_db):
+    """An uptime probe's HEAD gets the GET's status and headers, no body."""
+    client = TestClient(app)
+    get = client.get("/health")
+    head = client.head("/health")
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head.headers["content-type"] == get.headers["content-type"]
+    assert head.headers["content-length"] == get.headers["content-length"]
+    # Only the safe pair: another method is still refused.
+    assert client.post("/health").status_code == 405

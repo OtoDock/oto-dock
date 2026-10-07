@@ -90,6 +90,51 @@ def test_set_persists_and_load_repopulates(iso):
     assert session_state.get_session_security("sess-1") == ctx
 
 
+def test_the_mode_and_the_floor_survive_a_restart(iso, monkeypatch):
+    """The index keeps a session's permission mode (a change rewrites it) and
+    its token floor, read back for its re-adoption; a fresh registration of
+    the id replaces what was reloaded."""
+    monkeypatch.setattr(session_state, "_session_modes", {})
+    monkeypatch.setattr(session_state, "_session_token_floor", {})
+    monkeypatch.setattr(session_state, "_reloaded_state", {})
+    session_state.register_session_state("sess-1", "default", _ctx(), token_minted_at=1790000000)
+    on_disk = json.loads(session_state._SECURITY_INDEX.read_text())["sess-1"]
+    assert (on_disk["_mode"], on_disk["_floor"]) == ("default", 1790000000)
+    session_state.set_session_mode("sess-1", "plan")
+    assert json.loads(session_state._SECURITY_INDEX.read_text())["sess-1"]["_mode"] == "plan"
+    # A restart: memory gone, the index reloaded.
+    session_state._session_security.clear()
+    session_state._session_modes.clear()
+    session_state._session_token_floor.clear()
+    session_state.load_session_security()
+    assert session_state.reloaded_state("sess-1") == ("plan", 1790000000)
+    # The load rewrote the index: a second restart before the machine
+    # reports still finds them.
+    on_disk = json.loads(session_state._SECURITY_INDEX.read_text())["sess-1"]
+    assert (on_disk["_mode"], on_disk["_floor"]) == ("plan", 1790000000)
+    # Until re-adopted, the session answers in its kept mode, and a token
+    # of an earlier life of its id is refused against the kept floor.
+    assert session_state.get_session_mode("sess-1") == "plan"
+    monkeypatch.setattr(session_state, "session_is_live", lambda sid: True)
+    assert session_state.session_token_refusal({"sid": "sess-1", "iat": 1789999999}) == "stale"
+    assert session_state.session_token_refusal({"sid": "sess-1", "iat": 1790000000}) == ""
+    session_state.restore_session_state("sess-1", "plan", 1790000000)
+    assert session_state.get_session_mode("sess-1") == "plan"
+    assert session_state._session_token_floor["sess-1"] == 1790000000
+    assert session_state.reloaded_state("sess-1") == ("", 0)
+
+
+def test_an_older_index_reloads_with_no_mode_and_no_floor(iso, monkeypatch):
+    monkeypatch.setattr(session_state, "_reloaded_state", {})
+    monkeypatch.setattr(session_state, "_session_token_floor", {"sess-1": 5})
+    d = {**session_state._serialize_security_ctx(_ctx()), "_saved_at": time.time()}
+    session_state._SECURITY_INDEX.write_text(json.dumps({"sess-1": d}))
+    session_state.load_session_security()
+    assert session_state.reloaded_state("sess-1") == ("", 0)
+    session_state.restore_session_state("sess-1", "default", 0)
+    assert "sess-1" not in session_state._session_token_floor  # no floor, as before
+
+
 def test_close_deletes_from_disk(iso):
     session_state.set_session_security("sess-1", _ctx())
     session_state.set_session_security("sess-2", _ctx())
@@ -213,3 +258,21 @@ def test_a_pre_upgrade_document_loads_with_its_placement_intact():
     assert session_state._deserialize_security_ctx(
         {"role": "viewer", "username": "", "agent": "a", "is_admin_agent": False}).placement.is_local
 
+
+
+def test_an_expired_context_is_reported_expired(iso, monkeypatch):
+    session_state.set_session_security("sess-1", _ctx())
+    assert session_state.security_context_expired("sess-1") is False
+    session_state._session_security_ts["sess-1"] = time.time() - session_state._SECURITY_TTL_S - 1
+    assert session_state.security_context_expired("sess-1") is True
+    assert session_state.security_context_expired("sess-none") is False
+
+
+def test_a_replay_mark_ages_out_and_a_new_life_voids_it(iso, monkeypatch):
+    monkeypatch.setattr(session_state, "_sessions", {})
+    monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
+    session_state.mark_recover_pending("sess-9")
+    assert session_state._sessions["sess-9"]["last_active"]  # pruned with its entry
+    monkeypatch.setattr(session_state, "session_is_held", lambda sid: False)
+    session_state.register_session_state("sess-9", "default", None)
+    assert session_state.take_recover_pending("sess-9") is False

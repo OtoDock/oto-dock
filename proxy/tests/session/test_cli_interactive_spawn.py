@@ -55,6 +55,10 @@ def test_headless_argv_has_p_and_stream_json():
     # on --resume; the platform re-ships a fresh prompt file every resume, so
     # the recording is off (the flag exists on the previous pin 2.1.263 too).
     assert cmd[cmd.index("--system-prompt-snapshot") + 1] == "off"
+    # Only the platform's settings.json is read: a plugin a person installs
+    # from a terminal at the local scope writes settings.local.json, which
+    # the platform never rewrites and which would outrank the user file.
+    assert cmd[cmd.index("--setting-sources") + 1] == "user"
     # Headless does not force TERM.
     assert "TERM" not in env or env.get("TERM") != "xterm-256color" or True  # no assertion either way
 
@@ -98,6 +102,7 @@ def test_interactive_argv_drops_headless_flags_keeps_shared():
     # (see test_interactive_permission_mode.py).
     assert "--dangerously-skip-permissions" not in cmd
     assert "--permission-mode" in cmd
+    assert cmd[cmd.index("--setting-sources") + 1] == "user"
     # The TUI has AskUserQuestion natively — no stdio prompt tool.
     assert "--permission-prompt-tool" not in cmd
     # TUI needs TERM (sandbox env doesn't set it).
@@ -122,6 +127,15 @@ def _strip_perm_flags(argv):
     return out
 
 
+def test_the_satellite_spawns_read_the_platform_settings_only():
+    # The two satellite twins (headless, PTY) carry the same flag; the
+    # satellite suite asserts the headless argv, this reads both files.
+    from tests._paths import REPO_ROOT
+    for rel in ("satellite/sessions/cli_session.py", "satellite/terminal/pty_session.py"):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert '"--setting-sources", "user"' in text, rel
+
+
 def test_both_modes_agree_on_shared_tail():
     """The model/effort/session tail is identical — the two argvs differ ONLY in
     the headless -p framing block and the permission flag (headless
@@ -142,7 +156,8 @@ def test_interactive_task_uses_permission_mode_not_skip():
     cmd, env, _ = _mk_task("auto").build_spawn_command()
     assert "-p" not in cmd and "stream-json" not in cmd  # still interactive TUI
     assert "--dangerously-skip-permissions" not in cmd
-    assert "--permission-mode" in cmd and "default" in cmd
+    assert "--permission-mode" in cmd
+    assert cmd[cmd.index("--setting-sources") + 1] == "user" and "default" in cmd
     assert env.get("TERM") == "xterm-256color"
     assert env.get("OTO_INTERACTIVE") == "1"
 

@@ -216,6 +216,45 @@ def test_quota_preflight_refuses_on_the_hard_tier_only(agent_tree, monkeypatch):
     assert app_deploy.quota_preflight(row, src) == ""
 
 
+def test_the_purge_deletes_each_walked_file_by_the_path_it_was_walked_at(agent_tree, tmp_path, monkeypatch):
+    """Every regular file of the folder goes through the per-file delete
+    once, by the path joined from the agent's folder (never a resolved
+    one: the delete judges that text beneath the agents tree); a link or a
+    FIFO in the folder is neither counted nor followed."""
+    import os
+    from unittest.mock import AsyncMock
+    from services.infra import file_bookkeeping
+    linked_root = tmp_path / "agents-link"
+    linked_root.symlink_to(config.AGENTS_DIR, target_is_directory=True)
+    monkeypatch.setattr(config, "AGENTS_DIR", linked_root)
+    agent_dir = config.get_agent_dir(AGENT)
+    folder = agent_dir / "users/alice/workspace/apps/board"
+    for rel, text in (("app.json", "{}"), ("client/index.html", "<p>x</p>"),
+                      ("client/js/app.js", "1"), (".env.example", "K=")):
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_text(text)
+    keep = agent_dir / "workspace" / "keep.txt"
+    keep.write_text("k")
+    (folder / "client" / "linked.txt").symlink_to(keep)
+    os.mkfifo(folder / "pipe")
+    seen: list = []
+
+    async def deleting(agent, adir, target):
+        seen.append(target)
+        os.unlink(target)
+        return False
+
+    with patch.object(file_bookkeeping, "delete_platform_file", deleting), \
+            patch.object(file_bookkeeping, "push_file_delete", AsyncMock()) as push:
+        count = asyncio.run(app_lifecycle._remove_workspace_folder(AGENT, agent_dir, folder))
+    assert count == 4
+    assert sorted(seen) == sorted(folder / rel for rel in (
+        "app.json", "client/index.html", "client/js/app.js", ".env.example"))
+    assert all(str(p).startswith(str(linked_root)) for p in seen)
+    assert keep.read_text() == "k" and not folder.exists()
+    push.assert_awaited_once_with(AGENT, "users/alice/workspace/apps/board")
+
+
 def test_a_purge_that_leaves_a_linked_folder_in_place_announces_no_delete(agent_tree):
     """A folder that is a link is neither walked (the walk would follow it
     into another folder's files) nor announced to the satellites as gone."""
@@ -233,3 +272,17 @@ def test_a_purge_that_leaves_a_linked_folder_in_place_announces_no_delete(agent_
     assert count == 0
     assert (other / "keep.txt").read_text() == "k"
     push.assert_not_called()
+
+
+def test_a_user_delete_removes_the_viewer_documents_of_their_personal_apps(agent_tree):
+    """A user delete removes what a purge removes of each personal app: the
+    release copies, the database and the viewers' documents beside it
+    (APPS.md "Lifecycle"), so no later account under the username inherits
+    them."""
+    from services.apps import viewer_data
+    row = task_store.upsert_app(AGENT, "alice", "alice-sub", "notes", title="Notes",
+                                rel_path="users/alice/workspace/apps/notes.html")
+    viewer_data.write(row, "bob-sub", doc={"mine": 1})
+    assert viewer_data.viewers_dir(row).is_dir()
+    asyncio.run(app_lifecycle.remove_user_app_dirs("alice-sub"))
+    assert not viewer_data.viewers_dir(row).exists()

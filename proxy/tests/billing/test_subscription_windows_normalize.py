@@ -134,6 +134,18 @@ class TestClaudeNormalizers:
         rejected = dict(CLAUDE_EVENT, status="rejected", rateLimitType="seven_day_opus")
         assert claude_usage.from_event(rejected, SPECS).reached == "scoped:opus"
 
+    def test_a_rejected_family_window_is_reached_by_its_family(self):
+        # Any model family's weekly window, Fable's included; a type that
+        # names no family sets no reached flag.
+        for kind, reached in (("seven_day_fable", "scoped:fable"),
+                              ("seven_day_sonnet", "scoped:sonnet"),
+                              ("seven_day_haiku", "scoped:haiku"),
+                              ("five_hour", "five_hour"),
+                              ("seven_day_oauth_apps", ""),
+                              ("overage", "")):
+            rejected = dict(CLAUDE_EVENT, status="rejected", rateLimitType=kind)
+            assert claude_usage.from_event(rejected, SPECS).reached == reached, kind
+
     def test_event_above_the_cap(self):
         info = {"status": "allowed", "unifiedWindows": {
             "five_hour": {"utilization": 1.2, "resetsAt": 1787796000}}}
@@ -425,6 +437,29 @@ class TestRecording:
             assert sid == "s2" and round(w.windows["five_hour"].pct, 6) == 14.0
             get_layer_by_path("direct-llm").record_usage_event("s3", CLAUDE_EVENT)
             assert rec.call_count == 1
+
+    def test_a_new_reading_reaches_the_pools_rests(self):
+        w = _W(five=sw.Window(20.0, NOW + timedelta(hours=1)),
+               seven=sw.Window(30.0, NOW + timedelta(days=3)), observed_at=NOW)
+        with patch.object(sw, "is_enabled", return_value=True), \
+             patch(f"{_STORE}.latest_window_samples", return_value={}), \
+             patch(f"{_STORE}.insert_window_sample", return_value=False), \
+             patch(f"{_POOL}.clear_rests_with_headroom") as clear:
+            sw.record("sub-1", w)
+        sub, seen = clear.call_args.args
+        assert sub == "sub-1" and seen.windows["five_hour"].pct == 20.0
+
+    def test_headroom_is_below_the_spill_mark_and_not_reached(self):
+        fable = sw.Scoped("fable", "Fable", 40.0, NOW + timedelta(days=3))
+        w = _W(five=sw.Window(89.0, NOW + timedelta(hours=1)),
+               seven=sw.Window(95.0, NOW + timedelta(days=3)), scoped=[fable], observed_at=NOW)
+        assert sw.has_headroom(w, "five_hour")
+        assert not sw.has_headroom(w, "seven_day")
+        assert sw.has_headroom(w, "scoped:fable")
+        assert not sw.has_headroom(w, "scoped:opus")      # not in the reading
+        assert not sw.has_headroom(w, "an_unknown_window")
+        w.reached = "five_hour"
+        assert not sw.has_headroom(w, "five_hour")
 
     def test_disabled_records_nothing(self):
         w = _W(seven=sw.Window(1.0, NOW + timedelta(days=3)), observed_at=NOW)

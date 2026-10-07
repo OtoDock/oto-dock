@@ -199,13 +199,13 @@ async def test_held_mcp_skipped(monkeypatch, log_rows, notify_calls, tmp_path):
     recorded ``held`` (not a failure → no notification)."""
     from services.mcp import mcp_updater
 
-    m = _Manifest("ahead", runtime="docker")
+    m = _Manifest("held", runtime="docker")
     m.mcp_dir = tmp_path
     (tmp_path / mcp_updater.HOLD_MARKER).touch()
     called = _patch_updater(
         monkeypatch, targets=[m],
-        updates={"ahead": {"current": "0.0.70", "latest": "0.0.69",
-                           "downgrade": True}},
+        updates={"held": {"current": "0.0.69", "latest": "0.0.70",
+                          "reason": "manifest"}},
         in_use=lambda n: pytest.fail("held MCP must not be in-use-checked"),
     )
     summary = await au.run_auto_update()
@@ -216,25 +216,102 @@ async def test_held_mcp_skipped(monkeypatch, log_rows, notify_calls, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unheld_downgrade_applies_but_warns(
+async def test_an_install_ahead_of_the_catalog_is_left_alone(
     monkeypatch, log_rows, notify_calls, caplog,
 ):
-    """Without a hold the converge still applies (the catalog is the version
-    of record — rollbacks must land) but the run warns loudly."""
+    """The job never moves an install backwards: an ``ahead`` entry is not
+    updated, not recorded and not notified; one INFO line names it."""
     import logging
 
     m = _Manifest("ahead", runtime="docker")
     called = _patch_updater(
         monkeypatch, targets=[m],
         updates={"ahead": {"current": "0.0.70", "latest": "0.0.69",
-                           "downgrade": True}},
-        in_use=False,
+                           "reason": "ahead"}},
+        in_use=lambda n: pytest.fail("an ahead install is never in-use-checked"),
     )
-    with caplog.at_level(logging.WARNING, logger="claude-proxy.mcp-autoupdate"):
+    with caplog.at_level(logging.INFO, logger="claude-proxy.mcp-autoupdate"):
         summary = await au.run_auto_update()
-    assert called["update"] == ["ahead"]
-    assert summary["counts"][log_store.STATUS_UPDATED] == 1
-    assert any("DOWNGRAD" in r.message for r in caplog.records)
+    assert called["update"] == []
+    assert all(c == 0 for c in summary["counts"].values())
+    assert log_rows == []
+    assert notify_calls == []
+    assert any("ahead of the catalog" in r.message for r in caplog.records)
+    assert not any("DOWNGRAD" in r.message for r in caplog.records)
+
+
+def _source_update(declared: bool = False, to: str = "https://www.npmjs.com/package/other") -> dict:
+    return {"current": "1.0.0", "latest": "", "registry": "npm", "package": "pkg-mcp",
+            "reason": "source", "source_change": {
+                "status": "pending", "declared": declared,
+                "from": {"kind": "npm", "identity": "pkg", "url": "https://www.npmjs.com/package/pkg",
+                         "runtime": "node"},
+                "to": {"kind": "npm", "identity": to.rsplit("/", 1)[-1], "url": to,
+                       "runtime": "node", "version": ""},
+                "plan": {}, "to_manifest_hash": "h-catalog",
+            }}
+
+
+@pytest.mark.asyncio
+async def test_a_source_change_needs_approval_and_notifies_once_per_pair(
+    temp_db, monkeypatch, log_rows, notify_calls,
+):
+    """The job never applies a source change: it records ``needs_approval``
+    and tells the admins once; a second run is silent; a new pair tells
+    them again."""
+    from storage.mcp import mcp_update_state_store as store
+
+    m = _Manifest("pkg-mcp", runtime="python")
+    called = _patch_updater(
+        monkeypatch, targets=[m], updates={"pkg-mcp": _source_update()},
+        in_use=lambda n: pytest.fail("a source change is never in-use-checked"),
+    )
+    summary = await au.run_auto_update()
+    assert called["update"] == []
+    assert summary["counts"][log_store.STATUS_NEEDS_APPROVAL] == 1
+    assert [(r["status"], r["new"]) for r in log_rows] == [
+        ("needs_approval", "https://www.npmjs.com/package/other"),
+    ]
+    assert len(notify_calls) == 1
+    assert notify_calls[0]["scope"] == "admin"
+    assert notify_calls[0]["severity"] == "warning"
+    assert "possible compromise" in notify_calls[0]["body"]
+    assert notify_calls[0]["source_id"] == "source-change:pkg-mcp"
+    row = store.get_source_change("pkg-mcp")
+    assert row["notified_at"] is not None
+    # The row the job wrote from the detection carries the hash pin too.
+    assert row["to_manifest_hash"] == "h-catalog"
+
+    await au.run_auto_update()
+    assert len(notify_calls) == 1
+
+    _patch_updater(monkeypatch, targets=[m],
+                   updates={"pkg-mcp": _source_update(declared=True,
+                                                      to="https://www.npmjs.com/package/third")})
+    store.upsert_pending_source_change("pkg-mcp", {
+        "from_kind": "npm", "from_identity": "pkg", "from_url": "https://www.npmjs.com/package/pkg",
+        "to_kind": "npm", "to_identity": "third", "to_url": "https://www.npmjs.com/package/third",
+        "declared": True,
+    })
+    await au.run_auto_update()
+    assert len(notify_calls) == 2
+    assert notify_calls[1]["severity"] == "info"
+    assert "declares that it replaces" in notify_calls[1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_a_switched_row_is_not_an_update(monkeypatch, log_rows, notify_calls):
+    m = _Manifest("pkg-mcp", runtime="python")
+    called = _patch_updater(
+        monkeypatch, targets=[m],
+        updates={"pkg-mcp": {"current": "1.0.0", "latest": "1.0.0", "registry": "npm",
+                             "package": "pkg-mcp", "reason": "switched",
+                             "source_change": {"status": "switched"}}},
+    )
+    summary = await au.run_auto_update()
+    assert called["update"] == []
+    assert all(c == 0 for c in summary["counts"].values())
+    assert log_rows == [] and notify_calls == []
 
 
 # --- community_targets (tier filtering) ----------------------------------

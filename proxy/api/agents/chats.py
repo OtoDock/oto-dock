@@ -4,6 +4,7 @@ CRUD endpoints for chats and messages, authenticated via JWT session cookie.
 """
 
 import asyncio
+import time
 import functools
 import logging
 import re
@@ -17,7 +18,7 @@ from storage import database as task_store
 from storage.pg import run_db
 from core import placement
 from core.events import chat_writer
-from auth.providers import UserContext, get_current_user, require_auth, require_agent_access
+from auth.providers import UserContext, get_current_user, require_auth, require_agent_access, require_user
 from core.session import session_kind
 from core.session.visibility import is_phone_chat_owner, is_task_chat_owner
 from auth import roles
@@ -26,7 +27,8 @@ from ws import chat_phase
 from core import layout
 
 logger = logging.getLogger("claude-proxy.chat-api")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # Manual-rename titles fan out to OTHER users' sidebars (title_updated), so
 # sanitization is a spoofing defense, not cosmetics: strip C0/C1 controls,
@@ -101,20 +103,27 @@ def _task_mutation_allowed(role: str, acting: str, scope: str,
 
 
 def can_access_chat(u: UserContext, chat: dict) -> bool:
-    """May this user view this dashboard chat?
+    """May this user open this chat by id? The one rule the REST routes, the
+    dashboard's resume and every frame naming a chat share.
 
     Owner-equality (per-user chats) OR admin OR — for a Shared-only agent's
     synthetic-owner chat — any user assigned to the agent OR — for a task-run
     chat (synthetic ``task::`` owner) — the task listing's run rule:
     agent-scoped runs for anyone with agent access, user-scoped runs only for
     their creator. Without that branch the REST surface denies rows the
-    ``kind=tasks`` listing itself shows. Mutations layer ``can_mutate_chat``
-    on top.
+    ``kind=tasks`` listing itself shows. A phone call's conversation opens
+    for the agent's managers, which is who the conversations list serves, on
+    a person's dashboard only: a manager's session token or API key reads no
+    call. The chat's OWNER decides, never the agent's current mode: a
+    per-user chat from before an agent turned Shared-only stays its owner's.
+    Mutations layer ``can_mutate_chat`` on top.
     """
-    from core.session.visibility import is_shared_chat_owner
+    from core.session.visibility import is_phone_chat_owner, is_shared_chat_owner
     if u.is_admin:
         return True
     owner = chat.get("user_sub", "")
+    if session_kind.of_chat(chat) is session_kind.PHONE or is_phone_chat_owner(owner):
+        return not u.is_api_key and u.can_manage_agent(chat.get("agent", ""))
     if owner == u.sub:
         return True
     if is_shared_chat_owner(owner):
@@ -380,19 +389,76 @@ async def list_active_chats(
     from core.session import interactive_session, warmup_registry
     from datetime import datetime, timedelta, timezone
 
-    # Warming backfill: chats registered as warming have NO open turn yet, so
-    # the streaming sets miss them, but the title is already persisted
-    # (_persist_first_prompt runs before the warmup frame goes out), which is
-    # exactly the metadata the client's placeholder row needs. The registry
-    # entry's user_sub is the WARMER, not the audience — visibility comes from
-    # the chat row via the same gates as the streaming set. A registry entry
-    # with no DB row is skipped. The streaming row wins when a turn opened
-    # between the two snapshots (unregister precedes kick/submit, but stay
-    # defensive). The 48h window of the finished backfill is fixed here too.
+    # The in-memory snapshot on the loop, the rows in one batched job, and
+    # a 1 s memo keyed by everything the rows depend on besides the
+    # database (the viewer and the id sets): the tabs of one person seeding
+    # at once share one job, and a tab that navigates away cancels nobody's.
     streaming = list(pump_streaming()) + list(interactive_session.streaming_chat_ids())
     warming = list(warmup_registry.inflight_chat_ids())
     since = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
-    return {"chats": await run_db(_active_rows, u, streaming, warming, since)}
+    key = (u.sub, u.acting_sub, u.role, u.kind, u.agent, u.is_api_key,
+           tuple(sorted(u.agents)), tuple(sorted(u.agent_roles.items())),
+           tuple(sorted(set(streaming))), tuple(sorted(set(warming))))
+    return {"chats": await _active_memo.get(
+        key, lambda: run_db(_active_rows, u, streaming, warming, since))}
+
+
+_ACTIVE_MEMO_TTL_S = 1.0
+_ACTIVE_MEMO_MAX = 256
+
+
+class _ActiveMemo:
+    """``/v1/chats/active`` answers, memoized per key for ``ttl`` from the
+    job's completion and single-flighted: concurrent callers of one key
+    share the job (through ``asyncio.shield``, so a cancelled caller cancels
+    nobody's), a job that raises leaves no entry, and expired entries are
+    pruned on insert, at most ``cap`` kept."""
+
+    def __init__(self, ttl: float = _ACTIVE_MEMO_TTL_S, cap: int = _ACTIVE_MEMO_MAX) -> None:
+        self.ttl = ttl
+        self.cap = cap
+        self._done: dict[tuple, tuple[float, list]] = {}
+        self._flights: dict[tuple, asyncio.Future] = {}
+        self.hits = 0
+
+    async def get(self, key: tuple, job) -> list:
+        now = time.monotonic()
+        entry = self._done.get(key)
+        if entry is not None and now - entry[0] < self.ttl:
+            self.hits += 1
+            return entry[1]
+        flight = self._flights.get(key)
+        if flight is not None:
+            self.hits += 1
+        else:
+            # The job is its own task and every caller, the first included,
+            # awaits it shielded: a cancelled caller cancels nobody's job.
+            flight = self._flights[key] = asyncio.get_running_loop().create_task(job())
+            flight.add_done_callback(lambda f: self._finish(key, f))
+        return await asyncio.shield(flight)
+
+    def _finish(self, key: tuple, flight: asyncio.Task) -> None:
+        self._flights.pop(key, None)
+        if not flight.cancelled() and flight.exception() is None:
+            self._store(key, flight.result())
+
+    def _store(self, key: tuple, rows: list) -> None:
+        now = time.monotonic()
+        if len(self._done) >= self.cap:
+            for k, (at, _) in list(self._done.items()):
+                if now - at >= self.ttl:
+                    del self._done[k]
+            while len(self._done) >= self.cap:
+                del self._done[next(iter(self._done))]
+        self._done[key] = (now, rows)
+
+    def reset(self) -> None:
+        self._done.clear()
+        self._flights.clear()
+        self.hits = 0
+
+
+_active_memo = _ActiveMemo()
 
 
 def _active_rows(u: UserContext, streaming_ids: list[str], warming_ids: list[str],
@@ -494,15 +560,24 @@ async def get_chat(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
+
+    def _job():
+        chat = task_store.get_chat(chat_id)
+        if not chat or not can_access_chat(u, chat):
+            return chat, False, None
+        # One paged logic for both the initial window and lazy scroll-back: the
+        # newest `limit` rows (older than `before_id` when scrolling back) +
+        # whether still-older rows remain. An older page needs no `chat`; the
+        # initial fetch carries it.
+        return chat, True, task_store.get_chat_messages_page(
+            chat_id, limit, before_id=before_id)
+
+    chat, allowed, page = await run_db(_job)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
+    if not allowed:
         raise HTTPException(status_code=403, detail="Access denied")
-    # One paged logic for both the initial window and lazy scroll-back: the newest
-    # `limit` rows (older than `before_id` when scrolling back) + whether still-older
-    # rows remain. An older page needs no `chat`; the initial fetch carries it.
-    messages, has_more = task_store.get_chat_messages_page(chat_id, limit, before_id=before_id)
+    messages, has_more = page
     if before_id is not None:
         return {"messages": messages, "has_more": has_more}
     return {"chat": chat, "messages": messages, "has_more": has_more}
@@ -525,20 +600,30 @@ async def get_chat_project(
     (its parent, or itself when it is the delegating chat) plus the workers
     that root spawned. 404 only for chats with no delegation markers at all."""
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
+
+    def _job():
+        chat = task_store.get_chat(chat_id)
+        if not chat or not can_access_chat(u, chat):
+            return chat, False, None
+        project_id = chat.get("project_id") or ""
+        if project_id:
+            rows = task_store.list_chats_by_project(project_id)
+        elif chat.get("parent_chat_id") or chat.get("delegate_role") \
+                or chat.get("origin") == "delegated":
+            root_id = chat.get("parent_chat_id") or chat_id
+            root = chat if root_id == chat_id else task_store.get_chat(root_id)
+            rows = ([root] if root else []) + task_store.list_chats_by_parent(root_id)
+        else:
+            return chat, True, None
+        return chat, True, [r for r in rows if can_access_chat(u, r)]
+
+    chat, allowed, rows = await run_db(_job)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
+    if not allowed:
         raise HTTPException(status_code=403, detail="Access denied")
     project_id = chat.get("project_id") or ""
-    if project_id:
-        rows = task_store.list_chats_by_project(project_id)
-    elif chat.get("parent_chat_id") or chat.get("delegate_role") \
-            or chat.get("origin") == "delegated":
-        root_id = chat.get("parent_chat_id") or chat_id
-        root = chat if root_id == chat_id else task_store.get_chat(root_id)
-        rows = ([root] if root else []) + task_store.list_chats_by_parent(root_id)
-    else:
+    if rows is None:
         raise HTTPException(status_code=404, detail="Chat has no project")
     from services.delegation.lane_status import chat_status
     lanes = [
@@ -554,7 +639,6 @@ async def get_chat_project(
             "updated_at": r.get("updated_at"),
         }
         for r in rows
-        if can_access_chat(u, r)
     ]
     return {"project_id": project_id, "chats": lanes}
 
@@ -578,10 +662,15 @@ async def get_chat_pins(
     files API, where the viewer's own path-policy role decides what renders
     (a pin row itself leaks only the path + title)."""
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
+
+    def _job():
+        chat = task_store.get_chat(chat_id)
+        return chat, bool(chat) and can_access_chat(u, chat)
+
+    chat, allowed = await run_db(_job)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
+    if not allowed:
         raise HTTPException(status_code=403, detail="Access denied")
     from api.apps.apps import app_access, shape_app_rows
 
@@ -616,15 +705,17 @@ async def get_chat_pins(
 
 # --- resolve-path: live file-path chips (chat markdown → previewable file) ---
 
-# Collabora document types the workspace preview stack renders via
-# ``/v1/documents/wopi-url``. The proxy has NO existing extension
-# classification (the dashboard's ``lib/fileTypes.ts`` DOCUMENT_EXTENSIONS is
-# frontend-only; ``wopi.py`` gates on location, not extension), so this small
-# module-level set is defined here, matching Collabora's doc types.
+# Document types the workspace preview stack renders: Collabora's doc types
+# (via ``/v1/documents/wopi-url``) and ``.pdf``, which the Files tab
+# previews. The proxy has NO existing extension classification (the
+# dashboard's ``lib/fileTypes.ts`` DOCUMENT_EXTENSIONS is frontend-only;
+# ``wopi.py`` gates on location, not extension), so this small module-level
+# set is defined here.
 _COLLABORA_DOC_EXTENSIONS = frozenset({
     ".docx", ".doc", ".odt", ".rtf",
     ".xlsx", ".xls", ".ods", ".csv",
     ".pptx", ".ppt", ".odp",
+    ".pdf",
 })
 
 # Agent-tree top-level segments a chip path may name directly. Deliberately
@@ -756,6 +847,58 @@ def _chip_path_candidates(
     return candidates
 
 
+def _resolve_chip_in_chat(u: UserContext, chat: dict, raw_path: str) -> dict:
+    """The resolve-path answer for a chat the viewer may open. Blocking (the
+    username, the agent row, the chat machine's row, the file checks): run it
+    on the DB lane."""
+    agent = chat.get("agent", "")
+    normalized = _normalize_chip_path(raw_path)
+    if not normalized:
+        return {"found": False}
+
+    from api.agents._common import _get_agent_dir
+    from api.agents.files import safe_agent_path
+    try:
+        agent_dir = _get_agent_dir(agent)
+    except HTTPException:
+        return {"found": False}  # deleted agent — same no-oracle contract
+
+    username = task_store.get_username_by_sub(u.sub) or ""
+    for candidate in _chip_path_candidates(agent, chat, normalized, username):
+        # ONE gate per candidate: safe_agent_path normalizes, confines after
+        # symlink resolution, and runs the OAuth + role checks internally. It
+        # raises 400/403 — it never returns "no" — so every HTTPException is
+        # "not a match", which is what keeps the {found: false} contract.
+        try:
+            resolved, _uname = safe_agent_path(
+                agent_dir, agent, candidate, u, writing=False, username=username)
+        except HTTPException:
+            continue
+        if not resolved.is_file():
+            continue  # directories → found:false (v1 previews files only)
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            continue  # vanished between checks — not a match
+        rel = resolved.relative_to(agent_dir.resolve()).as_posix()
+        # previewable mirrors the /v1/documents/wopi-url confinement (workspace/
+        # + users/ only) so the client never requests a preview that endpoint
+        # would reject, AND the extension must be a previewable document type.
+        previewable = (
+            resolved.suffix.lower() in _COLLABORA_DOC_EXTENSIONS
+            and layout.head_of(rel) in (layout.WORKSPACE, layout.USERS)
+        )
+        return {
+            "found": True,
+            "agent": agent,
+            "path": rel,
+            "filename": resolved.name,
+            "size": size,
+            "previewable": previewable,
+        }
+    return {"found": False}
+
+
 @router.post("/v1/chats/{chat_id}/resolve-path")
 async def resolve_chat_path(
     chat_id: str,
@@ -778,58 +921,19 @@ async def resolve_chat_path(
     Read-only by construction: the gate never passes ``writing=True``.
     """
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
+
+    def _job():
+        chat = task_store.get_chat(chat_id)
+        if not chat or not can_access_chat(u, chat):
+            return chat, False, None
+        return chat, True, _resolve_chip_in_chat(u, chat, req.path)
+
+    chat, allowed, result = await run_db(_job)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
+    if not allowed:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    agent = chat.get("agent", "")
-    normalized = _normalize_chip_path(req.path)
-    if not normalized:
-        return {"found": False}
-
-    from api.agents._common import _get_agent_dir
-    from api.agents.files import safe_agent_path
-    try:
-        agent_dir = _get_agent_dir(agent)
-    except HTTPException:
-        return {"found": False}  # deleted agent — same no-oracle contract
-
-    username = task_store.get_username_by_sub(u.sub) or ""
-    for candidate in _chip_path_candidates(agent, chat, normalized, username):
-        # ONE gate per candidate: safe_agent_path normalizes, confines after
-        # symlink resolution, and runs the OAuth + role checks internally. It
-        # raises 400/403 — it never returns "no" — so every HTTPException is
-        # "not a match", which is what keeps the {found: false} contract.
-        try:
-            resolved, _uname = safe_agent_path(
-                agent_dir, agent, candidate, u, writing=False)
-        except HTTPException:
-            continue
-        if not resolved.is_file():
-            continue  # directories → found:false (v1 previews files only)
-        try:
-            size = resolved.stat().st_size
-        except OSError:
-            continue  # vanished between checks — not a match
-        rel = resolved.relative_to(agent_dir.resolve()).as_posix()
-        # previewable mirrors the /v1/documents/wopi-url confinement (workspace/
-        # + users/ only) so the client never requests a preview that endpoint
-        # would reject, AND the extension must be a Collabora document type.
-        previewable = (
-            resolved.suffix.lower() in _COLLABORA_DOC_EXTENSIONS
-            and layout.head_of(rel) in (layout.WORKSPACE, layout.USERS)
-        )
-        return {
-            "found": True,
-            "agent": agent,
-            "path": rel,
-            "filename": resolved.name,
-            "size": size,
-            "previewable": previewable,
-        }
-    return {"found": False}
+    return result
 
 
 @router.post("/v1/chats")

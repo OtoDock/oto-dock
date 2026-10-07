@@ -138,13 +138,21 @@ def test_gate_traversal_collapses_before_matching():
     assert not r.allowed
 
 
-def test_gate_bg_output_read_survives_with_carve_disabled():
-    # Regression guard: contexts without a cli_session_id (phone, synthetic,
-    # pre-upgrade rehydrations) keep the read-only bg-output carve.
-    ctx = _ctx(cli_session_id="", placement=dataclasses.replace(_PLACEMENT, claude_runtime_root=""))
+def test_gate_bg_output_read_needs_the_sessions_own_id():
+    # The bg-output carve is scoped by the session id like the runtime tree:
+    # a context without one (phone, synthetic, pre-upgrade rehydrations) gets
+    # nothing from it, and another session's output never matches.
+    no_sid = _ctx(cli_session_id="", placement=dataclasses.replace(_PLACEMENT, claude_runtime_root=""))
     r = resolve_path_for_session(
-        ctx, f"/tmp/claude-1000/-home-dave/{SID}/tasks/t1.output", writing=False)
+        no_sid, f"/tmp/claude-1000/-home-dave/{SID}/tasks/t1.output", writing=False)
+    assert not r.allowed
+    own = _ctx(placement=dataclasses.replace(_PLACEMENT, claude_runtime_root=""))
+    r = resolve_path_for_session(
+        own, f"/tmp/claude-1000/-home-dave/{SID}/tasks/t1.output", writing=False)
     assert r.allowed and r.is_remote_pull
+    r = resolve_path_for_session(
+        own, "/tmp/claude-1000/-home-dave/0ther-session/tasks/t1.output", writing=False)
+    assert not r.allowed
 
 
 # --------------------------------------------------------------------------- #

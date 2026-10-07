@@ -63,6 +63,7 @@ async def test_emit_fans_out_to_all_listeners():
 
     await warmup_registry.emit("c1", {"type": "warmup_progress", "pct": 10})
     await warmup_registry.emit("c1", {"type": "warmup_progress", "pct": 20})
+    await warmup_registry.drain_listeners()
 
     assert len(received_a) == 2
     assert len(received_b) == 2
@@ -82,6 +83,7 @@ async def test_event_history_bounded_at_50():
 
     for i in range(60):
         await warmup_registry.emit("c1", {"type": "warmup_progress", "pct": i})
+    await warmup_registry.drain_listeners()
 
     # All 60 reach the live listener.
     assert len(sent) == 60
@@ -153,7 +155,37 @@ async def test_emit_continues_when_one_listener_raises():
 
     # _send_a's exception must not stop _send_b from receiving.
     await warmup_registry.emit("c1", {"type": "warmup_progress"})
+    await warmup_registry.drain_listeners()
     assert len(received_b) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_slow_listener_delays_only_itself_and_keeps_its_order():
+    """One tab's paused socket must not hold the other tabs' warmup frames
+    (or the server kick behind warmup_ready): the emit returns at once and
+    each listener's sends run on their own chain, in order."""
+    gate = asyncio.Event()
+    slow: list[int] = []
+    fast: list[int] = []
+
+    async def _slow(ev):
+        await gate.wait()
+        slow.append(ev["n"])
+
+    async def _fast(ev):
+        fast.append(ev["n"])
+
+    await warmup_registry.register("c1", "u", "a")
+    await warmup_registry.attach_listener("c1", _slow)
+    await warmup_registry.attach_listener("c1", _fast)
+    for n in range(3):
+        await asyncio.wait_for(warmup_registry.emit("c1", {"type": "warmup_progress", "n": n}), 0.5)
+    await asyncio.sleep(0)
+    assert fast == [0, 1, 2]
+    assert slow == []
+    gate.set()
+    await warmup_registry.drain_listeners()
+    assert slow == [0, 1, 2]
 
 
 @pytest.mark.asyncio

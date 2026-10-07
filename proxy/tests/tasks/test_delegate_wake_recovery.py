@@ -108,7 +108,7 @@ def _stub_spawn(monkeypatch, layer):
     monkeypatch.setattr(mcp_registry, "build_session_mcp_config",
                         lambda *a, **k: (None, {}, [], {}, []))
 
-    async def _echo(layer, session_id, chat_id, agent, result_prompt):
+    async def _echo(layer, session_id, chat_id, agent, result_prompt, **kw):
         return ""
     monkeypatch.setattr(delivery, "_run_echo_turn_pumped", _echo)
 
@@ -152,6 +152,92 @@ class TestPendingWakeStore:
 
     def test_append_missing_chat_is_noop(self, temp_db):
         assert not task_store.append_pending_delegate_wake("no-such-chat", "w")
+
+    def test_a_wake_carries_its_person_and_role(self, temp_db):
+        """Each stored wake names who it runs as; the prompts claim (the turn
+        that claims runs as its own person) still returns the prompts."""
+        task_store.create_chat("chat-p", "agent::pa", "pa")
+        assert task_store.append_pending_delegate_wake("chat-p", "for ann", person="ann",
+                                                       role="editor")
+        assert task_store.append_pending_delegate_wake("chat-p", "for nobody")
+        assert task_store.append_pending_delegate_wake("chat-p", "by cy", role="viewer",
+                                                       by="cy")
+        assert task_store.claim_pending_wake_records("chat-p") == [
+            {"prompt": "for ann", "person": "ann", "role": "editor", "by": ""},
+            {"prompt": "for nobody", "person": "", "role": "", "by": ""},
+            {"prompt": "by cy", "person": "", "role": "viewer", "by": "cy"},
+        ]
+        task_store.append_pending_delegate_wake("chat-p", "again", person="ann", role="editor")
+        assert task_store.claim_pending_delegate_wake("chat-p") == ["again"]
+
+    def test_a_wake_stored_by_1_7_0_reads_as_no_person(self, temp_db):
+        from storage.pg import get_conn
+        task_store.create_chat("chat-old", "agent::pa", "pa")
+        with get_conn() as conn:
+            conn.execute("UPDATE chats SET pending_delegate_wake=%s WHERE id=%s",
+                         ('["old one", 7, {"prompt": "new", "person": "bo", "role": "manager"}]',
+                          "chat-old"))
+            conn.commit()
+        assert task_store.claim_pending_wake_records("chat-old") == [
+            {"prompt": "old one", "person": "", "role": "", "by": ""},
+            {"prompt": "new", "person": "bo", "role": "manager", "by": ""},
+        ]
+
+    def test_a_departed_persons_wakes_are_dropped_and_the_rest_kept(self, temp_db):
+        task_store.create_chat("chat-x", "agent::pa", "pa")
+        task_store.create_chat("chat-y", "agent::pb", "pb")
+        task_store.append_pending_delegate_wake("chat-x", "ann's", person="ann", role="editor")
+        task_store.append_pending_delegate_wake("chat-x", "bo's", person="bo", role="editor")
+        task_store.append_pending_delegate_wake("chat-y", "ann's too", person="ann", role="editor")
+        task_store.append_pending_delegate_wake("chat-y", "scheduled by ann", role="viewer",
+                                                by="ann")
+        assert sorted(task_store.pending_wake_agents_of("ann")) == ["pa", "pb"]
+        assert task_store.drop_pending_wakes_of("ann", ["pa"]) == 1
+        assert task_store.claim_pending_delegate_wake("chat-x") == ["bo's"]
+        assert task_store.drop_pending_wakes_of("ann", None) == 2
+        assert task_store.claim_pending_delegate_wake("chat-y") == []
+
+
+class TestWakeFormatMigration:
+    """1.7.0 stored a wake as a plain string; the migration rewrites each
+    stored value to the record form once (no person), forward on an
+    existing database, and leaves a converted value alone."""
+
+    @staticmethod
+    def _migrate():
+        from storage import pg as pg_pool
+        from storage import schema as pg_schema
+        with pg_pool.get_conn() as conn:
+            pg_schema.run_migrations(conn)
+            conn.commit()
+
+    @staticmethod
+    def _raw(chat_id):
+        from storage.pg import get_conn
+        with get_conn() as conn:
+            return conn.execute("SELECT pending_delegate_wake FROM chats WHERE id=%s",
+                                (chat_id,)).fetchone()["pending_delegate_wake"]
+
+    def test_the_string_form_is_rewritten_once(self, temp_db):
+        import json
+        from storage.pg import get_conn
+        for cid in ("m-old", "m-new", "m-bad", "m-none"):
+            task_store.create_chat(cid, "agent::pa", "pa")
+        task_store.append_pending_delegate_wake("m-new", "kept", person="ann", role="editor")
+        new_raw = self._raw("m-new")
+        with get_conn() as conn:
+            for cid, raw in (("m-old", '["one", "two"]'), ("m-bad", "not json")):
+                conn.execute("UPDATE chats SET pending_delegate_wake=%s WHERE id=%s", (raw, cid))
+            conn.commit()
+        self._migrate()
+        assert json.loads(self._raw("m-old")) == [
+            {"prompt": "one", "person": "", "role": "", "by": ""},
+            {"prompt": "two", "person": "", "role": "", "by": ""}]
+        assert self._raw("m-new") == new_raw
+        assert self._raw("m-bad") == "" and self._raw("m-none") == ""
+        once = self._raw("m-old")
+        self._migrate()
+        assert self._raw("m-old") == once
 
 
 class TestWakeAdmission:
@@ -543,7 +629,7 @@ class TestInteractiveRouting:
 
         echo_calls: list[str] = []
 
-        async def _fake_echo(layer, session_id, chat_id, agent, result_prompt):
+        async def _fake_echo(layer, session_id, chat_id, agent, result_prompt, **kw):
             echo_calls.append(chat_id)
             return ""
         monkeypatch.setattr(delivery, "_run_echo_turn_pumped", _fake_echo)
@@ -728,6 +814,48 @@ class TestHeadlessChokepointReplay:
         assert "PENDING WAKE X" in sent_prompt
         assert sent_prompt.index("PENDING WAKE X") < sent_prompt.index("user message")
 
+    def test_a_dashboard_turn_pump_names_the_socket_person(self, temp_db, monkeypatch):
+        """The pump of a dashboard turn runs as the socket's person: a system
+        prompt it never sends is stored as that person's wake."""
+        from core.events import stream_pump
+        from core.events.common_events import CommonEvent, TEXT, DONE
+        from tests.fixtures.ws_dashboard_harness import (
+            FakeExecutionLayer, dashboard_connection, drain_startup,
+            make_test_agent, run_ws_scenario, session_cookie, set_username,
+            stub_dashboard_seams, warm_new_chat,
+        )
+
+        layer = FakeExecutionLayer()
+        layer.turn_events = [
+            CommonEvent(type=TEXT, data={"text": "ok"}),
+            CommonEvent(type=DONE, data={}),
+        ]
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        persons: list[str] = []
+        start = stream_pump.ChatStreamPump.start
+
+        def _start(pump):
+            persons.append(pump.wake_person)
+            return start(pump)
+
+        monkeypatch.setattr(stream_pump.ChatStreamPump, "start", _start)
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                await warm_new_chat(ws, layer, slug)
+                ws.client_send({"type": "chat", "text": "user message"})
+                for _ in range(40):
+                    frame = await ws.next_frame()
+                    if frame.get("type") == "done":
+                        return
+                raise AssertionError("turn never completed")
+
+        run_ws_scenario(scenario)
+        assert persons and set(persons) == {"user-admin"}
+
 
 class TestRedeliverPendingWakes:
     """Startup / satellite-reconnect sweep (``scheduler.redeliver_pending_wakes``)."""
@@ -736,7 +864,8 @@ class TestRedeliverPendingWakes:
         from core.session import session_delivery
 
         async def _fake(chat_id, text, **kw):
-            outcomes.append((chat_id, text, kw.get("user_sub"), kw.get("role")))
+            outcomes.append((chat_id, text, kw.get("user_sub"), kw.get("role"),
+                             kw.get("oneshot_fn") is not None))
             outcome = session_delivery.DeliveryOutcome(
                 path=path, response=None, chat_id=chat_id, session_id="",
             )
@@ -807,13 +936,144 @@ class TestRedeliverPendingWakes:
         assert [d[0] for d in delivered] == ["chat-m1"]
         assert task_store.claim_pending_delegate_wake("chat-m2") == ["WB"]
 
-    def test_sweep_shared_owner_delivers_without_a_user_as_viewer(self, temp_db, monkeypatch):
-        task_store.create_chat("chat-sh1", "agent::pa", "pa")
-        task_store.append_pending_delegate_wake("chat-sh1", "W")
+    def test_machine_scope_includes_the_unpinned_chats_running_there(self, temp_db, monkeypatch):
+        # A chat with no pinned target whose session runs on the machine (a
+        # wake stored while its machine reconnected) replays at that reconnect.
+        _member("user-1", "pa")
+        task_store.create_chat("chat-u1", "user-1", "pa")
+        task_store.update_chat("chat-u1", session_id="s-there")
+        task_store.append_pending_delegate_wake("chat-u1", "WU")
+        task_store.create_chat("chat-u2", "user-1", "pa")
+        task_store.update_chat("chat-u2", session_id="s-elsewhere")
+        task_store.append_pending_delegate_wake("chat-u2", "WE")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+
+        woken = asyncio.run(scheduler.redeliver_pending_wakes(
+            machine_id="mach-A", session_ids=["s-there"]))
+        assert woken == 1
+        assert [d[0] for d in delivered] == ["chat-u1"]
+        assert task_store.claim_pending_delegate_wake("chat-u2") == ["WE"]
+
+    @staticmethod
+    def _shared_only(agent: str = "so") -> None:
+        from storage.agents import agent_store
+        agent_store.create_agent(agent, agent.upper(), collaborative=False,
+                                 default_scope="agent")
+
+    def test_a_shared_only_wake_runs_as_its_person(self, temp_db, monkeypatch):
+        self._shared_only()
+        _person("user-ann", "ann", agent="so", agent_role="editor")
+        task_store.create_chat("chat-sp", "agent::so", "so")
+        task_store.append_pending_delegate_wake("chat-sp", "W", person="user-ann",
+                                                role="editor")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+        assert asyncio.run(scheduler.redeliver_pending_wakes()) == 1
+        assert delivered == [("chat-sp", "W", "user-ann", "editor", True)]
+
+    def test_a_shared_only_wake_whose_person_fell_below_editor_is_dropped(
+            self, temp_db, monkeypatch):
+        self._shared_only()
+        _person("user-cy", "cy", agent="so", agent_role="contributor")
+        task_store.create_chat("chat-sd", "agent::so", "so")
+        task_store.append_pending_delegate_wake("chat-sd", "W", person="user-cy",
+                                                role="editor")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+        assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
+        assert delivered == []
+        assert task_store.claim_pending_delegate_wake("chat-sd") == []
+
+    def test_two_peoples_wakes_go_each_as_its_own_person(self, temp_db, monkeypatch):
+        self._shared_only()
+        _person("user-ann", "ann", agent="so", agent_role="editor")
+        _person("user-bo", "bo", agent="so", agent_role="manager")
+        task_store.create_chat("chat-s2p", "agent::so", "so")
+        task_store.append_pending_delegate_wake("chat-s2p", "A1", person="user-ann",
+                                                role="editor")
+        task_store.append_pending_delegate_wake("chat-s2p", "B1", person="user-bo",
+                                                role="manager")
+        task_store.append_pending_delegate_wake("chat-s2p", "A2", person="user-ann",
+                                                role="editor")
         delivered: list = []
         self._fake_ladder(monkeypatch, delivered)
         asyncio.run(scheduler.redeliver_pending_wakes())
-        assert delivered[0][2] is None and delivered[0][3] == "viewer"
+        assert delivered == [("chat-s2p", "A1\n\nA2", "user-ann", "editor", True),
+                             ("chat-s2p", "B1", "user-bo", "manager", True)]
+
+    def test_a_wake_with_no_person_below_editor_spawns_nothing(self, temp_db, monkeypatch):
+        """A wake stored by 1.7.0 on a Shared-only chat names nobody: it may
+        ride a live process but never starts one (the start floor would
+        refuse it at every boot); left undelivered, it stays for a person's
+        next turn."""
+        self._shared_only()
+        task_store.create_chat("chat-sh1", "agent::so", "so")
+        task_store.append_pending_delegate_wake("chat-sh1", "W")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered, path="none")
+        assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
+        assert delivered == [("chat-sh1", "W", None, "viewer", False)]
+        assert task_store.claim_pending_delegate_wake("chat-sh1") == ["W"]
+
+    def test_a_former_shared_chats_no_person_wake_is_dropped_as_the_fire_drops_it(
+            self, temp_db, monkeypatch, caplog):
+        """An ``agent::`` chat of an agent that is no longer Shared-only takes no
+        person's next turn: a no-person wake below the editor tier that nothing
+        took is dropped there, as ``_fire_continuation`` drops it, never stored
+        again at every sweep."""
+        from core.session.visibility import is_shared_only
+        assert not is_shared_only("pa")
+        _member("user-vi", "pa", "viewer")
+        task_store.create_chat("chat-fs", "agent::pa", "pa")
+        task_store.append_pending_delegate_wake("chat-fs", "W", by="user-vi")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered, path="none")
+        with caplog.at_level("INFO", logger="claude-proxy.scheduler"):
+            assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
+        assert delivered == [("chat-fs", "W", None, "viewer", False)]
+        assert task_store.claim_pending_delegate_wake("chat-fs") == []
+        assert any("dropped" in r.getMessage() for r in caplog.records)
+
+    def test_a_phone_chats_wake_nothing_takes_is_dropped_once(self, temp_db, monkeypatch, caplog):
+        task_store.create_chat("chat-ph", "phone", "pa")
+        task_store.append_pending_delegate_wake("chat-ph", "W")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered, path="none")
+        with caplog.at_level("INFO", logger="claude-proxy.scheduler"):
+            assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
+        assert delivered == [("chat-ph", "W", None, "viewer", False)]
+        assert task_store.claim_pending_delegate_wake("chat-ph") == []
+        assert any("dropped" in r.getMessage() for r in caplog.records)
+
+    def test_a_phone_wake_stored_at_manager_replays_at_manager(self, temp_db, monkeypatch):
+        task_store.create_chat("chat-pm", "phone", "pa")
+        task_store.append_pending_delegate_wake("chat-pm", "W", role="manager")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+        asyncio.run(scheduler.redeliver_pending_wakes())
+        assert delivered == [("chat-pm", "W", None, "manager", True)]
+
+    def test_the_real_ladder_starts_no_session_below_editor(self, temp_db, monkeypatch):
+        """End to end through the ladder: no live process, so nothing runs,
+        nothing raises, and the wake stays stored."""
+        self._shared_only()
+        task_store.create_chat("chat-real", "agent::so", "so")
+        task_store.append_pending_delegate_wake("chat-real", "W")
+
+        async def _dead(*a, **k):
+            return None
+
+        spawned: list = []
+
+        async def _spawn(*a, **k):
+            spawned.append(a)
+            return None
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _dead)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _spawn)
+        assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
+        assert spawned == []
+        assert task_store.claim_pending_delegate_wake("chat-real") == ["W"]
 
     def test_sweep_drops_the_wakes_of_an_owner_who_lost_the_agent(self, temp_db, monkeypatch):
         task_store.create_chat("chat-lost", "user-viewer", "pa")   # no row on "pa"
@@ -1121,6 +1381,12 @@ class TestWakeRespawnConfig:
         """The layer and a build that returns a flat env with a manifest
         injected variable, one bundle, and the bash-only key list."""
         from core.credentials.mcp_broker import SecretBundle
+        from core.credentials.mcp_gateway import GatewayCredential
+
+        def _gateway_cred():
+            return GatewayCredential(upstream="http://localhost:8935", path="/mcp",
+                                     allowlist_key="github", value="bearer-x",
+                                     proxy_local=True)
         from core.session import session_manager
         from services.mcp import mcp_registry
         layer = self._Layer()
@@ -1130,10 +1396,10 @@ class TestWakeRespawnConfig:
         def _build(*a, **k):
             builds.append((a, k))
             return (config_path, {"GH_TOKEN": "tok-flat"}, {},
-                    {"github-mcp": SecretBundle(http_bearer="bearer-x")}, {"GH_TOKEN"})
+                    {"github-mcp": SecretBundle(gateway=_gateway_cred())}, {"GH_TOKEN"})
         monkeypatch.setattr(mcp_registry, "build_session_mcp_config", _build)
 
-        async def _echo(layer, session_id, chat_id, agent, result_prompt):
+        async def _echo(layer, session_id, chat_id, agent, result_prompt, **kw):
             return ""
         monkeypatch.setattr(delivery, "_run_echo_turn_pumped", _echo)
         return layer, builds
@@ -1146,7 +1412,7 @@ class TestWakeRespawnConfig:
     def _assert_credentials(self, cfg, *, person: str) -> None:
         assert cfg.credential_env["GH_TOKEN"] == "tok-flat"
         assert set(cfg.mcp_secret_bundles) == {"github-mcp"}
-        assert cfg.mcp_secret_bundles["github-mcp"].http_bearer == "bearer-x"
+        assert cfg.mcp_secret_bundles["github-mcp"].gateway.value == "bearer-x"
         assert cfg.credential_env["OTO_AGENT_NAME"] == cfg.agent_name
         assert cfg.credential_env["OTO_SESSION_ID"] == _SID
         assert cfg.credential_env["OTO_USER_SUB"] == person
@@ -1299,6 +1565,72 @@ class TestWakeRespawnConfig:
         assert prompt.startswith("PERSONA") and "# Session Context" in prompt
         assert "# Folders" in prompt and "contributor" in prompt
 
+    def test_the_respawn_carries_the_delegation_roster_and_the_dynamic_context(
+            self, temp_db, ledger, monkeypatch):
+        """The woken session reaches and lists its delegation targets as the
+        chat builder makes them (self first, a person's wake only the agents
+        they hold), and its prompt carries the dynamic MCP context."""
+        from services.engines import subscription_pool as sp
+        from services.mcp import dynamic_context
+        from storage.agents import agent_store
+        for slug in ("pa", "peer-held", "peer-other"):
+            agent_store.create_agent(slug, slug.upper(), collaborative=True, default_scope="user")
+        agent_store.set_delegation_targets("pa", ["peer-held", "peer-other"])
+        _person("user-own", "owen", agent="pa", agent_role="editor")
+        from storage.identity import db_users
+        db_users.add_user_agent("user-own", "peer-held", "viewer", "user-admin")
+        _layer, builds = self._stub(monkeypatch)
+        monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-O", {}))
+        seen = self._capture_prompt(monkeypatch)
+        asked: list = []
+
+        async def _contexts(agent, assigned, **kw):
+            asked.append(kw["delegation_targets"])
+            return ["ROSTER BLOCK"]
+        monkeypatch.setattr(dynamic_context, "get_dynamic_contexts", _contexts)
+        task_store.create_chat("chat-w10", "user-own", "pa")
+        assert asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "wake!", user_sub="user-own", role="editor", chat_id="chat-w10")) == ""
+        (_args, kw), = builds
+        assert kw["delegation_targets"] == ["pa", "peer-held"]
+        assert asked == [["pa", "peer-held"]]
+        (_on_loop, prompt_kw), = seen
+        assert prompt_kw["dynamic_contexts"] == ["ROSTER BLOCK"]
+
+    def test_a_platform_admins_respawn_keeps_every_target(self, temp_db, ledger, monkeypatch):
+        """A platform admin's chat builder lists every target; so does the
+        woken session, whatever the admin's own agent row says. The assigned
+        MCPs of the dynamic context are read off the loop."""
+        import asyncio as _asyncio
+        from services.engines import subscription_pool as sp
+        from services.mcp import dynamic_context, mcp_registry
+        from storage.agents import agent_store
+        for slug in ("pa", "peer-a", "peer-b"):
+            agent_store.create_agent(slug, slug.upper(), collaborative=True, default_scope="user")
+        agent_store.set_delegation_targets("pa", ["peer-a", "peer-b"])
+        _person("user-adm", "addie", agent="pa", agent_role="viewer", platform_role="admin")
+        _layer, builds = self._stub(monkeypatch)
+        monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-A", {}))
+        self._capture_prompt(monkeypatch)
+        real = mcp_registry.get_agent_mcps
+
+        def _off_loop(*a, **k):
+            try:
+                _asyncio.get_running_loop()
+            except RuntimeError:
+                return real(*a, **k)
+            raise AssertionError("get_agent_mcps ran on the event loop")
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps", _off_loop)
+
+        async def _contexts(agent, assigned, **kw):
+            return []
+        monkeypatch.setattr(dynamic_context, "get_dynamic_contexts", _contexts)
+        task_store.create_chat("chat-w12", "user-adm", "pa")
+        assert _asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "wake!", user_sub="user-adm", role="viewer", chat_id="chat-w12")) == ""
+        (_args, kw), = builds
+        assert kw["delegation_targets"] == ["pa", "peer-a", "peer-b"]
+
     def test_a_shared_only_respawn_runs_where_the_chat_runs(self, temp_db, ledger,
                                                             monkeypatch):
         # The chat's own placement, as the dashboard resumes it; the person's
@@ -1317,6 +1649,43 @@ class TestWakeRespawnConfig:
         assert asyncio.run(scheduler._deliver_via_oneshot(
             _SID, "so", "wake!", user_sub="user-ed", role="editor", chat_id="chat-w7")) == ""
         assert layer.cfgs[0].execution_target == "local"
+
+    def test_a_personal_respawn_runs_where_the_chat_runs(self, temp_db, ledger,
+                                                         monkeypatch):
+        # A chat its owner wakes runs at the row's placement too, as the
+        # dashboard resumes it, not where the owner's resolution would place
+        # a new chat now; the role change after the wait keeps it there.
+        from storage import remote_store
+        from services.engines import subscription_pool as sp
+        from storage.agents import agent_store
+        agent_store.create_agent("pa", "PA", collaborative=True, default_scope="user")
+        _person("user-own", "owen", agent="pa", agent_role="editor")
+        layer, _ = self._stub(monkeypatch)
+        monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-P", {}))
+        monkeypatch.setattr(remote_store, "resolve_execution_target",
+                            lambda *a, **k: ("machine-elsewhere", None))
+        task_store.create_chat("chat-w8", "user-own", "pa")
+        task_store.update_chat("chat-w8", execution_target="local")
+        assert asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "wake!", user_sub="user-own", role="viewer", chat_id="chat-w8")) == ""
+        assert layer.cfgs[0].execution_target == "local"
+
+    def test_a_personal_chat_with_no_recorded_placement_resolves_as_the_dashboard_does(
+            self, temp_db, ledger, monkeypatch):
+        from storage import remote_store
+        from services.engines import subscription_pool as sp
+        from storage.agents import agent_store
+        agent_store.create_agent("pa", "PA", collaborative=True, default_scope="user")
+        _person("user-own", "owen", agent="pa", agent_role="editor")
+        layer, _ = self._stub(monkeypatch)
+        monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-P", {}))
+        monkeypatch.setattr(remote_store, "resolve_execution_target",
+                            lambda *a, **k: ("machine-elsewhere", None))
+        task_store.create_chat("chat-w11", "user-own", "pa")
+        task_store.update_chat("chat-w11", execution_target="")
+        assert asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "wake!", user_sub="user-own", role="editor", chat_id="chat-w11")) == ""
+        assert layer.cfgs[0].execution_target == "machine-elsewhere"
 
     def test_a_codex_respawn_resumes_the_chats_own_thread(self, temp_db, ledger,
                                                           monkeypatch):
@@ -1443,3 +1812,25 @@ class TestSharedChatDeliveryIdentity:
             asyncio.run(scheduler._do_deliver(_SID, agent, "R", task,
                                               chat_id=chat_id, output_text="OUT"))
         assert [(c["user_sub"], c["role"]) for c in calls] == [(None, "manager")] * 3
+
+
+def test_the_wake_context_bound_covers_its_roster_read(monkeypatch):
+    """The dynamic context of a respawned wake is bounded as a whole: a slow
+    roster read gives up at the bound like a slow MCP does."""
+    import time as _time
+    from core import placement
+    from services.mcp import dynamic_context, mcp_registry
+    monkeypatch.setattr(delivery, "_WAKE_CONTEXT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [])
+    monkeypatch.setattr(dynamic_context, "build_delegation_roster",
+                        lambda targets: _time.sleep(1.5) or {})
+
+    async def _go():
+        started = _time.monotonic()
+        out = await delivery._wake_dynamic_contexts(
+            "pa", {}, user_sub=None, role="manager", targets=["pa"],
+            where=placement.LOCAL_PLACEMENT)
+        return out, _time.monotonic() - started
+
+    out, took = asyncio.run(_go())
+    assert out is None and took < 1.0

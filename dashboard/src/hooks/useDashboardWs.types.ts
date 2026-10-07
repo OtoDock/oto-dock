@@ -1,12 +1,15 @@
 import type {
   AbortedFrame, AudioFrame, BgAgentDoneFrame, BgAgentsCompleteFrame, BgCommandDoneFrame,
-  BgCommandSpawnFrame, BgCommandsCompleteFrame, ChatHistoryFrame, ChatMovedFrame, ChatRowsFrame,
+  BgCommandSpawnFrame, BgCommandsCompleteFrame, ChatHistoryFrame,
+  ChatHistoryDeltaFrame, ChatMovedFrame, ChatRowsFrame,
   ContextCompactFrame, DelegateResultFrame, DelegateSpawnFrame, DocumentPreviewFrame,
-  EngineSwitchedFrame, FileFrame, FileUpdatedFrame, GoalUpdateFrame, ImageGeneratingFrame,
+  EngineSwitchedFrame, ExecutionModeChangedFrame, FileFrame, FileUpdatedFrame, GoalUpdateFrame,
+  ImageGeneratingFrame,
   ImagesFrame, LimitReachedFrame, LimitWarningFrame, LivenessFrame, LiveStateFrame,
   LocationRequestFrame, McpCostFrame, MediaFailedFrame, MediaProcessingFrame, MetadataFrame,
   NotificationCountFrame, NotificationFrame, NotificationSilentFrame, PermissionPromptFrame,
-  PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, QuestionFrame,
+  PromptRetiredFrame,
+  PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, QuestionFrame, ShareInboxFrame,
   QueueRemovedFrame, QueueSentFrame, QueuedFrame, SatelliteUpdateFailedFrame,
   SatelliteUpdatedFrame, SatelliteUpdatingFrame, SteeredFrame, SwitchEngineDeniedFrame,
   SystemFrame, TaskSpawnFrame, ThinkingFrame, TitleUpdatedFrame, TodoUpdateFrame,
@@ -57,6 +60,8 @@ export interface WsCallbacks {
   onWorkflowProgress?: (data: WorkflowProgressFrame) => void
   onWorkflowEnd?: (data: WorkflowEndFrame) => void
   onPermissionPrompt?: (data: PermissionPromptFrame) => void
+  // A prompt card whose wait ended with no answer: drop it by request_id.
+  onPromptRetired?: (data: PromptRetiredFrame) => void
   onLocationRequest?: (data: LocationRequestFrame) => void
   onPlanMode?: (data: PlanModeFrame) => void
   onPlanReview?: (data: PlanReviewFrame) => void
@@ -64,7 +69,8 @@ export interface WsCallbacks {
   // cost_billed false = subscription / local-model turn (cost hidden); missing = shown
   onMetadata?: (data: MetadataFrame) => void
   onDone?: () => void
-  onError?: (message: string) => void
+  /** `ending` is set when the engine stopped the turn (a decline, a usage limit). */
+  onError?: (message: string, ending?: { reason: string; resets_at?: string }) => void
   onImages?: (data: ImagesFrame) => void
   onImageGenerating?: (data: ImageGeneratingFrame) => void
   onMcpCost?: (data: McpCostFrame) => void
@@ -113,8 +119,10 @@ export interface WsCallbacks {
   onSatelliteUpdateFailed?: (data: SatelliteUpdateFailedFrame) => void
   onPreWarmupReady?: (data: PreWarmupReadyFrame) => void
   onModeChanged?: (mode: string) => void
+  onExecutionModeChanged?: (data: ExecutionModeChangedFrame) => void
   onModelChanged?: (model: string) => void
   onChatHistory?: (data: ChatHistoryFrame) => void
+  onChatHistoryDelta?: (data: ChatHistoryDeltaFrame) => void
   onQueued?: (data: QueuedFrame) => void
   onQueueRemoved?: (data: QueueRemovedFrame) => void
   onQueueSent?: (data: QueueSentFrame) => void
@@ -139,5 +147,8 @@ export interface WsCallbacks {
   // sync while the user is on another tab or in the background. No toast, no sound.
   onNotificationSilent?: (data: NotificationSilentFrame) => void
   onNotificationCount?: (data: NotificationCountFrame) => void
+  // "Shared with you" changed for this person (SHARING.md): the pending
+  // count and the agents whose Apps panel gained or lost a placed app.
+  onShareInbox?: (data: ShareInboxFrame) => void
   onTurnComplete?: (data: TurnCompleteFrame) => void
 }

@@ -7,7 +7,7 @@ const assert = require("assert");
 const path = require("path");
 const {
   sanitizeAgent, computeProfileDir, platformStateDirname, migrateLegacyProfileDir,
-  resolveCliPath, detectBrowser,
+  profileDirForStart, resolveCliPath, detectBrowser,
   resolveBrowserConfig, isChromiumFamily, findOrphanHolders, agentDisplayName,
   readDevtoolsPort, seedProfileDisplayName,
   LineSplitter, peekRpc, rewriteInitId, buildErrorResponse,
@@ -64,6 +64,58 @@ assert.strictEqual(sanitizeAgent("../../etc"), "______etc"); // separators + dot
   assert.ok(!fs.existsSync(legacy));
   assert.ok(fs.existsSync(path.join(home, "OtoDock", "browser-profiles", "sales", "Local State")));
   assert.strictEqual(migrateLegacyProfileDir(home, "sales", "win32"), false); // nothing left to move
+  fs.rmSync(home, { recursive: true, force: true });
+}
+{
+  // A move that fails (a browser of the earlier release still holds the
+  // profile) is tried again by a later start: that start runs on the legacy
+  // profile, the new folder is not created, and an empty new folder an
+  // earlier start left behind counts as absent.
+  const os = require("os");
+  const fs = require("fs");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bmcp-home-"));
+  const legacy = path.join(home, ".oto-dock", "browser-profiles", "sales");
+  const current = path.join(home, "OtoDock", "browser-profiles", "sales");
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, "Local State"), "{}");
+  const realRename = fs.renameSync;
+  fs.renameSync = () => {
+    const e = new Error("EBUSY: resource busy or locked");
+    e.code = "EBUSY";
+    throw e;
+  };
+  const realWrite = process.stderr.write;
+  process.stderr.write = () => true;
+  let held;
+  try {
+    held = profileDirForStart(home, "sales", "win32");
+  } finally {
+    fs.renameSync = realRename;
+    process.stderr.write = realWrite;
+  }
+  assert.strictEqual(held, legacy); // the logins stay usable on this start
+  assert.ok(!fs.existsSync(current), "the new folder waits for a successful move");
+  assert.ok(fs.existsSync(path.join(legacy, "Local State")));
+  // The browser let go: the next start moves the profile.
+  assert.strictEqual(profileDirForStart(home, "sales", "win32"), current);
+  assert.ok(fs.existsSync(path.join(current, "Local State")));
+  assert.ok(!fs.existsSync(legacy));
+  // An empty new folder (left by an earlier release's start after a failed
+  // move) does not block the move; a used one does.
+  fs.rmSync(path.join(home, "OtoDock"), { recursive: true, force: true });
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, "Local State"), "{}");
+  fs.mkdirSync(current, { recursive: true });
+  assert.strictEqual(migrateLegacyProfileDir(home, "sales", "win32"), true);
+  assert.ok(fs.existsSync(path.join(current, "Local State")));
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, "Local State"), "{\"old\":1}");
+  assert.strictEqual(migrateLegacyProfileDir(home, "sales", "win32"), false);
+  assert.strictEqual(profileDirForStart(home, "sales", "win32"), current);
+  assert.strictEqual(fs.readFileSync(path.join(current, "Local State"), "utf8"), "{}");
+  // Linux and macOS never look at the legacy folder.
+  assert.strictEqual(profileDirForStart(home, "sales", "linux"),
+    path.join(home, ".oto-dock", "browser-profiles", "sales"));
   fs.rmSync(home, { recursive: true, force: true });
 }
 

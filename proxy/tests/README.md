@@ -66,6 +66,9 @@ mcp/ auth/ remote/ session/ execution/ agents/ tasks/ meetings/
 phone/ audio/ billing/ media/ storage/ core/ api/
 ```
 
+`loadtest/` is the load-test harness: skipped unless `OTODOCK_LOADTEST=1`,
+never part of the normal run; it runs alone, on a quiet box, before a release.
+
 Shared helpers stay at the root: `conftest.py` (fixtures + DB setup),
 `fixtures/`, and `_paths.py` (filesystem anchors — import `PROXY_DIR`,
 `REPO_ROOT`, `CUSTOM_MCPS` from here instead of computing `__file__`-relative

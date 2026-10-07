@@ -18,11 +18,12 @@ import config
 from core.session.session_state import (
     _active_processes, _aborted_sessions, session_exists,
     _record_session_use, resolve_session_permissions,
-    get_hook_activity, get_session_user_tz, reset_subagent_registry,
+    get_hook_activity, get_session_user_tz, has_pending_prompt, reset_subagent_registry,
     resolve_bg_command_frame, clear_session_liveness,
-    reconcile_background_snapshot,
+    reconcile_background_snapshot, mark_closing,
 )
 from core.events.bg_command_state import reset_bg_command_registry
+from core.events import turn_ending, turn_life
 from core.layers.cli.helpers import (
     ClaudeStreamChunk, _build_env, _kill_process,
     _build_client_context,
@@ -149,6 +150,18 @@ class PersistentSession:
         # turn with it by itself; both flags are per turn.
         self._result_seen = False
         self._steer_written = False
+        # The live turn's last stdout line and its translator: the silence
+        # ceiling (core/events/turn_life.py) reads them through
+        # ``_silent_past_ceiling``, in the drive loop and in ``steer``.
+        self._last_line_at = time.monotonic()
+        self._translator: ClaudeCLIEventTranslator | None = None
+        # The live turn is a task run's (it settles after its result): its
+        # silence ceiling is the turn ceiling (turn_life.ceiling_for).
+        self._task_turn = False
+        # The proxy ended this process itself (a Stop, the interrupt
+        # watchdog, the silence or an ending's kill): the end of output that
+        # follows is that kill, not an exit of the engine's own.
+        self._proxy_killed = False
 
     @staticmethod
     def _strip_session_id(url: str) -> str:
@@ -325,13 +338,13 @@ class PersistentSession:
 
         # Claude Code ≥ 2.1.267 records the system prompt on a conversation's
         # first request and re-sends the record on every later request AND on
-        # --resume "even when a later launch passes different text, until the
-        # conversation is compacted". The platform re-sends the prompt file on
-        # every resume ON PURPOSE (fresh persona, memory topics, skills, the
-        # client context — see the --append-system-prompt-file note below), so
-        # the recording is switched off. The flag exists on the previous pin
-        # (2.1.263) too, so a host mid-reconcile accepts it.
-        cmd.extend(["--system-prompt-snapshot", "off"])
+        # --resume; the platform re-sends the prompt file on every resume ON
+        # PURPOSE (fresh persona, memory topics, skills, the client context —
+        # see the --append-system-prompt-file note below), so the recording is
+        # off. Only the platform's settings.json is read: a plugin a person
+        # enables from a terminal at the local scope lands in settings.local.json,
+        # which the platform never rewrites. Both flags exist on 2.1.281.
+        cmd.extend(["--system-prompt-snapshot", "off", "--setting-sources", "user"])
 
         if self.mcp_config_path:
             if self.sandbox_builder:
@@ -861,22 +874,60 @@ class PersistentSession:
                 or self.proc.returncode is not None or not self._turn_active
                 or self._result_seen or not text):
             return False
+        if self._silent_past_ceiling():
+            # The turn is about to end with the silent ending: a frame
+            # written now would be lost with the process, so the caller
+            # queues the message for the next turn instead.
+            return False
         msg = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": text},
         })
+        # Set before the write: a result read while the drain awaits must
+        # already know a steer is on its way (the read-through below).
+        prev_written, self._steer_written = self._steer_written, True
         try:
             self.proc.stdin.write((msg + "\n").encode("utf-8"))
             await self.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+            self._steer_written = prev_written
             return False
-        self._steer_written = True
         self.last_activity = time.monotonic()
         logger.info(
             f"Persistent session {self.session_id}: steered the live turn "
             f"({len(text)} chars, turn_seq={self._turn_seq})"
         )
         return True
+
+    def _silent_past_ceiling(self) -> bool:
+        """Whether the live turn's stdout silence has passed its ceiling with
+        nothing keeping the turn (``turn_life.ends``): the drive loop ends
+        the turn on it and ``steer`` refuses a frame that would be lost."""
+        if not self._turn_active or self._result_seen:
+            return False
+        tools_open = bool(self._translator.open_tools) if self._translator else False
+        return turn_life.ends(
+            self.session_id, tools_open=tools_open,
+            silent_for=time.monotonic() - self._last_line_at, task=self._task_turn,
+        )
+
+    def _exited_chunks(self, translator, rc, stderr_msg: str) -> list[ClaudeStreamChunk]:
+        """The process gone before its result: the ``exited`` ending with the
+        exit code and the stderr tail, then the turn's end."""
+        tail = (stderr_msg or "").strip().splitlines()
+        detail = f"exit {rc}" + (f": {tail[-1][:300]}" if tail else "")
+        ending = turn_ending.TurnEnding(
+            reason=turn_ending.EXITED, detail=detail,
+            exit_code=rc if isinstance(rc, int) else None,
+        )
+        return [
+            ClaudeStreamChunk(
+                event_type="turn_ending", event_data=ending.as_dict(),
+                text=ending.line(), is_error=True,
+                session_id=translator.actual_session_id,
+            ),
+            ClaudeStreamChunk(is_done=True, session_id=translator.actual_session_id),
+        ]
 
     async def send_message(
         self, prompt: str, settle_after_result: float = 0,
@@ -907,6 +958,8 @@ class PersistentSession:
         self._turn_active = True
         self._result_seen = False
         self._steer_written = False
+        self._proxy_killed = False
+        self._task_turn = settle_after_result > 0
         try:
             async for _chunk in self._drive_turn(
                 prompt, settle_after_result, inject_time,
@@ -922,6 +975,7 @@ class PersistentSession:
         """The actual turn drive — body of :meth:`send_message` (which wraps
         it only to maintain the turn-active span)."""
         self.last_activity = time.monotonic()
+        self._last_line_at = self.last_activity
 
         # Drain any stale output left in the pipe from a previous interrupted
         # response (e.g. SSE broken by client disconnect / phone barge-in).
@@ -959,6 +1013,7 @@ class PersistentSession:
         reset_subagent_registry(self.session_id)
         reset_bg_command_registry(self.session_id)
         translator = ClaudeCLIEventTranslator(self.session_id)
+        self._translator = translator
         settle = SettleController(
             self.session_id, settle_after_result, translator,
         )
@@ -999,9 +1054,42 @@ class PersistentSession:
                         proc_alive=bool(proc_alive),
                     )
                     if not proc_alive:
+                        rc = self.proc.returncode if self.proc else None
+                        if self._proxy_killed:
+                            yield ClaudeStreamChunk(
+                                is_done=True, session_id=translator.actual_session_id,
+                            )
+                            return
                         logger.error(
                             f"Persistent session {self.session_id}: process dead "
-                            f"in pre-settle (rc={self.proc.returncode if self.proc else '?'})"
+                            f"in pre-settle (rc={rc})"
+                        )
+                        for chunk in self._exited_chunks(translator, rc, ""):
+                            yield chunk
+                        return
+                    if self._silent_past_ceiling():
+                        # Nothing keeps the turn (no open tool, no prompt on
+                        # a person, no background work, no recent hook) and
+                        # the silence passed its ceiling: the process is
+                        # ended here and the turn ends typed, so the chat
+                        # offers the message again instead of a timer.
+                        silent_for = time.monotonic() - self._last_line_at
+                        logger.warning(
+                            f"Persistent session {self.session_id}: no stdout for "
+                            f"{silent_for:.0f}s with nothing running — ending the turn"
+                        )
+                        await interrupt_persistent_session(self.session_id)
+                        ending = turn_ending.TurnEnding(
+                            reason=turn_ending.SILENT,
+                            detail=f"no output for {int(silent_for)} s",
+                        )
+                        yield ClaudeStreamChunk(
+                            event_type="turn_ending", event_data=ending.as_dict(),
+                            text=ending.line(), is_error=True,
+                            session_id=translator.actual_session_id,
+                        )
+                        yield ClaudeStreamChunk(
+                            is_done=True, session_id=translator.actual_session_id,
                         )
                         return
                     continue
@@ -1026,9 +1114,12 @@ class PersistentSession:
                         )
                         stderr_msg = stderr_data.decode("utf-8", errors="replace").strip()
                 rc = self.proc.returncode if self.proc else "?"
-                if settle.settling:
+                if settle.settling or self._proxy_killed:
+                    # After the result, or the proxy's own kill (a Stop, the
+                    # watchdog): the turn ends here, nothing exited by itself.
                     logger.info(
-                        f"Persistent session {self.session_id}: EOF during settle "
+                        f"Persistent session {self.session_id}: EOF "
+                        f"{'during settle' if settle.settling else 'after the proxy ended it'} "
                         f"(rc={rc}, agents_spawned={translator.agents_spawned})"
                     )
                     yield ClaudeStreamChunk(
@@ -1042,6 +1133,8 @@ class PersistentSession:
                         f"{translator.agents_spawned}). "
                         f"stderr: {stderr_msg[:500] if stderr_msg else '(empty)'}"
                     )
+                    for chunk in self._exited_chunks(translator, rc, stderr_msg):
+                        yield chunk
                 return
 
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -1052,9 +1145,13 @@ class PersistentSession:
             except json.JSONDecodeError:
                 continue
 
-            # Settle-mode bookkeeping: extend reaper, emit periodic heartbeat
+            # Every line is the turn's life: the idle reaper and the stall
+            # watchdog measure stream silence, never a long streaming turn.
+            self.last_activity = time.monotonic()
+            self._last_line_at = self.last_activity
+
+            # Settle-mode bookkeeping: emit periodic heartbeat
             if settle.settling:
-                self.last_activity = time.monotonic()
                 # An init DURING settle = the CLI's self-wake review turn
                 # running INLINE through this pump (its content joins the
                 # task output). Note it so the task producer / bg monitors
@@ -1249,6 +1346,7 @@ async def get_persistent_session(session_id: str) -> PersistentSession | None:
             return session
         if session and not session.is_starting:
             _persistent_sessions.pop(session_id, None)
+            mark_closing(session_id)
         return None
 
 
@@ -1297,6 +1395,7 @@ async def get_or_create_persistent_session(
             # Clean up dead session if exists
             if session:
                 _persistent_sessions.pop(session_id, None)
+                mark_closing(session_id)
 
             # If this session was used before (has message history on disk),
             # don't create a fresh persistent process: it would fail because
@@ -1363,6 +1462,7 @@ async def get_or_create_persistent_session(
         async with _persistent_sessions_lock:
             if _persistent_sessions.get(session_id) is session:
                 _persistent_sessions.pop(session_id, None)
+                mark_closing(session_id)
         from core.concurrency import release_chat_slot
         release_chat_slot(session_id)
         from services.engines.subscription_pool import release_subscription
@@ -1377,6 +1477,7 @@ async def close_persistent_session(session_id: str) -> bool:
     async with _persistent_sessions_lock:
         session = _persistent_sessions.pop(session_id, None)
     if session:
+        mark_closing(session_id)
         await session.close()
         # Any backgrounded subagents/commands died with the process group —
         # clear their badges (the dead CLI can never emit the clears itself).
@@ -1390,12 +1491,15 @@ async def abort_persistent_session(session_id: str) -> bool:
     """Kill a persistent session's process (abort). Returns True if found."""
     async with _persistent_sessions_lock:
         session = _persistent_sessions.pop(session_id, None)
+    if session:
+        mark_closing(session_id)
     if session and session.is_starting:
         # Still waiting for its spawn slot: its start ends without spawning.
         session._closed = True
         return True
     if session and session.proc and session.proc.returncode is None:
         _aborted_sessions.add(session_id)
+        session._proxy_killed = True
         logger.info(f"Aborting persistent session {session_id} (pid={session.proc.pid})")
         await _kill_process(session.proc, session_id)
         session._closed = True
@@ -1415,6 +1519,7 @@ async def interrupt_persistent_session(session_id: str) -> bool:
     resolve_session_permissions(session_id, approved=False)
     session = _persistent_sessions.get(session_id)
     if session and session.proc and session.proc.returncode is None:
+        session._proxy_killed = True
         logger.info(f"Interrupting persistent session {session_id} (pid={session.proc.pid})")
         await _kill_process(session.proc, session_id)
         return True
@@ -1451,6 +1556,11 @@ async def _reap_idle_pass() -> None:
             if not session.is_alive:
                 to_reap.append(sid)
                 continue
+            if session._turn_active:
+                # A live turn is governed by its own silence ceiling
+                # (turn_life): an open tool may stream nothing for longer
+                # than the idle timeout.
+                continue
             idle = now - session.last_activity
             # Also check hook activity — background agents may be
             # working without producing stdout events or send_message
@@ -1460,6 +1570,11 @@ async def _reap_idle_pass() -> None:
                 hook_idle = now - last_hook
                 idle = min(idle, hook_idle)
             if idle > idle_timeout:
+                # A prompt waiting on a person keeps the session (the
+                # prompt's own wait bounds it).
+                if has_pending_prompt(sid):
+                    spared.append((sid, "a prompt waiting on a person"))
+                    continue
                 # A running background command or subagent keeps the
                 # session, up to the ceiling (its completion lands on this
                 # process's stdout; killing the process loses the job).

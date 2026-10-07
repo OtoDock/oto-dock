@@ -10,12 +10,14 @@ engine. Mixed into RemoteExecutionLayer; split out of remote_execution.py.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
 from collections import Counter
 from typing import AsyncIterator
 
+from core.events import turn_ending
 from core.events.common_events import CommonEvent, DONE, ERROR
 from core.remote import upload_inflight
 from core.remote.remote_session_info import RemoteSessionInfo
@@ -113,7 +115,11 @@ class RemoteTurnMixin:
             await self._drain_stale_events(info)
 
         # Fresh per-turn state — the engine's (a per-turn translator and settle
-        # controller, the registry prunes, a fresh main-turn consumer).
+        # controller, the registry prunes, a fresh main-turn consumer), and
+        # the turn's own silence clock.
+        info.proxy_killed = False
+        info.last_event_at = time.monotonic()
+        info.task_turn = bool(settle_after_result and settle_after_result > 0)
         await adapter.begin_turn(info, settle_after_result)
 
         # Pre-mint the command_id so we can correlate the satellite's
@@ -154,9 +160,12 @@ class RemoteTurnMixin:
             # verifies the transcript before issuing --resume, so a truly
             # unresumable chat reseeds from history rather than resuming blind.
             err_text = str(e)
+            data: dict = {"message": err_text}
             if "CLI process not running" in err_text or "Session not found" in err_text:
                 info.cli_dead = True
-            yield CommonEvent(type=ERROR, data={"message": err_text})
+                ending = turn_ending.TurnEnding(reason=turn_ending.LOST, detail=err_text)
+                data = {"message": ending.line(), "ending": ending.as_dict()}
+            yield CommonEvent(type=ERROR, data=data)
             yield CommonEvent(type=DONE)
             return
 
@@ -166,8 +175,22 @@ class RemoteTurnMixin:
         # can tell an in-flight turn from a genuinely idle session.
         info.turn_active = True
         try:
-            async for event in adapter.stream_turn(info, self._cm):
-                yield event
+            async with contextlib.aclosing(adapter.stream_turn(info, self._cm)) as events:
+                async for event in events:
+                    ending = turn_ending.from_dict(event.data.get("ending")) \
+                        if event.type == ERROR else None
+                    if (ending is not None and ending.reason in turn_ending.KILLS_PROCESS
+                            and self.capabilities_for(session_id).runtime.hard_abort_kills_process):
+                        # A typed ending (a decline, a usage limit): the
+                        # satellite ends the CLI before the ending is
+                        # forwarded, since a consumer may stop at the ERROR
+                        # and a declined Claude turn goes on by itself. The
+                        # session is flagged dead, so its next start resumes.
+                        await self._hard_abort(session_id)
+                        yield event
+                        yield CommonEvent(type=DONE)
+                        return
+                    yield event
         finally:
             info.turn_active = False
 

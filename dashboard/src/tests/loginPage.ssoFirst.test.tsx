@@ -4,8 +4,8 @@
 // arriving mid-Authentik flow clicked the familiar top passkey button and got
 // signed into the local account that owned the host's only passkey.
 
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 vi.mock('@/contexts/AuthContext', () => ({
@@ -28,6 +28,7 @@ vi.mock('@/components/TurnstileWidget', () => ({
 }))
 
 import LoginPage from '@/pages/LoginPage'
+import { startOidcLogin } from '@/api/auth'
 
 function cfg(over: Record<string, unknown> = {}) {
   return {
@@ -73,5 +74,32 @@ describe('LoginPage SSO-first ordering', () => {
     renderPage(cfg({ oidc_enabled: true }))
     const email = screen.getByPlaceholderText('you@example.com')
     expect(email.getAttribute('autocomplete')).toBe('email')
+  })
+})
+
+// A refused SSO start (the per-address bound's 429, proxy API.md) shows the
+// server's reason and its wait on the login page, never "OIDC not configured".
+describe('LoginPage SSO start refused', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.mocked(startOidcLogin).mockReset()
+  })
+
+  it('shows the 429 detail with its Retry-After', async () => {
+    const actual = await vi.importActual<typeof import('@/api/auth')>('@/api/auth')
+    vi.mocked(startOidcLogin).mockImplementation(actual.startOidcLogin)
+    const fetchMock = vi.fn(async (_url: string) => ({
+      ok: false,
+      status: 429,
+      headers: new Headers({ 'Retry-After': '300' }),
+      json: async () => ({ detail: 'Too many sign-ins started; try again in a few minutes.' }),
+    }) as unknown as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage(cfg({ oidc_enabled: true }))
+    fireEvent.click(screen.getByRole('button', { name: /continue with authentik/i }))
+    const shown = await screen.findByText(/Too many sign-ins started; try again in a few minutes\./)
+    expect(shown.textContent).toContain('(retry in 5 minutes)')
+    expect(fetchMock.mock.calls[0][0]).toBe('/auth/oidc-url')
+    expect(screen.queryByText(/OIDC not configured/)).toBeNull()
   })
 })

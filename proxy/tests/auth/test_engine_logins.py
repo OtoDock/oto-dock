@@ -13,10 +13,11 @@ import asyncio
 import base64
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import DEFAULT, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -157,9 +158,15 @@ async def _parked(rig, n: int) -> FakeCodex:
 
 
 async def _connected(rig, user):
-    """Start a login for ``user`` and let its fake print the URL and code."""
+    """Start a login for ``user`` and let its fake print the URL and code
+    (a start that fails before its read window raises its own error)."""
     task = _start(user)
-    proc = await _parked(rig, len(rig.procs) + 1)
+    parked = asyncio.ensure_future(_parked(rig, len(rig.procs) + 1))
+    await asyncio.wait({task, parked}, return_when=asyncio.FIRST_COMPLETED)
+    if task.done() and not parked.done():
+        parked.cancel()
+        await task
+    proc = await parked
     proc.release()
     return await task, proc
 
@@ -256,6 +263,200 @@ def test_finish_removes_the_login_home(rig):
         await _finish(ra["login_id"], A)
         assert not home.exists()
         assert ra["login_id"] not in openai_api._active_logins
+
+    asyncio.run(scenario())
+
+
+def _refused_on_loop(*_a, **_kw):
+    """A store mock's side effect: refuse a call made on a thread with a
+    running event loop (a worker thread has none)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return DEFAULT
+    raise AssertionError("a store call ran on the event loop")
+
+
+def test_finish_stores_the_login_off_the_loop(rig, monkeypatch):
+    from storage import database
+    for name in ("list_subscriptions", "add_subscription", "get_subscription",
+                 "update_credential_data", "update_subscription"):
+        getattr(rig.store, name).side_effect = _refused_on_loop
+    get_user = MagicMock(side_effect=_refused_on_loop, return_value={"role": "member"})
+    monkeypatch.setattr(database, "get_user", get_user)
+
+    async def scenario():
+        ra, pa = await _connected(rig, A)
+        pa.complete(_blob("A"))
+        await _finish(ra["login_id"], A)
+        rig.store.add_subscription.assert_called_once()
+        get_user.assert_called_once_with("user-a")
+
+        # The same account again: the row is matched and re-read.
+        rig.store.list_subscriptions.return_value = [{
+            "id": "row-a", "auth_type": "oauth", "provider": "openai",
+            "oauth_email": "acct-A", "status": "active",
+        }]
+        ra, pa = await _connected(rig, A)
+        pa.complete(_blob("A"))
+        assert await _finish(ra["login_id"], A) == {"subscription": {"id": "refreshed-sub"}}
+        rig.store.get_subscription.assert_called_once_with("row-a")
+        rig.store.add_subscription.assert_called_once()
+
+    asyncio.run(scenario())
+
+
+class _LoopFileGuard:
+    """While armed, refuses file work (a directory made, a mode set, a
+    directory listed or removed, a file read or tested) on a thread with a
+    running event loop; a worker thread has none. Disarmed around the test
+    body's own file work (the fake CLI writing its file)."""
+
+    def __init__(self, monkeypatch):
+        import shutil
+        self.armed = False
+        for owner, name in ((os, "mkdir"), (os, "chmod"), (os, "scandir"),
+                            (shutil, "rmtree"), (Path, "read_text"), (Path, "exists")):
+            monkeypatch.setattr(owner, name, self._guarded(getattr(owner, name), name))
+
+    def _guarded(self, real, name):
+        def call(*a, **kw):
+            if self.armed:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError(f"{name} ran on the event loop")
+            return real(*a, **kw)
+        return call
+
+
+def test_start_poll_and_finish_do_their_file_work_off_the_loop(rig, monkeypatch):
+    guard = _LoopFileGuard(monkeypatch)
+
+    async def scenario():
+        guard.armed = True
+        ra, pa = await _connected(rig, A)          # the sweep, the home
+        assert (await _status(ra["login_id"], A))["status"] == "pending"
+        guard.armed = False
+        pa.complete(_blob("A"))
+        guard.armed = True
+        assert (await _status(ra["login_id"], A))["status"] == "completed"
+        await _finish(ra["login_id"], A)           # the read, the removal
+        guard.armed = False
+        assert not Path(pa.env["CODEX_HOME"]).exists()
+        rig.store.add_subscription.assert_called_once()
+
+    asyncio.run(scenario())
+
+
+def test_an_ended_login_and_the_sweep_remove_homes_off_the_loop(rig, monkeypatch):
+    guard = _LoopFileGuard(monkeypatch)
+
+    async def scenario():
+        ra, pa = await _connected(rig, A)
+        pa.exit(1)
+        guard.armed = True
+        assert (await _status(ra["login_id"], A))["status"] == "failed"
+        guard.armed = False
+        assert not Path(pa.env["CODEX_HOME"]).exists()
+
+        rb, pb = await _connected(rig, B)
+        openai_api._active_logins[rb["login_id"]]["started_at"] -= 1201
+        old = rig.base / "orphan-old"
+        old.mkdir()
+        stale = time.time() - 1300
+        os.utime(old, (stale, stale))
+        guard.armed = True
+        await _connected(rig, A)                   # the sweep ends B's, removes the orphan
+        guard.armed = False
+        assert rb["login_id"] not in openai_api._active_logins
+        assert not old.exists() and not Path(pb.env["CODEX_HOME"]).exists()
+
+    asyncio.run(scenario())
+
+
+def _poll_read_hook(monkeypatch, during_read, *, first: bool = False):
+    """Run ``during_read`` while the poll's file read is in flight (before
+    the read itself when ``first``) when the read runs in a worker thread.
+    A read on the loop cannot overlap anything: ``during_read`` then runs
+    after the poll's loop slice, or not at all when ``first``."""
+    real = openai_api._whole_login_file
+
+    def read(home):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            if first:
+                during_read()
+                return real(home)
+            out = real(home)
+            during_read()
+            return out
+        out = real(home)
+        if not first:
+            asyncio.get_running_loop().call_soon(during_read)
+        return out
+
+    monkeypatch.setattr(openai_api, "_whole_login_file", read)
+
+
+def test_a_cli_that_exits_during_the_poll_read_is_not_failed(rig, monkeypatch):
+    """The CLI writes its file, then exits: an exit seen only after a read
+    that found no file is no failure, and the home stays for the finish."""
+    async def scenario():
+        ra, pa = await _connected(rig, A)
+        loop = asyncio.get_running_loop()
+
+        def write_and_exit():
+            pa.auth_path.write_text(json.dumps(_blob("A")))
+            if threading.get_ident() == loop_thread:
+                pa.returncode = 0
+                return
+            done = threading.Event()
+            loop.call_soon_threadsafe(lambda: (setattr(pa, "returncode", 0), done.set()))
+            done.wait(5)
+
+        loop_thread = threading.get_ident()
+        _poll_read_hook(monkeypatch, write_and_exit)
+        assert (await _status(ra["login_id"], A))["status"] in ("pending", "completed")
+        assert Path(pa.env["CODEX_HOME"]).is_dir()
+        assert ra["login_id"] in openai_api._active_logins
+
+    asyncio.run(scenario())
+
+
+def test_a_poll_that_overlaps_the_finish_never_ends_the_login(rig, monkeypatch):
+    """A poll whose read is in flight while the same login is finished
+    answers as the finish left it (completed, or 404 once it is gone) and
+    never reports it failed."""
+    async def scenario():
+        ra, pa = await _connected(rig, A)
+        pa.complete(_blob("A"))
+        finished = asyncio.Event()
+
+        async def finish_now():
+            await _finish(ra["login_id"], A)
+            finished.set()
+
+        loop = asyncio.get_running_loop()
+
+        def finish_during_read():
+            done = threading.Event()
+            loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(finish_now()).add_done_callback(lambda _f: done.set()))
+            done.wait(5)
+
+        _poll_read_hook(monkeypatch, finish_during_read, first=True)
+        try:
+            answer = (await _status(ra["login_id"], A))["status"]
+        except HTTPException as exc:
+            answer = exc.status_code
+        if not finished.is_set():
+            await finish_now()
+        assert answer in ("completed", 404)
+        rig.store.add_subscription.assert_called_once()
 
     asyncio.run(scenario())
 

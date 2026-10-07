@@ -531,3 +531,10 @@ def test_rate_limit_event_without_info_is_dropped():
     t = ClaudeCLIEventTranslator("s1")
     assert t.feed({"type": "rate_limit_event"}) == []
     assert t.feed({"type": "rate_limit_event", "rate_limit_info": "bad"}) == []
+
+
+def test_ping_stream_event_yields_nothing():
+    """Claude Code 2.1.285 sends a ``ping`` stream event every 30 s during a
+    non-streaming fallback with partial messages on: liveness, not content."""
+    t = ClaudeCLIEventTranslator("s1")
+    assert t.feed({"type": "stream_event", "event": {"type": "ping"}, "session_id": "s1"}) == []

@@ -4,20 +4,28 @@
 One resolver reads the ASGI scope for HTTP and WebSocket alike. uvicorn's own
 forwarded-header rewrite is off (``app.py``): the ASGI shim there calls
 ``stamp_scope`` once per connection, which keeps the socket peer in
-``scope["otodock.peer"]``, runs the misconfiguration detector and puts the
+``scope["otodock.peer"]``, runs the misconfiguration detector, puts the
 resolved client in ``scope["client"]`` (the access log and every handler see
-it). ``get_client_ip`` and ``check_local_auth_allowed`` resolve again from the
-peer, so they give the same answer with or without the shim (tests drive the
-app directly).
+it) and, from a hop, the scheme its ``X-Forwarded-Proto`` names in
+``scope["scheme"]``. ``get_client_ip``, ``auth_bucket_key``,
+``trusted_forwarded_proto`` and ``check_local_auth_allowed`` resolve again
+from the peer, so they give the same answer with or without the shim (tests
+drive the app directly).
+
+A request on the internal listener is not a person on the local network:
+sandboxes, app servers, scripts and the satellite tunnel arrive there from
+127.0.0.1, so it never passes the local-network rule and its per-address auth
+buckets are one bucket of their own (``INTERNAL_LISTENER_KEY``), apart from a
+person on the host's own loopback.
 """
 
 import ipaddress
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
-from fastapi import Request
+from starlette.requests import HTTPConnection
 
 import config
 
@@ -30,11 +38,17 @@ _EDGE_SIGNALS = frozenset({
     _XFF, b"forwarded", b"x-real-ip", b"x-forwarded-proto", b"x-forwarded-host",
 })
 _LOOPBACK_HOPS = ("127.0.0.1", "::1")
+# The X-Forwarded-Proto values a hop's scheme is read from, by security.
+_FORWARDED_PROTOS = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
 
 # The detector's memory: one log line per peer per hour, the last hour's
 # peers listed for the admin.
 _WARN_EVERY_S = 3600.0
 _WARN_PEERS_MAX = 64
+
+# The key every per-address auth bucket uses for the internal listener. The
+# resolver yields an address or the socket peer for a client, never this.
+INTERNAL_LISTENER_KEY = "internal-listener"
 
 Case = Literal["", "untrusted_forwarder", "edge_without_xff"]
 
@@ -43,13 +57,24 @@ Case = Literal["", "untrusted_forwarder", "edge_without_xff"]
 class ClientAddress:
     """``client``: the resolved address. ``case``: an edge misconfiguration
     seen on THIS request (never a flag a request can set for others).
-    ``shared``: the address is not one distinct outside client (a hop, an
-    untrusted forwarder, the Docker gateway): a per-address bucket keyed on it
-    is one bucket for everyone behind it."""
+    ``shared``: the address is not one distinct outside client (a hop, the
+    Docker gateway, the internal listener): a per-address bucket keyed on it
+    is one bucket for everyone behind it. It depends on the peer alone: a
+    private peer that is not a hop is one client whatever headers it sends.
+    ``internal``: the request came in on the internal listener (sandboxes
+    and the satellite tunnel), which is not the local network."""
     client: str
     peer: str
     case: Case = ""
     shared: bool = False
+    internal: bool = False
+
+    @property
+    def bucket_key(self) -> str:
+        """The key of a per-address bucket (``auth_bucket_key``): read with
+        ``shared`` from one resolution, so a check and its record, or a
+        reservation and its release, never disagree."""
+        return INTERNAL_LISTENER_KEY if self.internal else self.client
 
 
 def _ip_in_trusted(ip_str: str) -> bool:
@@ -221,7 +246,7 @@ def resolve(scope) -> ClientAddress:
     peer = _peer_of(scope)
     try:
         if _on_internal_listener(scope):
-            return ClientAddress(peer, peer, "", shared=True)
+            return ClientAddress(peer, peer, "", shared=True, internal=True)
         xff: list[bytes] = []
         signals = False
         for name, value in scope.get("headers") or ():
@@ -244,7 +269,10 @@ def resolve(scope) -> ClientAddress:
             return ClientAddress(first or peer, peer, "", shared=True)
         if signals and is_private_ip(peer) and not (
                 config.RUNNING_IN_DOCKER and _is_loopback(peer)):
-            return ClientAddress(peer, peer, "untrusted_forwarder", shared=True)
+            # The headers name the case (the detector, the local-only
+            # refusal), never the bucket: the peer is shared exactly as it
+            # would be without them.
+            return replace(_outside(peer, peer), case="untrusted_forwarder")
         return _outside(peer, peer)
     except Exception:  # a resolver that raised would drop the request
         logger.debug("client address unreadable; using the peer %s", peer, exc_info=True)
@@ -291,11 +319,11 @@ def _note(peer: str, case: Case) -> None:
             if gateway else "")
         logger.error(
             "Forwarding headers arrived from %s, which is not a trusted proxy: they "
-            "are ignored, every client behind it counts as %s for login limits, and "
-            "local-only accounts are refused through it. If %s is the reverse proxy "
-            "in front of OtoDock, set TRUSTED_PROXY=%s (that address, never a subnet) "
-            "and restart.%s If it is a forward proxy or not a proxy at all, leave "
-            "TRUSTED_PROXY alone.", peer, peer, peer, peer, where)
+            "are ignored, every client behind it counts as %s for the per-address "
+            "limits, and local-only accounts are refused through it. If %s is the "
+            "reverse proxy in front of OtoDock, set TRUSTED_PROXY=%s (that address, "
+            "never a subnet) and restart.%s If it is a forward proxy or not a proxy "
+            "at all, leave TRUSTED_PROXY alone.", peer, peer, peer, peer, where)
     else:
         logger.warning(
             "The trusted proxy %s forwards requests without X-Forwarded-For: every "
@@ -305,20 +333,48 @@ def _note(peer: str, case: Case) -> None:
             peer, peer)
 
 
+_STARTED_AT = time.time()
+
+
+def _unconfigured_edge() -> dict | None:
+    """The boot check (``config.untrusted_edge``) as a row, read live and
+    judged on the hops in effect (a loopback entry in a container trusts
+    nothing): ``peer`` is the container's gateway, the address an edge on
+    this host connects from (one on another machine connects from its own)."""
+    effective = [str(net) for net in _hop_networks()] if config.RUNNING_IN_DOCKER \
+        else config.TRUSTED_PROXIES
+    if not config.untrusted_edge(config.RUNNING_IN_DOCKER, config.DASHBOARD_PUBLIC_URL,
+                                 effective):
+        return None
+    gateway = _docker_gateway()
+    return {"peer": gateway, "case": "no_trusted_proxy", "first_seen": _STARTED_AT,
+            "last_seen": time.time(), "count": 0, "gateway": bool(gateway)}
+
+
 def forwarding_warnings() -> list[dict]:
-    """The edge misconfigurations seen in the last hour, newest first (the
-    admin platform settings carry them)."""
+    """The edge misconfigurations seen in the last hour, newest first, then
+    the boot check's row while it holds (the admin platform settings and
+    the dashboard's admin banner carry them)."""
     cutoff = time.time() - _WARN_EVERY_S
     rows = [{k: v for k, v in e.items() if k != "logged_at"}
             for e in _seen.values() if e["last_seen"] >= cutoff]
-    return sorted(rows, key=lambda e: e["last_seen"], reverse=True)
+    rows.sort(key=lambda e: e["last_seen"], reverse=True)
+    boot = _unconfigured_edge()
+    return rows + [boot] if boot else rows
 
 
 def stamp_scope(scope) -> ClientAddress:
-    """For the ASGI shim: keep the socket peer, feed the detector, and put the
-    resolved client in ``scope["client"]``."""
+    """For the ASGI shim: keep the socket peer, feed the detector, put the
+    resolved client in ``scope["client"]`` and the scheme a hop names in
+    ``scope["scheme"]`` (``ws``/``wss`` on a WebSocket)."""
     client = scope.get("client")
     scope["otodock.peer"] = client[0] if client else ""
+    proto = trusted_forwarded_proto(scope)
+    if proto:
+        if scope.get("type") == "websocket":
+            scope["scheme"] = "wss" if proto == "https" else "ws"
+        else:
+            scope["scheme"] = proto
     resolved = resolve(scope)
     if resolved.case:
         _note(resolved.peer, resolved.case)
@@ -332,27 +388,69 @@ def stamp_scope(scope) -> ClientAddress:
 
 # --- the request-level API --------------------------------------------------
 
-def client_address(request: Request) -> ClientAddress:
-    return resolve(request.scope)
+def trusted_forwarded_host(scope) -> str:
+    """The ``X-Forwarded-Host`` a trusted hop sent (its first value), or ""
+    when the socket peer is not a hop or the request came in on the
+    internal listener: a host header from anyone else names nothing."""
+    peer = _peer_of(scope)
+    if not peer or _on_internal_listener(scope) or not _is_hop(peer):
+        return ""
+    for name, value in scope.get("headers") or ():
+        if name == b"x-forwarded-host":
+            return value.decode("latin-1").split(",")[0].strip()
+    return ""
 
 
-def get_client_ip(request: Request) -> str:
+def trusted_forwarded_proto(scope) -> str:
+    """``http`` or ``https``, as the first ``X-Forwarded-Proto`` value a
+    trusted hop sent names it (``ws``/``wss`` read alike: Traefik sends them
+    on an upgrade), or "" when the socket peer is not a hop, the request
+    came in on the internal listener, or the value names neither: a scheme
+    from anyone else names nothing."""
+    peer = _peer_of(scope)
+    if not peer or _on_internal_listener(scope) or not _is_hop(peer):
+        return ""
+    for name, value in scope.get("headers") or ():
+        if name == b"x-forwarded-proto":
+            first = value.decode("latin-1").split(",")[0].strip().lower()
+            return _FORWARDED_PROTOS.get(first, "")
+    return ""
+
+
+def client_address(conn: HTTPConnection) -> ClientAddress:
+    return resolve(conn.scope)
+
+
+def get_client_ip(conn: HTTPConnection) -> str:
     """The resolved client address (see ``resolve``)."""
-    return resolve(request.scope).client
+    return resolve(conn.scope).client
 
 
-def check_local_auth_allowed(request: Request, user_row: dict) -> bool:
+def auth_bucket_key(conn: HTTPConnection) -> str:
+    """The key of a per-address auth bucket (login, 2FA, passkey, forgot,
+    reset, invite, webhook auth, a link's password): the resolved client, or
+    ``INTERNAL_LISTENER_KEY`` on the internal listener, so sandboxes never
+    spend the attempts of a person on the host's own loopback."""
+    return resolve(conn.scope).bucket_key
+
+
+def check_local_auth_allowed(conn: HTTPConnection, user_row: dict) -> bool:
     """Check if a local login is allowed for this user from this IP.
 
     Restriction is per-user only: an account with the ``local_only`` flag may
-    sign in solely from a private/LAN address. It fails closed per request: an
-    edge misconfiguration seen on this request, or (in a container) the
-    gateway as the client, cannot prove a local address.
+    sign in solely from a private/LAN address. It fails closed per request:
+    the internal listener (a sandbox, an app server, a script or the
+    satellite tunnel, all from 127.0.0.1), an edge misconfiguration seen on
+    this request, or (in a container) the gateway as the client, cannot prove
+    a local address.
     """
     if not bool(user_row.get("local_only", 0)):
         return True
-    r = resolve(request.scope)
-    if r.case == "untrusted_forwarder":
+    r = resolve(conn.scope)
+    if r.internal:
+        reason = ("the request came through the internal listener (an agent sandbox, "
+                  "an app server or a script, or the satellite tunnel), not the local network")
+    elif r.case == "untrusted_forwarder":
         reason = f"forwarding headers from the untrusted address {r.peer}"
     elif r.case == "edge_without_xff":
         reason = f"the trusted proxy {r.peer} sent no X-Forwarded-For"

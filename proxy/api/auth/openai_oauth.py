@@ -30,7 +30,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_human, UserContext
+from auth.providers import get_current_user, require_human, UserContext, require_user
 from services.engines import subscription_pool
 from storage.billing import subscription_status, subscription_store
 import config as app_config
@@ -38,7 +38,8 @@ import contextlib
 from auth import rate_limiter, roles
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 #: The vendor this login route belongs to — the engine's ``identity.vendor_id``
 #: and the provider its OAuth rows carry, named once.
@@ -128,7 +129,7 @@ async def oauth_start(
         await _end_login(lid, meta)
 
     login_id = secrets.token_urlsafe(16)
-    home = _new_login_home(login_id)
+    home = _LOGIN_HOME_BASE / login_id
     meta = {
         "proc": None,
         "home": home,
@@ -137,7 +138,17 @@ async def oauth_start(
         "layer": req.layer,
         "started_at": time.monotonic(),
     }
+    # Registered before the home is made (off the loop): a newer start by
+    # the same person during that wait finds this login and ends it.
     _active_logins[login_id] = meta
+    try:
+        await asyncio.to_thread(_make_login_home, home)
+    except Exception:
+        await _end_login(login_id, meta)
+        raise
+    if _active_logins.get(login_id) is not meta:
+        await _end_login(login_id, meta)
+        raise HTTPException(409, "Replaced by a newer login")
 
     # Spawn codex login --device-auth via node directly (the codex binary
     # is a Node.js script and systemd services have minimal PATH)
@@ -248,12 +259,18 @@ async def oauth_status(
         raise HTTPException(403, "Not your login session")
 
     # Only this login's own file counts, and only once it is whole: the CLI
-    # writes it, then exits.
-    if _whole_login_file(meta["home"]) is not None:
-        return {"status": "completed"}
-
+    # writes it, then exits. The exit is noted BEFORE the file is read (off
+    # the loop), so an exit judged a failure is one whose file the read
+    # would have found; a login finished or replaced during the read is
+    # gone, as for a later poll.
     proc = meta["proc"]
-    if proc is not None and proc.returncode is not None:
+    exited = proc is not None and proc.returncode is not None
+    if await asyncio.to_thread(_whole_login_file, meta["home"]) is not None:
+        return {"status": "completed"}
+    if _active_logins.get(login_id) is not meta:
+        raise HTTPException(404, "Login session not found")
+
+    if exited:
         await _end_login(login_id, meta)
         return {"status": "failed", "message": "Login process exited without writing credentials"}
 
@@ -283,7 +300,7 @@ async def oauth_finish(
         await _settle_process(meta["proc"])
         return await _store_login(req, meta, user)
     finally:
-        shutil.rmtree(meta["home"], ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, meta["home"], ignore_errors=True)
 
 
 async def _store_login(req: OAuthFinishRequest, meta: dict, user: UserContext) -> dict:
@@ -291,16 +308,7 @@ async def _store_login(req: OAuthFinishRequest, meta: dict, user: UserContext) -
         raise HTTPException(403, "Admin required for platform subscriptions")
     _require_chatgpt_login_engine(meta["layer"])
 
-    auth_path = Path(meta["home"]) / "auth.json"
-    if not auth_path.exists():
-        raise HTTPException(400, "No credentials found — login may have failed")
-
-    try:
-        auth_data = json.loads(auth_path.read_text())
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read credentials: {e}")
-    if not isinstance(auth_data, dict):
-        raise HTTPException(400, "Failed to read credentials: not a JSON object")
+    auth_data = await asyncio.to_thread(_read_login_blob, meta["home"])
 
     access_token = _token_field(auth_data, "access_token")
     refresh_token = _token_field(auth_data, "refresh_token")
@@ -336,30 +344,47 @@ async def _store_login(req: OAuthFinishRequest, meta: dict, user: UserContext) -
     # on CREATE only — reconnect just refreshes tokens.
     is_platform = meta["owner_type"] == "platform"
     owner_sub = meta["user_sub"]
-    # Admins' personal connects ALSO contribute to the shared agent pool by
-    # default (so agent-scoped tasks work without the admin knowing to tick it).
     from storage import database as _db
-    _connector_is_admin = roles.is_admin((_db.get_user(owner_sub) or {}).get("role"))
 
-    # Reconnecting the SAME account (matched by the auth blob's identity)
-    # refreshes tokens on the existing row; a DIFFERENT account creates a
-    # second subscription (users can pool several plans). Matching on mere
-    # (owner, layer, provider) silently clobbered the first account's
-    # credential when a second one was connected — see the Anthropic twin
-    # in claude_oauth.py.
-    # include_disabled: a reconnect on an admin-disabled row must MATCH it
-    # (and keep it disabled, below) — excluding it would fork a second ACTIVE
-    # row for the same account, silently routing around the admin.
-    existing = subscription_store.list_subscriptions(
-        layer=meta["layer"],
-        owner_sub=owner_sub,
-        include_disabled=True,
-    )
-    existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == _VENDOR]
-    # Only a row proven to be the same account is refreshed; legacy rows
-    # (oauth_email == "") are never adopted by guesswork.
-    match = next((s for s in existing_oauth if s.get("oauth_email") == identity), None)
+    def _match_or_create() -> tuple[dict | None, dict | None]:
+        """``(match, None)`` for the row already holding this account,
+        ``(None, row)`` for the row created for it."""
+        # Reconnecting the SAME account (matched by the auth blob's identity)
+        # refreshes tokens on the existing row; a DIFFERENT account creates a
+        # second subscription (users can pool several plans). Matching on mere
+        # (owner, layer, provider) silently clobbered the first account's
+        # credential when a second one was connected — see the Anthropic twin
+        # in claude_oauth.py.
+        # include_disabled: a reconnect on an admin-disabled row must MATCH it
+        # (and keep it disabled, below) — excluding it would fork a second ACTIVE
+        # row for the same account, silently routing around the admin.
+        existing = subscription_store.list_subscriptions(
+            layer=meta["layer"],
+            owner_sub=owner_sub,
+            include_disabled=True,
+        )
+        existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == _VENDOR]
+        # Only a row proven to be the same account is refreshed; legacy rows
+        # (oauth_email == "") are never adopted by guesswork.
+        match = next((s for s in existing_oauth if s.get("oauth_email") == identity), None)
+        if match:
+            return match, None
+        # Admins' personal connects ALSO contribute to the shared agent pool by
+        # default (so agent-scoped tasks work without the admin knowing to tick it).
+        connector_is_admin = roles.is_admin((_db.get_user(owner_sub) or {}).get("role"))
+        return None, subscription_store.add_subscription(
+            layer=meta["layer"],
+            provider=_VENDOR,
+            auth_type="oauth",
+            owner_sub=owner_sub,
+            use_personal=True,
+            contribute_platform=is_platform or connector_is_admin,
+            label=label,
+            credential_data=credential_data,
+            oauth_email=identity,
+        )
 
+    match, sub = await asyncio.to_thread(_match_or_create)
     if match:
         # Under the sub's refresh lock — an in-flight refresh of the old
         # token must not land its failure verdict on the fresh grant. An
@@ -377,24 +402,13 @@ async def _store_login(req: OAuthFinishRequest, meta: dict, user: UserContext) -
                 subscription_pool.clear_refresh_backoff(sub_id)
 
         await asyncio.to_thread(_apply_reconnect)
-        sub = subscription_store.get_subscription(sub_id)
+        sub = await asyncio.to_thread(subscription_store.get_subscription, sub_id)
         logger.info(f"Updated existing OpenAI OAuth subscription {sub_id[:8]} with fresh tokens")
         # The exchange rotated the grant OUTSIDE the rotation chokepoint —
         # push the fresh token into live bound sessions' auth.json files
         # (see the Anthropic twin in claude_oauth.py).
         await asyncio.to_thread(subscription_pool.fan_out_current_token, sub_id)
     else:
-        sub = subscription_store.add_subscription(
-            layer=meta["layer"],
-            provider=_VENDOR,
-            auth_type="oauth",
-            owner_sub=owner_sub,
-            use_personal=True,
-            contribute_platform=is_platform or _connector_is_admin,
-            label=label,
-            credential_data=credential_data,
-            oauth_email=identity,
-        )
         logger.info(f"Created new OpenAI OAuth subscription {sub['id'][:8]}")
 
     # A freshly (re)connected account may be the replacement that sessions
@@ -423,14 +437,26 @@ def limit_connect_start(bucket: str, user_sub: str) -> None:
         )
 
 
-def _new_login_home(login_id: str) -> Path:
-    """A private ``CODEX_HOME`` for one login, owner-only like the files the
+def _make_login_home(home: Path) -> None:
+    """Make a login's private ``CODEX_HOME``, owner-only like the files the
     CLI writes into it. A pre-existing base gets its mode corrected too."""
     _LOGIN_HOME_BASE.mkdir(mode=0o700, exist_ok=True)
     os.chmod(_LOGIN_HOME_BASE, 0o700)
-    home = _LOGIN_HOME_BASE / login_id
     home.mkdir(mode=0o700)
-    return home
+
+
+def _read_login_blob(home: Path) -> dict:
+    """The finished login's ``auth.json``, or the finish's 400."""
+    auth_path = Path(home) / "auth.json"
+    if not auth_path.exists():
+        raise HTTPException(400, "No credentials found — login may have failed")
+    try:
+        auth_data = json.loads(auth_path.read_text())
+    except Exception as e:
+        raise HTTPException(400, f"Failed to read credentials: {e}")
+    if not isinstance(auth_data, dict):
+        raise HTTPException(400, "Failed to read credentials: not a JSON object")
+    return auth_data
 
 
 def _token_field(auth_data: dict, name: str) -> str:
@@ -526,7 +552,7 @@ async def _end_login(login_id: str, meta: dict) -> None:
     proc = meta.get("proc")
     if proc is not None and proc.returncode is None:
         await _end_process(proc)
-    shutil.rmtree(meta["home"], ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, meta["home"], ignore_errors=True)
 
 
 async def _sweep_logins() -> None:
@@ -538,13 +564,21 @@ async def _sweep_logins() -> None:
     now = time.monotonic()
     for lid, meta in [(lid, m) for lid, m in _active_logins.items() if now - m["started_at"] > _LOGIN_MAX_AGE_S]:
         await _end_login(lid, meta)
+    # The registry is read here, on the loop; a login registered after it
+    # has a home younger than the cutoff, which the sweep never touches.
+    await asyncio.to_thread(_remove_orphan_homes, frozenset(_active_logins),
+                            time.time() - _LOGIN_MAX_AGE_S)
+
+
+def _remove_orphan_homes(registered: frozenset[str], cutoff: float) -> None:
+    """Remove the login homes older than ``cutoff`` that belong to no
+    registered login. Synchronous: call it on a worker thread."""
     try:
         entries = list(os.scandir(_LOGIN_HOME_BASE))
     except OSError:
         return
-    cutoff = time.time() - _LOGIN_MAX_AGE_S
     for entry in entries:
-        if entry.name in _active_logins:
+        if entry.name in registered:
             continue
         try:
             if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:

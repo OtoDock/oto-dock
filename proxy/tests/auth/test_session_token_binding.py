@@ -1,57 +1,62 @@
 """Tests for session-token binding on hook endpoints.
 
 A session JWT is scoped to its session_id. Hook endpoints cross-check the
-token's sid against the request body session_id so a compromised MCP
-can't request resources for other sessions."""
+token's sid against the request body session_id (``verify_session_match_async``)
+so a compromised MCP can't request resources for other sessions."""
 
 from fastapi import HTTPException
 
 import pytest
 
 
-def test_matching_session_accepted(temp_db):
+@pytest.mark.asyncio
+async def test_matching_session_accepted(temp_db):
     """Token for session-A + request body session-A → passes."""
-    from api.sessions.sessions import verify_session_match
+    from api.sessions.sessions import verify_session_match_async
     from auth.session_token import create_session_token
 
     token = create_session_token("session-A", "agent-1")
-    verify_session_match(f"Bearer {token}", "session-A")  # must not raise
+    await verify_session_match_async(f"Bearer {token}", "session-A")  # must not raise
 
 
-def test_mismatched_session_forbidden(temp_db):
+@pytest.mark.asyncio
+async def test_mismatched_session_forbidden(temp_db):
     """Token for session-A + request body session-B → 403."""
-    from api.sessions.sessions import verify_session_match
+    from api.sessions.sessions import verify_session_match_async
     from auth.session_token import create_session_token
 
     token = create_session_token("session-A", "agent-1")
     with pytest.raises(HTTPException) as exc:
-        verify_session_match(f"Bearer {token}", "session-B")
+        await verify_session_match_async(f"Bearer {token}", "session-B")
     assert exc.value.status_code == 403
 
 
-def test_master_api_key_bypasses_session_check(temp_db):
+@pytest.mark.asyncio
+async def test_master_api_key_bypasses_session_check(temp_db):
     """The master PROXY_API_KEY is service-to-service and not bound to any
     session — Docker MCPs on the platform use it."""
     import config
-    from api.sessions.sessions import verify_session_match
+    from api.sessions.sessions import verify_session_match_async
 
     # Works for any session_id
-    verify_session_match(f"Bearer {config.API_KEY}", "session-anything")
+    await verify_session_match_async(f"Bearer {config.API_KEY}", "session-anything")
 
 
-def test_missing_authorization_rejected(temp_db):
+@pytest.mark.asyncio
+async def test_missing_authorization_rejected(temp_db):
     """Missing Authorization header is 401."""
-    from api.sessions.sessions import verify_session_match
+    from api.sessions.sessions import verify_session_match_async
     with pytest.raises(HTTPException) as exc:
-        verify_session_match(None, "session-A")
+        await verify_session_match_async(None, "session-A")
     assert exc.value.status_code == 401
 
 
-def test_invalid_token_rejected(temp_db):
+@pytest.mark.asyncio
+async def test_invalid_token_rejected(temp_db):
     """Malformed / unknown token is 401."""
-    from api.sessions.sessions import verify_session_match
+    from api.sessions.sessions import verify_session_match_async
     with pytest.raises(HTTPException) as exc:
-        verify_session_match("Bearer not-a-real-token", "session-A")
+        await verify_session_match_async("Bearer not-a-real-token", "session-A")
     assert exc.value.status_code == 401
 
 

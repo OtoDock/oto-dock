@@ -70,6 +70,9 @@ export interface EngineRuntime {
   supports_interactive_pty: boolean
   interactive_first_prompt_via_argv: boolean
   supports_reattach_after_restart: boolean
+  /** An idle remote session a satellite kept across a platform restart is
+   *  taken back. */
+  readopts_idle_session: boolean
   binary: string
   pin_key: string
   config_dir_name: string

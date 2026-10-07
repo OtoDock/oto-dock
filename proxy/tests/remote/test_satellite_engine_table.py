@@ -45,6 +45,9 @@ def test_the_rows_agree_with_the_descriptors():
         assert row.installed_name == caps.runtime.installed_name, path
         assert row.config_dir == caps.runtime.config_dir_name, path
         assert row.turn_replay == caps.runtime.supports_reattach_after_restart, path
+        # Every remote engine's idle session is in the connect report (one
+        # list or the other), so every one is taken back or closed there.
+        assert caps.runtime.readopts_idle_session, path
         spec = caps.auth.credential_file
         assert spec is not None, f"{path}: a satellite row clamps a credential file the proxy does not declare"
         assert row.credential_kind == spec.wire_kind, path

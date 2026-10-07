@@ -12,8 +12,9 @@ owns their lifecycle:
   * chat-slot acquisition + a hook into the 120s reconciler (``concurrency.py``)
     so an interactive slot is never mis-reaped or leaked;
   * an **idle reaper** that will NOT reap a session a viewer is watching, and
-    treats PTY output as activity (so a long unviewed agent turn isn't killed
-    mid-flight);
+    treats input, turn signals and PTY output inside an open turn as activity
+    (so a long unviewed agent turn isn't killed mid-flight, and a TUI's redraw
+    between turns doesn't keep an abandoned terminal alive);
   * the **drainer** — a task that forwards the session's permission queue
     (permission prompts + display/file-tools artifacts pushed by ``api/hooks``)
     to a viewer callback, since there is no pump to drain it.
@@ -94,19 +95,32 @@ def _breadcrumb_text(raw: bytes) -> str:
 
 # Idle reaping is unified across all session kinds via config.get_idle_timeout()
 # (the admin `session_idle_timeout` setting); reap_idle() reads it per-sweep. A
-# viewer attached, or any PTY byte in/out, keeps an interactive session alive
-# regardless of the timeout (see reap_idle).
+# viewer attached keeps an interactive session alive regardless of the timeout;
+# its idle age moves on input, prompts, interrupts, turn signals and PTY output
+# inside an open turn (see _fanout_output and reap_idle).
 _REAPER_PERIOD_S = 60
-# Reaper spare cap for question-parked sessions, as a MULTIPLE of the admin idle
-# knob (30 min at the 900s default) — not a fixed wall clock: on a multi-tenant
-# box a long fixed cap lets abandoned questions pin slots the admin believes are
-# reclaimed after `session_idle_timeout`. Waiting on a HUMAN is not idleness, so
-# a parked turn gets ONE extra window; past it the platform reclaims the slot,
-# and the answer path revives the session (single-flight). Under memory pressure
-# the capacity evictor (core/concurrency._admit_with_eviction) spares an open
-# turn or a parked question up to the background-work ceiling and reclaims the
-# rest by last_activity.
-_QUESTION_PARK_TIMEOUT_MULT = 2
+# A turn parked on a question waits on a person, so the reaper spares it like
+# a held prompt: until the session's token ends less _TOKEN_MARGIN_S (an answer
+# after that lets the turn go on and every later hook is refused), at most
+# session_state.PROMPT_WAIT_S idle. Past it the answer path revives the session
+# (single-flight). Under memory pressure and at the per-person cap the capacity
+# evictor (core/concurrency._turn_live) spares a parked question up to the
+# background-work ceiling and reclaims it past that.
+_TOKEN_MARGIN_S = 60
+# A session token's life (auth/session_token.create_session_token): the
+# stand-in from the terminal's start when its own token cannot be read.
+_SESSION_TOKEN_LIFE_S = 24 * 3600
+
+
+def _token_expires_at(env: "dict | None") -> Optional[float]:
+    """The wall-clock expiry of the session token in a spawn env
+    (``PROXY_API_KEY``), or None when there is none or it cannot be read."""
+    token = str((env or {}).get("PROXY_API_KEY") or "")
+    if not token:
+        return None
+    from auth.session_token import validate_session_token
+    exp = (validate_session_token(token) or {}).get("exp")
+    return float(exp) if isinstance(exp, (int, float)) else None
 
 # Readiness gate: buffer input until the TUI has rendered + gone quiet, so the
 # first prompt (a human's, or an autonomous task's injected prompt) is never sent
@@ -267,6 +281,11 @@ class InteractiveSession:
     # No turn-end waiters on a partial instance (the turn-complete funnel
     # reads it); __init__ gives every real session its own list.
     _turn_end_waiters: "list[TurnCompleteCb] | tuple[()]" = ()
+    # The idle clock (``last_activity``) and the quiet clock: the newest PTY
+    # byte in or out or person's action, which the injection gate reads
+    # (``quiet_seconds``).
+    _last_activity = 0.0
+    _last_io_at = 0.0
 
     def __init__(
         self,
@@ -285,6 +304,7 @@ class InteractiveSession:
         prompt_in_argv: bool = False,
         tui_theme: str = "dark",
         chat_row: dict | None = None,
+        token_expires_at: Optional[float] = None,
     ) -> None:
         self.session_id = session_id
         self.chat_id = chat_id
@@ -320,6 +340,11 @@ class InteractiveSession:
         self.pty: Optional[PtyProcess] = None
         self.created_at = time.monotonic()
         self.last_activity = self.created_at
+        # When the session token in the CLI's env ends (wall clock): a parked
+        # question is spared no longer (_reap_spare_reason).
+        self.token_expires_at = (
+            token_expires_at if token_expires_at is not None
+            else time.time() + _SESSION_TOKEN_LIFE_S)
 
         # otodock-CLI: True while a local `otodock` terminal is attached to
         # this session over the satellite's local control socket. The local
@@ -545,8 +570,27 @@ class InteractiveSession:
         self._transcript_lock = asyncio.Lock()
 
     # -- activity / idle ------------------------------------------------------
-    def _note_activity(self) -> None:
-        self.last_activity = time.monotonic()
+    def _note_activity(self, *, io: bool = True) -> None:
+        """Stamp the idle clock; ``io`` also stamps the quiet clock. A
+        transcript turn signal passes ``io=False``: the tail may read lines
+        written seconds ago, and the PTY was not touched now."""
+        now = time.monotonic()
+        self._last_activity = now
+        if io:
+            self._last_io_at = now
+
+    @property
+    def last_activity(self) -> float:
+        """Monotonic time of the last activity: input, a prompt, an interrupt,
+        a viewer attaching, a transcript turn signal, or output inside an open
+        turn. The idle reaper and the evictor age a session from it."""
+        return self._last_activity
+
+    @last_activity.setter
+    def last_activity(self, value: float) -> None:
+        # Assigning sets when the session was last heard from: both clocks.
+        self._last_activity = value
+        self._last_io_at = value
 
     @property
     def turn_open(self) -> bool:
@@ -606,7 +650,15 @@ class InteractiveSession:
 
     @property
     def idle_seconds(self) -> float:
+        """The age the idle reaper and the evictor read (``last_activity``)."""
         return time.monotonic() - self.last_activity
+
+    @property
+    def quiet_seconds(self) -> float:
+        """Seconds since the last PTY byte in either direction or person's
+        action (the injection gate): output outside a turn is no activity,
+        but it is not quiet."""
+        return time.monotonic() - self._last_io_at
 
     @property
     def alive(self) -> bool:
@@ -743,9 +795,17 @@ class InteractiveSession:
             logger.exception("interactive %s: on_status failed", self.session_id[:8])
 
     def _fanout_output(self, data: bytes) -> None:
-        # PtyProcess.on_output → here. PTY output counts as activity (the agent
-        # is working) so an unviewed long turn isn't reaped.
-        self._note_activity()
+        # PtyProcess.on_output → here. Output inside an open turn is the agent
+        # working, so an unviewed long turn isn't reaped. Between turns a TUI
+        # redraws on its own (a warmup in the same scope rewrites its hook
+        # files, a status line), which must not reset the age the reaper and
+        # the evictor read; it still breaks the injection gate's quiet. A
+        # local otodock terminal types on the satellite, never through
+        # write_input, so its echo is the only trace of that input here.
+        if self._turn_open or self.otodock_attached:
+            self._note_activity()
+        else:
+            self._last_io_at = time.monotonic()
         # Readiness: output is flowing → (re)arm the settle timer. Ready fires
         # when output goes quiet for READY_SETTLE_S (the TUI finished rendering).
         if not self._ready:
@@ -1285,7 +1345,11 @@ class InteractiveSession:
         """Fold a tailer batch's ``last_signal`` into the turn-open state.
         ``question_pending`` tracks the question-parked flag alongside: set on
         a question fold, cleared by the next turn-relevant signal (reopen or
-        real end_turn); signal-less batches leave it untouched."""
+        real end_turn); signal-less batches leave it untouched. A batch with
+        a signal is activity: the CLI journaled turn work, which covers a turn
+        it opened with no input (a background subagent's result, a self-wake)."""
+        if last_signal is not None or question_pending:
+            self._note_activity(io=False)
         if question_pending:
             self._question_parked = True
         elif last_signal is not None:
@@ -1328,6 +1392,7 @@ class InteractiveSession:
             return
         logger.info("interactive %s: parked on the native %s dialog",
                     self.session_id[:8], tool_name)
+        self._note_activity(io=False)
         self._question_parked = True
         if self._turn_open:
             self._set_turn_open(False)
@@ -1364,6 +1429,8 @@ class InteractiveSession:
         skipped (per-speaker turns are not chat-level activity)."""
         was = self._turn_open
         self._turn_open = is_open
+        if is_open != was:
+            self._note_activity(io=False)
         if is_open:
             self._question_parked = False  # any open unparks (answer/inject)
             self._native_park_pinged = False
@@ -1530,7 +1597,7 @@ class InteractiveSession:
                      or time.monotonic() - self._composer_dirty_at
                      < _COMPOSER_DIRTY_TTL_S)):
             return "composer_dirty"
-        if not steer_live and self.idle_seconds < _INJECT_QUIET_S:
+        if not steer_live and self.quiet_seconds < _INJECT_QUIET_S:
             return "not_quiet"
         # Shared completion gates (mirror _maybe_fire_turn_complete): a young
         # session may still be warming; a pending bg subagent means a follow-up
@@ -2315,6 +2382,8 @@ class InteractiveSession:
         # the registry lock during a supersede (taking it here would deadlock).
         if _sessions.get(self.session_id) is self:
             _sessions.pop(self.session_id, None)
+            from core.session.session_state import mark_closing
+            mark_closing(self.session_id)
 
         # A session dying mid-turn can never emit its end_turn signal — clear
         # the sidebar dot (and stamp the partial response) via the transition
@@ -2422,6 +2491,7 @@ def persist_drained_artifact(chat_id: str, item: dict) -> Optional[int]:
     replay/dismissal key) or None — persistence must never break live delivery,
     hence the blanket except. Runs off the loop (``asyncio.to_thread``)."""
     from core.events.artifact_events import (
+        LIVE_ONLY_KEYS,
         REPLAYABLE_ARTIFACT_EVENT_TYPES,
         artifact_event_from_perm_item,
     )
@@ -2432,6 +2502,8 @@ def persist_drained_artifact(chat_id: str, item: dict) -> Optional[int]:
         event = artifact_event_from_perm_item(item)
         if event is None:
             return None
+        # The WOPI token rides the live frame only; a replayed card mints its own.
+        event = {k: v for k, v in event.items() if k not in LIVE_ONLY_KEYS}
         import json
         from storage import database as task_store
         return task_store.add_chat_message(
@@ -2647,6 +2719,7 @@ async def register(
         execution_path=execution_path, prompt_in_argv=prompt_in_argv,
         tui_theme=tui_theme,
         chat_row=await _load_chat_row(chat_id),
+        token_expires_at=_token_expires_at(env),
     )
 
     async def _make_local_pty(s: "InteractiveSession"):
@@ -2711,6 +2784,9 @@ async def register_remote(
         execution_path=execution_path, prompt_in_argv=prompt_in_argv,
         tui_theme=tui_theme,
         chat_row=await _load_chat_row(chat_id),
+        # The payload's token, minted at the payload build, which can run
+        # minutes before this session exists (a satellite MCP install).
+        token_expires_at=_token_expires_at(config_payload.get("env")),
     )
 
     async def _make_remote_pty(s: "InteractiveSession"):
@@ -2762,9 +2838,13 @@ def _reap_spare_reason(session: "InteractiveSession", timeout_s: float) -> str:
     """Why an over-timeout session must NOT be reaped, or "".
 
     * ``question-parked`` — the turn is parked on an unanswered
-      AskUserQuestion: idle by every byte measure, but waiting on a HUMAN.
-      Capped at ``_QUESTION_PARK_TIMEOUT_MULT`` × the idle knob (see the
-      constant).
+      AskUserQuestion: idle by every byte measure, but waiting on a person.
+      Spared like a held prompt: until the session's token ends less
+      ``_TOKEN_MARGIN_S``, at most ``session_state.PROMPT_WAIT_S`` idle (see
+      the constant).
+    * ``prompt-pending``: a prompt the platform holds for this session
+      waits on a person (``session_state.has_pending_prompt``), as the
+      headless reapers spare it; the prompt's own wait bounds it.
     * ``turn-open`` — mid-turn work with no viewer: a byte-quiet stretch of a
       long tool call can outlast the idle window. Capped at the per-TURN
       ceiling (``config.get_session_timeout()``): a turn cannot legitimately
@@ -2775,13 +2855,16 @@ def _reap_spare_reason(session: "InteractiveSession", timeout_s: float) -> str:
       signal the headless reapers consult. Self-limiting: it needs hooks to keep
       firing inside the window.
     """
+    from core.session import session_state
     if (session.question_parked
-            and session.idle_seconds < _QUESTION_PARK_TIMEOUT_MULT * timeout_s):
+            and session.idle_seconds < session_state.PROMPT_WAIT_S
+            and time.time() < session.token_expires_at - _TOKEN_MARGIN_S):
         return "question-parked"
+    if session_state.has_pending_prompt(session.session_id):
+        return "prompt-pending"
     if session.turn_open and session.idle_seconds < config.get_session_timeout():
         return "turn-open"
-    from core.session.session_state import get_hook_activity
-    last_hook = get_hook_activity(session.session_id)
+    last_hook = session_state.get_hook_activity(session.session_id)
     if last_hook and time.monotonic() - last_hook < timeout_s:
         return "hook-activity"
     return ""
@@ -2792,10 +2875,11 @@ async def reap_idle(timeout_s: float | None = None) -> int:
 
     ``timeout_s`` defaults to the platform-wide admin idle timeout (the
     cached off-loop read): ONE knob shared with the headless reapers.
-    A viewer attached, or any byte in/out, keeps a session alive, so a
-    long unviewed agent turn is never killed mid-flight; an on-screen or
-    reconnect-grace terminal is also spared below (don't kill visible state —
-    that is NOT a longer timeout). A parked question / open turn / recent hook
+    A viewer attached keeps a session alive; input, prompts, turn signals
+    and output inside an open turn reset its age, so a long unviewed agent
+    turn is never killed mid-flight while a redraw between turns is no
+    activity. An on-screen or reconnect-grace terminal is also spared below
+    (don't kill visible state — that is NOT a longer timeout). A parked question / open turn / recent hook
     activity also spares (``_reap_spare_reason``). Returns the count reaped.
     """
     if timeout_s is None:

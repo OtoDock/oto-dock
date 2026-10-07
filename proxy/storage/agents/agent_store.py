@@ -552,6 +552,17 @@ def delete_agent(slug: str) -> bool:
         # Pinned apps registry (shared + every user's personal rows —
         # their HTML files live under the agent folder being removed).
         conn.execute("DELETE FROM pinned_apps WHERE agent = %s", (slug,))
+        # Shares that place apps of OTHER agents here (SHARING.md): the
+        # agent's own shares cascaded with its rows above; a person's app
+        # accepted into this agent returns to their section unplaced.
+        from storage.sharing import share_store
+        conn.execute("DELETE FROM shares WHERE grantee_agent = %s", (slug,))
+        conn.execute(
+            "UPDATE shares SET placed_agent = NULL, decision = %s "
+            "WHERE placed_agent = %s AND revoked_at IS NULL",
+            (share_store.PENDING, slug),
+        )
+        conn.execute("DELETE FROM share_placement_hides WHERE agent = %s", (slug,))
         # Dock file pins — references into the agent folder being removed
         # (scope rows for this agent's chats already died with the chats
         # delete above; this covers pins this agent placed on OTHER agents'

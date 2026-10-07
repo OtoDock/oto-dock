@@ -1,19 +1,21 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAgentInfo, useUpdateAgent, useDeleteAgent, useDelegationTargets, useSetDelegationTargets, useExecutionLayers, useSetDefaultForNewUsers, useKnowledgeAttachments, useKnowledgeLibraries, useSetKnowledgeLibrary, useAttachKnowledgeLibrary, useDetachKnowledgeLibrary, useAgentFiles, type KnowledgeLibrary, type FileNode } from '../../api/agents'
+import { useAgentInfo, useUpdateAgent, useDeleteAgent, useDelegationTargets, useSetDelegationTargets, useExecutionLayers, useSetDefaultForNewUsers, useKnowledgeAttachments, useKnowledgeLibraries, useSetKnowledgeLibrary, useAttachKnowledgeLibrary, useDetachKnowledgeLibrary, useAgentFiles, useAgentUsers, AgentUpdateError, type AgentUser, type SharedOnlySwitchResult, type KnowledgeLibrary, type FileNode } from '../../api/agents'
 import { useRemoteMachines } from '../../api/remoteMachines'
 import { PAIRING_SCOPE, TARGET_LOCAL, isLocalTarget } from '../../lib/placement'
 import { MACHINE_STATE } from '../../lib/status/machine'
 import { useDepartments } from '../../api/departments'
 import { wiringSentence } from '../../lib/kinds/department'
 import { useAuth } from '../../contexts/AuthContext'
-import { ROLE, canManageAgent, isAdmin as isPlatformAdmin, isCreatorOrAbove, type AgentRole } from '../../lib/permissions'
+import { ROLE, allowedOnSharedOnly, canManageAgent, isAdmin as isPlatformAdmin, isCreatorOrAbove, roleLabel, type AgentRole } from '../../lib/permissions'
 import { tierMarkText, tierTitle } from '../../lib/tiers'
 import {
   type VisibilityMode,
   columnsOf,
+  isSharedOnly,
   modeOf,
+  modeOfAgent,
   MODE_GROUPS,
   MODE_LABEL,
   MODE_OPTION_HINT,
@@ -41,9 +43,13 @@ const libMountPath = (source: string, subdir: string) =>
 export default function AgentConfig() {
   const { name } = useParams<{ name: string }>()
   const navigate = useNavigate()
-  const { user } = useAuth()
+  const { user, refreshUser } = useAuth()
   const { data: info, isLoading } = useAgentInfo(name!)
   const updateAgent = useUpdateAgent()
+  // The switch to Shared only has its own mutation: its answer (the removal
+  // report, or a 409 with the fresh list) must not be dropped by another save
+  // made on the shared instance while it is in flight.
+  const switchMode = useUpdateAgent()
   const deleteAgent = useDeleteAgent()
   const { data: delegationData } = useDelegationTargets(name!)
   const setDelegationTargets = useSetDelegationTargets()
@@ -93,6 +99,13 @@ export default function AgentConfig() {
   // Pending mode awaiting a type-to-confirm (set only for into/out-of Shared
   // only flips, which reshuffle which chats a user sees).
   const [pendingMode, setPendingMode] = useState<VisibilityMode | null>(null)
+  // The switch INTO Shared only removes the viewer and contributor rows: the
+  // list the server answered with (a 409 when the live rows changed), the
+  // error to show in the dialog, and what the switch reported once done.
+  const [switchPeople, setSwitchPeople] = useState<AgentUser[] | null>(null)
+  const [switchError, setSwitchError] = useState<string | null>(null)
+  const [switchNotice, setSwitchNotice] = useState<string | null>(null)
+  const [dfnuError, setDfnuError] = useState<string | null>(null)
   const [adminOnly, setAdminOnly] = useState(false)
   const [showTemplateUpdate, setShowTemplateUpdate] = useState(false)
   const [agentColor, setAgentColor] = useState('')
@@ -143,9 +156,9 @@ export default function AgentConfig() {
     setDepartmentLevelId(info.department_level_id || '')
     const dfnuRoleRaw = info.default_for_new_users_role
     setDfnuEnabled(!!dfnuRoleRaw)
-    if (dfnuRoleRaw) {
-      setDfnuRole(dfnuRoleRaw)
-    }
+    // Off: the role the toggle would turn on with (editor on a Shared-only
+    // agent, whose rows take editor or above).
+    setDfnuRole(dfnuRoleRaw || (isSharedOnly(modeOfAgent(info)) ? ROLE.EDITOR : ROLE.VIEWER))
   }, [info])
 
   useEffect(() => {
@@ -327,8 +340,66 @@ export default function AgentConfig() {
   const onSelectMode = (next: VisibilityMode) => {
     if (next === mode) return
     const crossesShared = (mode === 'shared_only') !== (next === 'shared_only')
-    if (crossesShared) setPendingMode(next)
-    else saveMode(next)
+    setSwitchNotice(null)
+    if (crossesShared) {
+      setSwitchPeople(null)
+      setSwitchError(null)
+      setPendingMode(next)
+    } else saveMode(next)
+  }
+
+  // Shared only takes the editor role to chat: switching into it removes the
+  // viewer and contributor rows, which the dialog names (the users list, read
+  // while it is open) and the PATCH confirms exactly. Saved only when the
+  // server agrees: a 409 means the rows changed, and the dialog shows the
+  // fresh list to confirm again.
+  const { data: agentUsers, isLoading: usersLoading, isError: usersFailed } = useAgentUsers(name || '', {
+    enabled: pendingMode === 'shared_only' && canManage,
+  })
+  // The server's list, exactly: an admin's row is inert (they act as admin)
+  // and is neither named nor removed.
+  const losing = switchPeople ?? (agentUsers || [])
+    .filter((p) => !allowedOnSharedOnly(p.role) && !isPlatformAdmin(p.platform_role))
+  // Until the list is read the dialog cannot say who loses access; a failed
+  // read may still confirm (the server answers with the list to check).
+  const listPending = pendingMode === 'shared_only' && !switchPeople && usersLoading
+  const confirmSharedOnly = () => {
+    const cols = columnsOf('shared_only')
+    setSwitchError(null)
+    switchMode.mutate(
+      { name: name!, collaborative: cols.collaborative, default_scope: cols.default_scope,
+        confirm_removals: losing.map((p) => p.sub) },
+      {
+        onSuccess: (row: { shared_only_switch?: SharedOnlySwitchResult }) => {
+          setCollaborative(cols.collaborative)
+          setDefaultScope(cols.default_scope)
+          setPendingMode(null)
+          setSwitchPeople(null)
+          const r = row?.shared_only_switch
+          const notes: string[] = []
+          if (r?.not_removed?.length) {
+            notes.push(`${r.not_removed.length} viewer or contributor assignment(s) were kept `
+              + '(added during the switch, or not removed): an admin changes them in Admin → Users.')
+          }
+          if (r?.default_cleared) notes.push('The role new users are attached with was cleared.')
+          setSwitchNotice(notes.length ? notes.join(' ') : null)
+          queryClient.invalidateQueries({ queryKey: ['agent-users', name] })
+          queryClient.invalidateQueries({ queryKey: ['admin-users'] })
+          if (user?.sub && r?.removed?.includes(user.sub)) void refreshUser()
+          setSavedField('visibility_mode')
+          setTimeout(() => setSavedField(null), 1500)
+        },
+        onError: (e) => {
+          const fresh = e instanceof AgentUpdateError ? e.sharedOnlyPeople : null
+          if (fresh) {
+            setSwitchPeople(fresh)
+            setSwitchError('Check who loses access and confirm again: the list above is the current one.')
+          } else {
+            setSwitchError(e.message)
+          }
+        },
+      },
+    )
   }
 
   // The agent's enabled engines, in the catalog's engine order.
@@ -958,6 +1029,7 @@ export default function AgentConfig() {
                   ))}
                 </div>
                 <p className="text-xs text-p-text-secondary">{MODE_SUMMARY[mode]}</p>
+                {switchNotice && <p className="text-xs text-amber-600">{switchNotice}</p>}
               </>
             )}
           </div>
@@ -1000,13 +1072,24 @@ export default function AgentConfig() {
                   <Toggle
                     checked={dfnuEnabled}
                     onChange={(v) => {
+                      // A Shared-only agent takes editor or above: turning the
+                      // default on there starts from editor, never a lower role.
+                      const role = v && mode === 'shared_only' && !allowedOnSharedOnly(dfnuRole)
+                        ? ROLE.EDITOR : dfnuRole
                       setDfnuEnabled(v)
+                      setDfnuRole(role)
+                      setDfnuError(null)
                       setDefaultForNewUsers.mutate(
-                        { agent: name!, enabled: v, role: v ? dfnuRole : null },
+                        { agent: name!, enabled: v, role: v ? role : null },
                         {
                           onSuccess: () => {
                             setSavedField('default_for_new_users_role')
                             setTimeout(() => setSavedField(null), 1500)
+                          },
+                          onError: (e) => {
+                            setDfnuEnabled(!v)
+                            setDfnuRole(dfnuRole)
+                            setDfnuError(e.message)
                           },
                         },
                       )
@@ -1022,7 +1105,9 @@ export default function AgentConfig() {
                   disabled={!dfnuEnabled}
                   onChange={(e) => {
                     const v = e.target.value as AgentRole
+                    const previous = dfnuRole
                     setDfnuRole(v)
+                    setDfnuError(null)
                     if (dfnuEnabled) {
                       setDefaultForNewUsers.mutate(
                         { agent: name!, enabled: true, role: v },
@@ -1031,18 +1116,37 @@ export default function AgentConfig() {
                             setSavedField('default_for_new_users_role')
                             setTimeout(() => setSavedField(null), 1500)
                           },
+                          onError: (err) => {
+                            setDfnuRole(previous)
+                            setDfnuError(err.message)
+                          },
                         },
                       )
                     }
                   }}
                   className="w-full sm:w-auto px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 disabled:cursor-not-allowed"
                 >
-                  <option value="viewer">Viewer (read-only, recommended for personal assistants)</option>
-                  <option value="contributor">Contributor (writes the shared workspace, nothing as the agent)</option>
-                  <option value="editor">Editor (shared workspace edits and agent-scope automations)</option>
-                  <option value="manager">Manager (full configuration access)</option>
+                  {/* A Shared-only agent takes editor or above; a lower default
+                      stored before the switch shows, marked, and cannot be picked. */}
+                  {(mode !== 'shared_only' || dfnuRole === ROLE.VIEWER) && (
+                    <option value={ROLE.VIEWER} disabled={mode === 'shared_only'}>
+                      {mode === 'shared_only'
+                        ? 'Viewer (not for a Shared-only agent)'
+                        : 'Viewer (read-only, recommended for personal assistants)'}
+                    </option>
+                  )}
+                  {(mode !== 'shared_only' || dfnuRole === ROLE.CONTRIBUTOR) && (
+                    <option value={ROLE.CONTRIBUTOR} disabled={mode === 'shared_only'}>
+                      {mode === 'shared_only'
+                        ? 'Contributor (not for a Shared-only agent)'
+                        : 'Contributor (writes the shared workspace, nothing as the agent)'}
+                    </option>
+                  )}
+                  <option value={ROLE.EDITOR}>Editor (shared workspace edits and agent-scope automations)</option>
+                  <option value={ROLE.MANAGER}>Manager (full configuration access)</option>
                 </select>
               </div>
+              {dfnuError && <p className="text-xs text-red-600">{dfnuError}</p>}
             </div>
           )}
         </div>
@@ -1580,11 +1684,45 @@ export default function AgentConfig() {
               </>
             )
           }
+          extra={pendingMode === 'shared_only' && (losing.length > 0 || switchError || listPending || usersFailed) ? (
+            <div className="text-sm text-p-text">
+              {listPending && <p className="text-xs text-p-text-light">Loading who loses access…</p>}
+              {usersFailed && !switchPeople && (
+                <p className="text-xs text-p-text-light">
+                  The list of assignments could not be read: confirming asks the server for it.
+                </p>
+              )}
+              {losing.length > 0 && (
+                <>
+                  <p className="mb-1">
+                    Shared only takes the <strong>editor</strong> role or above to chat, so
+                    {' '}{losing.length === 1 ? 'this person loses' : `these ${losing.length} people lose`}
+                    {' '}their assignment to this agent:
+                  </p>
+                  <ul className="max-h-40 overflow-y-auto rounded-lg border border-p-border-light px-3 py-1.5 text-xs">
+                    {losing.map((p) => (
+                      <li key={p.sub} className="flex justify-between gap-2 py-0.5">
+                        <span className="truncate">{p.name}</span>
+                        <span className="shrink-0 text-p-text-light">{roleLabel(p.role)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+              {switchError && <p className="mt-2 text-xs text-red-600">{switchError}</p>}
+            </div>
+          ) : undefined}
           confirmWord="CONFIRM"
           confirmLabel="Switch mode"
-          destructive={false}
-          onCancel={() => setPendingMode(null)}
+          destructive={pendingMode === 'shared_only' && losing.length > 0}
+          isPending={switchMode.isPending}
+          confirmDisabled={listPending}
+          onCancel={() => { setPendingMode(null); setSwitchPeople(null); setSwitchError(null) }}
           onConfirm={() => {
+            if (pendingMode === 'shared_only') {
+              confirmSharedOnly()
+              return
+            }
             saveMode(pendingMode)
             setPendingMode(null)
           }}

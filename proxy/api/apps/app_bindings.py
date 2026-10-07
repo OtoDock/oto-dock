@@ -151,7 +151,7 @@ async def _caller_context(request: Request, row: dict) -> tuple[dict, dict | Non
     caller = await resolve_caller(request, row)
     if caller.basis != "app":
         raise _refuse(403, "the broker takes the app's launch token")
-    if caller.instance != "live":
+    if caller.instance != app_supervisor.LIVE:
         raise _refuse(403, "the preview copy cannot call other apps")
     viewer: dict | None = None
     forwarded = request.headers.get("x-otodock-viewer", "")
@@ -159,6 +159,10 @@ async def _caller_context(request: Request, row: dict) -> tuple[dict, dict | Non
         viewer = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_VIEWER)
         if viewer is None:
             platform = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_CALLER)
+            if (platform or {}).get("placement"):
+                # A placed agent's session reaches the app's exports alone;
+                # its claim is never brokered on (APPS.md "Agents call apps").
+                raise _refuse(403, "not available to a placed agent's session")
             relayed = (platform or {}).get("principal")
             if relayed not in (app_tokens.PRINCIPAL_PLATFORM, app_tokens.PRINCIPAL_AGENT):
                 raise _refuse(400, "the forwarded viewer claim is not this app's")
@@ -174,6 +178,8 @@ async def _caller_context(request: Request, row: dict) -> tuple[dict, dict | Non
     chain = request.headers.get("x-otodock-caller", "")
     if chain:
         parent = app_tokens.verify(chain, row["id"], app_tokens.PURPOSE_CALLER)
+        if parent and parent.get("placement"):
+            raise _refuse(403, "not available to a placed agent's session")
         if not parent or parent.get("principal") not in ("membership", "delegation", "platform"):
             raise _refuse(400, "the forwarded caller claim is not this app's")
     return viewer or {}, parent
@@ -324,9 +330,7 @@ async def broker(app_id: str, name: str, path: str, request: Request):
     raw = request.scope.get("raw_path") or b""
     raw_s = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
     check_app_path(path, raw_s)
-    methods = _mf.parse_exports(target).get("methods") or {}
-    first = path.split("/", 1)[0]
-    entry = methods.get(first)
+    entry = _mf.exported_method(target, path)
     if entry is None:
         raise _refuse(404, "not exported by that app")
     if not _take(f"bind|{row['id']}|{target['id']}", BIND_RATE, BIND_BURST):
@@ -418,7 +422,7 @@ async def emit_event(app_id: str, request: Request):
     caller = await resolve_caller(request, row)
     if caller.basis != "app":
         raise _refuse(403, "events are emitted with the app's launch token")
-    if caller.instance != "live":
+    if caller.instance != app_supervisor.LIVE:
         raise _refuse(403, "the preview copy cannot emit events")
     if not task_store.app_actions_approved(row):
         raise _refuse(409, "the app is waiting for approval")

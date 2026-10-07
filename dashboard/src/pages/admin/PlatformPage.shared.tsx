@@ -142,4 +142,5 @@ export const MCP_STATUS_LABEL: Record<string, string> = {
   skipped_in_use: 'skipped (in use)',
   failed: 'failed',
   held: 'held (.hold marker)',
+  needs_approval: 'new source, needs approval',
 }

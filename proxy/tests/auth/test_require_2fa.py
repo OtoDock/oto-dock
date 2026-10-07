@@ -215,11 +215,11 @@ def test_must_change_password_gates_until_the_change(_gate_fresh):
 
 
 def test_a_gated_persons_session_token_is_never_gated(_gate_fresh):
-    from auth.session_token import create_session_token
+    from tests.conftest import live_session_token
     sub = db.create_local_user(_EMAIL, "U", "U", "member", hash_password(_PW),
                                must_change_password=True)
     db.set_platform_setting("require_2fa", "1")
-    token = create_session_token("s-gate", "any-agent", sub)
+    token = live_session_token("s-gate", "any-agent", sub)
     assert client.get("/v1/tasks", headers={"Authorization": f"Bearer {token}"}).status_code == 200
 
 
@@ -306,3 +306,19 @@ async def test_turning_the_requirement_on_counts_a_passkey_only_while_passkeys_a
     with pytest.raises(HTTPException) as excinfo:
         await platform_api._refuse_require_2fa_that_would_hold(u)
     assert excinfo.value.status_code == 409
+
+
+def test_the_banner_route_is_an_admins_and_empty_on_the_cloud(_gate_fresh, monkeypatch):
+    from auth import lan_check
+    lan_check.reset_state()
+    lan_check.stamp_scope({"type": "http", "client": ("10.200.0.1", 1), "server": ("x", 8400),
+                           "headers": [(b"x-forwarded-for", b"203.0.113.7")]})
+    assert client.get("/v1/admin/forwarding-warnings").status_code == 401
+    _as_admin()
+    (row,) = client.get("/v1/admin/forwarding-warnings").json()["warnings"]
+    assert row["peer"] == "10.200.0.1" and row["case"] == "untrusted_forwarder"
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", True)
+    assert client.get("/v1/admin/forwarding-warnings").json() == {"warnings": []}
+    _mk_user()
+    assert client.get("/v1/admin/forwarding-warnings").status_code == 403
+    lan_check.reset_state()

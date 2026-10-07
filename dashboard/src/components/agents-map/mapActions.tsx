@@ -7,7 +7,7 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { useSetDefaultAgent, useUpdateAgent } from '../../api/agents'
 import type { User } from '../../api/auth'
 import type { Department, useAdminAddUserAgent } from '../../api/departments'
-import { canManageAgent, isAdmin } from '../../lib/permissions'
+import { ROLE, canManageAgent, isAdmin } from '../../lib/permissions'
 import type { MapNode } from './layout'
 import type { MenuState, PopupState } from './mapConstants'
 import { MenuIcon, type MapMenuAction } from './MapOverlays'
@@ -105,8 +105,10 @@ export function buildAgentActions({
         label: 'Add me to this agent',
         icon: <MenuIcon d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />,
         onClick: () => {
+          // A Shared-only agent takes editor or above (an unknown mode too:
+          // editor is valid on every agent).
           addMe.mutate(
-            { sub: user.sub, agent: n.slug },
+            { sub: user.sub, agent: n.slug, role: n.sharedOnly === false ? ROLE.VIEWER : ROLE.EDITOR },
             {
               onSuccess: () => {
                 setNotice(`Added you to ${n.displayName}`)

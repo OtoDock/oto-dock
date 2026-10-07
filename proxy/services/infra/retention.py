@@ -8,7 +8,7 @@ session files that ``delete_chat`` never removes. This module bounds all of it
 with a daily sweep (wired into app.py's registry sweep loop) and powers the
 admin "Storage & Retention" card (run-now + usage readout).
 
-Four passes:
+Passes (the full list and its order are ``_run_sweep_sync``'s):
   A. Aged chats — governed by the admin knob (``session_retention_enabled``,
      default ON; ``session_retention_days``, default 180): local chats
      untouched for N days lose their session files and are flagged
@@ -24,6 +24,10 @@ Four passes:
      idle homes. ``state_*.sqlite`` (thread state) and ``sessions/`` are kept.
   D. MCP tarball cache GC — ``services/mcp_tarball.gc()`` (500 MB quota +
      7-day stale) existed but was never scheduled; the sweep calls it.
+  Shares (``share-snapshots``, then ``stale-shares``) — always on: a
+     revoked chat share's copy 7 days after the revoke, then revoked and
+     declined share rows 30 days after the revoke or the decision
+     (``share_store.STALE_SHARE_DAYS``).
 
 Never touched: anything on a remote satellite, workspaces/user content,
 plans, ``state_*.sqlite``, token/credential dirs.
@@ -41,6 +45,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -98,6 +103,225 @@ def settings_days() -> int:
     except (TypeError, ValueError):
         days = DEFAULT_DAYS
     return max(MIN_DAYS, days)
+
+
+# The .offboarded/ archive (services/agents/offboarding_transfer.py): a
+# removed person's trees, kept OFFBOARDED_DEFAULT_DAYS after they were
+# archived unless the admin says otherwise (0 keeps them for ever).
+OFFBOARDED_DEFAULT_DAYS = 180
+OFFBOARDED_MAX_DAYS = 3650
+# A username as the platform mints it (``db_users._make_username_slug``):
+# nothing else under the archive is ever swept or purged.
+_ARCHIVE_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# A purge waits while the archive of a just-removed person is still due
+# to be written (the offboarding timer, plus a margin).
+_ARCHIVE_GRACE_S = 600
+
+
+class ArchiveBusy(RuntimeError):
+    """The person's archive is still being written."""
+
+
+def offboarded_enabled() -> bool:
+    """Unset means ON; only an explicit '0' disables the archive sweep."""
+    return task_store.get_platform_setting("offboarded_retention_enabled") != "0"
+
+
+def offboarded_days_from(raw: str | None) -> int:
+    """The archive retention a stored value means: unset is the default, 0
+    keeps every archive for ever. A value outside 0..OFFBOARDED_MAX_DAYS or
+    not a number (a forced setting, an older write: the settings route
+    refuses one) keeps every archive too, never the default: a "-1" meant as
+    "for ever" must not delete anything."""
+    if not raw:
+        return OFFBOARDED_DEFAULT_DAYS
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError):
+        days = -1
+    if 0 <= days <= OFFBOARDED_MAX_DAYS:
+        return days
+    logger.warning("offboarded_retention_days %r is not a number of days from 0 to %d: "
+                   "every archive is kept", raw, OFFBOARDED_MAX_DAYS)
+    return 0
+
+
+def offboarded_days() -> int:
+    """Days an archive is kept after it was written (``offboarded_days_from``)."""
+    return offboarded_days_from(task_store.get_platform_setting("offboarded_retention_days"))
+
+
+def _archive_dirname() -> str:
+    from services.agents.offboarding_transfer import ARCHIVE_DIRNAME
+    return ARCHIVE_DIRNAME
+
+
+def _archive_names() -> list[str]:
+    """The archived people: the directories directly under the archive whose
+    name is a username (links and anything else are left alone). Raises when
+    the archive root cannot be entered safely (a link standing in for it)."""
+    from services.infra import safe_fs
+    walk = safe_fs.walk_beneath(config.AGENTS_DIR, _archive_dirname())
+    try:
+        top = next(walk)
+        names = [n for n in top.dirs if _ARCHIVE_NAME_RE.match(n)]
+        top.dirs[:] = []
+    except FileNotFoundError:
+        return []
+    finally:
+        walk.close()
+    return names
+
+
+def _archive_contents(username: str) -> tuple[list[str], int]:
+    """An archive's agent folders and its size in bytes, walked beneath the
+    agents root without following a link. A folder that cannot be entered
+    (a tree the agent left unreadable) is skipped, so the size is a floor."""
+    from services.infra import safe_fs
+    rel = f"{_archive_dirname()}/{username}"
+    agents: list[str] = []
+    total = 0
+    for step in safe_fs.walk_beneath(config.AGENTS_DIR, rel, onerror=lambda _e: None):
+        if step.rel == rel:
+            agents = list(step.dirs)
+        for name in step.files:
+            with contextlib.suppress(OSError):
+                total += os.stat(name, dir_fd=step.dirfd, follow_symlinks=False).st_size
+    return agents, total
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        stamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def list_offboarded_archives() -> dict:
+    """The admin list: every archive with its agent folders, size, when the
+    person was removed and archived, and when the sweep deletes it ("" when
+    it never will: the setting keeps it, or its date is unknown)."""
+    enabled, days = offboarded_enabled(), offboarded_days()
+    retired = {r["username"]: r for r in task_store.list_retired_usernames()}
+    archives = []
+    for name in _archive_names():
+        try:
+            agents, size = _archive_contents(name)
+        except OSError:
+            logger.warning("retention: the archive of %s could not be measured", name, exc_info=True)
+            agents, size = [], None
+        row = retired.get(name) or {}
+        archived = _parse_iso(row.get("archived_at") or "")
+        purge_after = ""
+        if enabled and days > 0 and archived:
+            purge_after = (archived + timedelta(days=days)).isoformat()
+        archives.append({"username": name, "agents": agents, "bytes": size,
+                         "retired_at": row.get("retired_at") or "",
+                         "archived_at": row.get("archived_at") or "",
+                         "purge_after": purge_after})
+    return {"archives": archives, "retention": {"enabled": enabled, "days": days}}
+
+
+def purge_offboarded_archive(username: str) -> dict:
+    """Delete one person's archive now (the admin action). ValueError for a
+    name that is not a username, FileNotFoundError when there is no such
+    archive, ArchiveBusy while it is still being written."""
+    from services.agents.offboarding_transfer import ARCHIVE_AFTER_S
+    if not _ARCHIVE_NAME_RE.match(username or ""):
+        raise ValueError("not a username")
+    if username not in _archive_names():
+        raise FileNotFoundError(username)
+    row = next((r for r in task_store.list_retired_usernames() if r["username"] == username), None)
+    if row and not row.get("archived_at"):
+        retired = _parse_iso(row.get("retired_at") or "")
+        if retired and (datetime.now(timezone.utc) - retired).total_seconds() \
+                < ARCHIVE_AFTER_S + _ARCHIVE_GRACE_S:
+            raise ArchiveBusy(username)
+    try:
+        _agents, size = _archive_contents(username)
+    except FileNotFoundError:
+        return {"username": username, "bytes": 0}
+    _delete_archive(username)
+    return {"username": username, "bytes": size}
+
+
+def _open_writable(parent_fd: int, name: str) -> None:
+    """Give the proxy's own directory ``name`` (under ``parent_fd``) its
+    owner bits back, without following a link: opened as a path handle with
+    O_NOFOLLOW and changed through that handle."""
+    fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parent_fd)
+    try:
+        os.chmod(f"/proc/self/fd/{fd}", 0o700)
+    finally:
+        os.close(fd)
+
+
+def _make_tree_writable(rel: str) -> None:
+    """Every directory of the tree at ``rel`` owner-writable and enterable
+    (a module cache is read-only, a tree can be left unreadable), each one
+    before the walk enters it; links are never followed."""
+    from services.infra import safe_fs
+    parent_rel, _, leaf = rel.rpartition("/")
+    for step in safe_fs.walk_beneath(config.AGENTS_DIR, parent_rel):
+        if step.rel == parent_rel:
+            if leaf in step.dirs:
+                _open_writable(step.dirfd, leaf)
+            step.dirs[:] = []
+    for step in safe_fs.walk_beneath(config.AGENTS_DIR, rel, onerror=lambda _e: None):
+        for name in step.dirs:
+            with contextlib.suppress(OSError):
+                _open_writable(step.dirfd, name)
+
+
+def _delete_archive(username: str) -> None:
+    """Remove one archive beneath the agents root; a tree a permission stops
+    is made owner-writable first and removed again."""
+    from services.infra import safe_fs
+    rel = f"{_archive_dirname()}/{username}"
+    try:
+        safe_fs.rmtree_beneath(config.AGENTS_DIR, rel, missing_ok=True)
+    except PermissionError:
+        _make_tree_writable(rel)
+        safe_fs.rmtree_beneath(config.AGENTS_DIR, rel, missing_ok=True)
+
+
+def _pass_offboarded_archives(stats: dict, dry_run: bool) -> None:
+    """Delete the archives written more than ``offboarded_days`` ago. An
+    archive whose date is unknown (no retired row, or no ``archived_at``) is
+    never deleted here; an admin purges it by hand."""
+    if not offboarded_enabled():
+        return
+    days = offboarded_days()
+    if days <= 0:
+        return
+    try:
+        names = _archive_names()
+    except OSError:
+        stats["errors"] += 1
+        logger.warning("retention: the archive of removed people was not swept "
+                       "(its folder could not be entered safely)", exc_info=True)
+        return
+    if not names:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    retired = {r["username"]: r for r in task_store.list_retired_usernames()}
+    for name in names:
+        archived = _parse_iso((retired.get(name) or {}).get("archived_at") or "")
+        if archived is None or archived > cutoff:
+            continue
+        try:
+            _agents, size = _archive_contents(name)
+            if not dry_run:
+                _delete_archive(name)
+                logger.info("retention: deleted the archive of %s (%d bytes, archived %s)",
+                            name, size, archived.date().isoformat())
+        except OSError:
+            stats["errors"] += 1
+            logger.warning("retention: the archive of %s was not deleted", name, exc_info=True)
+            continue
+        stats["offboarded_deleted"] += 1
+        stats["offboarded_bytes"] += size
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +667,15 @@ def _pass_share_snapshots(stats: dict, dry_run: bool) -> None:
         stats["share_snapshots_deleted"] = stats.get("share_snapshots_deleted", 0) + n
 
 
+def _pass_stale_shares(stats: dict, dry_run: bool) -> None:
+    """Share rows (SHARING.md "The ``shares`` table"): a revoked or a
+    declined one is deleted 30 days after its revoke or its decision.
+    Runs after ``share-snapshots``, which finds a revoked chat share's copy
+    through its row."""
+    from storage.sharing import share_store
+    stats["shares_deleted"] += share_store.delete_stale_shares(dry_run=dry_run)
+
+
 def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
                     dry_run: bool) -> dict:
     started = time.monotonic()
@@ -464,6 +697,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "partial_bytes": 0,
         "quota_projects_reclaimed": 0,
         "mcp_autoupdate_rows_deleted": 0,
+        "share_snapshots_deleted": 0,
+        "shares_deleted": 0,
         # Caller data (external routes) — services/infra/external_retention.py
         "callers_forgotten": 0,
         "callers_busy_skipped": 0,
@@ -471,6 +706,9 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "phone_chats_deleted": 0,
         "call_log_rows_deleted": 0,
         "caller_bytes_freed": 0,
+        # The archive of removed people (its own setting, read in the pass).
+        "offboarded_deleted": 0,
+        "offboarded_bytes": 0,
         "errors": 0,
     }
     passes = [
@@ -493,6 +731,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         ("orphan-quota-projects", lambda: _pass_orphan_quota_projects(stats, dry_run)),
         ("mcp-autoupdate-log", lambda: _pass_mcp_autoupdate_log(stats, dry_run)),
         ("share-snapshots", lambda: _pass_share_snapshots(stats, dry_run)),
+        ("stale-shares", lambda: _pass_stale_shares(stats, dry_run)),
+        ("offboarded-archives", lambda: _pass_offboarded_archives(stats, dry_run)),
     ])
     for name, fn in passes:
         try:
@@ -503,7 +743,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
     stats["duration_ms"] = int((time.monotonic() - started) * 1000)
     total = (stats["bytes_freed"] + stats["orphan_bytes"]
              + stats["codex_junk_bytes"] + stats["tarball_bytes"]
-             + stats["caller_bytes_freed"])
+             + stats["caller_bytes_freed"] + stats["offboarded_bytes"])
     logger.info(
         f"retention: sweep done in {stats['duration_ms']}ms "
         f"(dry_run={dry_run}, enabled={enabled}): "
@@ -513,6 +753,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         f"{stats['codex_junk_files']} codex-junk files, "
         f"{stats['callers_forgotten']} callers forgotten, "
         f"{stats['phone_chats_deleted']} phone chats, "
+        f"{stats['shares_deleted']} share rows, "
         f"{total} bytes total"
     )
     return stats

@@ -10,7 +10,8 @@ bucket for every vendor behind an edge would let any sender refuse them
 all), the per-app bucket, the hook in the row's signed block, the manifest
 approved and the secret set (else one 404 for all three: nothing about the
 app's state leaks), the
-raw body under 48 KB (413), the scheme over the raw bytes (401 on a bad
+raw body under 48 KB (413), the failed-signature bucket of the hook (429;
+per client for a distinct client), the scheme over the raw bytes (401 on a bad
 signature — an operator debugging a pasted secret needs it), the wrapped
 payload sized (413), then ``enqueue`` for the named handler with basis
 ``inbound`` and the vendor's event id — a replay answers ``duplicate``,
@@ -68,7 +69,7 @@ async def inbound(app_id: str, name: str, request: Request):
         raise _not_found()
     addr = client_address(request)
     if not addr.shared:
-        ok, retry_after = rate_limiter.hit("app_inbound_ip", f"ip:{addr.client}")
+        ok, retry_after = rate_limiter.hit("app_inbound_ip", f"ip:{addr.bucket_key}")
         if not ok:
             raise _too_many(retry_after)
     ok, retry_after = rate_limiter.hit("app_inbound_app", row["id"])
@@ -81,8 +82,19 @@ async def inbound(app_id: str, name: str, request: Request):
     if not secret:
         raise _not_found()
     raw = await _read_body(request)
+    # Failed signatures per hook, and per client for a distinct client, so a
+    # sender on its own address locks only itself and one hook's stale
+    # secret never locks another hook. No await from the check to the
+    # record: a burst of wrong signatures cannot all pass the check first.
+    fail_key = f"{row['id']}:{name}" if addr.shared else f"{row['id']}:{name}:ip:{addr.bucket_key}"
+    ok, retry_after = rate_limiter.check_rate_limit("app_inbound_fail", fail_key)
+    if not ok:
+        logger.info("App %s: inbound %s refused (too many failed signatures)", row.get("slug"), name)
+        raise _too_many(retry_after)
     verdict = app_inbound.verify(spec, raw, request.headers, secret)
     if not verdict.ok:
+        if verdict.reason == "signature_mismatch":
+            rate_limiter.record_attempt("app_inbound_fail", fail_key)
         logger.info("App %s: inbound %s refused (%s)", row.get("slug"), name, verdict.reason)
         raise HTTPException(status_code=401,
                             detail=f"signature verification failed ({verdict.reason})")

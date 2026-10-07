@@ -33,6 +33,10 @@ PURPOSES = frozenset({PURPOSE_VIEWER, PURPOSE_LAUNCH, PURPOSE_CALLER})
 # of the claim, not the agent scope it shares a spelling with.
 PRINCIPAL_AGENT = "agent"
 PRINCIPAL_PLATFORM = "platform"
+# A session of an agent a share placed the app in (SHARING.md "Agents use a
+# placed app"): a word of its own, so code that takes ``agent`` for the
+# app's own agent never takes a placed agent's session for it.
+PRINCIPAL_PLACEMENT = "placement"
 
 VIEWER_TTL_S = 10 * 60
 CALLER_TTL_S = 60
@@ -51,6 +55,12 @@ def _private_key(app_id: str) -> ed25519.Ed25519PrivateKey:
         key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
         _keys[app_id] = key
     return key
+
+
+def forget(app_id: str) -> None:
+    """Drop the cached key of an id that never comes back (a check's stub);
+    the same id would derive the same key again."""
+    _keys.pop(app_id, None)
 
 
 def _private_pem(app_id: str) -> str:

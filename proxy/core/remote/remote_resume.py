@@ -10,20 +10,27 @@ remote_execution.py.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import AsyncIterator
 
-from core.events.common_events import CommonEvent, DONE, TEXT
+from core.events.common_events import CommonEvent, DONE, ERROR, TEXT
+from core.events import turn_ending
 from core import placement
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session.session_state import (
     _record_session_use,
     reset_subagent_registry,
+    clear_starting, mark_closing, restore_session_state,
 )
 from core.events.bg_command_state import reset_bg_command_registry
+from core.execution_layer import RECONNECT_WAIT_S
 
 logger = logging.getLogger("remote-layer")
+
+# How often a turn start waiting on a reconnecting machine looks again.
+_RECONNECT_POLL_S = 0.25
 
 
 class RemoteResumeMixin:
@@ -76,12 +83,28 @@ class RemoteResumeMixin:
                 "future rotations may miss it until re-warm)", session_id[:8],
             )
 
-    def _adoptable(self, session_id: str, execution_path: str) -> bool:
-        """Only an engine whose in-flight turn survives a proxy restart
-        (``runtime.supports_reattach_after_restart``) is re-adopted; the
-        satellite names the engine in its ``sessions_alive`` report."""
+    @staticmethod
+    def _restore_state(info: RemoteSessionInfo, mode: str, token_floor: int) -> None:
+        """The session's mode and token floor as they were before the restart,
+        set before the registry insert so its hooks never run in the default
+        ``auto`` mode and the floor is the running process's, never "now"."""
+        if not mode:
+            return
+        restore_session_state(info.session_id, mode, token_floor)
+        info.mode = mode
+
+    def _adoptable(self, session_id: str, execution_path: str, *, idle: bool = False) -> bool:
+        """Whether the engine the satellite names takes this session back: a
+        turn in flight only where the turn survives a proxy restart
+        (``runtime.supports_reattach_after_restart``), an idle session where
+        the engine re-adopts one (``runtime.readopts_idle_session``)."""
         from core.session.session_manager import capabilities_for_path
-        if capabilities_for_path(execution_path).runtime.supports_reattach_after_restart:
+        try:
+            runtime = capabilities_for_path(execution_path).runtime
+        except ValueError:
+            runtime = None
+        if runtime is not None and (runtime.readopts_idle_session if idle
+                                    else runtime.supports_reattach_after_restart):
             return True
         logger.info(
             "adopt %s: %s has no live re-adopt — skipped",
@@ -92,7 +115,9 @@ class RemoteResumeMixin:
     async def adopt_idle_session(
         self, *, machine_id: str, session_id: str, agent_name: str,
         execution_path: str, use_native_permissions: bool = False,
-    ) -> None:
+        mode: str = "", token_floor: int = 0, resume_handle: str = "",
+        model: str = "", used_mcps=(), allow_full_fs: bool = False,
+    ) -> bool:
         """Registry-only twin of ``adopt_session`` for sessions the satellite
         kept alive across a proxy restart with NO turn in flight. Nothing
         streams — the point is that the session EXISTS proxy-side again:
@@ -102,11 +127,21 @@ class RemoteResumeMixin:
         session capacity (the operator's laptop hit its at-capacity wall
         after an evening of proxy redeploys). ``last_activity`` starts
         fresh: one more standard idle leash beats yanking a session a
-        user is about to resume."""
+        user is about to resume. ``mode`` and ``token_floor`` are what the
+        session had before the restart (``run_recovery``), restored before
+        the insert; ``resume_handle``, ``model``, ``used_mcps`` and
+        ``allow_full_fs`` are what a start would have put on the record
+        (the report's handle, the machine's file policy now). A start
+        spawning this id meanwhile owns it, and from the checks to the
+        insert nothing awaits. True when the session was taken back."""
+        if session_id in self._spawning:
+            return False
         if session_id in self._sessions:
-            return
-        if not self._adoptable(session_id, execution_path):
-            return
+            clear_starting(session_id)
+            return False
+        if not self._adoptable(session_id, execution_path, idle=True):
+            clear_starting(session_id)
+            return False
         queue = self._cm.create_session_queue(machine_id, session_id, execution_path)
         info = RemoteSessionInfo(
             session_id=session_id,
@@ -115,9 +150,15 @@ class RemoteResumeMixin:
             execution_path=execution_path,
             event_queue=queue,
             use_native_permissions=use_native_permissions,
+            allow_full_fs=allow_full_fs,
+            model=model,
+            used_mcps=set(used_mcps),
+            resume_handle=resume_handle,
         )
-        self._adapter(info).adopt_state(info)
+        self._restore_state(info, mode, token_floor)
+        self._adapter(info).adopt_state(info, self._cm)
         self._sessions[session_id] = info
+        clear_starting(session_id)
         reset_subagent_registry(session_id)
         reset_bg_command_registry(session_id)
         _record_session_use(session_id, client_type="", agent=agent_name)
@@ -125,10 +166,24 @@ class RemoteResumeMixin:
             self._restore_adopted_credentials, session_id, machine_id,
             agent_name, info.execution_path,
         )
+        await self._reprovision_gateway(session_id, machine_id)
+        return True
+
+    @staticmethod
+    async def _reprovision_gateway(session_id: str, machine_id: str) -> None:
+        """The session's gateway credentials, re-provisioned from its
+        descriptor and pushed again (the broker store died with the old
+        process; the machine kept its tokens under their lease)."""
+        from core.remote import mcp_gateway_push
+        try:
+            await mcp_gateway_push.reprovision_adopted(session_id, machine_id)
+        except Exception:
+            logger.exception("adopt %s: gateway re-provision failed", session_id[:8])
 
     async def adopt_session(
         self, *, machine_id: str, session_id: str, agent_name: str,
         execution_path: str, command_id: str, use_native_permissions: bool = False,
+        mode: str = "", token_floor: int = 0,
     ) -> AsyncIterator[CommonEvent]:
         """Re-adopt a turn the satellite kept alive across a proxy restart
         (Mode C). Rebuilds a minimal RemoteSessionInfo (no spawn, no
@@ -138,6 +193,7 @@ class RemoteResumeMixin:
         and the buffered turn's sentinel/turn_ended closes it. A truncated
         replay injects a durable ⚠ block first."""
         if not self._adoptable(session_id, execution_path):
+            clear_starting(session_id)
             yield CommonEvent(type=DONE)
             return
         # A larger queue: the replay arrives as one burst (session_event
@@ -155,8 +211,10 @@ class RemoteResumeMixin:
         )
         info.current_send_command_id = command_id
         adapter = self._adapter(info)
-        adapter.adopt_state(info)
+        self._restore_state(info, mode, token_floor)
+        adapter.adopt_state(info, self._cm)
         self._sessions[session_id] = info
+        clear_starting(session_id)
         reset_subagent_registry(session_id)
         reset_bg_command_registry(session_id)
         # Restore the runtime state a spawn would have created: last_active
@@ -169,6 +227,7 @@ class RemoteResumeMixin:
             self._restore_adopted_credentials, session_id, machine_id, agent_name,
             info.execution_path,
         )
+        await self._reprovision_gateway(session_id, machine_id)
 
         # Ask the satellite to replay. Fire-and-forget: the replay arrives as
         # session_event frames on the queue we just created.
@@ -211,8 +270,21 @@ class RemoteResumeMixin:
                                        "output was truncated during a platform "
                                        "restart.\n",
                         })
-            async for event in adapter.stream_turn(info, self._cm):
-                yield event
+            async with contextlib.aclosing(adapter.stream_turn(info, self._cm)) as events:
+                async for event in events:
+                    ending = turn_ending.from_dict(event.data.get("ending")) \
+                        if event.type == ERROR else None
+                    if (ending is not None and ending.reason in turn_ending.KILLS_PROCESS
+                            and self.capabilities_for(session_id).runtime.hard_abort_kills_process):
+                        # A decline, a limit or a silence in a replayed turn
+                        # ends the CLI as a live turn's does
+                        # (``RemoteTurnMixin._send_turn``); an error, an exit
+                        # or a loss leaves it as it is.
+                        await self._hard_abort(session_id)
+                        yield event
+                        yield CommonEvent(type=DONE)
+                        return
+                    yield event
         finally:
             info.turn_active = False
 
@@ -235,6 +307,20 @@ class RemoteResumeMixin:
         return bool(
             info and self._cm.is_session_in_grace(info.machine_id, session_id)
         )
+
+    async def wait_session_reconnect(self, session_id: str, *,
+                                     timeout: float = RECONNECT_WAIT_S) -> bool:
+        """Wait while the session is held in its machine's reconnect grace,
+        at most ``timeout`` seconds; True when it is alive again. A reconnect
+        re-attaches the held queues and an expiry pops them, so the grace
+        ending either way ends the wait. A session not held (a machine away
+        past the grace, no record) answers at once."""
+        if not self.is_session_grace_held(session_id):
+            return False
+        deadline = time.monotonic() + timeout
+        while self.is_session_grace_held(session_id) and time.monotonic() < deadline:
+            await asyncio.sleep(_RECONNECT_POLL_S)
+        return await self.is_session_alive(session_id)
 
     async def probe_session_process_dead(self, session_id: str) -> bool:
         """RPC the satellite for actual process liveness before a reap.
@@ -293,6 +379,7 @@ class RemoteResumeMixin:
         # Remove dead session entry so a new start_session can be issued
         info = self._sessions.pop(session_id, None)
         if info is not None:
+            mark_closing(session_id)
             # Drop any grace-held queue for this session (the reap
             # path) so a reconnect won't re-adopt a turn we're discarding.
             self._cm.drop_grace_session(info.machine_id, session_id)

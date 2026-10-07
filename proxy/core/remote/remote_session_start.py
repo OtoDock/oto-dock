@@ -10,6 +10,7 @@ RemoteExecutionLayer; split out of remote_execution.py.
 """
 
 import asyncio
+from concurrent.futures import Future
 import logging
 import time
 
@@ -18,9 +19,11 @@ from core import placement
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session import session_state as _state
 from core.session.session_state import (
-    _record_session_use, set_session_security, set_session_mode,
+    _record_session_use, register_session_state, cleanup_session_permission_state,
+    mark_starting, clear_starting, session_is_held, REMOTE_START_MARK_TTL_S,
 )
 from auth.roles import row_role
+from storage.pg import run_db
 from ws import wire_events as wire
 
 logger = logging.getLogger("remote-layer")
@@ -120,7 +123,62 @@ def _collect_session_files(
 class RemoteSessionStartMixin:
     # --- ExecutionLayer interface: start ---
 
+    @staticmethod
+    async def _provision_gateway(session_id: str, config: AgentConfig, payload: dict,
+                                 machine_id: str, plan) -> None:
+        from auth.session_token import validate_session_token
+        from core.credentials import mcp_gateway
+        from core.remote import mcp_gateway_push
+        creds = mcp_gateway.credentials_of(session_id)
+        if not creds:
+            return
+        token = str((payload.get("env") or {}).get("PROXY_API_KEY") or "")
+        claims = validate_session_token(token) or {}
+        token_hash = mcp_gateway_push.token_hash_of(token) if token else ""
+        sec = getattr(config, "security_context", None)
+        try:
+            await asyncio.to_thread(
+                mcp_gateway.write_descriptor, session_id, creds,
+                machine_id=machine_id, token_hash=token_hash, agent=config.agent_name,
+                user_sub=str(claims.get("user_sub") or ""),
+                task_scope=str(getattr(sec, "session_scope", "") or "") if sec else "",
+            )
+        except Exception:
+            logger.exception("gateway descriptor of %s not written", session_id[:8])
+        if getattr(plan, "gateway_mode", False) and token_hash:
+            try:
+                await mcp_gateway_push.push_session(session_id, machine_id, token_hash)
+            except Exception:
+                logger.exception("gateway push for %s failed", session_id[:8])
+
     async def start_session(self, session_id: str, config: AgentConfig) -> None:
+        """Start a session on the satellite.
+
+        The session is marked starting for the whole start (the workspace
+        sync, the MCP installs, the satellite's ack) and its permission mode
+        + security context are registered BEFORE the payload is built, as the
+        local layers register before the spawn: a hook fired during the ack
+        window resolves, and the session's token floor exists. A failed start
+        drops the registration it made again; a start refused before it
+        registered, or a failed re-warm of a session the layer still holds,
+        leaves that session's state alone.
+        """
+        held = session_is_held(session_id)
+        registered: list[bool] = []
+        mark_starting(session_id, REMOTE_START_MARK_TTL_S)
+        self._spawning.add(session_id)
+        try:
+            await self._start_session_impl(session_id, config, registered)
+        except BaseException:
+            if registered and not held:
+                cleanup_session_permission_state(session_id)
+            raise
+        finally:
+            self._spawning.discard(session_id)
+            clear_starting(session_id)
+
+    async def _start_session_impl(self, session_id: str, config: AgentConfig,
+                                  registered: list[bool]) -> None:
         machine_id = config.execution_target
         if placement.is_local(machine_id):
             raise RuntimeError("RemoteExecutionLayer called with local target")
@@ -177,6 +235,10 @@ class RemoteSessionStartMixin:
         if adapter is None:
             raise RuntimeError(f"{_rcaps.display_name} has no remote adapter")
 
+        register_session_state(session_id, config.permission_mode, config.security_context,
+                               token_minted_at=config.token_minted_at)
+        registered.append(True)
+
         # Build layer-specific config payload for satellite
         plan = await self._build_start_payload(session_id, config, execution_path)
         payload = plan.payload
@@ -211,7 +273,7 @@ class RemoteSessionStartMixin:
         from storage import remote_store as _rs
         from storage import database as _db
         target_username: str | None = None
-        machine = _rs.get_remote_machine(machine_id)
+        machine = await run_db(_rs.get_remote_machine, machine_id)
         if machine and not placement.machine_is_admin_paired(machine):
             # User-paired (or orphaned-owner) machine. Resolve the owner's
             # username so the sync filter scopes data to that one user;
@@ -221,7 +283,7 @@ class RemoteSessionStartMixin:
             # behavior).
             owner_sub = machine.get("registered_by", "")
             target_username = (
-                _db.get_username_by_sub(owner_sub) if owner_sub else None
+                await run_db(_db.get_username_by_sub, owner_sub) if owner_sub else None
             ) or ""
         # Session-file broker: provision per-session secret FILES (SSH keys
         # for ssh-hosts + OAuth token files for credentials_dir MCPs) and
@@ -338,6 +400,8 @@ class RemoteSessionStartMixin:
             })
 
         async def _on_progress(ev: dict) -> None:
+            # An install in progress keeps the session starting.
+            mark_starting(session_id, REMOTE_START_MARK_TTL_S)
             await _emit_install_started_once()
             # The satellite emits one aggregate phase="verifying" event (no
             # mcp) when it begins the post-install pre-warm boot check. Map
@@ -361,11 +425,14 @@ class RemoteSessionStartMixin:
                 "message": ev.get("message", ""),
             })
 
-        async def _sync_progress(done: int, total: int) -> None:
+        async def _sync_progress(done: float, total: int) -> None:
             # W2 (sync-performance): live workspace-sync progress in the SAME
             # install bar ("workspace files — N%"). Throttling lives in
             # _initial_workspace_sync; the started-once defer keeps an
-            # already-synced tree bar-free (no 100% flash).
+            # already-synced tree bar-free (no 100% flash). ``done`` counts
+            # the share of a push still moving, so a large file moves the
+            # row, and a sync that moves keeps the session starting.
+            mark_starting(session_id, REMOTE_START_MARK_TTL_S)
             await _emit_install_started_once()
             await install_registry.emit(machine_id, config.agent_name, {
                 "type": wire.INSTALL_PROGRESS,
@@ -374,9 +441,10 @@ class RemoteSessionStartMixin:
                 "mcp": "workspace files",
                 "phase": "syncing",
                 "pct": int(done * 100 / max(total, 1)),
-                "message": f"{done}/{total} files",
+                "message": f"{int(done)}/{total} files",
             })
 
+        mark_starting(session_id, REMOTE_START_MARK_TTL_S)
         try:
             try:
                 await self._initial_workspace_sync(
@@ -394,24 +462,40 @@ class RemoteSessionStartMixin:
                     session_id[:8], e,
                 )
             try:
+                # The MCPs this session leaves out by its context alone stay
+                # wanted: a task start never makes the next chat rebuild them.
+                lifted = await mcp_sync.lifted_by_context(config, set(assigned_mcps))
                 sync_result = await mcp_sync.sync_mcps_for_session(
-                    machine_id, session_id, list(assigned_mcps),
+                    machine_id, session_id, list(assigned_mcps), also_wanted=lifted,
                     plan_cb=_on_plan, progress_cb=_on_progress,
                 )
-                if sync_result.excluded_names:
-                    # Filter out failed MCPs from the config the CLI will read.
-                    payload = adapter.without_mcps(payload, sync_result.excluded_names)
-                    assigned_mcps -= sync_result.excluded_names
+                lifted_failed = sync_result.excluded_names - set(assigned_mcps)
+                lifted_cold = set(sync_result.warmup_failed) - set(assigned_mcps)
+                if lifted_failed or lifted_cold:
+                    logger.info(
+                        "sync_mcps: MCP(s) this session does not launch failed on %s: "
+                        "install %s, warm-up %s", machine_id[:8],
+                        {n: sync_result.failed.get(n, "install failed") for n in sorted(lifted_failed)},
+                        {n: sync_result.warmup_failed[n] for n in sorted(lifted_cold)},
+                    )
+                excluded = sync_result.excluded_names & set(assigned_mcps)
+                if excluded:
+                    # Filter out failed MCPs from the config the CLI will read,
+                    # and tell the prompt (rendered before the sync) the same.
+                    payload = adapter.without_mcps(payload, excluded)
+                    payload = adapter.with_unavailable_mcps(
+                        payload, mcp_sync.unavailable_reasons(sync_result, assigned_mcps))
+                    assigned_mcps -= excluded
                     logger.warning(
                         "sync_mcps excluded %d MCP(s) from session %s: %s",
-                        len(sync_result.excluded_names),
+                        len(excluded),
                         session_id[:8],
                         {
                             n: sync_result.failed.get(n, "install failed")
-                            for n in sorted(sync_result.excluded_names)
+                            for n in sorted(excluded)
                         },
                     )
-                    for failed_name in sorted(sync_result.excluded_names):
+                    for failed_name in sorted(excluded):
                         # Memoized skips attempted nothing this session — a
                         # lone failure frame outside a started/done lifecycle
                         # would seed a ghost "installing" bar client-side.
@@ -425,7 +509,9 @@ class RemoteSessionStartMixin:
                             "mcp": failed_name,
                             "error": sync_result.failed.get(failed_name, "install failed"),
                         })
-                warmup_failures = sorted(sync_result.warmup_failed.keys())
+                # A lifted MCP this session does not launch never shows on
+                # its card (logged with the lifted install failures above).
+                warmup_failures = sorted(n for n in sync_result.warmup_failed if n in assigned_mcps)
                 if warmup_failures:
                     logger.warning(
                         "session %s: %d MCP(s) failed the pre-warm boot check "
@@ -468,6 +554,18 @@ class RemoteSessionStartMixin:
         # (pty_open) with the SAME `payload` and streams bytes both ways. ALL the
         # interactive intelligence stays on the proxy (dumb-pipe satellite). The
         # payload build + MCP/workspace sync above are shared with the -p path.
+        # The satellite's ack (or the PTY open) may take the plan's start
+        # timeout: the starting mark covers it.
+        mark_starting(session_id, plan.start_timeout_s + 60)
+
+        # The credential gateway: the session's descriptor records its
+        # credentialed HTTP MCPs by reference (a re-adoption after a proxy
+        # restart re-provisions exactly that set), and on a machine that
+        # runs the gateway the vendor tokens are pushed before the spawn
+        # frame so the first MCP request finds them; a sidecar's token stays
+        # here (the tunnel's forward adds it).
+        await self._provision_gateway(session_id, config, payload, machine_id, plan)
+
         if config.interactive:
             await self._start_interactive_remote(
                 session_id, config, execution_path, payload, machine_id,
@@ -518,16 +616,14 @@ class RemoteSessionStartMixin:
         # consumes the event queue — whatever the engine keeps across turns).
         adapter.init_session(info, config, self._cm)
 
-        self._sessions[session_id] = info
+        await self._insert_session(info)
 
-        # Set session state
         _record_session_use(session_id, client_type=config.client_type, agent=config.agent_name)
-        if config.security_context:
-            set_session_security(session_id, config.security_context)
-        set_session_mode(session_id, config.permission_mode)
-        self._bind_subscription(
+        bound = self._bind_subscription(
             session_id, config, execution_path, plan.credential_file_delivered,
         )
+        if bound is not None:
+            await asyncio.wrap_future(bound)
 
         logger.info(
             "Remote session %s started on satellite %s (path=%s)",
@@ -538,7 +634,7 @@ class RemoteSessionStartMixin:
     def _bind_subscription(
         session_id: str, config: AgentConfig, execution_path: str,
         credential_file_delivered: bool,
-    ) -> None:
+    ) -> "Future | None":
         """Bind the acquired subscription + register the session's satellite
         credential file for rotation fan-out. Mirrors the local layers' bind at
         the end of ``start_session`` — without it a remote session leaked its
@@ -548,11 +644,13 @@ class RemoteSessionStartMixin:
         builder's word (``RemoteStartPlan``) that the engine wrote its login
         into the start payload — the file the satellite now holds."""
         if not config.subscription_id:
-            return
+            return None
         from services.engines.subscription_pool import (
             bind_session, credential_scope_key,
         )
-        bind_session(
+        # The binding writer's future: the start awaits it so the row is
+        # durable before the session runs.
+        bound = bind_session(
             session_id, config.subscription_id,
             layer=execution_path, user_sub=config.subscription_user_sub,
             scope_key=credential_scope_key(
@@ -565,11 +663,11 @@ class RemoteSessionStartMixin:
         # declared dirname, the same tree the satellite clamps the file to;
         # the builder said whether this session has one to rewrite.
         if not credential_file_delivered:
-            return  # env-delivered credentials or an API-key session — nothing to rewrite
+            return bound  # env-delivered credentials or an API-key session — nothing to rewrite
         from core.session.session_manager import capabilities_for_path
         spec = capabilities_for_path(execution_path).auth.credential_file
         if spec is None:
-            return
+            return bound
         from core import layout
         from services.engines import token_fanout
         mount_username = (
@@ -585,6 +683,7 @@ class RemoteSessionStartMixin:
                 dir_relative=f"{layout.scope_root(mount_username)}/{spec.dirname}",
             ),
         )
+        return bound
 
     async def _evict_idle_on_machine(self, machine_id: str) -> int:
         """Capacity twin of the local ``_admit_with_eviction``: a satellite at
@@ -646,14 +745,13 @@ class RemoteSessionStartMixin:
         by the caller).
         """
         from core.session import interactive_session
-        # Proxy-side identity BEFORE the PTY starts so the PreToolUse hook resolves
-        # the moment the CLI launches (mirrors the -p path + the local CLI layer).
+        # The permission mode + security context were registered by
+        # start_session before the payload build, so the PreToolUse hook
+        # resolves the moment the CLI launches (as the -p path and the local
+        # CLI layer).
         _record_session_use(
             session_id, client_type=config.client_type, agent=config.agent_name,
         )
-        if config.security_context:
-            set_session_security(session_id, config.security_context)
-        set_session_mode(session_id, config.permission_mode)
         ctx = config.security_context
         # Codex fresh delivers the first prompt via the launch argv (the satellite
         # appends it; the TUI auto-runs it after MCP warm), so there is NO cold
@@ -680,9 +778,11 @@ class RemoteSessionStartMixin:
         )
         # Subscription binding + fan-out target (InteractiveSession.close()
         # releases the seat, mirroring the local interactive branches).
-        self._bind_subscription(
+        bound = self._bind_subscription(
             session_id, config, execution_path, credential_file_delivered,
         )
+        if bound is not None:
+            await asyncio.wrap_future(bound)
         logger.info(
             "Remote INTERACTIVE session %s started on satellite %s (path=%s)",
             session_id[:8], machine_id[:8], execution_path,

@@ -195,6 +195,11 @@ def test_collect_oauth_token_files_user_scope(token_source):
         "/users/alice/.credentials/google-tokens/alice@gmail.com.json":
             b'{"access_token":"x"}',
     }
+    # The local broker's form: the same file under the manifest it was
+    # collected for.
+    assert cr.collect_oauth_token_files_by_manifest(
+        "agent", user_sub="sub-1", session_scope="user",
+    ) == {"google-workspace": out}
 
 
 def test_collect_oauth_token_files_agent_scope(token_source):
@@ -212,6 +217,25 @@ def test_collect_oauth_token_files_missing_file_skipped(token_source):
     from services.oauth import credential_resolver as cr
     (token_source / "alice@gmail.com.json").unlink()
     assert cr.collect_oauth_token_files("agent", user_sub="s") == {}
+
+
+@pytest.mark.parametrize("body", [
+    # the worker recorded a permanent refresh failure (a revoked grant)
+    b'{"access_token":"x","refresh_token":"r","expires_at":"2099-01-01T00:00:00Z",'
+    b'"extra":{"refresh_failed":"invalid_grant"}}',
+    # expired, with no refresh token to renew it
+    b'{"access_token":"x","expires_at":"2020-01-01T00:00:00Z"}',
+])
+def test_a_token_file_that_needs_a_reconnect_is_not_delivered(token_source, body):
+    """The resolver leaves such an MCP out of the session
+    (``AccountNeedsReconnect``); its dead file is not delivered either, to a
+    satellite (``collect_oauth_token_files``) or to a local session's secret
+    bundle (``credential_files.token_file_env``)."""
+    from core.credentials import credential_files
+    from services.oauth import credential_resolver as cr
+    (token_source / "alice@gmail.com.json").write_bytes(body)
+    assert cr.collect_oauth_token_files("agent", user_sub="sub-1", session_scope="user") == {}
+    assert credential_files.token_file_env("agent", user_sub="sub-1", session_scope="user") == {}
 
 
 # ── _collect_session_files gating (pairing scope × session scope) ──────────

@@ -1,7 +1,7 @@
 """Version-pinned preview snapshots: the store
 (services/media/preview_snapshots.py), the WOPI snapshot namespace + the
 view-only ``/v1/documents/snapshot-wopi-url`` mint (api/media/wopi.py), and
-instance-scoped dismissal (storage/chat/db_chats.py).
+instance-scoped dismissal (storage/chat/db_previews.py).
 
 The frozen "previous version" block's whole trust story lives here: snapshots
 are proxy-owned copies outside every agent tree, served only through
@@ -107,7 +107,7 @@ def test_oversized_source_skips_snapshot(temp_db, tmp_path, snap_root, monkeypat
     assert ps.create_snapshot("chat-1", small) is not None
 
 
-def test_gc_keeps_referenced_drops_unreferenced(temp_db, tmp_path, snap_root):
+def test_gc_keeps_referenced_drops_unreferenced(temp_db, tmp_path, snap_root, monkeypatch):
     from services.media import preview_snapshots as ps
     task_store.create_chat("chat-1", "user-a", "test-agent")
     src = _seed_source(tmp_path)
@@ -115,11 +115,9 @@ def test_gc_keeps_referenced_drops_unreferenced(temp_db, tmp_path, snap_root):
     dropped = ps.create_snapshot("chat-1", src)
     _add_preview_row("chat-1", "f1", kept)
     _add_preview_row("chat-1", "f1", dropped, dismissed=True)
-    # Age both files past the in-flight grace window.
-    import os
-    old = time.time() - 600
-    for sid in (kept, dropped):
-        os.utime(snap_root / "chat-1" / sid, (old, old))
+    # Ten minutes on: both copies are past the in-flight grace window.
+    later = time.time() + 600
+    monkeypatch.setattr(ps, "_clock", lambda: later)
     removed = ps.gc_chat("chat-1")
     assert removed == 1
     assert ps.snapshot_path("chat-1", kept) is not None
@@ -128,12 +126,124 @@ def test_gc_keeps_referenced_drops_unreferenced(temp_db, tmp_path, snap_root):
 
 def test_gc_age_gate_spares_inflight_snapshot(temp_db, tmp_path, snap_root):
     # A hook-created snapshot whose row has not persisted yet (perm-queue
-    # in flight) is unreferenced but FRESH — GC must not eat it.
+    # in flight) is unreferenced but FRESH — GC must not eat it, even when
+    # the source (whose times the copy keeps) was last written long ago.
+    import os
     from services.media import preview_snapshots as ps
     task_store.create_chat("chat-1", "user-a", "test-agent")
-    sid = ps.create_snapshot("chat-1", _seed_source(tmp_path))
+    src = _seed_source(tmp_path)
+    old = time.time() - 3600
+    os.utime(src, (old, old))
+    sid = ps.create_snapshot("chat-1", src)
+    assert (snap_root / "chat-1" / sid).stat().st_mtime < time.time() - 3000
     assert ps.gc_chat("chat-1") == 0
     assert ps.snapshot_path("chat-1", sid) is not None
+
+
+def test_the_newest_row_of_a_file_is_the_one_a_mint_reads(temp_db, tmp_path, snap_root):
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    _add_preview_row("chat-1", "f1", "s1", filename="old.xlsx")
+    _add_preview_row("chat-1", "f2", "s2", filename="other.xlsx")
+    _add_preview_row("chat-1", "f1", "s3", filename="new.xlsx")
+    assert task_store.get_preview_event_by_file("chat-1", "f1")["snapshot_id"] == "s3"
+    assert task_store.count_preview_rows("chat-1", "f1") == 2
+
+
+def test_a_push_numbers_itself_and_caps_the_files_versions(temp_db, tmp_path, snap_root, monkeypatch):
+    from services.media import preview_snapshots as ps
+    monkeypatch.setattr(ps, "MAX_VERSIONS_PER_FILE", 3)
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    src = _seed_source(tmp_path)
+    assert ps.stamp_and_cap("chat-1", "f1") == 1
+    sids = []
+    for _ in range(4):
+        sid = ps.create_snapshot("chat-1", src)
+        sids.append(sid)
+        _add_preview_row("chat-1", "f1", sid)
+    other = ps.create_snapshot("chat-1", src)
+    _add_preview_row("chat-1", "f2", other)
+    # The fifth push: the newest two persisted keep their copies (the push
+    # itself is the third), the older two lose theirs, the rows stay.
+    assert ps.stamp_and_cap("chat-1", "f1") == 5
+    assert [ps.snapshot_path("chat-1", s) is not None for s in sids] == [False, False, True, True]
+    assert ps.snapshot_path("chat-1", other) is not None
+    assert task_store.count_preview_rows("chat-1", "f1") == 4
+
+
+def _refresh_rig(tmp_path, snap_root):
+    import os
+    from services.media import preview_snapshots as ps
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    src = _seed_source(tmp_path, b"pushed bytes")
+    os.utime(src, (1_700_000_000, 1_700_000_000))
+    sid = ps.create_snapshot("chat-1", src)
+    _add_preview_row("chat-1", "f1", sid)
+    st = src.stat()
+    return ps, sid, (st.st_size, st.st_mtime_ns, None)
+
+
+def test_a_pane_save_refreshes_the_version_that_mirrors_the_file(temp_db, tmp_path, snap_root):
+    ps, sid, before = _refresh_rig(tmp_path, snap_root)
+    saved_ns = 1_700_000_500 * 10**9
+    assert ps.refresh_newest("chat-1", "f1", None, b"pushed bytes, edited", saved_ns, before)
+    copy = snap_root / "chat-1" / sid
+    assert copy.read_bytes() == b"pushed bytes, edited"
+    # The copy takes the save's time: the next save's check compares it.
+    assert copy.stat().st_mtime_ns == saved_ns
+    st_before = (len(b"pushed bytes, edited"), saved_ns, None)
+    assert ps.refresh_newest("chat-1", "f1", None, b"second save", saved_ns + 10**9, st_before)
+    assert copy.read_bytes() == b"second save"
+
+
+def test_a_version_the_file_moved_away_from_is_left_alone(temp_db, tmp_path, snap_root):
+    # The agent changed the file without a push: the save's "before" no
+    # longer matches the version, which keeps the push's bytes.
+    ps, sid, (size, mtime_ns, _digest) = _refresh_rig(tmp_path, snap_root)
+    assert not ps.refresh_newest("chat-1", "f1", None, b"x", 1, (size + 1, mtime_ns, None))
+    assert not ps.refresh_newest("chat-1", "f1", None, b"x", 1, (size, mtime_ns + 5, None))
+    assert not ps.refresh_newest("chat-1", "f1", None, b"x", 1, (size, mtime_ns + 5, "0" * 64))
+    assert (snap_root / "chat-1" / sid).read_bytes() == b"pushed bytes"
+
+
+def test_the_same_bytes_with_another_time_still_mirror(temp_db, tmp_path, snap_root):
+    import hashlib
+    ps, sid, (size, mtime_ns, _digest) = _refresh_rig(tmp_path, snap_root)
+    digest = hashlib.sha256(b"pushed bytes").hexdigest()
+    assert ps.refresh_newest("chat-1", "f1", None, b"edited", 1, (size, mtime_ns + 5, digest))
+
+
+def test_the_pending_push_is_the_newest_version(temp_db, tmp_path, snap_root):
+    # A push the pump still holds for the turn's flush is newer than the
+    # persisted one: the save refreshes it, never the older version.
+    import os
+    ps, sid, before = _refresh_rig(tmp_path, snap_root)
+    src = _seed_source(tmp_path, b"pushed bytes")
+    os.utime(src, (1_700_000_000, 1_700_000_000))
+    pending = ps.create_snapshot("chat-1", src)
+    assert ps.refresh_newest("chat-1", "f1", pending, b"edited", 1, before)
+    assert (snap_root / "chat-1" / pending).read_bytes() == b"edited"
+    assert (snap_root / "chat-1" / sid).read_bytes() == b"pushed bytes"
+
+
+def test_a_pruned_or_absent_version_is_never_recreated(temp_db, tmp_path, snap_root):
+    ps, sid, before = _refresh_rig(tmp_path, snap_root)
+    ps.delete_snapshot("chat-1", sid)
+    assert not ps.refresh_newest("chat-1", "f1", None, b"edited", 1, before)
+    assert not (snap_root / "chat-1" / sid).exists()
+
+
+def test_a_newest_row_without_a_copy_never_falls_back_to_an_older_one(temp_db, tmp_path, snap_root):
+    ps, sid, before = _refresh_rig(tmp_path, snap_root)
+    _add_preview_row("chat-1", "f1", "")
+    assert not ps.refresh_newest("chat-1", "f1", None, b"edited", 1, before)
+    assert (snap_root / "chat-1" / sid).read_bytes() == b"pushed bytes"
+
+
+def test_a_save_past_the_snapshot_cap_refreshes_nothing(temp_db, tmp_path, snap_root, monkeypatch):
+    ps, sid, before = _refresh_rig(tmp_path, snap_root)
+    monkeypatch.setattr(ps, "_MAX_SNAPSHOT_BYTES", 4)
+    assert not ps.refresh_newest("chat-1", "f1", None, b"edited", 1, before)
+    assert (snap_root / "chat-1" / sid).read_bytes() == b"pushed bytes"
 
 
 def test_sweep_orphans_reaps_deleted_chats_only(temp_db, tmp_path, snap_root, monkeypatch):
@@ -245,6 +355,26 @@ def test_lock_ops_require_edit(temp_db, tmp_path, monkeypatch):
     assert r.status_code == 200 and r.headers.get("X-WOPI-Lock") == "L1"
 
 
+def test_lock_ops_refuse_an_undecodable_or_foreign_file_id(temp_db, tmp_path, monkeypatch):
+    # The read routes' answer: a file_id that is not base64, or not UTF-8
+    # once decoded, or that names another path than the token, is 403.
+    from api.media import wopi
+    _wopi_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(wopi, "_wopi_locks", {})
+    rel = "test-agent/workspace/x.docx"
+    token, _ = wopi.create_wopi_token(rel, "u", "U", "edit", "test-agent")
+    client = _wopi_client()
+    foreign = wopi.encode_file_id("test-agent/workspace/other.docx")
+    for file_id in ("not-base64!", "__4", foreign):
+        for op in ("GET_LOCK", "LOCK", "UNLOCK", "REFRESH_LOCK"):
+            r = client.post(
+                f"/wopi/files/{file_id}?access_token={token}",
+                headers={"X-WOPI-Override": op, "X-WOPI-Lock": "L1"},
+            )
+            assert r.status_code == 403, (file_id, op)
+    assert wopi._wopi_locks == {}
+
+
 # ---------------------------------------------------------------------------
 # /v1/documents/snapshot-wopi-url — chat-access-gated view-only mint
 # ---------------------------------------------------------------------------
@@ -289,8 +419,8 @@ def test_snapshot_url_happy_path_is_view_only(temp_db, tmp_path, snap_root, monk
     assert r.status_code == 200
     url = r.json()["wopi_url"]
     assert url.startswith("https://collabora.example/browser/dist/cool.html?WOPISrc=")
-    token = url.split("access_token=")[1].split("&")[0]
-    claims = _jwt.decode(token, config.WOPI_SECRET, algorithms=["HS256"])
+    assert "access_token" not in url
+    claims = _jwt.decode(r.json()["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
     assert claims["permissions"] == "view"
     assert claims["display_name"] == "budget.xlsx"
 
@@ -387,12 +517,12 @@ def _remint(client, chat_id, file_id):
     )
 
 
-def _claims(url):
+def _claims(body):
     import jwt as _jwt
 
     import config
-    token = url.split("access_token=")[1].split("&")[0]
-    return _jwt.decode(token, config.WOPI_SECRET, algorithms=["HS256"])
+    assert "access_token" not in body["wopi_url"]
+    return _jwt.decode(body["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
 
 
 def test_preview_remint_recomputes_requester_permission(temp_db, tmp_path, monkeypatch):
@@ -407,12 +537,12 @@ def test_preview_remint_recomputes_requester_permission(temp_db, tmp_path, monke
         "https://collabora.example/browser/dist/cool.html?WOPISrc="
     )
     assert body["permissions"] == "edit"
-    assert _claims(body["wopi_url"])["permissions"] == "edit"
+    assert _claims(body)["permissions"] == "edit"
     # Same chat owner with NO per-agent role → viewer → view-only token.
     viewer = _mint_app(monkeypatch, tmp_path, agents=())
     body = _remint(viewer, "chat-1", fid).json()
     assert body["permissions"] == "view"
-    assert _claims(body["wopi_url"])["permissions"] == "view"
+    assert _claims(body)["permissions"] == "view"
 
 
 def test_preview_remint_requires_chat_access(temp_db, tmp_path, monkeypatch):

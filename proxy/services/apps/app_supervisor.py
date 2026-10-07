@@ -2,8 +2,9 @@
 
 The registry lives in this process only: port, pid, launch token, activity,
 open bridged sockets and backoff per ``(row id, instance)``, where the
-instance is ``live`` (the release the row serves) or ``preview`` (the
-working tree copied for the owner or an editor, with its own data). The
+instance is ``LIVE`` (the release the row serves), ``PREVIEW`` (the
+working tree copied for the owner or an editor, with its own data) or
+``CHECK`` (a copy a check or a render runs on scratch data). The
 proxy's death kills every child (pasta dies with the proxy, bwrap with
 pasta), so the table is legitimately empty at boot.
 
@@ -77,6 +78,14 @@ SERVING: frozenset[str] = frozenset({UP, STATIC})
 HELD: frozenset[str] = frozenset({BACKOFF, QUOTA_FULL})
 SHIM_FAILED = "failed"
 
+# The instance words, named once: ``Instance.name``, the second half of a
+# registry key, and the ``instance`` a launch or viewer claim carries (the
+# app proxy clamps an unknown word to ``LIVE``).
+LIVE = "live"
+PREVIEW = "preview"
+CHECK = "check"
+INSTANCES: tuple[str, ...] = (LIVE, PREVIEW, CHECK)
+
 
 class AppUnavailable(Exception):
     """The server is not up and will not be for ``retry_after`` seconds."""
@@ -91,7 +100,7 @@ class AppUnavailable(Exception):
 @dataclass
 class Instance:
     row_id: str
-    name: str                     # "live" | "preview" | "check"
+    name: str                     # one of INSTANCES
     row: dict
     release_dir: Path
     data_dir: Path
@@ -138,7 +147,16 @@ def _lock(key: tuple[str, str]) -> asyncio.Lock:
     return _locks.setdefault(key, asyncio.Lock())
 
 
-def get(row_id: str, name: str = "live") -> Instance | None:
+def forget(row_id: str) -> None:
+    """Drop what the registry keeps for an id that never comes back (a
+    check's stub, whose instance is already stopped): its start locks and
+    its derived signing key."""
+    for name in INSTANCES:
+        _locks.pop((row_id, name), None)
+    app_tokens.forget(row_id)
+
+
+def get(row_id: str, name: str = LIVE) -> Instance | None:
     return _instances.get((row_id, name))
 
 
@@ -279,7 +297,7 @@ async def _watch(inst: Instance) -> None:
     inst.closed.set()
     logger.warning("App %s (%s) %s; next start in %.0fs", inst.row.get("slug"),
                    inst.name, inst.last_error, inst.next_start_at - time.monotonic())
-    if not inst.notified and inst.name == "live":
+    if not inst.notified and inst.name == LIVE:
         inst.notified = True
         try:
             await _notify_crash(inst)
@@ -336,7 +354,7 @@ async def _launch(inst: Instance, *, preview: bool, allow_hosts: list[str] | Non
     nobody approved and never receives a value (APPS.md "Secrets")."""
     row = inst.row
     allow = allow_hosts if allow_hosts is not None else await asyncio.to_thread(_allow_hosts, row)
-    if inst.name != "live":
+    if inst.name != LIVE:
         secrets = None
     last = ""
     for _attempt in range(BIND_RETRIES):
@@ -381,7 +399,7 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def start(row: dict, name: str = "live", *, release_dir: Path | None = None,
+async def start(row: dict, name: str = LIVE, *, release_dir: Path | None = None,
                 data_dir: Path | None = None, allow_hosts: list[str] | None = None) -> Instance:
     """Start (or return the running) instance of ``row``. Raises
     ``AppStartError`` when it cannot come up; the previous instance of the
@@ -395,17 +413,17 @@ async def start(row: dict, name: str = "live", *, release_dir: Path | None = Non
         if existing and existing.state in SERVING and release_dir is None:
             existing.touch()
             return existing
-        if name != "check" and not task_store.app_actions_approved(row):
+        if name != CHECK and not task_store.app_actions_approved(row):
             raise AppUnavailable("the app is waiting for approval", 30, state=UNAPPROVED)
         # A personal app whose owner lost the agent never starts, whichever
         # route asked (APPS.md "Lifecycle").
-        if name != "check" and await asyncio.to_thread(task_store.personal_row_dormant, row):
+        if name != CHECK and await asyncio.to_thread(task_store.personal_row_dormant, row):
             raise app_sandbox.AppStartError("the owner no longer has access to this agent")
         # APPS.md "Secrets": a required secret without a value keeps the
         # live server down the way a waiting approval does; a preview or a
         # check runs without any value and so waits for none.
         secrets: dict[str, str] = {}
-        if name == "live":
+        if name == LIVE:
             from services.apps import app_secrets
             missing = await asyncio.to_thread(app_secrets.missing_required, row)
             if missing:
@@ -417,14 +435,14 @@ async def start(row: dict, name: str = "live", *, release_dir: Path | None = Non
             raise AppUnavailable(existing.last_error or "starting soon",
                                  int(existing.next_start_at - time.monotonic()) + 1)
         if release_dir is None:
-            if name == "preview":
+            if name == PREVIEW:
                 release_dir = releases.preview_dir(row)
             else:
                 release_dir = releases.live_release_dir(row)
             if release_dir is None:
                 raise app_sandbox.AppStartError("the app has no release to run")
         if data_dir is None:
-            data_dir = (release_dir / "data") if name == "preview" else releases.app_data_dir(row)
+            data_dir = (release_dir / "data") if name == PREVIEW else releases.app_data_dir(row)
         entry = app_sandbox.server_entry(release_dir)
         inst = Instance(row_id=row["id"], name=name, row=row, release_dir=release_dir,
                         data_dir=data_dir, entry=entry)
@@ -449,7 +467,7 @@ async def start(row: dict, name: str = "live", *, release_dir: Path | None = Non
         inst.started_at = time.monotonic()
         inst.scrub = [v for v in [inst.token, *secrets.values()] if isinstance(v, str) and len(v) >= 8]
         try:
-            await _launch(inst, preview=(name == "preview"), allow_hosts=allow_hosts,
+            await _launch(inst, preview=(name == PREVIEW), allow_hosts=allow_hosts,
                           secrets=secrets or None)
             if not await _health(inst):
                 tail = "\n".join(inst._tail[-5:])
@@ -509,7 +527,7 @@ async def _drain_and_stop(old: Instance) -> None:
 async def stop(row_id: str, name: str | None = None) -> int:
     """Stop the live instance, the preview, or both (``name=None``).
     Returns how many processes were stopped."""
-    names = [name] if name else ["live", "preview", "check"]
+    names = (name,) if name else INSTANCES
     count = 0
     for n in names:
         inst = _instances.pop((row_id, n), None)
@@ -526,7 +544,7 @@ async def stop(row_id: str, name: str | None = None) -> int:
     return count
 
 
-async def ensure_up(row: dict, name: str = "live") -> Instance:
+async def ensure_up(row: dict, name: str = LIVE) -> Instance:
     """The instance to route to, started if needed. Raises
     ``AppUnavailable`` (503 with Retry-After for the routes) when the
     server is in backoff, unapproved, or fails to start now."""
@@ -547,20 +565,20 @@ async def ensure_up(row: dict, name: str = "live") -> Instance:
         raise AppUnavailable(str(e), max(1, int(wait) + 1)) from e
 
 
-def touch(row_id: str, name: str = "live") -> None:
+def touch(row_id: str, name: str = LIVE) -> None:
     inst = _instances.get((row_id, name))
     if inst is not None:
         inst.touch()
 
 
-def ws_opened(row_id: str, name: str = "live") -> None:
+def ws_opened(row_id: str, name: str = LIVE) -> None:
     inst = _instances.get((row_id, name))
     if inst is not None:
         inst.ws_count += 1
         inst.touch()
 
 
-def ws_closed(row_id: str, name: str = "live") -> None:
+def ws_closed(row_id: str, name: str = LIVE) -> None:
     inst = _instances.get((row_id, name))
     if inst is not None:
         inst.ws_count = max(0, inst.ws_count - 1)
@@ -569,8 +587,8 @@ def ws_closed(row_id: str, name: str = "live") -> None:
 
 def status(row_id: str) -> dict:
     """What the tools and the dashboard show about the server."""
-    inst = _instances.get((row_id, "live"))
-    preview = _instances.get((row_id, "preview"))
+    inst = _instances.get((row_id, LIVE))
+    preview = _instances.get((row_id, PREVIEW))
     out = {"server": inst.state if inst else STOPPED,
            "error": (inst.last_error if inst and inst.state in HELD else ""),
            "retry_after": (max(0, int(inst.next_start_at - time.monotonic()))
@@ -600,20 +618,20 @@ async def smoke(row: dict, tree_dir: Path) -> dict:
     if not entry:
         return {"ok": True, "server": "none"}
     with tempfile.TemporaryDirectory(prefix="otodock-app-check-") as scratch:
-        key = (row["id"], "check")
+        key = (row["id"], CHECK)
         # The declared hosts open only once a person approved the manifest
         # (the rendered check's rule); a smoke of an unapproved manifest
         # runs with none.
         allow = None if task_store.app_actions_approved(row) else []
         try:
-            inst = await start(row, "check", release_dir=tree_dir, data_dir=Path(scratch),
+            inst = await start(row, CHECK, release_dir=tree_dir, data_dir=Path(scratch),
                                allow_hosts=allow)
         except (app_sandbox.AppStartError, AppUnavailable) as e:
             inst = _instances.pop(key, None)
             tail = "\n".join(inst._tail[-20:]) if inst else ""
             return {"ok": False, "server": "failed", "reason": str(e), "log": tail}
         tail = "\n".join(inst._tail[-20:])
-        await stop(row["id"], "check")
+        await stop(row["id"], CHECK)
         return {"ok": True, "server": "up", "log": tail}
 
 
@@ -631,7 +649,7 @@ async def sweep_once() -> None:
         # A dormant personal app's server stops here too: the offboarding
         # event is sent once, and a request in flight at the removal could
         # have started it again just after.
-        if row is None or dormant or (row.get("hidden") and inst.name == "live"):
+        if row is None or dormant or (row.get("hidden") and inst.name == LIVE):
             await stop(inst.row_id)
             continue
         if inst.state == UP and inst.ws_count == 0 and now - inst.last_activity > IDLE_STOP_S \
@@ -642,7 +660,7 @@ async def sweep_once() -> None:
             continue
         if inst.state == UP and inst.notified and now - inst.healthy_since > HEALTHY_RESET_S:
             inst.notified = False
-        if inst.state == STOPPED and inst.name == "check":
+        if inst.state == STOPPED and inst.name == CHECK:
             _instances.pop(inst.key, None)
 
 

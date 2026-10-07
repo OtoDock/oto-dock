@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react'
 import MarkdownContent from './MarkdownContent'
+import { usePrimaryPointerCoarse } from '../../hooks/usePrimaryPointerCoarse'
+import { usePasteGuard } from '../../hooks/usePasteGuard'
+import { enterAction, insertNewline } from '../../lib/composerKeys'
 
 export default function PlanReviewCard({
   requestId,
@@ -24,6 +27,9 @@ export default function PlanReviewCard({
 }) {
   const [editing, setEditing] = useState(false)
   const [feedback, setFeedback] = useState('')
+  // The composer's key rule (lib/composerKeys): Enter adds a line here too.
+  const touchPrimary = usePrimaryPointerCoarse()
+  const pasteGuard = usePasteGuard()
 
   // Use proxy-provided filename (consistent across edits), fall back to toolInput path
   const planFilePath = toolInput?.planFilePath || toolInput?.plan_file_path || ''
@@ -106,13 +112,17 @@ export default function PlanReviewCard({
             value={feedback}
             onChange={(e) => setFeedback(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                handleSubmitFeedback()
-              }
+              pasteGuard.onKeyDown(e)
+              const action = enterAction(e.nativeEvent, { coarse: touchPrimary, pasteHeld: pasteGuard.held() })
+              if (action !== 'pass') e.preventDefault()
+              if (action === 'newline') insertNewline(e.currentTarget, setFeedback)
+              if (action === 'send') handleSubmitFeedback()
             }}
+            onKeyUp={pasteGuard.onKeyUp}
+            onPaste={pasteGuard.onPaste}
+            onBlur={pasteGuard.onBlur}
             placeholder="Describe what to change in the plan..."
-            className="w-full px-3 py-2 text-sm border border-brand/30 rounded-lg resize-none
+            className="w-full px-3 py-2 text-sm pointer-coarse:text-base border border-brand/30 rounded-lg resize-none
                        bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light
                        focus:outline-hidden focus:ring-1 focus:ring-brand"
             rows={3}
@@ -121,6 +131,7 @@ export default function PlanReviewCard({
             <button
               onClick={handleSubmitFeedback}
               disabled={!feedback.trim()}
+              title={touchPrimary ? undefined : 'Send Feedback (Shift+Enter)'}
               className="px-3 py-1 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover disabled:opacity-50 transition-colors"
             >
               Send Feedback

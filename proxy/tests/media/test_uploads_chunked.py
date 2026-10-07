@@ -399,20 +399,111 @@ def test_open_uploads_are_capped_per_user_and_an_idle_pair_is_evicted_first(
     from api.media import uploads
     app, _agents, _staging, user = app_with_router
     monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 2)
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
     client = TestClient(app)
     first = _init(client, 10).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{first}/0", content=b"AAAA").status_code == 200
+    assert first in uploads._chunk_locks
     assert _init(client, 10).status_code == 200
     r = _init(client, 10)
     assert r.status_code == 429, r.text
     assert "UPLOAD_MAX_OPEN" in r.text
-    # An interrupted upload (no chunk in the idle window) gives its slot up.
+    # An interrupted upload (no chunk in the idle window) gives its slot up,
+    # and its idle lock goes with it.
     for p in uploads._staging_paths(first, user.sub):
         _age(p, uploads._IDLE_EVICT_S + 60)
     assert _init(client, 10).status_code == 200
     assert not any(p.exists() for p in uploads._staging_paths(first, user.sub))
+    assert first not in uploads._chunk_locks
     assert _init(client, 10).status_code == 429
     monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 0)  # 0 = no cap
     assert _init(client, 10).status_code == 200
+
+
+def test_an_admission_that_evicts_and_still_refuses_releases_the_evicted_lock(
+        app_with_router, monkeypatch):
+    import config
+    from api.media import uploads
+    app, _agents, _staging, user = app_with_router
+    chunk = 64 * 1024
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", chunk, raising=False)
+    monkeypatch.setattr(config, "UPLOAD_STAGING_USER_MB", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 0)
+    client = TestClient(app)
+    idle = _init(client, 2 * chunk).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{idle}/0", content=b"A" * chunk).status_code == 200
+    for p in uploads._staging_paths(idle, user.sub):
+        _age(p, uploads._IDLE_EVICT_S + 60)
+    # The idle pair is evicted, and the request is over the cap on its own.
+    r = _init(client, 2 * 1024 * 1024)
+    assert r.status_code == 429 and "UPLOAD_STAGING_USER_MB" in r.text
+    assert not any(p.exists() for p in uploads._staging_paths(idle, user.sub))
+    assert idle not in uploads._chunk_locks
+
+
+def test_a_chunk_whose_pair_is_evicted_in_flight_answers_410_and_leaves_no_meta(
+        app_with_router, monkeypatch):
+    """The eviction removes the pair while a chunk is written to the open
+    staging file: the chunk's commit must not re-create the meta."""
+    import config
+    from api.media import uploads
+    app, _agents, _staging, user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    up = _init(client, 8).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{up}/0", content=b"AAAA").status_code == 200
+    staging, meta_path = uploads._staging_paths(up, user.sub)
+    real_open = uploads._open_chunk_target
+
+    def _open_then_evict(*a, **kw):
+        f = real_open(*a, **kw)
+        staging.unlink()
+        meta_path.unlink()
+        return f
+    monkeypatch.setattr(uploads, "_open_chunk_target", _open_then_evict)
+    r = client.put(f"/v1/upload/chunked/{up}/1", content=b"BBBB")
+    assert r.status_code == 410, r.text
+    assert not meta_path.exists() and not staging.exists()
+    assert up not in uploads._chunk_locks
+
+
+def _drop_meta_after_next_read(monkeypatch, meta_path):
+    """The next read of ``meta_path`` returns the meta and then removes it,
+    as a DELETE that ran between a route's first read and its lock would."""
+    from pathlib import Path
+    real_read = Path.read_text
+    armed = {"on": True}
+
+    def _read(self, *a, **kw):
+        text = real_read(self, *a, **kw)
+        if armed["on"] and self == meta_path:
+            armed["on"] = False
+            meta_path.unlink()
+        return text
+    monkeypatch.setattr(Path, "read_text", _read)
+
+
+def test_a_meta_gone_under_the_lock_leaves_no_lock(app_with_router, monkeypatch):
+    import config
+    from api.media import uploads
+    app, _agents, _staging, user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    # PUT: the upload already holds a chunk, so its lock outlives a failed PUT
+    # unless the upload itself is gone.
+    up = _init(client, 8).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{up}/0", content=b"AAAA").status_code == 200
+    assert up in uploads._chunk_locks
+    _drop_meta_after_next_read(monkeypatch, uploads._staging_paths(up, user.sub)[1])
+    assert client.put(f"/v1/upload/chunked/{up}/1", content=b"BBBB").status_code == 404
+    assert up not in uploads._chunk_locks
+    # Complete.
+    done = _init(client, 8).json()["upload_id"]
+    _upload_all(client, done, b"ABCDEFGH", 4)
+    assert done in uploads._chunk_locks
+    _drop_meta_after_next_read(monkeypatch, uploads._staging_paths(done, user.sub)[1])
+    assert client.post(f"/v1/upload/chunked/{done}/complete").status_code == 404
+    assert done not in uploads._chunk_locks
 
 
 def test_staged_bytes_are_capped_per_user_by_real_occupancy(app_with_router, monkeypatch):
@@ -574,12 +665,13 @@ def test_a_planted_link_at_the_landing_name_is_never_written_through(
 def test_writes_fsync_and_finalize_run_off_the_loop(app_with_router, monkeypatch):
     import os
     import threading
+    from pathlib import Path
     import config
     from api.media import uploads
-    app, _agents, _staging, _user = app_with_router
+    app, _agents, staging_dir, user = app_with_router
     monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
     client = TestClient(app)
-    threads = {"fsync": set(), "finalize": set()}
+    threads = {"fsync": set(), "finalize": set(), "meta_read": set(), "unlink": set()}
     real_fsync = os.fsync
 
     def _fsync(fd):
@@ -590,13 +682,40 @@ def test_writes_fsync_and_finalize_run_off_the_loop(app_with_router, monkeypatch
     def _finalize(*a, **kw):
         threads["finalize"].add(threading.current_thread().name)
         return real_finalize(*a, **kw)
+    real_read, real_unlink = Path.read_text, Path.unlink
+
+    def _read(self, *a, **kw):
+        if self.suffix == ".json" and self.is_relative_to(staging_dir):
+            threads["meta_read"].add(threading.current_thread().name)
+        return real_read(self, *a, **kw)
+
+    def _unlink(self, *a, **kw):
+        if self.is_relative_to(staging_dir):
+            threads["unlink"].add(threading.current_thread().name)
+        return real_unlink(self, *a, **kw)
     monkeypatch.setattr(os, "fsync", _fsync)
     monkeypatch.setattr(uploads, "_finalize_staged_file", _finalize)
+    monkeypatch.setattr(Path, "read_text", _read)
+    monkeypatch.setattr(Path, "unlink", _unlink)
     up = _init(client, 8).json()["upload_id"]
     _upload_all(client, up, b"ABCDEFGH", 4)
+    assert client.get(f"/v1/upload/chunked/{up}").status_code == 200
     assert client.post(f"/v1/upload/chunked/{up}/complete").status_code == 200
-    assert threads["fsync"] and all(n.startswith("file-commit") for n in threads["fsync"])
-    assert threads["finalize"] and all(n.startswith("file-commit") for n in threads["finalize"])
+    # A torn staging file: complete's size probe and its unlinks.
+    torn = _init(client, 8).json()["upload_id"]
+    _upload_all(client, torn, b"ABCDEFGH", 4)
+    os.truncate(uploads._staging_paths(torn, user.sub)[0], 3)
+    assert client.post(f"/v1/upload/chunked/{torn}/complete").status_code == 409
+    # A reaped staging file: the 410's unlink.
+    gone = _init(client, 8).json()["upload_id"]
+    os.remove(uploads._staging_paths(gone, user.sub)[0])
+    assert client.put(f"/v1/upload/chunked/{gone}/0", content=b"AAAA").status_code == 410
+    # An abort: its read and its unlinks.
+    aborted = _init(client, 8).json()["upload_id"]
+    assert client.delete(f"/v1/upload/chunked/{aborted}").json() == {"ok": True}
+    assert _staged_files(staging_dir) == []
+    for kind, names in threads.items():
+        assert names and all(n.startswith("file-commit") for n in names), (kind, names)
 
 
 def test_complete_schedules_push_with_transfer_id(app_with_router, monkeypatch):

@@ -27,46 +27,66 @@ def _ctx(role="manager", username="", agent="personal-assistant", is_admin_agent
 
 # --- the structural matcher ------------------------------------------------
 
+SID = "83089e74-1234"
+
+
 def test_matcher_linux_sandbox_path():
     assert path_roles.is_claude_bg_output_path(
-        "/tmp/claude-1000/-home-dave/83089e74-1234/tasks/b6v8ayxb6.output")
+        "/tmp/claude-1000/-home-dave/83089e74-1234/tasks/b6v8ayxb6.output", SID)
+
+
+def test_matcher_rejects_another_sessions_output():
+    # The session segment is the capability: a foreign session's output,
+    # however well its path is guessed, never matches the caller's id.
+    assert not path_roles.is_claude_bg_output_path(
+        "/tmp/claude-1000/-home-dave/83089e74-1234/tasks/b6v8ayxb6.output", "0ther-sess")
+
+
+def test_matcher_empty_session_matches_nothing():
+    assert not path_roles.is_claude_bg_output_path(
+        "/tmp/claude-1000/-home-dave/83089e74-1234/tasks/b6v8ayxb6.output", "")
+
+
+def test_matcher_session_id_case_insensitive():
+    assert path_roles.is_claude_bg_output_path(
+        "/tmp/claude-1000/-home-dave/83089E74-1234/tasks/x.output", SID)
 
 
 def test_matcher_windows_path():
     assert path_roles.is_claude_bg_output_path(
-        r"C:\Users\frank\AppData\Local\Temp\claude\abc\tasks\bzsw24mbr.output")
+        r"C:\Users\frank\AppData\Local\Temp\claude\abc\tasks\bzsw24mbr.output", "abc")
 
 
 def test_matcher_macos_tmpdir_path():
     assert path_roles.is_claude_bg_output_path(
-        "/var/folders/xy/claude-501/proj/sess/tasks/q1w2e3.output")
+        "/var/folders/xy/claude-501/proj/sess/tasks/q1w2e3.output", "sess")
 
 
-def test_matcher_tasks_immediately_after_claude():
-    assert path_roles.is_claude_bg_output_path("/tmp/claude-1000/tasks/x.output")
+def test_matcher_rejects_tasks_without_a_session_segment():
+    assert not path_roles.is_claude_bg_output_path("/tmp/claude-1000/tasks/x.output", "sess")
 
 
 def test_matcher_rejects_non_output_suffix():
     assert not path_roles.is_claude_bg_output_path(
-        "/tmp/claude-1000/x/sess/tasks/notes.txt")
+        "/tmp/claude-1000/x/sess/tasks/notes.txt", "sess")
 
 
 def test_matcher_rejects_without_claude_segment():
-    assert not path_roles.is_claude_bg_output_path("/tmp/foo/sess/tasks/x.output")
+    assert not path_roles.is_claude_bg_output_path("/tmp/foo/sess/tasks/x.output", "sess")
 
 
 def test_matcher_rejects_without_tasks_segment():
-    assert not path_roles.is_claude_bg_output_path("/tmp/claude-1000/sess/x.output")
+    assert not path_roles.is_claude_bg_output_path("/tmp/claude-1000/sess/x.output", "sess")
 
 
 def test_matcher_rejects_claude_after_tasks():
     # "claude-*" must come BEFORE "tasks"; this ordering must not match.
-    assert not path_roles.is_claude_bg_output_path("/tmp/tasks/claude-1000/x.output")
+    assert not path_roles.is_claude_bg_output_path("/tmp/tasks/claude-1000/x.output", "x")
 
 
 def test_matcher_accepts_pathlib_input():
     assert path_roles.is_claude_bg_output_path(
-        Path("/tmp/claude-1000/p/s/tasks/abc.output"))
+        Path("/tmp/claude-1000/p/s/tasks/abc.output"), "s")
 
 
 # --- the local read-path gate ----------------------------------------------
@@ -105,6 +125,6 @@ def test_credential_and_config_paths_are_structurally_exclusive():
     # can never end in ".output", so the bg-output allow can't shadow those
     # denies by construction.
     assert not path_roles.is_claude_bg_output_path(
-        "/tmp/claude-1000/tasks/anthropic-tokens.json")
+        "/tmp/claude-1000/sess/tasks/anthropic-tokens.json", "sess")
     assert not path_roles.is_claude_bg_output_path(
-        str(_AGENTS / "pa" / "workspace" / ".claude" / "settings.json"))
+        str(_AGENTS / "pa" / "workspace" / ".claude" / "settings.json"), "sess")

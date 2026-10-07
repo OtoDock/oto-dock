@@ -11,6 +11,8 @@ merges the bundle into the MCP child's env at spawn, and the entry's
 launcher writes the files 0600 into a private directory under the session's
 temporary space and points the env var there. The copy dies with the session
 and is never written back; the refresh worker keeps the central file current.
+A file reaches only the MCP whose binding it was collected for, so two MCPs
+that declare the same subpath each receive their own account's file.
 
 Remote sessions keep the session-file channel
 (``core/remote/remote_session_start.py``): their bundles carry no files and
@@ -36,20 +38,23 @@ def token_file_env(
 ) -> dict[str, dict[str, str]]:
     """``{<config key>: {OTO_CREDENTIAL_FILES: <json>}}`` for every stdio MCP
     of the agent whose bound account has a token file, keyed the way the
-    secret bundles are (``server_name`` or the manifest name). The files
-    come from the collector the remote channel trusts, keyed there by the
-    sandbox-virtual ``credentials_dir`` path; they are re-keyed per MCP by
-    the manifest's ``(env var, subpath)`` entries."""
+    secret bundles are (``server_name`` or the manifest name). Each MCP
+    takes only the files collected for its own binding (the collector keys
+    them by manifest, then by the sandbox-virtual ``credentials_dir`` path),
+    split by the manifest's ``(env var, subpath)`` entries."""
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver
 
-    files = credential_resolver.collect_oauth_token_files(
+    by_manifest = credential_resolver.collect_oauth_token_files_by_manifest(
         agent_name, user_sub=user_sub or None, session_scope=session_scope,
     )
-    if not files:
+    if not by_manifest:
         return {}
     out: dict[str, dict[str, str]] = {}
     for manifest in mcp_registry.get_agent_mcps(agent_name):
+        files = by_manifest.get(manifest.name)
+        if not files:
+            continue
         entries = mcp_registry.get_credentials_dirs(manifest.name)
         if not entries:
             continue

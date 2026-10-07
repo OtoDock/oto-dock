@@ -27,6 +27,7 @@ import config
 from app import app
 from auth.providers import UserContext, get_current_user
 from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from api.apps import app_proxy
 from services.apps import app_supervisor, app_tokens, releases
 from storage import database as task_store
@@ -287,7 +288,7 @@ def test_agent_basis_reaches_its_own_apps_only(agent_tree, upstream):
     _install(shared, upstream.server_port)
     _install(personal, upstream.server_port)
     # The session agent's own shared app: allowed, the claim names the session.
-    tok = create_session_token("sess-1", AGENT, "")
+    tok = live_session_token("sess-1", AGENT, "")
     r = client.get(f"/v1/apps/{shared['id']}/api/cards", headers=_bearer(tok))
     assert r.status_code == 200, r.text
     claim = app_tokens.verify(r.json()["headers"]["x-otodock-viewer"], shared["id"],
@@ -297,24 +298,28 @@ def test_agent_basis_reaches_its_own_apps_only(agent_tree, upstream):
     assert r.json()["headers"]["x-otodock-basis"] == "agent"
     # Another agent's session: 404. A no-user session never owns a personal row.
     assert client.get(f"/v1/apps/{shared['id']}/api/cards",
-                      headers=_bearer(create_session_token("s2", OTHER_AGENT, ""))).status_code == 404
+                      headers=_bearer(live_session_token("s2", OTHER_AGENT, ""))).status_code == 404
     assert client.get(f"/v1/apps/{personal['id']}/api/cards", headers=_bearer(tok)).status_code == 404
     # The owner's session reaches the personal row with the owner's role;
     # another user's session does not; an external session never.
-    mine = create_session_token("s3", AGENT, "alice-sub")
+    mine = live_session_token("s3", AGENT, "alice-sub")
     r = client.get(f"/v1/apps/{personal['id']}/api/cards", headers=_bearer(mine))
     assert r.status_code == 200
     claim = app_tokens.verify(r.json()["headers"]["x-otodock-viewer"], personal["id"],
                               app_tokens.PURPOSE_CALLER)
     assert claim["sub"] == "alice-sub" and claim["username"] == "alice" and claim["role"] == "manager"
     assert client.get(f"/v1/apps/{personal['id']}/api/cards",
-                      headers=_bearer(create_session_token("s4", AGENT, "bob-sub"))).status_code == 404
+                      headers=_bearer(live_session_token("s4", AGENT, "bob-sub"))).status_code == 404
     # The owner's session on ANOTHER agent does not reach it either: a
     # personal app lives in its agent's tree, and a session never crosses one.
     assert client.get(f"/v1/apps/{personal['id']}/api/cards",
-                      headers=_bearer(create_session_token("s6", OTHER_AGENT, "alice-sub"))).status_code == 404
-    ext = create_session_token("s5", AGENT, "", external="phone:+15550001")
-    assert client.get(f"/v1/apps/{shared['id']}/api/cards", headers=_bearer(ext)).status_code == 401
+                      headers=_bearer(live_session_token("s6", OTHER_AGENT, "alice-sub"))).status_code == 404
+    # A live external session is confined to its allowlist by the middleware
+    # (403) before the app proxy's own refusal; a dead one is 401 everywhere.
+    ext = live_session_token("s5", AGENT, "", external="phone:+15550001")
+    assert client.get(f"/v1/apps/{shared['id']}/api/cards", headers=_bearer(ext)).status_code == 403
+    dead_ext = create_session_token("s5-dead", AGENT, "", external="phone:+15550001")
+    assert client.get(f"/v1/apps/{shared['id']}/api/cards", headers=_bearer(dead_ext)).status_code == 401
 
 
 def test_api_answers_503_in_backoff_404_for_static_and_429_on_bursts(agent_tree, upstream,
@@ -568,7 +573,7 @@ def test_logs_are_for_managers_and_the_twins_take_agents_and_apps(agent_tree, up
     viewer = _viewer_token(row["id"])
     r = client.patch(f"/v1/apps/{row['id']}/state", json={"patch": {"a": 1}}, headers=_bearer(viewer))
     assert r.status_code == 403
-    agent_tok = create_session_token("sess-9", AGENT, "")
+    agent_tok = live_session_token("sess-9", AGENT, "")
     r = client.patch(f"/v1/apps/{row['id']}/state", json={"patch": {"a": 1}}, headers=_bearer(agent_tok))
     assert r.status_code == 200 and r.json()["rev"] == 1
     from api.apps import apps as apps_api
@@ -583,7 +588,7 @@ def test_logs_are_for_managers_and_the_twins_take_agents_and_apps(agent_tree, up
     assert client.patch(f"/v1/apps/{row['id']}/state", json={"patch": {}}).status_code == 401
     # Another agent's session cannot write this row.
     assert client.patch(f"/v1/apps/{row['id']}/state", json={"patch": {}},
-                        headers=_bearer(create_session_token("s", OTHER_AGENT, ""))).status_code == 404
+                        headers=_bearer(live_session_token("s", OTHER_AGENT, ""))).status_code == 404
 
 
 def _person(sub: str, name: str, platform: str = "member", agent_role: str = "") -> None:
@@ -617,11 +622,11 @@ def test_rest_twins_carry_the_pin_authority(agent_tree, upstream):
                            headers=_bearer(token)).status_code
         return state, push
 
-    assert write(create_session_token("s-pm", AGENT, "pm-sub")) == (403, 403)
-    assert write(create_session_token("s-bob", AGENT, "bob-sub")) == (403, 403)
-    assert write(create_session_token("s-ed", AGENT, "ed-sub")) == (200, 200)
-    assert write(create_session_token("s-root", AGENT, "root-sub")) == (200, 200)
-    assert write(create_session_token("s-svc", AGENT, "")) == (200, 200)
+    assert write(live_session_token("s-pm", AGENT, "pm-sub")) == (403, 403)
+    assert write(live_session_token("s-bob", AGENT, "bob-sub")) == (403, 403)
+    assert write(live_session_token("s-ed", AGENT, "ed-sub")) == (200, 200)
+    assert write(live_session_token("s-root", AGENT, "root-sub")) == (200, 200)
+    assert write(live_session_token("s-svc", AGENT, "")) == (200, 200)
     assert write(inst.token) == (200, 200)
     # The refused writes wrote nothing: four accepted writers, four revisions.
     assert task_store.get_app_state(shared["id"])[1] == 4
@@ -629,7 +634,7 @@ def test_rest_twins_carry_the_pin_authority(agent_tree, upstream):
     mine = _folder_row("pm-board", "pm", "pm-sub")
     apps_api._fire_rate.clear()
     r = client.patch(f"/v1/apps/{mine['id']}/state", json={"patch": {"c": 1}},
-                     headers=_bearer(create_session_token("s-pm2", AGENT, "pm-sub")))
+                     headers=_bearer(live_session_token("s-pm2", AGENT, "pm-sub")))
     assert r.status_code == 200, r.text
 
 
@@ -680,10 +685,10 @@ def test_the_agent_caller_judges_the_tokens_holder(agent_tree, upstream):
     upstream.app_id = shared["id"]
     _install(shared, upstream.server_port)
     url = f"/v1/apps/{shared['id']}/api/cards"
-    assert client.get(url, headers=_bearer(create_session_token("s-g", AGENT, "ghost-sub"))).status_code == 401
-    assert client.get(url, headers=_bearer(create_session_token("s-a", AGENT, "alice-sub"))).status_code == 200
-    assert client.get(url, headers=_bearer(create_session_token("s-n", AGENT, ""))).status_code == 200
-    stale = create_session_token("s-b", AGENT, "bob-sub")
+    assert client.get(url, headers=_bearer(live_session_token("s-g", AGENT, "ghost-sub"))).status_code == 401
+    assert client.get(url, headers=_bearer(live_session_token("s-a", AGENT, "alice-sub"))).status_code == 200
+    assert client.get(url, headers=_bearer(live_session_token("s-n", AGENT, ""))).status_code == 200
+    stale = live_session_token("s-b", AGENT, "bob-sub")
     later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     with get_conn() as conn:
         conn.execute("UPDATE users SET password_changed_at=%s WHERE sub=%s", (later, "bob-sub"))
@@ -741,7 +746,7 @@ def test_apps_owner_standing(owner_standing, monkeypatch):
     _as(PM)
     claim = _viewer_token(row["id"])
     assert client.get(f"/v1/apps/{row['id']}/api/x", headers=_bearer(claim)).status_code == 200
-    session = create_session_token("s-pm", AGENT, "pm-sub")
+    session = live_session_token("s-pm", AGENT, "pm-sub")
     # The server's open subscription socket loses its feeds at its next
     # frame (the row is read afresh per frame).
     socket_cm = client.websocket_connect(f"/v1/apps/{row['id']}/platform/ws")
@@ -818,6 +823,37 @@ def test_the_owner_standing_follows_the_row_not_the_event(owner_standing):
     assert app_supervisor.get(row["id"]) is not None
 
 
+def test_a_claims_instance_word_is_one_of_the_three_else_live(agent_tree):
+    """The viewer claim names the process it reaches; a word the platform
+    never mints reads as the live release. A launch caller's actor carries
+    its instance unless it is the live one (the preview spends its own
+    buckets)."""
+    row = _folder_row()
+    for word, want in (("preview", app_supervisor.PREVIEW), ("check", app_supervisor.CHECK),
+                       ("live", app_supervisor.LIVE), ("staging", app_supervisor.LIVE),
+                       ("", app_supervisor.LIVE)):
+        claim = app_tokens.mint(row["id"], app_tokens.PURPOSE_VIEWER, {
+            "principal": "viewer", "sub": "alice-sub", "role": "manager", "external": False,
+            "instance": word}, 60)
+        assert asyncio.run(app_proxy.caller_from_token(claim, row)).instance == want, word
+    assert app_supervisor.INSTANCES == (app_supervisor.LIVE, app_supervisor.PREVIEW, app_supervisor.CHECK)
+    live = app_proxy.Caller(basis="app", sub=row["id"], instance=app_supervisor.LIVE)
+    preview = app_proxy.Caller(basis="app", sub=row["id"], instance=app_supervisor.PREVIEW)
+    assert live.actor == f"app:{row['id']}" and preview.actor == f"app:{row['id']}:preview"
+    # A check instance runs unapproved code without the approval gate: its
+    # launch token is never the app identity on a route that takes one.
+    check = app_supervisor.Instance(row_id=row["id"], name=app_supervisor.CHECK, row=row,
+                                    release_dir=config.get_agent_dir(AGENT),
+                                    data_dir=config.get_agent_dir(AGENT), host_port=1, state="up")
+    check.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
+                                  {"sub": f"app:{row['id']}", "instance": app_supervisor.CHECK}, 3600)
+    app_supervisor._instances[(row["id"], app_supervisor.CHECK)] = check
+    r = client.get(f"/v1/apps/{row['id']}/egress/api.example.com/x", headers=_bearer(check.token))
+    assert r.status_code == 401, r.text
+    r = client.post(f"/v1/apps/{row['id']}/platform/viewer.me", json={}, headers=_bearer(check.token))
+    assert r.status_code == 401, r.text
+
+
 def test_free_functions():
     assert app_proxy._redirect_ok("", "x") and app_proxy._redirect_ok("ok", "x")
     assert app_proxy._redirect_ok("/v1/apps/x/api/y", "x")
@@ -883,3 +919,246 @@ def test_the_runtime_hands_back_one_socket_per_path():
     assert out.returncode == 0, out.stderr[-800:]
     seen = json.loads(out.stdout.strip().splitlines()[-1])
     assert seen == {"same": True, "other": True, "opened": 2}
+
+
+# ── a placed app and the receiving agent's sessions (SHARING.md) ────────────
+
+THIRD_AGENT = "proxy-third"
+
+EXPORTS = {"methods": {
+    "status": {"description": "the register's status"},
+    "update-project": {"description": "write a project's status", "min_role": "editor"},
+    "purge-cache": {"description": "drop the cache", "min_role": "manager"},
+}}
+
+
+def _exporting_row(slug: str = "register", *, username: str = "", owner: str | None = None,
+                   approve: bool = True) -> dict:
+    root = f"users/{username}/workspace" if username else "workspace"
+    row = task_store.upsert_app(AGENT, username, owner, slug, title=slug.title(),
+                                rel_path=f"{root}/apps/{slug}", kind="folder", actions_json="[]",
+                                blocks={"exports": task_store.canonical_actions_json(EXPORTS)})
+    if approve:
+        task_store.approve_app_actions(row["id"], task_store.manifest_sig(row), "alice-sub")
+    return task_store.get_app(row["id"])
+
+
+def _place(row: dict, agent: str = OTHER_AGENT, cap: str = "editor") -> dict:
+    from storage.sharing import share_store
+    return share_store.create_internal_share(
+        target_kind="app", target_id=row["id"], created_by="alice-sub",
+        grantee_kind=share_store.AGENT, grantee_agent=agent, role_cap=cap,
+        decision=share_store.ACCEPTED, decided_by="alice-sub")
+
+
+def _caller(token: str, row: dict) -> app_proxy.Caller:
+    return asyncio.run(app_proxy._agent_caller(app_proxy.validate_session_token(token), row))
+
+
+@pytest.fixture
+def contexts():
+    """Register a session's security context for the scope rule; popped after."""
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    sids: list[str] = []
+
+    def _register(sid: str, agent: str, username: str, scope: str) -> None:
+        session_state.set_session_security(sid, SecurityContext(
+            role="viewer", username=username, agent=agent, is_admin_agent=False,
+            session_scope=scope))
+        sids.append(sid)
+
+    yield _register
+    for sid in sids:
+        session_state._session_security.pop(sid, None)
+
+
+def test_a_placement_admits_the_receiving_agents_sessions_on_its_exports(agent_tree, upstream):
+    """SHARING.md "Agents use a placed app": an agent share lets every
+    session of the receiving agent call the app's signed exports at the
+    person's row there capped by the share, and nothing else of the app."""
+    from storage.sharing import share_store
+    row = _exporting_row()
+    upstream.app_id = row["id"]
+    _install(row, upstream.server_port)
+    url = f"/v1/apps/{row['id']}/api"
+    nobody = live_session_token("s-x", OTHER_AGENT, "")
+    assert client.get(f"{url}/status", headers=_bearer(nobody)).status_code == 404
+    share = _place(row, cap="editor")
+    # A session with no person carries the no-user word, which ranks below
+    # every floor: the methods without one answer, the floored ones refuse.
+    r = client.get(f"{url}/status", headers=_bearer(nobody))
+    assert r.status_code == 200 and r.json()["path"] == "/api/status", r.text
+    assert client.post(f"{url}/update-project", headers=_bearer(nobody)).status_code == 403
+    c = _caller(nobody, row)
+    assert c.basis == "agent" and c.role == "agent" and c.sub == "session:s-x"
+    marker = {"kind": "agent", "share_id": share["id"], "from_agent": AGENT,
+              "agent": OTHER_AGENT, "role_cap": "editor"}
+    assert c.extra["placement"] == marker
+    # What the app sees: the placement principal and basis (never the word
+    # its own agent's sessions carry), the calling agent, the capped role
+    # and the placement naming the app's own agent.
+    assert r.json()["headers"]["x-otodock-basis"] == "placement"
+    claim = app_tokens.verify(r.json()["headers"]["x-otodock-viewer"], row["id"],
+                              app_tokens.PURPOSE_CALLER)
+    assert claim["principal"] == "placement" and claim["placement"] == marker
+    assert claim["agent"] == OTHER_AGENT and claim["role"] == "agent" and claim["sub"] == "session:s-x"
+    assert claim["session"] == "s-x" and claim["external"] is False
+    # bob, a viewer of the home agent and an editor of the receiving one:
+    # editor there, capped at the share's editor; the manager floor refuses.
+    task_store.add_user_agent("bob-sub", OTHER_AGENT, "editor", "test")
+    bob = live_session_token("s-bob", OTHER_AGENT, "bob-sub")
+    r = client.post(f"{url}/update-project", headers=_bearer(bob))
+    assert r.status_code == 200
+    claim = app_tokens.verify(r.json()["headers"]["x-otodock-viewer"], row["id"],
+                              app_tokens.PURPOSE_CALLER)
+    assert (claim["principal"], claim["sub"], claim["username"], claim["role"]) == \
+        ("placement", "bob-sub", "bob", "editor")
+    r = client.post(f"{url}/purge-cache", headers=_bearer(bob))
+    assert r.status_code == 403 and "manager" in r.text
+    assert _caller(bob, row).role == "editor"
+    # carol holds no row on the receiving agent: a viewer, capped.
+    carol = live_session_token("s-carol", OTHER_AGENT, "carol-sub")
+    assert client.get(f"{url}/status", headers=_bearer(carol)).status_code == 200
+    assert client.post(f"{url}/update-project", headers=_bearer(carol)).status_code == 403
+    # A platform admin with no row acts at viewer capped, never at their standing.
+    task_store.upsert_user("root-sub", "root@test.com", "Root", "admin")
+    root = live_session_token("s-root", OTHER_AGENT, "root-sub")
+    assert client.post(f"{url}/update-project", headers=_bearer(root)).status_code == 403
+    # The exported methods alone: an unexported path, an empty first segment
+    # and the app's own endpoints are refused; the home agent's own session
+    # keeps every path and carries no marker.
+    r = client.get(f"{url}/raw", headers=_bearer(bob))
+    assert r.status_code == 404 and "not exported" in r.text
+    assert client.get(f"{url}//status", headers=_bearer(bob)).status_code == 404
+    assert client.get(f"{url}/_handler/x", headers=_bearer(bob)).status_code == 404
+    own = live_session_token("s-own", AGENT, "")
+    assert client.get(f"{url}/raw", headers=_bearer(own)).status_code == 200
+    assert "placement" not in _caller(own, row).extra
+    # A third agent's session: 404. The cap lowered to viewer: the editor
+    # floor refuses at once. The share revoked: 404 at once, no cache.
+    assert client.get(f"{url}/status",
+                      headers=_bearer(live_session_token("s-3", THIRD_AGENT, ""))).status_code == 404
+    share_store.revoke_share(share["id"])
+    _place(row, cap="viewer")
+    assert client.get(f"{url}/status", headers=_bearer(bob)).status_code == 200
+    assert client.post(f"{url}/update-project", headers=_bearer(bob)).status_code == 403
+    for s in share_store.list_target_shares("app", row["id"]):
+        share_store.revoke_share(s["id"])
+    assert client.get(f"{url}/status", headers=_bearer(bob)).status_code == 404
+    # An unapproved manifest answers nothing to a placed session, as the
+    # broker answers; the approval opens it.
+    draft = _exporting_row("draft", approve=False)
+    _install(draft, upstream.server_port)
+    _place(draft)
+    assert client.get(f"/v1/apps/{draft['id']}/api/status", headers=_bearer(bob)).status_code == 404
+    task_store.approve_app_actions(draft["id"], task_store.manifest_sig(draft), "alice-sub")
+    assert client.get(f"/v1/apps/{draft['id']}/api/status", headers=_bearer(bob)).status_code == 200
+
+
+def test_a_placed_call_lands_on_the_route_a_binding_reaches(agent_tree, upstream):
+    """An exported method is served once, at ``/api/<method>``, where the
+    broker forwards a binding's call (``app_bindings.broker``): a placed
+    agent's session calling ``/v1/apps/<id>/api/<method>`` lands there too,
+    while the home agent's own session keeps the path it sent, as a page
+    does."""
+    row = _exporting_row()
+    upstream.app_id = row["id"]
+    _install(row, upstream.server_port)
+    _place(row, cap="editor")
+    url = f"/v1/apps/{row['id']}/api"
+    placed = live_session_token("s-pl", OTHER_AGENT, "")
+    r = client.get(f"{url}/status?week=3", headers=_bearer(placed))
+    assert r.status_code == 200 and r.json()["path"] == "/api/status?week=3", r.text
+    own = live_session_token("s-own", AGENT, "")
+    r = client.get(f"{url}/status", headers=_bearer(own))
+    assert r.status_code == 200 and r.json()["path"] == "/status", r.text
+
+
+def test_a_person_placement_admits_their_own_user_scope_sessions_alone(agent_tree, upstream, contexts):
+    """A person's accepted share placed in an agent admits that person's
+    own sessions mounting the user scope there, at the share's cap uncapped
+    by their row; a Shared-only chat (the agent scope), a session with no
+    context, a no-user session, another person and another agent are out."""
+    from core.session import visibility
+    from storage.sharing import share_store
+    row = _exporting_row()
+    _install(row, upstream.server_port)
+    url = f"/v1/apps/{row['id']}/api"
+    task_store.add_user_agent("carol-sub", OTHER_AGENT, "viewer", "test")
+    task_store.add_user_agent("bob-sub", OTHER_AGENT, "editor", "test")
+    mine = share_store.create_internal_share(target_kind="app", target_id=row["id"],
+                                             created_by="alice-sub", grantee_sub="carol-sub",
+                                             role_cap="editor")
+    share_store.set_decision(mine["id"], share_store.ACCEPTED, "carol-sub", placed_agent=OTHER_AGENT)
+    contexts("s-carol-user", OTHER_AGENT, "carol", visibility.SCOPE_USER)
+    carol = live_session_token("s-carol-user", OTHER_AGENT, "carol-sub")
+    assert client.post(f"{url}/update-project", headers=_bearer(carol)).status_code == 200
+    assert client.post(f"{url}/purge-cache", headers=_bearer(carol)).status_code == 403
+    c = _caller(carol, row)
+    assert c.role == "editor" and c.extra["placement"]["kind"] == "person"
+    assert c.extra["placement"]["share_id"] == mine["id"]
+    contexts("s-carol-shared", OTHER_AGENT, "carol", visibility.SCOPE_AGENT)
+    contexts("s-carol-third", THIRD_AGENT, "carol", visibility.SCOPE_USER)
+    for tok in (live_session_token("s-carol-shared", OTHER_AGENT, "carol-sub"),
+                live_session_token("s-carol-none", OTHER_AGENT, "carol-sub"),
+                live_session_token("s-nobody", OTHER_AGENT, ""),
+                live_session_token("s-bob", OTHER_AGENT, "bob-sub"),
+                live_session_token("s-carol-third", THIRD_AGENT, "carol-sub")):
+        assert client.get(f"{url}/status", headers=_bearer(tok)).status_code == 404
+    # Beside an agent share at manager, her own cap wins over her capped row
+    # (a viewer's row capped at manager is still a viewer); bob acts at his
+    # row and a no-user session at the no-user word.
+    _place(row, cap="manager")
+    c = _caller(carol, row)
+    assert c.role == "editor" and c.extra["placement"]["kind"] == "person"
+    assert _caller(live_session_token("s-bob", OTHER_AGENT, "bob-sub"), row).role == "editor"
+    assert _caller(live_session_token("s-nobody", OTHER_AGENT, ""), row).role == "agent"
+    # A placed PERSONAL row answers its grantee's sessions on the receiving
+    # agent; the owner's own session there holds no placement.
+    personal = _exporting_row("mine", username="alice", owner="alice-sub")
+    _install(personal, upstream.server_port)
+    theirs = share_store.create_internal_share(target_kind="app", target_id=personal["id"],
+                                               created_by="alice-sub", grantee_sub="carol-sub",
+                                               role_cap="viewer")
+    share_store.set_decision(theirs["id"], share_store.ACCEPTED, "carol-sub", placed_agent=OTHER_AGENT)
+    assert client.get(f"/v1/apps/{personal['id']}/api/status", headers=_bearer(carol)).status_code == 200
+    assert client.get(f"/v1/apps/{personal['id']}/api/status",
+                      headers=_bearer(live_session_token("s-alice-o", OTHER_AGENT, "alice-sub"))).status_code == 404
+
+
+def test_a_placed_session_reaches_the_exports_and_nothing_else(agent_tree, ws_upstream):
+    """Push, state, the platform route and the socket refuse a placed
+    agent's session, with or without a person, and a placed session's token
+    never keeps alive a socket the home agent's own session opened."""
+    from starlette.websockets import WebSocketDisconnect
+    from api.apps import apps as apps_api
+    row = _exporting_row()
+    _install(row, ws_upstream)
+    _place(row, cap="manager")
+    task_store.add_user_agent("bob-sub", OTHER_AGENT, "manager", "test")
+    bob = live_session_token("s-bob", OTHER_AGENT, "bob-sub")
+    for tok in (bob, live_session_token("s-x", OTHER_AGENT, "")):
+        apps_api._fire_rate.clear()
+        assert client.patch(f"/v1/apps/{row['id']}/state", json={"patch": {"a": 1}},
+                            headers=_bearer(tok)).status_code == 403
+        apps_api._fire_rate.clear()
+        assert client.post(f"/v1/apps/{row['id']}/push", json={"payload": {}},
+                           headers=_bearer(tok)).status_code == 403
+        assert client.post(f"/v1/apps/{row['id']}/platform/viewer.me", json={},
+                           headers=_bearer(tok)).status_code == 403
+        with client.websocket_connect(f"/v1/apps/{row['id']}/ws/live") as ws:
+            ws.send_text(json.dumps({"type": "auth", "token": tok}))
+            with pytest.raises(WebSocketDisconnect) as e:
+                ws.receive_text()
+        assert e.value.code == 1008
+    assert task_store.get_app_state(row["id"])[1] == 0
+    own = live_session_token("s-own", AGENT, "bob-sub")
+    with client.websocket_connect(f"/v1/apps/{row['id']}/ws/chat") as ws:
+        ws.send_text(json.dumps({"type": "auth", "token": own}))
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "auth", "token": bob}))
+        ws.send_text("after")
+        with pytest.raises(WebSocketDisconnect) as e:
+            ws.receive_text()
+    assert e.value.code == 4401

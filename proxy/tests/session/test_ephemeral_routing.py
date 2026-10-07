@@ -316,11 +316,12 @@ async def test_chat_status_targets_plain_owner():
 async def test_chat_status_targets_shared_owner(monkeypatch):
     # The synthetic agent:: owner has no connections of its own — the fan-out
     # resolves to every user of the agent (same set the notification system
-    # uses for scope="agent").
+    # uses for scope="agent"). Read from a worker thread: a fan-out's first
+    # read on the loop answers nobody while its entry fills.
     from services.notifications import notification_manager as nm
     monkeypatch.setattr(nm.notification_store, "get_agent_user_subs",
                         lambda agent: ["alice", "bob"] if agent == "so" else [])
-    assert nm.chat_status_targets("agent::so", "so") == ["alice", "bob"]
+    assert await asyncio.to_thread(nm.chat_status_targets, "agent::so", "so") == ["alice", "bob"]
     assert nm.chat_status_targets("agent::so", "") == []
 
 
@@ -366,12 +367,14 @@ async def test_a_file_change_is_one_catalog_delta_whoever_watches(monkeypatch):
     nm._user_connections.update({"u1": [c1], "u2": [c2]})
     try:
         await nm.broadcast_file_updated("agent-x", "workspace/a.md")
+        await nm.flush_file_updates()
         assert [f["type"] for f in _frames(c1)] == ["file_updated"]
         assert [f["type"] for f in _frames(c2)] == ["file_updated"]
         assert deltas == [["u1", "u2"]]
 
         nm._user_connections.clear()
         await nm.broadcast_file_updated("agent-x", "workspace/b.md")
+        await nm.flush_file_updates()
         assert deltas[-1] == []
         assert len(deltas) == 2
     finally:

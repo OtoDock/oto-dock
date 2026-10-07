@@ -27,9 +27,19 @@ from urllib.parse import urlencode
 
 import httpx
 
-from auth.oauth_providers.base import OAuthProvider, TokenSet, UserInfo
+from auth.oauth_providers.base import OAuthProvider, OAuthTokenError, TokenSet, UserInfo
 
 logger = logging.getLogger("claude-proxy.oauth-providers.generic")
+
+
+def _json_object(resp: httpx.Response) -> dict:
+    """The response's JSON object, or an empty dict when the body is not one
+    (an HTML error page): the caller then reports the status alone."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 class GenericOAuthProvider(OAuthProvider):
@@ -122,10 +132,13 @@ class GenericOAuthProvider(OAuthProvider):
             data["code_verifier"] = code_verifier
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(self.token_url, data=data)
-        payload = resp.json()
+        payload = _json_object(resp)
         if resp.status_code != 200 or "error" in payload:
-            err = payload.get("error_description") or payload.get("error") or str(payload)
-            raise RuntimeError(f"{self.provider_id} token exchange failed: {err}")
+            raise OAuthTokenError(
+                self.provider_id, "exchange",
+                str(payload.get("error") or f"http_{resp.status_code}"),
+                str(payload.get("error_description") or ""), resp.status_code,
+            )
         return self.normalize_token_response(payload)
 
     async def refresh(
@@ -145,10 +158,13 @@ class GenericOAuthProvider(OAuthProvider):
                     "grant_type": "refresh_token",
                 },
             )
-        payload = resp.json()
+        payload = _json_object(resp)
         if resp.status_code != 200 or "error" in payload:
-            err = payload.get("error_description") or payload.get("error") or str(payload)
-            raise RuntimeError(f"{self.provider_id} token refresh failed: {err}")
+            raise OAuthTokenError(
+                self.provider_id, "refresh",
+                str(payload.get("error") or f"http_{resp.status_code}"),
+                str(payload.get("error_description") or ""), resp.status_code,
+            )
         ts = self.normalize_token_response(payload)
         # Refresh-token rotation safety: preserve previous refresh
         # if vendor's response omits it.

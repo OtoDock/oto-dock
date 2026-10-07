@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from app import app
 from auth.providers import create_session_jwt
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from services.infra import api_key_manager
 from storage import database as task_store
 from storage.agents import agent_store
@@ -34,7 +34,7 @@ def _world(temp_db):
 
 
 def _bearer(sub: str) -> dict:
-    return {"Authorization": f"Bearer {create_session_token(str(uuid.uuid4()), AGENT, sub)}"}
+    return {"Authorization": f"Bearer {live_session_token(str(uuid.uuid4()), AGENT, sub)}"}
 
 
 def _cookie(sub: str, role: str) -> dict:

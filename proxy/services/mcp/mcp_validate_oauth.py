@@ -11,8 +11,10 @@ live here; the generic transport / env-var-name patterns are shared from
 ``_parse_manifest`` and the validator tests).
 """
 
+import fnmatch
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from services.mcp.mcp_manifest_types import _ENV_VAR_NAME_RE, _HTTP_TRANSPORTS
 
@@ -46,6 +48,21 @@ _OAUTH_FLOWS = {
 # subdomains (matches the allowlist matcher in storage.identity.bearer_allowlist).
 _HOSTNAME_RE = re.compile(r"^[*A-Za-z0-9](?:[-A-Za-z0-9.*])*$")
 
+# ``credentials.oauth.authorization_server``: the MCP server names its own
+# authorization server (RFC 9728 and RFC 8414) and the install registers
+# itself there (RFC 7591) instead of carrying an admin's app credentials.
+_REGISTRATION_MODES = {"dynamic"}
+# A token issued for the MCP server never reaches a shell, another host or
+# an authorize-URL quirk, and the registered client has one flow: these keys
+# are refused beside the block. The app-flow URLs (``authorization_url``,
+# ``token_url``, ``revoke_url``) may stay: they serve an admin's own app when
+# one is configured, and the registered-client flow discovers its own.
+_KEYS_EXCLUDED_WITH_AUTHORIZATION_SERVER = (
+    "device_authorization_url", "app_credential_variants", "authorize_params",
+    "env_injection", "mcp_env_injection", "git_credential_helper",
+)
+_IDENTITY_FIELDS = ("label_field", "display_field", "id_field")
+
 
 def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) -> None:
     """Strict validator for the ``credentials.oauth`` block.
@@ -66,8 +83,11 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
       * ``bearer_required`` + ``proposed_hosts`` for remote-HTTP MCPs
         that need ``Authorization: Bearer`` injection. When
         ``bearer_required=true``, validator also cross-checks
-        ``server.transport`` is HTTP-class and ``server.url_template`` host
-        is in ``proposed_hosts``.
+        ``server.transport`` is HTTP-class.
+      * ``authorization_server`` for an MCP server that names its own
+        authorization server (``_validate_authorization_server``): the
+        block's own fields, the keys it excludes, and the literal https
+        ``server.url_template`` host matching ``proposed_hosts``.
 
     Scope validation uses per-provider regex: Google scopes validated by
     ``_GOOGLE_SCOPE_RE``; other providers only enforce non-empty strings.
@@ -359,6 +379,17 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"credentials.oauth.bearer_required=true requires HTTP-class "
                     f"server.transport; got {transport!r}"
                 )
+            # The credential gateway confines every forward to the one
+            # declared path, which an SSE endpoint event escapes (the
+            # ``api_key_header`` validator's rule).
+            if transport == "sse":
+                raise ValueError(
+                    "credentials.oauth.bearer_required=true requires a streamable-HTTP "
+                    "server.transport: the credential gateway forwards only to the one "
+                    f"declared path, which an SSE endpoint escapes; got {transport!r}"
+                )
+
+    _validate_authorization_server(raw, server_raw)
 
     # Per-provider scope regex. Unknown providers skip the URL pattern
     # check; only the "non-empty string" rule applies.
@@ -462,3 +493,137 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"credentials.oauth.services[{idx}].{bf} must be a boolean "
                     f"(service key={key!r})"
                 )
+
+
+def _validate_authorization_server(raw: dict, server_raw: Any = None) -> None:
+    """The ``credentials.oauth.authorization_server`` block.
+
+    The server's own metadata names every endpoint the registered client
+    uses; the install registers itself as a public client (``confidential: true`` asks for a secret)
+    with PKCE, so ``flows`` is exactly ``["authorization_code_pkce"]``; the
+    token is sent to the MCP server only, so ``bearer_required`` is set and
+    the literal https ``server.url_template`` host matches ``proposed_hosts``
+    (the allowlist's ``fnmatch`` rule). A hardcoded provider id (its Python
+    class speaks another protocol) cannot carry the block.
+    ``accepts_app_tokens`` says the server also takes the vendor's own app
+    tokens (the relay's or an admin's app), which makes the registered
+    client the fallback sign-in; by default the server takes its own
+    authorization server's tokens only.
+    """
+    block = raw.get("authorization_server")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError(
+            "credentials.oauth.authorization_server must be an object when declared"
+        )
+    if raw.get("flows") != ["authorization_code_pkce"]:
+        raise ValueError(
+            "credentials.oauth.authorization_server requires flows to be exactly "
+            "[\"authorization_code_pkce\"]"
+        )
+    for key in _KEYS_EXCLUDED_WITH_AUTHORIZATION_SERVER:
+        if key in raw:
+            raise ValueError(
+                f"credentials.oauth.{key} cannot be declared beside "
+                "authorization_server (the registered client's token is sent to "
+                "the MCP server only, through one flow)"
+            )
+    registration = block.get("registration", "dynamic")
+    if registration not in _REGISTRATION_MODES:
+        raise ValueError(
+            f"credentials.oauth.authorization_server.registration={registration!r} "
+            f"is not supported; valid: {sorted(_REGISTRATION_MODES)}"
+        )
+    if not isinstance(block.get("confidential", False), bool):
+        raise ValueError(
+            "credentials.oauth.authorization_server.confidential must be a boolean "
+            "when declared"
+        )
+    if not isinstance(block.get("accepts_app_tokens", False), bool):
+        raise ValueError(
+            "credentials.oauth.authorization_server.accepts_app_tokens must be a "
+            "boolean when declared"
+        )
+    issuer = block.get("issuer", "")
+    if issuer:
+        if not isinstance(issuer, str):
+            raise ValueError(
+                "credentials.oauth.authorization_server.issuer must be a string"
+            )
+        parts = urlsplit(issuer)
+        if parts.scheme != "https" or not parts.netloc or parts.query or parts.fragment:
+            raise ValueError(
+                "credentials.oauth.authorization_server.issuer must be an https URL "
+                "with no query or fragment"
+            )
+    client_name = block.get("client_name", "")
+    if client_name is not None and not isinstance(client_name, str):
+        raise ValueError(
+            "credentials.oauth.authorization_server.client_name must be a string"
+        )
+    scopes = block.get("scopes")
+    if scopes is not None:
+        if not isinstance(scopes, list) or not all(
+            isinstance(sc, str) and sc.strip() for sc in scopes
+        ):
+            raise ValueError(
+                "credentials.oauth.authorization_server.scopes must be a list of "
+                "non-empty strings when declared"
+            )
+    identity = block.get("identity")
+    if identity is not None:
+        if not isinstance(identity, dict) or not identity:
+            raise ValueError(
+                "credentials.oauth.authorization_server.identity must be a non-empty "
+                "object when declared"
+            )
+        for ik, iv in identity.items():
+            if ik not in _IDENTITY_FIELDS:
+                raise ValueError(
+                    f"credentials.oauth.authorization_server.identity.{ik} is not a "
+                    f"known field; valid: {list(_IDENTITY_FIELDS)}"
+                )
+            if not isinstance(iv, str) or not iv.strip():
+                raise ValueError(
+                    f"credentials.oauth.authorization_server.identity.{ik} must be a "
+                    "non-empty string"
+                )
+    userinfo_url = raw.get("userinfo_url", "")
+    if userinfo_url and urlsplit(str(userinfo_url)).scheme != "https":
+        raise ValueError(
+            "credentials.oauth.userinfo_url must be an https URL beside "
+            "authorization_server (the token reaches the MCP server's host only)"
+        )
+    from auth.oauth_providers import hardcoded_provider_ids
+    provider_id = raw.get("provider_id", "")
+    if provider_id in hardcoded_provider_ids():
+        raise ValueError(
+            f"credentials.oauth.provider_id={provider_id!r} is a provider with its "
+            "own Python class and cannot carry authorization_server"
+        )
+    if not raw.get("bearer_required", False):
+        raise ValueError(
+            "credentials.oauth.authorization_server requires bearer_required=true "
+            "(the token reaches the MCP server as its bearer)"
+        )
+    if isinstance(server_raw, dict):
+        url_template = server_raw.get("url_template", "")
+        if not isinstance(url_template, str) or not url_template:
+            raise ValueError(
+                "credentials.oauth.authorization_server requires server.url_template"
+            )
+        parts = urlsplit(url_template)
+        if parts.scheme != "https" or "${" in parts.netloc or not parts.hostname:
+            raise ValueError(
+                "credentials.oauth.authorization_server requires an https "
+                "server.url_template with a literal host"
+            )
+        host = parts.hostname.lower()
+        proposed = [str(h).lower() for h in (raw.get("proposed_hosts") or [])]
+        if not any(fnmatch.fnmatchcase(host, pat) for pat in proposed):
+            raise ValueError(
+                f"credentials.oauth.proposed_hosts must match the server.url_template "
+                f"host {host!r} when authorization_server is declared"
+            )
+

@@ -88,6 +88,18 @@ def test_folder_skill_materializes_scrubbed(tmp_path):
     assert marker["package"] == "pkg" and marker["version"] == "1.0.0"
 
 
+def test_the_persons_dir_asks_for_their_audience(tmp_path):
+    """A person's own config dir computes the set for THEIR role (the
+    registry keys the audience on the username); the agent-level dir asks
+    for the role-free set."""
+    cfg = _cfg_dir(tmp_path)
+    with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
+                      return_value=[]) as wanted:
+        sm.materialize_skills_for_sandbox("pa", cfg, username="edna")
+        sm.materialize_skills_for_sandbox("pa", cfg)
+    assert [c.kwargs.get("username") for c in wanted.call_args_list] == ["edna", None]
+
+
 def test_legacy_flat_file_synthesizes_frontmatter(tmp_path):
     wanted = _wire(tmp_path, [
         ("voiceover", "skills/voiceover.md", "# Voice-overs\n\nPick a voice.\n",

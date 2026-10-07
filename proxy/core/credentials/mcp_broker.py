@@ -10,6 +10,11 @@ which holds the session JWT + ``PROXY_URL`` + curl, cannot harvest another MCP's
 (or another user's) secrets. The ``mcp`` is derived from the token, so a token
 for one MCP can't fetch another's.
 
+An HTTP MCP's credential (a vendor bearer, a header-style API key, a
+sidecar's token) is the bundle's ``gateway`` half: it is never fetched by a
+process and never written anywhere; the gateway (``core/credentials/
+mcp_gateway.py``) resolves it per request and adds it on the way out.
+
 CRITICAL — this store holds SECRETS. It is in-memory ONLY and MUST NEVER be
 persisted to disk. This is the exact OPPOSITE of the secret-free
 ``_session_security`` context, which IS persisted for crash recovery (see
@@ -34,6 +39,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 
 import config
+from core.credentials.mcp_gateway import GatewayCredential
 
 logger = logging.getLogger("claude-proxy")
 
@@ -43,17 +49,6 @@ logger = logging.getLogger("claude-proxy")
 # the session closes finds a purged store anyway; the short TTL is belt-and-
 # suspenders against a captured-but-unused token.
 MCP_CRED_TOKEN_TTL_S = 30 * 60
-
-# Sentinel bearer written to config FILES for proxy-terminable HTTP MCPs
-# (github/m365 — localhost Docker sidecars). The real upstream token lives ONLY
-# in the in-memory bundle; each spawn path swaps this sentinel for the right
-# value at materialization:
-#   - local  → the real bearer (trusted proxy host; per-session sandbox copy)
-#   - remote → the per-session JWT, which the tunnel ``_dispatch`` then swaps for
-#              the real bearer server-side (the real token never hits the satellite)
-# A request that reaches the sidecar still carrying the sentinel (swap failed /
-# store miss) just gets a 401 → clean, fail-closed error.
-BROKER_BEARER_PLACEHOLDER = "OTO_BROKERED_BEARER"
 
 # session_id -> mcp_name -> SecretBundle.  IN-MEMORY ONLY (see module docstring).
 _store: dict[str, dict[str, "SecretBundle"]] = {}
@@ -68,11 +63,12 @@ _file_store: dict[str, dict[str, "SessionFile"]] = {}
 
 @dataclass
 class SecretBundle:
-    """The secret material one MCP needs at spawn: env vars + an optional HTTP
-    bearer (for proxy-terminated HTTP MCPs)."""
+    """The secret material one MCP needs: env vars a stdio MCP fetches at
+    spawn, or the gateway credential an HTTP MCP's requests receive on the
+    way out (never both: an HTTP MCP has no process to fetch)."""
 
     env: dict[str, str] = field(default_factory=dict)
-    http_bearer: str | None = None
+    gateway: GatewayCredential | None = None
 
 
 @dataclass
@@ -108,11 +104,19 @@ def get(session_id: str, mcp: str) -> "SecretBundle | None":
     return _store.get(session_id, {}).get(mcp)
 
 
+def bundles_of(session_id: str) -> dict[str, "SecretBundle"]:
+    """Every bundle a session holds, by MCP key (a copy)."""
+    return dict(_store.get(session_id, {}))
+
+
 def purge_session(session_id: str) -> None:
     """Drop a session's secrets — called on session close, so a capability token
-    replayed afterwards (within its TTL) finds nothing."""
+    replayed afterwards (within its TTL) finds nothing. The gateway forgets
+    the session's descriptor and tells the push registry."""
     _store.pop(session_id, None)
     _file_store.pop(session_id, None)
+    from core.credentials import mcp_gateway
+    mcp_gateway.on_purge(session_id)
 
 
 def provision_session_files(

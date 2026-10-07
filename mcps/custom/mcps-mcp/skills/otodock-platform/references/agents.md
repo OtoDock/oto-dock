@@ -35,10 +35,19 @@ as the agent; **manager** = + knowledge and config RW.
 - **Shared + personal** — same two spaces, shared is home base.
 - **Personal only** — fully private per person (own files, chats, memory).
 - **Shared only** — one space, one shared chat history for the whole team. Everything
-  there runs as the agent itself, so chatting takes **editor+**: a viewer or contributor
-  can read the history, but a chat, or a personal task they made before the switch,
-  stops with a message. To let them chat, give them editor or switch to a mode with
-  personal chats.
+  there runs as the agent itself, which takes **editor+**, so the agent holds **editor**
+  and **manager** assignments only: Admin → Users offers nothing lower for it (a newly
+  ticked one starts at editor), and so do the agent's Default-for-new-users setting and
+  the map's "Add me". Switching an agent to Shared only lists the people who hold viewer
+  or contributor there; a manager confirms exactly that list, their assignments are
+  removed, and the switch saves. An agent's own mode tools make the switch only when
+  nobody would lose an assignment; otherwise a manager confirms it in Agent Settings →
+  Configuration. A viewer or contributor assignment kept from an
+  older install stays as it was but opens no chat (a chat there shows a "This chat
+  takes the editor role" card, and a personal task they made earlier fails each run
+  with a message too): the agent's Users card marks it "no chat access",
+  and an admin raises it to editor or removes it. For people who should only read or
+  chat privately, pick a mode with personal chats instead.
 
 Switching modes never deletes files. Chats on shared agents are visible per mode; on a
 colleague's live interactive terminal you get read-only + a **Take over** button.
@@ -49,11 +58,23 @@ colleague's live interactive terminal you get read-only + a **Take over** button
   to be enabled), pick a **Default Model** (or Auto), a **Default Session Mode**
   (headless vs interactive terminal), and a **Default Effort** (thinking depth).
 - **Auto** (no pinned model) runs the engine's own default, chosen by tier: Claude Opus
-  5.5 on Claude Code, GPT-6 Sol on Codex, Sonnet 5 on Direct LLM. Since 1.7 Claude Opus
-  5.5 replaces Opus 5, and GPT-6 Sol and GPT-6 Luna replace their GPT-5.6 versions;
-  pins on the old ids move over at the next start.
-- A message typed while the agent works reaches it mid-turn, at its next tool step (in
-  the sandbox, on a paired machine, and in a delegated worker still working).
+  5.5 on Claude Code, GPT-6.1 Sol on Codex, Sonnet 5.5 on Direct LLM. Since 1.7.1 Claude
+  Sonnet 5.5 replaces Sonnet 5 and GPT-6.1 Sol replaces GPT-6 Sol; pins on the old ids
+  move over at the next start.
+- A message typed while the agent works reaches a Claude Code or Codex turn at its next
+  tool step (in the sandbox, on a paired machine, and in a delegated worker still
+  working). When the turn cannot take it (a Direct LLM chat, a turn that is ending) it
+  waits as a faded bubble labelled "queued" at the end of the conversation: the waiting
+  messages belong to the chat, so every tab and a teammate on a shared chat see them,
+  they survive a chat switch, a closed tab and a restart, and they go out together as
+  the next turn, in order. The x on a waiting message takes it back (its author, or an
+  admin); Edit returns it to the composer with its photos and files. A failed or
+  stopped turn hands the waiting messages back to their authors.
+- A turn that ends short shows a card that says why: the model declined it, the usage
+  limit was reached, the engine reported an error or its process exited, it stayed
+  silent past the ceiling (10 minutes with no tool running, `TURN_SILENCE_S`), or its
+  machine was lost. For an error, an exit, a silence and a lost machine the card offers
+  **Send again**, which sends that turn's messages again as a new turn.
 - A chat's permission mode sits in its status bar (**Default**, **Accept Edits**,
   **Plan**, **Don't Ask**); a Codex chat asks before commands and edits the way a Claude
   chat does.
@@ -78,7 +99,12 @@ Integrations (GitHub, Notion, and more as the catalog grows) connect per user un
 **User Settings → Integrations**; shared agents get a **service account** — a manager
 binds one of their own connected accounts on Agent Settings → MCPs; beneath the
 binding the manager subscribes the agent to that vendor's events (needed before an
-agent trigger or a shared app can react to them).
+agent trigger or a shared app can react to them). A hosted MCP server that signs
+people in itself (Notion, Linear) needs no OAuth app from an admin: the install
+registers itself with the vendor on first use, each person signs in on the vendor's
+page from Connected Accounts, and the token is added to the server's calls in transit,
+never handed to a session or a machine. An admin sees the registration on **Admin →
+MCP Servers** and can **Forget** it.
 
 ## Skills
 
@@ -88,7 +114,9 @@ with MCPs (ride the tool's enablement), or an admin-uploaded ZIP (community pack
 format or a bare SKILL.md folder). Two loading modes: **always in context** (inlined in
 the system prompt) vs **on demand** (loaded when the task matches the description —
 the default). Per-agent enablement lives on **Agent Settings → Skills** *(manager)*.
-Packages bundling executable scripts carry a "bundles scripts" badge.
+Packages bundling executable scripts carry a "bundles scripts" badge. A skill may be
+meant for one tier (manager, editor or contributor and up); a person below it does not
+get it in their sessions. `mcp-authoring`, for packaging an MCP, is for editors and up.
 
 ## Creating agents (platform creators and admins)
 

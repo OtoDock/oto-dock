@@ -315,8 +315,10 @@ TOOLS = [
         name="convert_document",
         description=(
             "Convert a document between formats using LibreOffice. Common conversions: "
-            "DOCX->PDF, XLSX->PDF, PPTX->PDF, CSV->XLSX, HTML->PDF. "
-            "Markdown->PDF uses the built-in renderer. Auto-previews the output."
+            "DOCX->PDF, XLSX->PDF, PPTX->PDF, CSV->XLSX. "
+            "Markdown->PDF and HTML->PDF use the built-in renderer: an HTML file's "
+            "pictures load only from this session's folders (a relative path names "
+            "a file beside the HTML file), never from the web. Auto-previews the output."
         ),
         inputSchema={
             "type": "object",
@@ -424,7 +426,8 @@ TOOLS = [
         description=(
             "Render document pages as images for visual inspection. "
             "Use this to SEE what a document looks like after creating or editing it. "
-            "Supports PDF, DOCX, XLSX, PPTX and other Office formats. "
+            "Supports PDF, DOCX, XLSX, PPTX and other Office formats, and HTML "
+            "(rendered by the built-in renderer, as convert_document does). "
             "Pages are shown inline in the chat so you can review layout, sizing, and content.\n\n"
             "Workflow: create/edit document → screenshot_document → review layout → adjust if needed.\n"
             "Default renders page 1 at 150 DPI. Use pages='-1' for last page, 'all' for all pages."

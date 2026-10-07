@@ -619,3 +619,210 @@ async def test_memo_cleared_when_satellite_updates(monkeypatch):
     assert fake_cm.send_command.await_count == 1
     assert r.installed == ["music-gen-mcp"]
     assert not mcp_sync._unsatisfiable_installs
+
+
+# ── a remote session's prompt after its MCP sync ─────────────────────────────
+
+_PROMPT = "\n".join([
+    "You are the agent.",
+    "\n\n---\n\n# Available Tools (MCPs)\n\nYou have these MCP servers enabled in this session — each provides a set of tools you can call:\n",
+    "- **Music** (`music-gen-mcp`) — Generate music.",
+    "- **Notes** (`notes-mcp`) — Keep notes.",
+    "\n\nDetailed usage instructions for each MCP follow in `# MCP Tool Skills` below.",
+    "\n\n---\n\n# MCP Tool Skills\n\nThe following tool instructions are auto-loaded from active MCP servers.\n",
+    "\n## Music\nCall generate_music.",
+    "\n## Notes\nCall add_note.",
+])
+
+
+def _fold(adapter_cls, payload, reasons, monkeypatch):
+    import config
+    bodies = {"music-gen-mcp": ["## Music\nCall generate_music."]}
+    monkeypatch.setattr(config, "_always_skill_bodies", lambda name: bodies.get(name, []))
+    return adapter_cls.with_unavailable_mcps(adapter_cls, payload, reasons)
+
+
+def test_unavailable_reasons_name_each_install_failure():
+    from services.mcp.mcp_sync import SyncResult, unavailable_reasons
+    r = SyncResult(failed={"music-gen-mcp": "npm ERR!\n  code E404", "stray.bak": "unsafe"},
+                   excluded_names={"music-gen-mcp", "x-mcp", "stray.bak"})
+    assert unavailable_reasons(r, {"music-gen-mcp", "x-mcp", "notes-mcp"}) == {
+        "music-gen-mcp": "could not be installed on this machine (npm ERR! code E404)",
+        "x-mcp": "could not be installed on this machine",
+    }  # a folder the machine holds for no assigned MCP never reaches the prompt
+
+
+def test_an_excluded_mcp_leaves_the_prompt_catalog_for_unavailable(monkeypatch):
+    from core.layers.cli.remote import ClaudeRemoteAdapter
+    payload = {"system_prompt": _PROMPT}
+    out = _fold(ClaudeRemoteAdapter, payload, {"music-gen-mcp": "could not be installed"}, monkeypatch)
+    text = out["system_prompt"]
+    assert "(`music-gen-mcp`)" not in text and "(`notes-mcp`)" in text
+    assert "Call generate_music." not in text and "Call add_note." in text
+    assert text.endswith(
+        "# Unavailable Tools\n\nThe following MCP servers are NOT available in this session:\n\n"
+        "- **music-gen-mcp**: could not be installed\n\n"
+        "Do not attempt to use tools from these servers. "
+        "If the user asks about them, explain they need to be configured first.")
+
+
+def test_the_fold_joins_an_existing_unavailable_block(monkeypatch):
+    import config
+    from core.layers.codex.remote import CodexRemoteAdapter
+    prompt = _PROMPT + "\n".join([
+        "", config._UNAVAILABLE_HEAD, config._unavailable_row("ads-mcp", "Excluded in task mode"),
+        config._UNAVAILABLE_TAIL, "\n## Permission context",
+    ])
+    payload = {"system_prompt": prompt, "agents_md_content": prompt}
+    out = _fold(CodexRemoteAdapter, payload, {"music-gen-mcp": "could not be installed"}, monkeypatch)
+    for key in ("system_prompt", "agents_md_content"):
+        text = out[key]
+        assert text.count("# Unavailable Tools") == 1
+        assert ("- **ads-mcp**: Excluded in task mode\n- **music-gen-mcp**: could not be installed\n\n"
+                "Do not attempt") in text
+        assert text.rstrip().endswith("## Permission context")
+        assert "(`music-gen-mcp`)" not in text
+
+
+# --- The churn: what one session leaves out, the next must not rebuild -------
+
+
+class _McpFolder:
+    """A satellite's MCP folder: verify reports it, ``sync_mcps`` applies a
+    frame to it as the satellite does (``core`` only under the flag)."""
+
+    def __init__(self, installed: dict[str, str], version: str):
+        self.installed = dict(installed)       # name -> category
+        self.version = version
+        self.frames: list[dict] = []
+
+    async def send_command(self, machine_id, msg, *, timeout=30.0, command_id=None):
+        if msg["type"] == "sync_mcps_verify":
+            return {"mcps": {n: {"version_hash": "h", "healthy": True, "category": c}
+                             for n, c in self.installed.items()}}
+        self.frames.append(msg)
+        results = {}
+        for spec in msg["mcps_to_install"]:
+            self.installed[spec["name"]] = spec["category"]
+            results[spec["name"]] = {"status": "ok"}
+        cats = (("core", "custom", "community") if msg.get("remove_any_category")
+                else ("custom", "community"))
+        for name in msg["mcps_to_remove"]:
+            if self.installed.get(name) in cats:
+                del self.installed[name]
+                results[name] = {"status": "removed"}
+            else:
+                results[name] = {"status": "not_found"}
+        return {"results": results}
+
+
+def _platform(monkeypatch, folder: _McpFolder, shipped: dict[str, str]):
+    """The platform ships ``shipped`` (name -> category); the connection
+    manager talks to ``folder``."""
+    from types import SimpleNamespace
+    from services.mcp import mcp_sync
+
+    manifests = {}
+    for name, cat in shipped.items():
+        m = MagicMock()
+        m.name = name
+        m.category = cat
+        m.server.runtime = "python"
+        m.server.transport = "stdio"
+        manifests[name] = m
+    cm = MagicMock()
+    cm.is_connected = MagicMock(return_value=True)
+    cm.get_install_lock = MagicMock(side_effect=lambda mid: _async_ctx())
+    cm.send_command = AsyncMock(side_effect=folder.send_command)
+    cm.get_connection = MagicMock(return_value=SimpleNamespace(
+        satellite_version=folder.version, capabilities={}))
+    cm._satellite_at_least = lambda mid, v: tuple(
+        int(p) for p in folder.version.split(".")) >= v
+
+    async def _hashes(names, *, force=False):
+        return {n: "h" for n in names}
+
+    tb = MagicMock()
+    tb.tarball_b64 = ""
+    tb.version_hash = "h"
+    monkeypatch.setattr("services.mcp.mcp_registry.get_manifest", manifests.get)
+    monkeypatch.setattr("services.mcp.mcp_registry.get_all_manifests", lambda: dict(manifests))
+    monkeypatch.setattr(mcp_sync, "version_hashes_for", _hashes)
+    monkeypatch.setattr(mcp_sync, "_manifest_to_dict", lambda m: {"name": m.name})
+    monkeypatch.setattr(mcp_sync, "_install_spec",
+                        lambda name, m, tb: {"name": name, "category": m.category})
+    monkeypatch.setattr("services.mcp.mcp_tarball.build_tarball", lambda name: tb)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    monkeypatch.setattr("core.remote.remote_execution.get_remote_layer",
+                        lambda: SimpleNamespace(_sessions={}))
+
+
+_SHIPPED = {"file-x": "custom", "image-gen-mcp": "custom", "agent-config-mcp": "core"}
+
+
+@pytest.mark.asyncio
+async def test_a_task_session_then_a_chat_session_installs_nothing(monkeypatch):
+    from services.mcp import mcp_sync
+    folder = _McpFolder(_SHIPPED, "0.5.136")
+    _platform(monkeypatch, folder, _SHIPPED)
+    plans: list[dict] = []
+
+    async def _plan(ev):
+        plans.append(ev)
+
+    # The task leaves out its ``exclude_from: task`` MCPs.
+    await mcp_sync.sync_mcps_for_session("m-1", "task-sess", ["file-x"], plan_cb=_plan)
+    await mcp_sync.sync_mcps_for_session(
+        "m-1", "chat-sess", ["file-x", "image-gen-mcp", "agent-config-mcp"], plan_cb=_plan)
+    assert folder.installed == _SHIPPED
+    assert folder.frames == []         # no rebuild, no removal, no round trip
+    assert plans == []
+
+
+@pytest.mark.asyncio
+async def test_no_round_trip_for_a_core_leftover_on_an_old_satellite(monkeypatch):
+    from services.mcp import mcp_sync
+    folder = _McpFolder({**_SHIPPED, "retired-core": "core", "odd": "extras"}, "0.5.136")
+    _platform(monkeypatch, folder, _SHIPPED)
+    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
+    assert folder.frames == []         # it would answer not_found every start
+    assert result.ok
+
+
+@pytest.mark.asyncio
+async def test_a_0_5_137_satellite_removes_a_retired_mcp_from_any_category(monkeypatch, caplog):
+    from services.mcp import mcp_sync
+    folder = _McpFolder({**_SHIPPED, "retired-core": "core", "retired": "community"}, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    with caplog.at_level("INFO", logger="claude-proxy.mcp-sync"):
+        result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
+    [frame] = folder.frames
+    assert frame["remove_any_category"] is True
+    assert sorted(frame["mcps_to_remove"]) == ["retired", "retired-core"]
+    assert folder.installed == _SHIPPED
+    assert sorted(result.removed) == ["retired", "retired-core"]
+    assert "sync_mcps plan m-1: install=[] update=[] remove=['retired', 'retired-core']" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sync_now_keeps_its_reach(monkeypatch):
+    """Admin Sync Now (no session) removes what no agent targeting the
+    machine wants, shipped or not, never ``core`` (no flag)."""
+    from services.mcp import mcp_sync
+    folder = _McpFolder(_SHIPPED, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    await mcp_sync.sync_mcps_for_session("m-1", "", ["file-x"])
+    [frame] = folder.frames
+    assert "remove_any_category" not in frame
+    assert frame["mcps_to_remove"] == ["image-gen-mcp"]
+    assert folder.installed == {"file-x": "custom", "agent-config-mcp": "core"}
+
+
+@pytest.mark.asyncio
+async def test_a_lifted_mcp_is_installed_with_the_session(monkeypatch):
+    from services.mcp import mcp_sync
+    folder = _McpFolder({"file-x": "custom"}, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    await mcp_sync.sync_mcps_for_session("m-1", "task-sess", ["file-x"],
+                                         also_wanted={"image-gen-mcp"})
+    assert folder.installed == {"file-x": "custom", "image-gen-mcp": "custom"}

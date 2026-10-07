@@ -3,6 +3,7 @@ import { type User, type AuthConfig, fetchCurrentUser, fetchAuthConfig, startLog
 import { useChatStore } from '../store/chatStore'
 import { useAgentPrefsStore, migrateAgentPrefsToUser } from '../store/agentPrefsStore'
 import { migrateAudioPrefsToUser } from '../store/audioPrefsStore'
+import { useDocumentPaneStore } from '../store/documentPaneStore'
 import { setWakeDiag } from '../audio/wakeDiag'
 import { clearShareConfirm } from '../lib/shareConfirm'
 
@@ -10,6 +11,9 @@ interface AuthContextValue {
   user: User | null
   loading: boolean
   authConfig: AuthConfig | null
+  /** Why the bypass-mode sign-in start was refused (the server's reason,
+   * a 429's wait included); null while none was. */
+  loginError: string | null
   login: () => void
   logout: () => void
   setUser: (u: User) => void
@@ -20,6 +24,7 @@ const AuthContext = createContext<AuthContextValue>({
   user: null,
   loading: true,
   authConfig: null,
+  loginError: null,
   login: () => {},
   logout: () => {},
   setUser: () => {},
@@ -30,12 +35,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loginError, setLoginError] = useState<string | null>(null)
 
   useEffect(() => {
     // Load auth config and current user in parallel
     Promise.all([fetchAuthConfig(), fetchCurrentUser()])
       .then(([cfg, u]) => {
         setAuthConfig(cfg)
+        // The document pane's stored ids name their owner's files: another
+        // person's are dropped before any chat page renders them.
+        if (u?.sub) useDocumentPaneStore.getState().setOwner(u.sub)
         setUser(u)
         // Per-user isolation for persisted localStorage stores: wipe drafts
         // + sticky prefs when the booting user differs from what was last
@@ -55,8 +64,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false))
   }, [])
 
+  // Bypass mode's start: a refusal (the SSO start bound's 429, a provider
+  // the server cannot reach) is the person's to read, never a console line;
+  // RequireAuth shows it and stops asking until they try again.
   const login = useCallback(() => {
-    startLogin().catch(console.error)
+    startLogin().catch((e: unknown) => {
+      setLoginError(e instanceof Error && e.message ? e.message : 'Could not start the sign-in.')
+    })
   }, [])
 
   // Re-fetch /auth/me and swap the snapshot in place. The user object is
@@ -77,6 +91,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // machine doesn't inherit them. Theme stays (display preference).
     try { useChatStore.persist.clearStorage() } catch { /* ignore */ }
     try { useAgentPrefsStore.persist.clearStorage() } catch { /* ignore */ }
+    // The document pane's per-chat ids name the previous person's files.
+    try { useDocumentPaneStore.persist.clearStorage() } catch { /* ignore */ }
     // The wake-word diagnostics recorder is a per-tab switch: it ends with
     // the session, never with the next user's sign-in.
     try { setWakeDiag(false) } catch { /* ignore */ }
@@ -87,7 +103,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <AuthContext.Provider value={{ user, loading, authConfig, login, logout, setUser, refreshUser }}>
+    <AuthContext.Provider value={{ user, loading, authConfig, loginError, login, logout, setUser, refreshUser }}>
       {children}
     </AuthContext.Provider>
   )

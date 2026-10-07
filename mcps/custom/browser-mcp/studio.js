@@ -543,11 +543,43 @@ function pidAlive(pid) {
   }
 }
 
-// The everyday browser tools block loopback origins via
-// PLAYWRIGHT_MCP_BLOCKED_ORIGINS (manifest default) — the studio drives a
-// raw CDP attach that never sees that list, so it enforces the same default
-// here: without it, studio_goto + studio_eval would read any localhost
-// service (proxy API, satellite control ports) the normal tools can't reach.
+// One entry of PLAYWRIGHT_MCP_{ALLOWED,BLOCKED}_ORIGINS as a URL regex — a
+// mirror of @playwright/mcp's originOrHostGlob + playwright's globToRegex
+// (playwright-core/lib/coreBundle.js): `https://host:*` wildcards the port,
+// a parseable origin matches that origin (default ports normalised away), a
+// bare `host` or `host:port` matches it on any scheme; `*` never crosses `/`.
+function originEntryRegex(entry) {
+  let glob;
+  const wildcardPort = entry.match(/^(https?:\/\/[^/:]+):\*$/);
+  if (wildcardPort) {
+    glob = `${wildcardPort[1]}:*/**`;
+  } else {
+    try {
+      const origin = new URL(entry).origin;
+      glob = origin !== "null" ? `${origin}/**` : null;
+    } catch (_) {
+      glob = null;
+    }
+    if (glob === null) glob = `*://${entry}/**`;
+  }
+  const re = glob
+    .replace(/[$^+.()|\\?{}[\]]/g, "\\$&")
+    .replace(/\*\*/g, "\0")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\0/g, ".*");
+  return new RegExp(`^${re}$`);
+}
+
+function originList(name) {
+  const raw = process.env[name];
+  if (!raw) return [];
+  return raw.split(";").map((v) => v.trim()).filter(Boolean);
+}
+
+// The studio drives a raw CDP attach that @playwright/mcp's context.route
+// never sees, so the two origin lists it honours for the everyday tools are
+// applied here with the same semantics: a blocked match refuses, and when an
+// allow-list is set anything outside it refuses (deny wins on both).
 function assertStudioUrlAllowed(rawUrl) {
   let u;
   try {
@@ -558,15 +590,14 @@ function assertStudioUrlAllowed(rawUrl) {
   if (!/^https?:$/.test(u.protocol)) {
     throw new Error("studio_goto takes http(s) URLs only");
   }
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const loopback =
-    host === "localhost" || host === "::1" || host.endsWith(".localhost") ||
-    /^127(\.\d{1,3}){3}$/.test(host) || host === "0.0.0.0";
-  if (loopback && process.env.OTO_STUDIO_ALLOW_LOOPBACK !== "1") {
+  const hit = (name) => originList(name).some((e) => originEntryRegex(e).test(u.href));
+  if (hit("PLAYWRIGHT_MCP_BLOCKED_ORIGINS")) {
+    throw new Error(`${u.origin} is on the blocked origins list`);
+  }
+  const allowed = originList("PLAYWRIGHT_MCP_ALLOWED_ORIGINS");
+  if (allowed.length && !hit("PLAYWRIGHT_MCP_ALLOWED_ORIGINS")) {
     throw new Error(
-      "loopback origins are blocked in the studio (same default as the " +
-      "everyday browser tools); set OTO_STUDIO_ALLOW_LOOPBACK=1 in the " +
-      "MCP env to opt in",
+      `${u.origin} is outside this agent's allowed origins; ask the admin to add it`,
     );
   }
 }
@@ -1603,5 +1634,6 @@ module.exports = {
   keycodeForKeysym, mergeToolsResult,
   buildHandshake, parseSetup, buildQueryExtension, buildGetKeyboardMapping,
   buildGetInputFocus, buildFakeInput, overlayScript, X11Client,
+  assertStudioUrlAllowed, originEntryRegex,
   DISPLAY_CANDIDATES: displayCandidates(), ZOOM_LADDER, POINTER_STYLES,
 };

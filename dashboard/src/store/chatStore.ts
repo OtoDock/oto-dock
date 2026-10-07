@@ -105,9 +105,13 @@ interface ChatStoreState {
   clearDraft: (chatId: string) => void
   // Queue mutators — mirror backend pump deltas.
   setQueuedMessages: (chatId: string, messages: QueuedMessage[]) => void
+  /** A `queued` chip: by its queue id when both carry one (a re-announce
+   *  replaces it in place), else at the index the proxy names. */
   addQueuedMessage: (chatId: string, index: number, item: QueuedMessage) => void
-  removeQueuedMessageByIndex: (chatId: string, index: number) => void
-  clearQueuedMessages: (chatId: string) => void
+  /** A chip leaves: by queue id when given, else by index. */
+  removeQueuedMessage: (chatId: string, key: { queueId?: string; index?: number }) => void
+  /** The chips of `queueIds` leave (every chip when the list is absent). */
+  clearQueuedMessages: (chatId: string, queueIds?: string[]) => void
   // Pending image mutators.
   setPendingImages: (chatId: string, images: PendingImage[]) => void
   addPendingImages: (chatId: string, images: PendingImage[]) => void
@@ -318,32 +322,46 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
   addQueuedMessage: (chatId, index, item) =>
     set((s) => {
       const prev = s.byChat[chatId] ?? _emptySlice(chatId)
-      // Backend sends a 0-based index; pad with empty items if it arrives
-      // out of order (rare but possible across WS reconnect).
       const next = prev.queuedMessages.slice()
-      while (next.length <= index) next.push({ text: '' })
-      next[index] = item
+      const at = item.queueId ? next.findIndex((m) => m.queueId === item.queueId) : -1
+      if (at >= 0) {
+        next[at] = item
+      } else if (item.queueId) {
+        // A new chip: the proxy's index is its place in the chat's queue.
+        next.splice(Math.min(Math.max(index, 0), next.length), 0, item)
+      } else {
+        // A 1.7.0 proxy keys by index only; pad if it arrives out of order.
+        while (next.length <= index) next.push({ text: '' })
+        next[index] = item
+      }
       return {
         byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: next } },
       }
     }),
 
-  removeQueuedMessageByIndex: (chatId, index) =>
+  removeQueuedMessage: (chatId, key) =>
     set((s) => {
       const prev = s.byChat[chatId]
       if (!prev) return s
-      const next = prev.queuedMessages.filter((_, i) => i !== index)
+      const next = key.queueId
+        ? prev.queuedMessages.filter((m) => m.queueId !== key.queueId)
+        : prev.queuedMessages.filter((_, i) => i !== key.index)
+      if (next.length === prev.queuedMessages.length) return s
       return {
         byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: next } },
       }
     }),
 
-  clearQueuedMessages: (chatId) =>
+  clearQueuedMessages: (chatId, queueIds) =>
     set((s) => {
       const prev = s.byChat[chatId]
       if (!prev || prev.queuedMessages.length === 0) return s
+      const next = queueIds && queueIds.length
+        ? prev.queuedMessages.filter((m) => !m.queueId || !queueIds.includes(m.queueId))
+        : []
+      if (next.length === prev.queuedMessages.length) return s
       return {
-        byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: [] } },
+        byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: next } },
       }
     }),
 
@@ -473,10 +491,11 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
 }), {
   name: 'oto-dock-chat-store',
   storage: createJSONStorage(debouncedLocalStorage),
-  // Version 1 persisted a queued message as its bare text; the item now
-  // carries the attachment meta too. The migration lifts old entries, and
-  // the queue_snapshot on resume reconciles either way.
-  version: 2,
+  // Version 1 persisted a queued message as its bare text, version 2 the
+  // item with its attachment meta; version 3 items carry their queue id and
+  // author. The migration lifts old entries (no id), and the queue_snapshot
+  // on resume replaces them: the chat's queue is the proxy's.
+  version: 3,
   migrate: (persisted) => {
     const state = (persisted ?? {}) as { byChat?: Record<string, ChatSlice> }
     for (const slice of Object.values(state.byChat ?? {})) {

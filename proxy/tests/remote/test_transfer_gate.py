@@ -1,8 +1,9 @@
 """Unit tests for core.remote.transfer_gate (Feature F, 1.4.0).
 
-The global outbound-transfer semaphore: concurrency cap across callers,
-0=unlimited bypass, size-threshold bypass, queued→active on_state lifecycle
-with a single INFO log, best-effort callbacks.
+The outbound-transfer semaphore, one per machine since 1.7.1: concurrency
+cap across callers of one machine, machines independent, 0=unlimited
+bypass, size-threshold bypass, queued→active on_state lifecycle with a
+single INFO log, best-effort callbacks.
 """
 
 import asyncio
@@ -36,8 +37,31 @@ async def _hold(machine, seconds, state, on_state=None):
 @pytest.mark.asyncio
 async def test_cap_enforced_all_complete():
     state = {"active": 0, "max_active": 0}
-    await asyncio.gather(*(_hold(f"m{i}", 0.02, state) for i in range(6)))
+    await asyncio.gather(*(_hold("m1", 0.02, state) for i in range(6)))
     assert state["max_active"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_slow_machine_never_holds_another_machines_pushes():
+    """A push runs until its file is there, however slow the link: the
+    slots of one machine taken for minutes must not queue another's."""
+    release = asyncio.Event()
+    held = 0
+
+    async def _slow():
+        nonlocal held
+        async with tg.slot("m-slow", "agent-1", "big.bin", 8 * MB):
+            held += 1
+            await release.wait()
+
+    tasks = [asyncio.create_task(_slow()) for _ in range(2)]
+    while held < 2:
+        await asyncio.sleep(0)
+    async with asyncio.timeout(1.0):
+        async with tg.slot("m-fast", "agent-1", "big.bin", 8 * MB):
+            pass
+    release.set()
+    await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio
@@ -53,7 +77,7 @@ async def test_zero_limit_unlimited_no_callbacks(monkeypatch):
     await asyncio.gather(*(_hold(f"m{i}", 0.02, state, on_state) for i in range(6)))
     assert state["max_active"] == 6  # fully unbounded
     assert calls == []               # bypass emits nothing
-    assert tg._sem is None           # no semaphore even created
+    assert tg._sems == {}            # no semaphore even created
 
 
 @pytest.mark.asyncio
@@ -72,7 +96,7 @@ async def test_threshold_bypass_while_slots_held(monkeypatch):
     await parked.wait()
     # The only slot is held — a below-threshold push must not wait.
     async with asyncio.timeout(1.0):
-        async with tg.slot("m-small", "agent-1", "small.md", 100):
+        async with tg.slot("m-big", "agent-1", "small.md", 100):
             pass
     release.set()
     await task
@@ -98,7 +122,7 @@ async def test_queued_then_active_and_single_info_log(caplog, monkeypatch):
             release.set()  # let the holder finish once we're provably queued
 
     async def _second():
-        async with tg.slot("m2", "agent-1", "big.bin", 8 * MB, on_state=on_state):
+        async with tg.slot("m1", "agent-1", "big.bin", 8 * MB, on_state=on_state):
             pass
 
     t1 = asyncio.create_task(_first())

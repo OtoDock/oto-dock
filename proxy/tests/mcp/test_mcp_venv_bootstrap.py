@@ -546,3 +546,90 @@ async def test_python_requirements_build_runs_for_platform_shipped_folders_only(
     assert results["py-community"] == "skipped-community-python"
     # the community venv is left exactly as it was
     assert (fake_mcps_root / "community" / "py-community" / "venv" / "pyvenv.cfg").is_file()
+
+
+# ───── the npm rebuild and the pinned venv run as every install subprocess does ─────
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+
+
+def _node_mcp_due_for_rebuild(root: Path) -> Path:
+    mcp_dir = _make_mcp(root, "custom", "node-mcp", {
+        "name": "node-mcp", "server": {"runtime": "node"},
+    })
+    (mcp_dir / "node_modules").mkdir()
+    (mcp_dir / mcp_venv_bootstrap._RUNTIME_MARKER).write_text(json.dumps({"node_major": 22}))
+    return mcp_dir
+
+
+@pytest.mark.asyncio
+async def test_npm_rebuild_runs_under_the_installers_environment(fake_mcps_root, monkeypatch):
+    """``npm rebuild`` runs the packages' lifecycle scripts: they see the
+    installer's allowlisted environment, never the proxy's secrets."""
+    monkeypatch.setenv("JWT_SECRET", "s3")
+    _node_mcp_due_for_rebuild(fake_mcps_root)
+    fake_proc = AsyncMock()
+    fake_proc.communicate = AsyncMock(return_value=(b"rebuilt", None))
+    fake_proc.returncode = 0
+    with patch("services.mcp.mcp_venv_bootstrap._node_major", return_value=24), \
+         patch("asyncio.create_subprocess_exec", new_callable=AsyncMock,
+               return_value=fake_proc) as spawn:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert results == {"node-mcp": "ok-node-rebuild"}
+    env = spawn.await_args.kwargs["env"]
+    assert env is not None and "JWT_SECRET" not in env
+    assert env["UV_NO_CONFIG"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+async def test_a_hung_npm_rebuild_is_killed_and_retried_next_boot(fake_mcps_root, tmp_path, monkeypatch):
+    import asyncio
+    import os
+    from services.mcp import mcp_installer
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pids = tmp_path / "npm.pids"
+    npm = bin_dir / "npm"
+    npm.write_text(f'#!/bin/sh\necho $$ >> "{pids}"\nsleep 20 & echo $! >> "{pids}"\nsleep 20\n')
+    npm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '/usr/bin')}")
+    monkeypatch.setattr(mcp_installer, "DEFAULT_INSTALL_TIMEOUT", 1)
+    mcp_dir = _node_mcp_due_for_rebuild(fake_mcps_root)
+    with patch("services.mcp.mcp_venv_bootstrap._node_major", return_value=24):
+        results = await asyncio.wait_for(mcp_venv_bootstrap.ensure_bundled_venvs_at_startup(), 10)
+    assert results == {"node-mcp": "skipped-node-rebuild-fail"}
+    marker = json.loads((mcp_dir / mcp_venv_bootstrap._RUNTIME_MARKER).read_text())
+    assert marker["node_major"] == 22
+    for _ in range(40):
+        if not any(_alive(int(p)) for p in pids.read_text().split()):
+            break
+        await asyncio.sleep(0.05)
+    assert not [p for p in pids.read_text().split() if _alive(int(p))]
+
+
+@pytest.mark.asyncio
+async def test_uv_venv_pinned_runs_under_the_installers_environment(tmp_path, monkeypatch):
+    """The pin sees the installer's environment: no platform secret, but the
+    names that say where an interpreter or a package comes from."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db/x")
+    monkeypatch.setenv("UV_PYTHON_INSTALL_MIRROR", "https://mirror.example/python")
+    monkeypatch.setenv("UV_DEFAULT_INDEX", "https://pypi.example/simple")
+    fake = AsyncMock()
+    fake.communicate = AsyncMock(return_value=(b"", None))
+    fake.returncode = 0
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake) as spawn:
+        await mcp_venv_bootstrap._uv_venv_pinned(
+            "/usr/bin/uv", tmp_path / "m" / "venv", (3, 13), tmp_path / "m")
+    env = spawn.await_args.kwargs["env"]
+    assert "DATABASE_URL" not in env
+    assert env["UV_NO_CONFIG"] == "1" and env["UV_LINK_MODE"] == "copy"
+    assert env["UV_PYTHON_INSTALL_DIR"].endswith(".uv-python")
+    assert env["UV_PYTHON_INSTALL_MIRROR"] == "https://mirror.example/python"
+    assert env["UV_DEFAULT_INDEX"] == "https://pypi.example/simple"

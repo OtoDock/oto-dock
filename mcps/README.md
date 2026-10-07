@@ -20,4 +20,8 @@ next to the MCP. The bundled ones share one family, a blue tile with a
 is the upstream project's own mark.
 
 Developer docs — manifest format, sandboxing, credential brokering — live at
-[docs.otodock.io](https://docs.otodock.io).
+[docs.otodock.io](https://docs.otodock.io). An agent can author a package
+too: the `mcp-authoring` skill bundled with `custom/mcps-mcp` (its check tool
+for editors and above) carries the manifest contract and the package rules, and its
+`validate_mcp_package` tool checks a folder the way the admin installer
+will, before an admin installs the zip from Admin → MCP Servers.

@@ -222,6 +222,23 @@ def purge_agent_tree_credentials(agents_dir: Path | None) -> None:
         )
 
 
+def purge_agent_tree_mcp_configs(agents_dir: Path | None) -> None:
+    """Startup sweep: remove every session MCP config copy from the agent
+    tree. They are rewritten at every session start, and the copies an
+    earlier satellite wrote carried vendor bearers inline."""
+    if not agents_dir or not agents_dir.is_dir():
+        return
+    removed = 0
+    for scope in (f"*/{layout.USERS}/*", f"*/{layout.WORKSPACE}"):
+        for pattern in (f"{scope}/.claude/mcp-config*.json", f"{scope}/.codex/config.toml"):
+            for f in agents_dir.glob(pattern):
+                with contextlib.suppress(OSError):
+                    f.unlink()
+                    removed += 1
+    if removed:
+        logger.info("session-files: purged %d session MCP config copy(ies)", removed)
+
+
 def _agent_tree_files(session_dir: Path) -> list[str]:
     """The absolute agent-tree paths this session's materialize() wrote."""
     try:

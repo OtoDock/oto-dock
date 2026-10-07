@@ -196,6 +196,72 @@ class TestFileHandler:
         assert "GET /health" in err and "app line" in err
 
 
+class TestSecretsStayOutOfTheLog:
+    """F57: a token carried in a URL never reaches stderr or the file."""
+
+    def test_query_tokens_are_redacted_in_both_outputs(self, tmp_path, private_logger, capsys):
+        lq, lg, path = _writer(tmp_path, private_logger)
+        lg.info("HTTP Request: GET http://c/cool.html?WOPISrc=x&access_token=eyJ.a.b&ui=1")
+        rec = logging.LogRecord(
+            "uvicorn.access", logging.INFO, __file__, 0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("1.2.3.4:5", "GET", "/wopi/files/f?access_token=SECRET1", "1.1", 200), None,
+        )
+        lg.handle(rec)
+        assert lq.drain(5.0)
+        text = path.read_text()
+        err = capsys.readouterr().err
+        for out in (text, err):
+            assert "eyJ.a.b" not in out
+            assert "access_token=[redacted]&ui=1" in out
+        assert "SECRET1" not in err and "/wopi/files/f?access_token=[redacted]" in err
+
+    def test_encoded_tokens_in_a_socket_path_are_redacted(self, tmp_path, private_logger):
+        lq, lg, path = _writer(tmp_path, private_logger)
+        lg.info("%s", '"WebSocket /collabora/cool/http%3A//p/wopi/files/f%3Faccess_token%3DJWT.x.y%26permission%3Dedit/ws" [accepted]')
+        assert lq.drain(5.0)
+        text = path.read_text()
+        assert "JWT.x.y" not in text and "%3Faccess_token%3D[redacted]%26permission" in text
+
+    def test_other_query_parameters_are_kept(self):
+        assert log_queue.redact("GET /x?a=1&_t=99&path=/y") == "GET /x?a=1&_t=99&path=/y"
+        assert log_queue.redact("GET /x?key=abc&t=zz&token=q") == (
+            "GET /x?key=[redacted]&t=[redacted]&token=[redacted]")
+
+    def test_share_paths_and_other_secret_names_are_redacted(self):
+        line = ('"GET /s/AbCdEf0123456789xyz/ws HTTP/1.1" /x?api_key=K1&sig=S2'
+                '&X-Amz-Signature=S3&code=C4&password=P5&secret=S6&page=2')
+        out = log_queue.redact(line)
+        for value in ("AbCdEf0123456789xyz", "K1", "S2", "S3", "C4", "P5", "S6"):
+            assert value not in out
+        assert "/s/[redacted]/ws" in out and "&page=2" in out
+        assert log_queue.redact("GET /s/") == "GET /s/"
+
+    def test_the_overflow_line_still_formats(self, tmp_path, private_logger):
+        lq = _configure(tmp_path, private_logger, queue_size=1000)
+        rec = lq._listener._overflow_record(3)
+        lq._listener.handle(rec)
+        assert lq.drain(5.0)
+        assert "dropped 3 records" in (tmp_path / "proxy.log").read_text()
+
+    def test_http_client_loggers_sit_at_warning(self, tmp_path, private_logger):
+        _configure(tmp_path, private_logger, queue_size=8)
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
+
+    def test_the_log_file_is_private(self, tmp_path, private_logger):
+        import os
+        import stat
+        lq = _configure(tmp_path, private_logger, queue_size=1000, max_bytes=300)
+        for i in range(20):
+            private_logger.info("rotate me %d %s", i, "x" * 40)
+        assert lq.drain(5.0)
+        files = sorted(tmp_path.glob("proxy.log*"))
+        assert len(files) >= 2
+        for f in files:
+            assert stat.S_IMODE(os.stat(f).st_mode) == 0o600, f
+
+
 class TestExitSignal:
     def test_handler_drains_then_dies_by_the_signal(self, monkeypatch):
         """uvicorn restores this handler and re-raises the served signal after

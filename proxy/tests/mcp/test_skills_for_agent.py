@@ -74,6 +74,61 @@ def test_returns_id_content_loading_triples(temp_db, tmp_path):
     assert skills == [("alpha-skill", "Alpha body.", "always")]
 
 
+def _tiered_manifest(tmp_path):
+    return _manifest_with_skills(tmp_path, "mcps-test", [
+        {"id": "everyone-skill", "file": "skills/e.md", "content": "For all.",
+         "loading": "on_demand"},
+        {"id": "mcp-authoring", "file": "skills/a.md", "content": "Authors.",
+         "loading": "on_demand", "audience": "editor"},
+        {"id": "owner-skill", "file": "skills/o.md", "content": "Owners.",
+         "loading": "always", "audience": "owner"},
+    ])
+
+
+def test_audience_filters_by_the_session_role_when_told(temp_db, tmp_path):
+    """A skill's ``audience`` names a tier; the readers drop it below that
+    tier when they know the person's role, and filter nothing when they
+    are not told (every existing caller)."""
+    m = _tiered_manifest(tmp_path)
+    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+        ids = lambda role: [s[0] for s in mcp_registry.get_skills_for_agent("pa", context="", user_role=role)]  # noqa: E731
+        assert ids(None) == ["everyone-skill", "mcp-authoring", "owner-skill"]
+        assert ids("viewer") == ["everyone-skill"]
+        assert ids("contributor") == ["everyone-skill"]
+        assert ids("editor") == ["everyone-skill", "mcp-authoring"]
+        assert ids("manager") == ["everyone-skill", "mcp-authoring", "owner-skill"]
+        assert ids("admin") == ["everyone-skill", "mcp-authoring", "owner-skill"]
+        catalog = mcp_registry.get_skill_catalog_for_agent("pa", context="", user_role="viewer")
+        assert [c[0] for c in catalog] == ["everyone-skill"]
+
+
+def test_materialization_keys_the_audience_on_the_person(temp_db, tmp_path):
+    m = _tiered_manifest(tmp_path)
+    roles_by_name = {"vince": "viewer", "edna": "editor"}
+    with patch.object(mcp_registry, "get_agent_mcps_all_placements", return_value=[m]), \
+            patch.object(mcp_registry, "_role_of_username",
+                         side_effect=lambda u, a: roles_by_name.get(u)):
+        ids = lambda **kw: [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", **kw)]  # noqa: E731
+        assert ids() == ["everyone-skill", "mcp-authoring"]
+        assert ids(username="edna") == ["everyone-skill", "mcp-authoring"]
+        assert ids(username="vince") == ["everyone-skill"]
+        # Nobody by that name: the role-free set, as for no username.
+        assert ids(username="ghost") == ["everyone-skill", "mcp-authoring"]
+
+
+def test_role_of_username_reads_the_users_table(temp_db):
+    from storage.identity import db_users
+    # The seed carries no username slug; a login-shaped upsert mints one.
+    db_users.upsert_user("user-author", "author@test.com", "Edna Author", "member")
+    username = db_users.get_username_by_sub("user-author")
+    assert username
+    db_users.add_user_agent("user-author", "pa", "editor", "user-admin")
+    assert mcp_registry._role_of_username(username, "pa") == "editor"
+    db_users.set_user_agent_role("user-author", "pa", "viewer")
+    assert mcp_registry._role_of_username(username, "pa") == "viewer"
+    assert mcp_registry._role_of_username("nobody-here", "pa") is None
+
+
 def test_frontmatter_never_reaches_prompt_content(temp_db, tmp_path):
     with patch.object(mcp_registry, "get_agent_mcps",
                       return_value=[_voice_manifest(tmp_path)]):

@@ -83,3 +83,41 @@ async def test_remote_eviction_reads_the_cached_timeout(monkeypatch):
     evicted = await rss.RemoteSessionStartMixin._evict_idle_on_machine(layer, "m1")
     assert evicted == 0
     session_state.cached_idle_timeout.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_remote_reaper_spares_a_session_waiting_on_a_person(monkeypatch):
+    """A remote turn parked on a prompt past the CLI turn ceiling is not a
+    wedge: the prompt's own wait (three days) bounds it."""
+    import time
+    import config as app_config
+    from core.remote import remote_reaper as rr
+    from core.session import session_manager, session_state
+    from services.scheduler import run_recovery
+    from types import SimpleNamespace
+    monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=7))
+    monkeypatch.setattr(run_recovery, "sweep_expired", AsyncMock())
+    closed: list[str] = []
+    old = time.monotonic() - app_config.CLAUDE_TIMEOUT - 60
+
+    class _Cm:
+        def is_connected(self, mid):
+            return True
+
+        def is_session_in_grace(self, mid, sid):
+            return False
+
+    async def close_session(sid):
+        closed.append(sid)
+
+    layer = SimpleNamespace(
+        _sessions={"parked": SimpleNamespace(last_activity=old, machine_id="m", turn_active=True),
+                   "idle": SimpleNamespace(last_activity=old, machine_id="m", turn_active=False)},
+        _cm=_Cm(), close_session=close_session,
+        probe_session_process_dead=AsyncMock(return_value=False))
+    monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: layer)
+    monkeypatch.setattr(session_state, "has_pending_prompt", lambda sid: sid == "parked")
+    _one_tick(monkeypatch, rr)
+    with pytest.raises(asyncio.CancelledError):
+        await rr.reap_idle_remote_sessions()
+    assert closed == ["idle"]

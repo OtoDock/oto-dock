@@ -15,7 +15,8 @@
 #      docker-compose.phone.yml to a temporary folder and checks them against
 #      this install's own .env. Nothing has changed yet, so a value the new
 #      files refuse (a host name in OTO_AUDIOSOCKET_PUBLIC_HOST, say) stops the
-#      upgrade here with the old stack still running.
+#      upgrade here with the old stack still running. A phone publish address
+#      the files accept but this host does not hold draws a warning.
 #   3. Dumps the database to backups/upgrade-<time>/ (--no-db-backup skips it)
 #      and copies .env and the compose files next to the dump.
 #   4. Puts the new compose files in place and sets at most two lines in .env:
@@ -196,6 +197,16 @@ compose_check() {
     else
         docker compose "$@"
     fi
+}
+
+# Does this host hold the IPv4 address $1? The wildcard and loopback always
+# bind; without a readable `ip` the answer is yes (nothing to warn about).
+host_holds_ipv4() { # host_holds_ipv4 <address>
+    local addrs
+    case "$1" in 0.0.0.0|127.*) return 0 ;; esac
+    command -v ip >/dev/null 2>&1 || return 0
+    addrs="$(ip -o -4 addr show 2>/dev/null)" || return 0
+    printf '%s\n' "$addrs" | awk '{ sub(/\/.*/, "", $4); print $4 }' | grep -qxF -- "$1"
 }
 
 # Is A an older release than B? The -rcN suffix is ignored.
@@ -420,6 +431,18 @@ if ! $PHONE; then
             -f "$NEW/docker-compose.phone.yml" config -q >/dev/null 2>&1; then
         warn "the phone overlay is not in use here, and $TARGET's would not accept this .env:
   before you turn it on, set OTO_PHONE_BIND=<this host's LAN IP> in .env."
+    fi
+fi
+# The phone ports publish on OTO_PHONE_BIND, else on OTO_AUDIOSOCKET_PUBLIC_HOST.
+# A literal address there passes the file check even when this host does not
+# hold it, and the phone container then fails to start after the swap. A host
+# name is the file check's to refuse, never judged here.
+if $PHONE && [ -z "$(env_value OTO_PHONE_BIND .env || true)" ]; then
+    _pub="$(env_value OTO_AUDIOSOCKET_PUBLIC_HOST .env || true)"
+    if [[ "$_pub" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && ! host_holds_ipv4 "$_pub"; then
+        warn "OTO_AUDIOSOCKET_PUBLIC_HOST=$_pub is not an address of this host, and the
+  phone ports publish on it while OTO_PHONE_BIND is unset: the phone container
+  would not start after the upgrade. Set OTO_PHONE_BIND=<this host's LAN IP> in .env."
     fi
 fi
 

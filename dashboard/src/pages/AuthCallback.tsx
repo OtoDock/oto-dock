@@ -101,7 +101,10 @@ export default function AuthCallback() {
           return
         }
         if (e.message === 'ACCESS_DENIED') {
-          setError('Access denied. You are not a member of any OtoDock group. Contact your administrator.')
+          // The server says why (no group, an ID token check, an email that
+          // another account uses); the group wording is the fallback.
+          setError((e as { detail?: string }).detail
+            || 'Access denied. You are not a member of any OtoDock group. Contact your administrator.')
         } else {
           setError(e.message || 'Authentication failed')
         }

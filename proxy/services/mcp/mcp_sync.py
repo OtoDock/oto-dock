@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -66,6 +67,64 @@ def _mark_update_deferred(machine_id: str, mcp_name: str) -> None:
 # it, and ``force`` (the dashboard retry button) bypasses + clears it.
 # In-memory: a proxy restart grants every memoized MCP one fresh attempt.
 # Transient failures (network, file locks, disk) are NEVER memoized.
+# The version hash per MCP dir, keyed by the manifest version plus the mtime
+# and size of each hash input file present, served for a minute: an
+# install, update or switch rewrites the manifest (a new key at once), a
+# source edit under an unchanged manifest (the documented way to drift the
+# hash) is seen within the minute, and a remote session start no longer
+# hashes every MCP's source on the loop. Misses are computed off the loop
+# (``version_hashes_for``) before ``_diff`` runs.
+_HASH_TTL_S = 60.0
+_version_hashes: dict[str, tuple[tuple, str, float]] = {}
+
+
+def _hash_key(manifest) -> tuple | None:
+    parts: list = [manifest.version]
+    mcp_dir = Path(manifest.mcp_dir)
+    for fname in mcp_installer._HASH_INPUT_FILES:
+        try:
+            st = (mcp_dir / fname).stat()
+        except FileNotFoundError:
+            parts.append(None)
+        except OSError:
+            return None
+        else:
+            parts.append((st.st_mtime_ns, st.st_size))
+    return tuple(parts)
+
+
+def _version_hash(manifest, *, force: bool = False) -> str:
+    """``compute_version_hash`` for ``manifest``, from the cache when its key
+    and age allow. Synchronous: a miss walks the MCP's source."""
+    key = _hash_key(manifest)
+    now = time.monotonic()
+    entry = _version_hashes.get(str(manifest.mcp_dir))
+    if (not force and key is not None and entry is not None
+            and entry[0] == key and now - entry[2] < _HASH_TTL_S):
+        return entry[1]
+    digest = mcp_installer.compute_version_hash(manifest.mcp_dir)
+    if key is not None:
+        _version_hashes[str(manifest.mcp_dir)] = (key, digest, now)
+    return digest
+
+
+async def version_hashes_for(names, *, force: bool = False) -> dict[str, str]:
+    """The current version hash of every named MCP with a manifest, the
+    misses computed in a worker thread."""
+    manifests = {n: m for n in names if (m := mcp_registry.get_manifest(n)) is not None}
+
+    def _job() -> dict[str, str]:
+        out: dict[str, str] = {}
+        for name, manifest in manifests.items():
+            try:
+                out[name] = _version_hash(manifest, force=force)
+            except Exception:
+                out[name] = ""
+        return out
+
+    return await asyncio.to_thread(_job)
+
+
 _UNSAT_FAIL_RE = re.compile(
     r"No solution found when resolving dependencies"
     r"|does not satisfy Python"
@@ -105,21 +164,134 @@ class SyncResult:
     deferred: dict[str, str] = field(default_factory=dict)
 
 
+def unavailable_reasons(result: SyncResult, assigned) -> dict[str, str]:
+    """The prompt's reason for each of the session's own MCPs the sync
+    excluded (one line each); a folder the machine holds for no assigned MCP
+    is the sync's business, never the prompt's."""
+    out: dict[str, str] = {}
+    for name in result.excluded_names & set(assigned):
+        err = " ".join(str(result.failed.get(name) or "").split())
+        if len(err) > 200:
+            err = err[:197] + "..."
+        out[name] = (f"could not be installed on this machine ({err})" if err
+                     else "could not be installed on this machine")
+    return out
+
+
+# The satellite version that removes an MCP from any category when the
+# frame says ``remove_any_category`` (older ones never touch ``core``), and
+# the categories a removal may name at all.
+_REMOVE_ANY_CATEGORY_MIN_VERSION = (0, 5, 137)
+_MCP_CATEGORIES = frozenset({"core", "custom", "community"})
+
+
+def _session_contexts(client_type: str) -> set[str]:
+    """The ``exclude_from`` contexts a session of this kind was built for
+    (``build_session_mcp_config``: meetings ride the task lane). A kind's
+    name is its ``exclude_from`` word."""
+    from core.session import session_kind
+    kind = session_kind.of(client_type)
+    if kind is session_kind.MEETING:
+        return {session_kind.TASK.name, session_kind.MEETING.name}
+    if kind in (session_kind.TASK, session_kind.PHONE):
+        return {kind.name}
+    return {session_kind.DASHBOARD.name}
+
+
+def _lifted(agent_name: str, launched: set[str], *, contexts: set[str],
+            external: bool, role: str, placement) -> set[str]:
+    """See ``lifted_by_context``. Reads the database: off the loop."""
+    from storage.mcp import mcp_store
+    out: set[str] = set()
+    infra: list[str] = []
+    for m in mcp_registry.get_agent_mcps(agent_name, placement=placement):
+        if m.name in launched or not _mt.installs_on_host(m.server):
+            continue
+        if mcp_registry.session_exclusion_reason(m, contexts=contexts, external=external) is None:
+            continue                    # another gate left it out: it stays out
+        if getattr(m, "audience", "") and not mcp_registry.audience_admits(m.audience, role):
+            continue
+        if (m.remote_policy == "admin_paired_only" and placement.is_remote
+                and not placement.admin_paired):
+            continue
+        inst = getattr(m, "instances", None)
+        if inst is not None:
+            if inst.delivery == "config_file":
+                continue                # never delivered to a satellite
+            if (inst.delivery == "env"
+                    and not mcp_store.get_instance_for_agent_env_delivery(m.name, agent_name)):
+                continue
+        kind = getattr(getattr(m, "credentials", None), "type", "none")
+        if kind == "per_user":
+            continue                    # the build's identity is not known here
+        if kind == "infra":
+            infra.append(m.name)
+        else:
+            out.add(m.name)
+    if infra:
+        from services.oauth import credential_resolver
+        excluded = credential_resolver.resolve_credentials(
+            agent_name, None, task_scope="agent").excluded_mcps
+        out.update(n for n in infra if n not in excluded)
+    return out
+
+
+async def lifted_by_context(config, launched: set[str]) -> set[str]:
+    """The agent's enabled MCPs this remote session leaves out by its
+    context alone (a task leaves out ``exclude_from: task``): they stay
+    wanted at its start, installed and updated, so a task never makes the
+    next chat on the machine rebuild them.
+
+    Never more than the session's build would have admitted: an MCP left
+    out by another gate (the placement, the audience, the credentials, an
+    instance) stays out. The build's credential identity is not on the
+    session config, so an MCP with per-user credentials is never lifted,
+    an audience needs the session's role, and a judge session lifts
+    nothing. Leaving one out only defers its install to the first session
+    that launches it."""
+    from core.session import external_identity
+    sc = getattr(config, "security_context", None)
+    placement = getattr(sc, "placement", None)
+    if sc is None or placement is None or getattr(config, "permission_mode", "") == "judge":
+        return set()
+    try:
+        return await asyncio.to_thread(
+            _lifted, config.agent_name, set(launched),
+            contexts=_session_contexts(getattr(config, "client_type", "") or ""),
+            external=external_identity.is_external_ctx(sc),
+            role=getattr(sc, "role", "") or "",
+            placement=placement,
+        )
+    except Exception:
+        logger.warning("sync_mcps: the lifted set failed for %s", config.agent_name,
+                       exc_info=True)
+        return set()
+
+
 async def sync_mcps_for_session(
     machine_id: str,
     session_id: str,
     agent_assigned_mcps: list[str],
     *,
+    also_wanted: set[str] | frozenset[str] = frozenset(),
     plan_cb: Callable[[dict], Awaitable[None]] | None = None,
     progress_cb: ProgressCb = None,
     force: bool = False,
 ) -> SyncResult:
     """Align the satellite's installed MCPs with what this session needs.
 
-    ``agent_assigned_mcps`` is the set of MCP names this session requires.
-    The desired set is the union of these with MCPs already in use by any
-    active session on the same satellite (prevents premature uninstall of
-    an MCP still bound to an older session).
+    ``agent_assigned_mcps`` is the set of MCP names this session requires,
+    ``also_wanted`` the ones it leaves out by its context alone
+    (``lifted_by_context``): installed and kept current too. The desired
+    set is their union with MCPs already in use by any active session on
+    the same satellite (an MCP the platform uninstalled while a session
+    uses it stays until that session ends).
+
+    At a session start nothing the platform still ships is removed, only
+    an MCP it no longer has. With no session (admin "Sync Now", the
+    explicit clean-up) an MCP outside the desired set goes too, the desired
+    set being the agents whose default target is the machine. Nothing is
+    removed while the registry holds no manifest.
 
     ``plan_cb`` (optional) is invoked once the install plan is known
     (``mcps_to_install`` / ``mcps_to_update`` resolved) so the caller can
@@ -142,7 +314,7 @@ async def sync_mcps_for_session(
     # Desired set = this agent's assignment ∪ every other active session's
     # MCPs on the same satellite. Prevents uninstalling an MCP a peer
     # session still depends on (scope-aware GC).
-    desired: set[str] = set(agent_assigned_mcps)
+    desired: set[str] = set(agent_assigned_mcps) | set(also_wanted)
     for other_sid, other_info in layer._sessions.items():
         if other_sid == session_id:
             continue
@@ -156,11 +328,26 @@ async def sync_mcps_for_session(
         # doesn't refresh on each install — a reconnect might though).
         installed = await _fetch_satellite_state(cm, machine_id)
 
+        hashes = await version_hashes_for(desired, force=force)
+        gc = not session_id
         to_install, to_update, to_remove = _diff(
             desired=desired,
             installed=installed,
             force=force,
+            hashes=hashes,
+            gc=gc,
         )
+        # A removal goes only where the satellite can act on it: a known
+        # category (a failed verify reports none), and ``core`` only for a
+        # satellite that removes from any category when told so. The flag
+        # rides a session start's frame only: Sync Now keeps its reach.
+        any_category = not gc and cm._satellite_at_least(
+            machine_id, _REMOVE_ANY_CATEGORY_MIN_VERSION)
+        to_remove = {
+            n for n in to_remove
+            if (installed.get(n) or {}).get("category") in _MCP_CATEGORIES
+            and (any_category or installed[n]["category"] != "core")
+        }
 
         # Drop updates the satellite recently DEFERRED (old version still in use
         # → swap blocked). Re-shipping would rebuild ~70s on the satellite every
@@ -195,14 +382,7 @@ async def sync_mcps_for_session(
                 # the verdict deserves a fresh attempt.
                 _unsatisfiable_installs.pop((machine_id, name), None)
                 continue
-            manifest = mcp_registry.get_manifest(name)
-            try:
-                current_hash = (
-                    mcp_installer.compute_version_hash(manifest.mcp_dir)
-                    if manifest else ""
-                )
-            except Exception:
-                current_hash = ""
+            current_hash = hashes.get(name, "")
             if current_hash and current_hash == memo.get("hash"):
                 memo_skips[name] = memo.get("error", "install unsatisfiable")
             else:
@@ -226,6 +406,10 @@ async def sync_mcps_for_session(
 
         if not (to_install or to_update or to_remove):
             return _with_memo_skips(SyncResult(ok=True))
+        logger.info(
+            "sync_mcps plan %s: install=%s update=%s remove=%s",
+            machine_id[:8], sorted(to_install), sorted(to_update), sorted(to_remove),
+        )
 
         # Announce the install plan upfront so the caller's UI can render
         # per-MCP rows even before the first progress event fires.
@@ -282,11 +466,16 @@ async def sync_mcps_for_session(
             # the satellite would receive a different generated id and emit
             # `mcp_install_progress` events with that one — leaving the
             # callback orphaned and the dashboard install bar stuck at 0%.
-            ack = await cm.send_command(machine_id, {
+            frame = {
                 "type": "sync_mcps",
                 "mcps_to_install": specs,
                 "mcps_to_remove": sorted(to_remove),
-            }, timeout=600.0, command_id=command_id)  # 10 min ceiling for slow pip builds
+            }
+            if any_category and to_remove:
+                frame["remove_any_category"] = True
+            ack = await cm.send_command(
+                machine_id, frame, timeout=600.0, command_id=command_id,
+            )  # 10 min ceiling for slow pip builds
         except Exception as e:
             logger.exception("sync_mcps command failed: %s", e)
             cm.unregister_install_progress(command_id)
@@ -360,12 +549,20 @@ async def _fetch_satellite_state(cm, machine_id: str) -> dict[str, dict]:
 
 def _diff(
     desired: set[str], installed: dict[str, dict], *, force: bool = False,
+    hashes: dict[str, str] | None = None, gc: bool = False,
 ) -> tuple[set[str], set[str], set[str]]:
     """Split desired vs installed into (install, update, remove).
 
     install: in desired but not installed (or unhealthy)
     update:  in desired, installed, but version_hash differs from current
-    remove:  installed but not desired
+    remove:  installed, not desired, and no longer shipped by the platform;
+             with ``gc`` (admin Sync Now) shipped ones too. Nothing while the
+             registry holds no manifest (a failed scan must not wipe a
+             working satellite).
+
+    ``hashes`` is the current version hash per name (``version_hashes_for``,
+    computed off the loop); without it each one is read here, from the cache
+    when it can be.
     """
     to_install: set[str] = set()
     to_update: set[str] = set()
@@ -384,16 +581,21 @@ def _diff(
             to_install.add(name)
             continue
         # Compare version_hash against what the platform has now.
-        try:
-            current_hash = mcp_installer.compute_version_hash(manifest.mcp_dir)
-        except Exception:
-            current_hash = ""
+        if hashes is not None:
+            current_hash = hashes.get(name, "")
+        else:
+            try:
+                current_hash = _version_hash(manifest, force=force)
+            except Exception:
+                current_hash = ""
         if force or (current_hash and current_hash != info.get("version_hash", "")):
             to_update.add(name)
 
-    for name in installed:
-        if name not in desired:
-            to_remove.add(name)
+    known = mcp_registry.get_all_manifests()
+    if known:
+        for name in installed:
+            if name not in desired and (gc or name not in known):
+                to_remove.add(name)
 
     return to_install, to_update, to_remove
 

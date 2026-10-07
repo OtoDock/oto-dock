@@ -955,6 +955,138 @@ def test_copy_symlink_escape_rejected(tmp_path, monkeypatch):
     assert (agent_dir / "config" / "secret.md").exists()
 
 
+def test_copy_of_a_scope_root_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="viewer")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "shared.md").write_text("x")
+    (agent_dir / "users" / "alice" / "workspace").mkdir(parents=True)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace"], "dest_dir": "users/alice/workspace"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"copied": [], "failed": [
+        {"src": "workspace", "reason": "Cannot copy a whole scope root"}]}
+    assert not (agent_dir / "users" / "alice" / "workspace" / "workspace").exists()
+
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="admin")
+    for d in ("knowledge", "config", "users/bob", "workspace/dest"):
+        (agent_dir / d).mkdir(parents=True, exist_ok=True)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["knowledge", "config", "users/bob", "users"],
+              "dest_dir": "workspace/dest"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["copied"] == []
+    assert {f["reason"] for f in body["failed"]} == {"Cannot copy a whole scope root"}
+    assert len(body["failed"]) == 4
+    assert list((agent_dir / "workspace" / "dest").iterdir()) == []
+
+
+def test_copy_of_a_link_landing_on_a_scope_root_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="manager")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "shared.md").write_text("x")
+    (agent_dir / "workspace" / "self").symlink_to("../workspace")
+    mine = agent_dir / "users" / "alice" / "workspace"
+    mine.mkdir(parents=True)
+    (mine / "ws").symlink_to("../../../workspace")
+    (mine / "dest").mkdir()
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/self", "users/alice/workspace/ws"],
+              "dest_dir": "users/alice/workspace/dest"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["copied"] == []
+    assert [f["reason"] for f in body["failed"]] == ["Cannot copy a whole scope root"] * 2
+    assert list((mine / "dest").iterdir()) == []
+
+
+def test_copy_over_the_byte_cap_fails_and_leaves_nothing(tmp_path, monkeypatch):
+    import config
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    big = agent_dir / "workspace" / "big"
+    big.mkdir(parents=True)
+    for i in range(3):
+        (big / f"f{i}.bin").write_bytes(os.urandom(512 * 1024))
+    (agent_dir / "workspace" / "large.bin").write_bytes(os.urandom(1536 * 1024))
+    (agent_dir / "workspace" / "small.md").write_text("small")
+    (agent_dir / "workspace" / "dest").mkdir()
+    monkeypatch.setattr(config, "COPY_MAX_INPUT_MB", 1)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/big", "workspace/large.bin", "workspace/small.md"],
+              "dest_dir": "workspace/dest"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["failed"] == [
+        {"src": "workspace/big", "reason": "the copy is larger than 1 MB"},
+        {"src": "workspace/large.bin", "reason": "the copy is larger than 1 MB"},
+    ]
+    # The sources after a failed one run against what is left.
+    assert body["copied"] == [{"src": "workspace/small.md", "dest": "workspace/dest/small.md"}]
+    assert sorted(p.name for p in (agent_dir / "workspace" / "dest").iterdir()) == ["small.md"]
+
+
+def test_copy_over_the_file_cap_fails_and_shares_one_budget(tmp_path, monkeypatch):
+    import config
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    for d in ("a", "b"):
+        (agent_dir / "workspace" / d).mkdir(parents=True)
+        for i in range(2):
+            (agent_dir / "workspace" / d / f"f{i}.md").write_text(d)
+    (agent_dir / "workspace" / "c.md").write_text("c")
+    (agent_dir / "workspace" / "dest").mkdir()
+    # A directory counts as an entry, as each file does.
+    monkeypatch.setattr(config, "COPY_MAX_ENTRIES", 4)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/a", "workspace/b", "workspace/c.md"],
+              "dest_dir": "workspace/dest"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [c["src"] for c in body["copied"]] == ["workspace/a", "workspace/c.md"]
+    assert body["failed"] == [{"src": "workspace/b", "reason": "the copy has more than 4 entries"}]
+    assert sorted(p.name for p in (agent_dir / "workspace" / "dest").iterdir()) == ["a", "c.md"]
+    # 0 is no cap.
+    monkeypatch.setattr(config, "COPY_MAX_ENTRIES", 0)
+    monkeypatch.setattr(config, "COPY_MAX_INPUT_MB", 0)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/b"], "dest_dir": "workspace/dest"},
+    )
+    assert resp.json()["failed"] == []
+    assert (agent_dir / "workspace" / "dest" / "b" / "f1.md").read_text() == "b"
+
+
+def test_copy_counts_directories_and_links_against_the_entry_cap(tmp_path, monkeypatch):
+    import config
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace" / "empty" / "x" / "y").mkdir(parents=True)
+    (agent_dir / "workspace" / "links").mkdir()
+    for i in range(3):
+        (agent_dir / "workspace" / "links" / f"l{i}").symlink_to("../empty")
+    (agent_dir / "workspace" / "dest").mkdir()
+    monkeypatch.setattr(config, "COPY_MAX_ENTRIES", 2)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/empty", "workspace/links"],
+              "dest_dir": "workspace/dest"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"copied": [], "failed": [
+        {"src": "workspace/empty", "reason": "the copy has more than 2 entries"},
+        {"src": "workspace/links", "reason": "the copy has more than 2 entries"},
+    ]}
+    assert list((agent_dir / "workspace" / "dest").iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # Zip — happy paths + error cases
 # ---------------------------------------------------------------------------
@@ -1900,3 +2032,25 @@ def test_restore_never_writes_through_a_link_inside_the_tree(tmp_path, monkeypat
     assert resp.status_code == 200
     assert resp.json()["denied"] == [entry_id]
     assert list(bob.iterdir()) == []
+
+
+def test_a_zip_download_takes_only_a_token_minted_for_it():
+    """F70: other tokens signed with the same secret carry an ``agent``
+    claim too; only one stamped with the download's purpose opens a zip."""
+    import time as _time
+
+    import jwt as _jwt
+    from fastapi.testclient import TestClient
+
+    import config as _config
+    from api.agents.files import _create_zip_token
+    from app import app
+    c = TestClient(app)
+    foreign = _jwt.encode({"agent": "zip-agent", "paths": ["workspace"], "role": "manager",
+                           "exp": int(_time.time()) + 60}, _config.JWT_SECRET, algorithm="HS256")
+    r = c.get(f"/v1/agents/zip-agent/zip-download?t={foreign}")
+    assert r.status_code == 403 and r.json()["detail"] == "Invalid download token"
+    minted = _create_zip_token("zip-agent", ["workspace"], "user-x", "viewer", "x")
+    assert _jwt.decode(minted, _config.JWT_SECRET, algorithms=["HS256"])["purpose"] == "zip_download"
+    r = c.get(f"/v1/agents/zip-agent/zip-download?t={minted}")
+    assert r.json().get("detail") != "Invalid download token"

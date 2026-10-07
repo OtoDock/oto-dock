@@ -152,7 +152,10 @@ def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -
     which puts ``<dir>`` first on ``sys.path``, so a planted ``json.py`` (or
     ``json/__init__.py``) there would run inside the gate; and a directive
     file there (``CLAUDE.md``, ``AGENTS.md``) is read by every session the
-    dir configures. A ``.claude``/``.codex``
+    dir configures. Everything under a scope-root ``.claude/dev-mods`` (or
+    ``.codex/dev-mods``: the rule needs no engine branch) is a write too: Claude Code 2.1.287+ loads a mod Claude writes there after a
+    hot-reload prompt, and a mod's handlers run ahead of the platform's
+    gate. A ``.claude``/``.codex``
     nested deeper (e.g. ``workspace/<repo>/.claude/settings.json``) is NOT
     matched, so an agent working on a repo that itself uses Claude Code /
     Codex can still read and edit that repo's config — those files hold none
@@ -181,6 +184,10 @@ def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -
     if writing:
         if parts[-1] in _STATE_DIRS:
             return _at_scope_root(parts[:-1])
+        for i in range(len(parts) - 2):
+            if (parts[i] in _STATE_DIRS and parts[i + 1] == _DEV_MODS_DIR
+                    and _at_scope_root(parts[:i])):
+                return True
         if (len(parts) >= 3 and parts[-3] in _STATE_DIRS and name.startswith("__init__.")
                 and _at_scope_root(parts[:-3])):
             return True
@@ -197,6 +204,9 @@ def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -
 
 
 _STATE_DIRS = (".claude", ".codex")
+# Where Claude Code 2.1.287+ keeps the mods Claude writes during a session
+# (judged under either state dir: the rule needs no engine branch).
+_DEV_MODS_DIR = "dev-mods"
 
 
 def _at_scope_root(before: tuple[str, ...]) -> bool:
@@ -238,30 +248,37 @@ def in_session_state_dir(path: Path | str) -> bool:
 _BG_PATH_SPLIT = re.compile(r"[\\/]+")
 
 
-def is_claude_bg_output_path(path: Path | str) -> bool:
-    """True for a Claude Code CLI background-command output file.
+def is_claude_bg_output_path(path: Path | str, session_id: str) -> bool:
+    """True for THIS session's Claude Code CLI background-command output file.
 
     The CLI writes ``run_in_background`` Bash output to
     ``$HOME/claude-<uid>/<cwd-hash>/<session>/tasks/<id>.output``. Under the
     sandbox's ``HOME=/tmp`` that's ``/tmp/claude-1000/.../tasks/<id>.output``
     (Linux); on a satellite it's ``…/AppData/Local/Temp/claude/…/tasks/<id>.output``
-    (Windows) or the macOS ``$TMPDIR`` equivalent. Structural match — a
-    ``claude``/``claude-*`` segment, a later ``tasks`` segment, and a ``.output``
-    suffix — so it holds across OSes (and raw vs forward-slash forms) while
-    admitting nothing but the agent's own ephemeral task output. Reading it is
-    safe: it's the agent's own command output in its per-session tmpfs, no
-    cross-user surface. Callers MUST still run the credential / agent-config /
-    cross-user denies first; this only widens, never narrows.
+    (Windows) or the macOS ``$TMPDIR`` equivalent. Structural match: a
+    ``claude``/``claude-*`` segment, then ``session_id`` as a later segment,
+    then a ``tasks`` segment, and a ``.output`` suffix, so it holds across
+    OSes (and raw vs forward-slash forms). The session-id equality is the
+    capability, as in ``is_session_runtime_path``: another session on the
+    same host (another platform user on a shared-admin satellite) can never
+    name this session's UUID, so the carve admits only the caller's own
+    ephemeral task output. An empty id matches nothing. Callers MUST still
+    run the credential / agent-config / cross-user denies first; this only
+    widens, never narrows.
     """
+    sid = (session_id or "").lower()
+    if not sid:
+        return False
     parts = [p.lower() for p in _BG_PATH_SPLIT.split(str(path)) if p]
     if not parts or not parts[-1].endswith(".output"):
         return False
     try:
         claude_i = next(i for i, p in enumerate(parts)
                         if p == "claude" or p.startswith("claude-"))
-    except StopIteration:
+        sid_i = parts.index(sid, claude_i + 1)
+    except (StopIteration, ValueError):
         return False
-    return "tasks" in parts[claude_i + 1:-1]
+    return "tasks" in parts[sid_i + 1:-1]
 
 
 def is_session_runtime_path(
@@ -305,8 +322,8 @@ _HOOK_SCRIPTS_ALT = "|".join(re.escape(s) for s in sorted(_HOOK_SCRIPTS))
 _AGENT_CONFIG_CMD_RE = re.compile(
     r'(?:^|[\s/\\"\'=])'                                   # boundary before
     r'(?:(?:users/[^/\s"\']+|workspace|knowledge|tmp)/'    # session scope root
-    r'\.(?:claude/(?:[^/\s"\']*\.json|' + _HOOK_SCRIPTS_ALT + r')'
-    r'|codex/(?:config\.toml|auth\.json|hooks\.json|' + _HOOK_SCRIPTS_ALT + r'))'
+    r'\.(?:claude/(?:[^/\s"\']*\.json|dev-mods(?:/[^\s"\';|&)<>]*)?|' + _HOOK_SCRIPTS_ALT + r')'
+    r'|codex/(?:config\.toml|auth\.json|hooks\.json|dev-mods(?:/[^\s"\';|&)<>]*)?|' + _HOOK_SCRIPTS_ALT + r'))'
     r'|tmp/\.claude\.json)'                                # the sandbox HOME's own
     r'(?:$|[\s"\';|&)<>])'                                 # boundary after
 )

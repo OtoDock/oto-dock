@@ -11,7 +11,7 @@
  */
 
 import { useRef, useState } from 'react'
-import { useAdminMcps, useCheckMcpUpdates, useUpdateMcp, useDeleteMcp, useInstallSkillZip, McpServer, McpUpdateInfo } from '../../api/mcps'
+import { useAdminMcps, useCheckMcpUpdates, useUpdateMcp, useDeleteMcp, useInstallSkillZip, isUpdateOffer, McpServer, McpUpdateInfo } from '../../api/mcps'
 import CommunitySkillsBrowser from '../../components/CommunitySkillsBrowser'
 
 export default function SkillsPage() {
@@ -40,7 +40,7 @@ export default function SkillsPage() {
   if (isLoading) return <div className="text-sm text-p-text-light">Loading skill packages...</div>
 
   const packages = (mcps ?? []).filter(m => m.category === 'skill')
-  const updateCount = packages.filter(p => updates[p.name]).length
+  const updateCount = packages.filter(p => isUpdateOffer(updates[p.name])).length
 
   return (
     <div>
@@ -69,7 +69,7 @@ export default function SkillsPage() {
         <input
           ref={fileRef}
           type="file"
-          accept=".zip"
+          accept=".zip,application/zip,application/x-zip-compressed,application/octet-stream"
           className="hidden"
           onChange={e => handleZipPicked(e.target.files?.[0] ?? null)}
         />
@@ -194,7 +194,23 @@ function SkillPackageRow({ pkg, updateInfo }: { pkg: McpServer; updateInfo?: Mcp
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          {updateInfo && (
+          {updateInfo?.reason === 'ahead' && (
+            // Installed past the catalog: never an offer, never moved back on
+            // its own; the way back is explicit (proxy MCP-FRAMEWORK.md
+            // "Automatic MCP Updates").
+            <button
+              onClick={() => {
+                if (!window.confirm(`Revert "${pkg.label}" to the catalog's ${updateInfo.latest}? Its per-agent enablement is kept.`)) return
+                handleUpdate()
+              }}
+              disabled={updateMcp.isPending}
+              className="text-xs px-2 py-1 rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-40 transition-colors"
+              title={`Installed ${updateInfo.current} is ahead of the catalog's ${updateInfo.latest}. Automatic updates leave it alone.`}
+            >
+              {updateMcp.isPending ? 'Reverting…' : `Revert to catalog ${updateInfo.latest}`}
+            </button>
+          )}
+          {updateInfo && isUpdateOffer(updateInfo) && (
             <button
               onClick={handleUpdate}
               disabled={updateMcp.isPending}

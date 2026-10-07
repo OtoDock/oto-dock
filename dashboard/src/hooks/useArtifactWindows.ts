@@ -10,7 +10,8 @@ import { evictedBy, identityKey, isArtifactBlock } from '../lib/kinds/artifact'
 
 /**
  * Owns the floating display/file-tools artifact windows for an interactive CLI
- * session. Subscribes to `pty_artifact` frames (the
+ * session (a document push goes to the chat's document pane instead, through
+ * `onDocument`). Subscribes to `pty_artifact` frames (the
  * drainer forwards display-mcp/file-tools artifacts there — there is no inline
  * message list in interactive), converts each to a renderable MessageBlock via
  * the shared `eventToBlock` mapper, and maintains the open-window list. The
@@ -61,8 +62,6 @@ export function titleFor(block: MessageBlock): string {
       return block.title || block.url || 'Link'
     case 'file':
       return block.filename || 'File'
-    case 'document_preview':
-      return block.filename || 'Document'
     case 'ui':
       return block.title || 'UI artifact'
     default:
@@ -109,7 +108,12 @@ function upsertWindow(
   return [...wins, { id: allocId(), block, title: titleFor(block), dbId }]
 }
 
-export function useArtifactWindows(ws: InteractiveWs, chatId: string) {
+export function useArtifactWindows(
+  ws: InteractiveWs,
+  chatId: string,
+  /** A document push: the chat's document pane takes it, not a window. */
+  onDocument?: (event: any) => void,
+) {
   const { subscribe } = ws
   const [windows, setWindows] = useState<ArtifactWindow[]>([])
   const [minimized, setMinimized] = useState<Set<number>>(new Set())
@@ -117,6 +121,8 @@ export function useArtifactWindows(ws: InteractiveWs, chatId: string) {
   const allocId = useCallback(() => ++idRef.current, [])
   const windowsRef = useRef(windows)
   windowsRef.current = windows
+  const onDocumentRef = useRef(onDocument)
+  onDocumentRef.current = onDocument
 
   const close = useCallback((id: number) => {
     // X = permanent for this browser: remember the persisted row id so the
@@ -163,6 +169,10 @@ export function useArtifactWindows(ws: InteractiveWs, chatId: string) {
       const event = msg.event
       const t = event?.type
       if (!t) return
+      if (t === WIRE.DOCUMENT_PREVIEW) {
+        onDocumentRef.current?.(event)
+        return
+      }
       const evicts = evictedBy(t)
       // A removal kind carries no renderable block — it only drops the
       // latest window of the placeholder it evicts.

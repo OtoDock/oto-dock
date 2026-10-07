@@ -24,6 +24,7 @@ import { isTaskChatId } from '../lib/session/kind'
 import { CHAT_PHASE } from '../lib/status/chat'
 import { OUT, PER_CHAT_FRAMES, WIRE, isWireType, type WireFrame, type WireType } from '../api/wireEvents'
 import { callNative } from '../lib/nativeBridge'
+import { sessionStillValid } from '../api/auth'
 
 // The frames, their per-chat flag (PER_CHAT_FRAMES is derived from the
 // catalogue's table: a frame carrying a chat_id different from the viewed
@@ -39,6 +40,10 @@ const warnedFrameTypes = new Set<string>()
  *  or 2FA enrolment (proxy ``ws/dashboard.py`` ``WS_CLOSE_GATE``); the close
  *  reason names the gate. */
 export const WS_CLOSE_GATE = 4403
+// The server closes an open socket 4001 when its session no longer holds
+// (signed out, the password changed, the person removed); the tab asks
+// /auth/me before it reconnects into the same refusal.
+export const WS_CLOSE_SESSION = 4001
 function warnUnknownFrame(type: unknown): void {
   const key = String(type)
   if (warnedFrameTypes.has(key)) return
@@ -53,6 +58,46 @@ export function _resetUnknownFrameWarningsForTests(): void { warnedFrameTypes.cl
 export type WireImage = { name: string; base64?: string; path?: string }
 const wireImage = (i: WireImage) =>
   i.base64 ? { data: i.base64, name: i.name } : { path: i.path, name: i.name }
+
+/** A message's id in its chat's queue. `crypto.randomUUID` exists only in
+ *  a secure context (a dashboard served over plain http on a LAN address
+ *  has none), `getRandomValues` everywhere. */
+export function mintQueueId(): string {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** A queued message handed back to its author: into the composer of the
+ *  chat this view shows (the page's callback), or into the stored draft
+ *  and pending attachments of the chat it was typed into when the author
+ *  is elsewhere. */
+function returnToComposer(
+  chatId: string | null | undefined,
+  frame: { text?: string; images?: Array<{ name: string; path?: string }>;
+           files?: Array<{ path: string; name: string }>; chat_id?: string },
+  cb: WsCallbacks,
+): void {
+  if (!chatId || chatId === cb.viewedChatId) {
+    cb.onQueueEditReturn?.({ type: WIRE.QUEUE_REMOVED, queue_id: '', index: -1,
+                             text: frame.text, images: frame.images, files: frame.files,
+                             chat_id: frame.chat_id })
+    return
+  }
+  const st = useChatStore.getState()
+  if (frame.text) {
+    const draft = st.byChat[chatId]?.draftInput ?? ''
+    st.setDraftInput(chatId, draft ? `${draft}\n\n${frame.text}` : frame.text)
+  }
+  const images = (frame.images ?? []).filter((i) => i.path)
+  if (images.length) {
+    st.addPendingImages(chatId, images.map((i) => ({ id: `img-${i.path}`, path: i.path, name: i.name })))
+  }
+  if (frame.files?.length) {
+    st.addPendingFiles(chatId, frame.files.map((f) => ({
+      id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path })))
+  }
+}
 
 export function useDashboardWs(callbacks: WsCallbacks) {
   const wsRef = useRef<WebSocket | null>(null)
@@ -176,6 +221,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         type: OUT.CLIENT_INFO,
         platform: isNative ? 'android' : 'web',
         time_zone: tz,
+        // A watched task chat's turn end arrives as the rows this tab lacks
+        // (chat_history_delta) instead of the whole history re-sent.
+        history_deltas: true,
       }))
       if (tz) lastSentTz.current = tz
     } catch { /* ignore */ }
@@ -297,6 +345,11 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }
 
     ws.onclose = (event?: CloseEvent) => {
+      if (event?.code === WS_CLOSE_SESSION) {
+        void sessionStillValid().then((ok) => {
+          if (!ok) window.location.href = '/'
+        })
+      }
       // A session held by the forced password change or 2FA enrolment: the
       // socket closes 4403 with the gate's name, and the tab goes to that
       // screen (the same targets as apiFetch's X-Auth-Gate rule) instead of
@@ -438,6 +491,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.PERMISSION_PROMPT:
             cb.onPermissionPrompt?.(msg)
             break
+          case WIRE.PROMPT_RETIRED:
+            cb.onPromptRetired?.(msg)
+            break
           case WIRE.LOCATION_REQUEST:
             cb.onLocationRequest?.(msg)
             break
@@ -472,7 +528,15 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             cb.onDone?.()
             break
           case WIRE.ERROR:
-            cb.onError?.(msg.message)
+            // A pump's error carries the chat it ends: the turn is over, so
+            // the composer goes back to Send and the next message starts a
+            // new turn (a `done` follows once the rows landed). A bare error
+            // (one refused message, no chat_id) changes nothing.
+            if (msg.chat_id && msg.chat_id === cb.viewedChatId) {
+              setStreaming(false)
+              useChatStore.getState().setReady(msg.chat_id)
+            }
+            cb.onError?.(msg.message, msg.reason ? { reason: msg.reason, resets_at: msg.resets_at } : undefined)
             break
           case WIRE.IMAGES:
             cb.onImages?.(msg)
@@ -707,40 +771,79 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.MODEL_CHANGED:
             cb.onModelChanged?.(msg.model)
             break
+          case WIRE.EXECUTION_MODE_CHANGED:
+            cb.onExecutionModeChanged?.(msg)
+            break
           case WIRE.CHAT_HISTORY:
             cb.onChatHistory?.(msg)
             break
-          case WIRE.QUEUED:
-            cb.onQueued?.(msg)
+          case WIRE.CHAT_HISTORY_DELTA:
+            cb.onChatHistoryDelta?.(msg)
             break
+          case WIRE.QUEUED: {
+            // The chat's queue (any chat: the frame is chat-routed). A chip
+            // from a 1.7.0 proxy (no queue id) takes the page's own path.
+            const qChat = msg.view_chat_id || msg.chat_id
+            if (msg.queue_id && qChat) {
+              useChatStore.getState().addQueuedMessage(qChat, msg.index, toQueuedMessage(msg))
+            }
+            if (!qChat || qChat === cb.viewedChatId) cb.onQueued?.(msg)
+            break
+          }
           case WIRE.STEERED:
             // Mid-turn steer accepted by the engine — the message is part of
             // the RUNNING turn (no queue entry, no new turn starts).
             cb.onSteered?.(msg)
             break
-          case WIRE.QUEUE_REMOVED:
-            // A removed item's text and attachments go back to the composer
-            // (an attachment-only message carries no text).
-            if (msg.text || msg.images?.length || msg.files?.length) {
-              cb.onQueueEditReturn?.(msg)
+          case WIRE.QUEUE_REMOVED: {
+            const rChat = msg.chat_id || currentChatId.current
+            if (msg.queue_id && rChat) {
+              useChatStore.getState().removeQueuedMessage(rChat, { queueId: msg.queue_id })
+            }
+            // The author's copy hands the text and the attachments back to
+            // the composer of the chat they were typed into. A 1.7.0 proxy
+            // sends them on every copy, with no `returned`.
+            if ((msg.returned || !msg.queue_id)
+                && (msg.text || msg.images?.length || msg.files?.length)) {
+              returnToComposer(rChat, msg, cb)
             }
             cb.onQueueRemoved?.(msg)
             break
+          }
           case WIRE.QUEUE_SENT: {
-            setStreaming(true)  // Queue starts a new streaming turn
-            // Key the slice by the FRAME's chat, not the viewed chat.
+            // Key the slice by the FRAME's chat, not the viewed chat: its
+            // chips go and its turn runs; the socket's own turn state moves
+            // only for the chat this view shows.
             const qsChatId = msg.chat_id || currentChatId.current
-            if (qsChatId) useChatStore.getState().setStreaming(qsChatId)
-            cb.onQueueSent?.(msg)
+            if (qsChatId) {
+              const st = useChatStore.getState()
+              // A turn that took no queued message (a nudge, an utterance)
+              // names none: the chips stay.
+              if (msg.queue_ids?.length) st.clearQueuedMessages(qsChatId, msg.queue_ids)
+              st.setStreaming(qsChatId)
+            }
+            if (!msg.chat_id || msg.chat_id === cb.viewedChatId) {
+              setStreaming(true)
+              cb.onQueueSent?.(msg)
+            }
             break
           }
           case WIRE.QUEUE_CLEARED:
-            // Backend confirmed all queue items cleared (from cancel_all_queued)
+            // The chips of the chat the frame names leave (a cancel, a Stop,
+            // a failed turn, a refused delivery), whichever chat this view
+            // shows; the author's copy hands them back to its composer. An
+            // untagged frame acknowledges a clear the page already applied.
+            if (msg.chat_id) {
+              useChatStore.getState().clearQueuedMessages(msg.chat_id, msg.queue_ids)
+              if (msg.returned && (msg.text || msg.images?.length || msg.files?.length)) {
+                returnToComposer(msg.chat_id, msg, cb)
+              }
+            }
             break
           case WIRE.QUEUE_SNAPSHOT:
             // Backend-authoritative reconciliation on resume_chat — replaces
-            // any reload-persisted queuedMessages with the pump's actual
-            // queue. Strict replace, backend wins.
+            // any reload-persisted queuedMessages with the chat's queue as
+            // the proxy holds it. Strict replace, backend wins.
             if (msg.chat_id) {
               useChatStore.getState().setQueuedMessages(
                 msg.chat_id, Array.isArray(msg.messages) ? msg.messages.map(toQueuedMessage) : [])
@@ -800,9 +903,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             }
             break
           case WIRE.CHAT_STATUS_SNAPSHOT: {
-            // Connect-time authoritative "streaming right now" set — clears
-            // stale streaming dots from missed frames and lights ones this
-            // client never saw start (mirror of satellite_update_sync).
+            // The authoritative "streaming right now" set, sent on connect and
+            // again after the proxy's notify queue dropped a status frame —
+            // clears stale streaming dots from missed frames and lights ones
+            // this client never saw start (mirror of satellite_update_sync).
             const live = new Set<string>((msg.chat_ids as string[]) || [])
             const store = useChatStore.getState()
             for (const [cid, slice] of Object.entries(store.byChat)) {
@@ -930,6 +1034,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.NOTIFICATION_COUNT:
             cb.onNotificationCount?.(msg)
             break
+          case WIRE.SHARE_INBOX:
+            cb.onShareInbox?.(msg)
+            break
           case WIRE.TURN_COMPLETE:
             cb.onTurnComplete?.(msg)
             break
@@ -1006,7 +1113,11 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     (text: string, chatId: string, images?: WireImage[], files?: Array<{ path: string; name: string }>) => {
       setStreaming(true)
       useChatStore.getState().setStreaming(chatId)
-      const msg: Record<string, unknown> = { type: OUT.CHAT, text, chat_id: chatId }
+      // The message's id in the chat's queue: a re-send after a reconnect
+      // is answered once, and a cancel names it.
+      const msg: Record<string, unknown> = {
+        type: OUT.CHAT, text, chat_id: chatId, queue_id: mintQueueId(),
+      }
       if (images?.length) {
         msg.images = images.map(wireImage)
       }
@@ -1229,10 +1340,14 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   }, [])
 
   const resumeChat = useCallback(
-    (chatId: string) => {
+    (chatId: string, opts?: { delta?: boolean }) => {
       currentChatId.current = chatId
       setStreaming(false)  // Reset streaming state before switching chats
-      send({ type: OUT.RESUME_CHAT, chat_id: chatId })
+      // `delta`: the rows this view lacks are enough (the post-done refetch);
+      // the server answers in full when it holds no base for the chat.
+      send(opts?.delta
+        ? { type: OUT.RESUME_CHAT, chat_id: chatId, delta: true }
+        : { type: OUT.RESUME_CHAT, chat_id: chatId })
     },
     [send],
   )
@@ -1248,15 +1363,19 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     [send],
   )
 
+  // By its id, with its index for a 1.7.0 proxy that reads only the index.
   const cancelQueued = useCallback(
-    (index: number) => {
-      send({ type: OUT.CANCEL_QUEUED, index })
+    (key: { queueId?: string; index: number }, chatId?: string) => {
+      const msg: Record<string, unknown> = { type: OUT.CANCEL_QUEUED, index: key.index }
+      if (key.queueId) msg.queue_id = key.queueId
+      if (chatId) msg.chat_id = chatId
+      send(msg)
     },
     [send],
   )
 
-  const cancelAllQueued = useCallback(() => {
-    send({ type: OUT.CANCEL_ALL_QUEUED })
+  const cancelAllQueued = useCallback((chatId?: string) => {
+    send(chatId ? { type: OUT.CANCEL_ALL_QUEUED, chat_id: chatId } : { type: OUT.CANCEL_ALL_QUEUED })
   }, [send])
 
   const abort = useCallback(() => {

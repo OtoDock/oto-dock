@@ -20,6 +20,7 @@ import {
   TIMEZONE_OPTIONS,
   MCP_STATUS_LABEL,
 } from './PlatformPage.shared'
+import OffboardedArchivesCard from './OffboardedArchivesCard'
 
 // ---------------------------------------------------------------------------
 // Storage & Retention card (Setup → System Settings). Settings ride the shared
@@ -51,14 +52,19 @@ function StorageRetentionCard({
       if (!res.ok) throw new Error('Request failed')
       const d = await res.json()
       const freed = (d.bytes_freed || 0) + (d.orphan_bytes || 0)
-        + (d.codex_junk_bytes || 0) + (d.tarball_bytes || 0)
+        + (d.codex_junk_bytes || 0) + (d.tarball_bytes || 0) + (d.offboarded_bytes || 0)
       setResultOk(true)
       setResult(
         `${dryRun ? 'Would free' : 'Freed'} ${formatBytes(freed)} · `
         + `${d.chats_flagged ?? 0} chats aged out · ${d.orphans_deleted ?? 0} orphans · `
-        + `${d.codex_junk_files ?? 0} junk files${d.errors ? ` · ${d.errors} errors` : ''}`,
+        + `${d.codex_junk_files ?? 0} junk files`
+        + `${d.offboarded_deleted ? ` · ${d.offboarded_deleted} archives of removed people` : ''}`
+        + `${d.errors ? ` · ${d.errors} errors` : ''}`,
       )
-      if (!dryRun) qc.invalidateQueries({ queryKey: ['storage-usage'] })
+      if (!dryRun) {
+        qc.invalidateQueries({ queryKey: ['storage-usage'] })
+        qc.invalidateQueries({ queryKey: ['offboarded-archives'] })
+      }
     } catch {
       setResultOk(false)
       setResult('Cleanup request failed')
@@ -135,7 +141,8 @@ function StorageRetentionCard({
             Last cleanup: {new Date(String(last.ran_at)).toLocaleString()} —
             freed {formatBytes(
               (Number(last.bytes_freed) || 0) + (Number(last.orphan_bytes) || 0)
-              + (Number(last.codex_junk_bytes) || 0) + (Number(last.tarball_bytes) || 0),
+              + (Number(last.codex_junk_bytes) || 0) + (Number(last.tarball_bytes) || 0)
+              + (Number(last.offboarded_bytes) || 0),
             )}
           </p>
         )}
@@ -376,6 +383,7 @@ function McpAutoUpdateCard({ enabled, forced, saved, onToggle }: {
         count('failed') ? `${count('failed')} failed` : null,
         count('skipped_in_use') ? `${count('skipped_in_use')} skipped (in use)` : null,
         count('held') ? `${count('held')} held` : null,
+        count('needs_approval') ? `${count('needs_approval')} with a new source to approve` : null,
       ].filter(Boolean)
       statusLine = `Last run ${relativeTime(lastRunAt)} — ${parts.join(', ')}.`
     } else {
@@ -459,6 +467,9 @@ export default function SystemSettingsTab() {
   const [interactiveCli, setInteractiveCli] = useState(false)
   const [retentionEnabled, setRetentionEnabled] = useState(true)
   const [retentionDays, setRetentionDays] = useState('180')
+  const [archiveEnabled, setArchiveEnabled] = useState(true)
+  const [archiveDays, setArchiveDays] = useState('180')
+  const [archiveDaysError, setArchiveDaysError] = useState<string | null>(null)
   const [mcpAutoUpdate, setMcpAutoUpdate] = useState(true)
   const [windowsEnabled, setWindowsEnabled] = useState(true)
   const [quotas, setQuotas] = useState<Record<string, string>>({
@@ -480,6 +491,8 @@ export default function SystemSettingsTab() {
       setInteractiveCli(data.interactive_cli_enabled === true)
       setRetentionEnabled(data.session_retention_enabled !== false)
       setRetentionDays(data.session_retention_days || '180')
+      setArchiveEnabled(data.offboarded_retention_enabled !== false)
+      setArchiveDays(data.offboarded_retention_days || '180')
       setMcpAutoUpdate(data.mcp_auto_update_enabled !== false)
       setWindowsEnabled(data.subscription_windows_enabled !== false)
       setQuotas({
@@ -503,6 +516,22 @@ export default function SystemSettingsTab() {
     )
   }
   const isForced = (k: string) => (data?.forced_keys || []).includes(k)
+  // The archive days: a destructive setting the server refuses out of range,
+  // so its answer is shown, not swallowed.
+  const saveArchiveDays = () => {
+    if (archiveDays === data?.offboarded_retention_days) return
+    setArchiveDaysError(null)
+    saveMutation.mutate(
+      { offboarded_retention_days: archiveDays },
+      {
+        onSuccess: () => {
+          setSavedField('offboarded_retention_days')
+          setTimeout(() => setSavedField(''), 2000)
+        },
+        onError: (e: Error) => setArchiveDaysError(e.message),
+      },
+    )
+  }
 
   const onQuotaChange = (k: string, v: string) => setQuotas((prev) => ({ ...prev, [k]: v }))
   const onQuotaSave = (k: string) => {
@@ -812,6 +841,19 @@ export default function SystemSettingsTab() {
           savedField={savedField}
         />
       )}
+
+      {/* The archive of removed people: shown on the cloud too (its list and
+          purge are an admin's; a forced setting shows disabled). */}
+      <OffboardedArchivesCard
+        enabled={archiveEnabled}
+        days={archiveDays}
+        onEnabledChange={(v) => { setArchiveEnabled(v); save('offboarded_retention_enabled', v) }}
+        onDaysChange={setArchiveDays}
+        onSaveDays={saveArchiveDays}
+        savedField={savedField}
+        daysError={archiveDaysError}
+        forcedKeys={data?.forced_keys || []}
+      />
 
       {/* Storage Quotas — per-agent disk limits on local agent folders (hidden
           on cloud, where the operator pins them via OTODOCK_FORCED_SETTINGS). */}

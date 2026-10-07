@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { rollbackNoticeText, useApps, useHideAppForMe, usePurgeApp, useReorderApps, useRollbackApp, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
+import { GRANTEE_KIND, useHideShare, usePatchShare, useUnhideShare } from '../../api/shares'
+import { roleLabel } from '../../lib/permissions'
 import { onFileUpdate } from '../../lib/fileUpdates'
 import { onAppDeployed } from '../../lib/appLive'
 import { appKind } from '../../lib/kinds/app'
@@ -8,6 +10,20 @@ import { DEPLOY_STATE } from '../../lib/status/appDeploy'
 import { useQueryClient } from '@tanstack/react-query'
 import AppFrame from './AppFrame'
 import AppMenu from './AppMenu'
+import { appChipClass, cameByShare, unpinWords } from './appRow'
+
+/** The sentence of "Where it comes from" that says which sessions may call
+ * a placed app's exported methods (SHARING.md "Agents use a placed app"):
+ * worded from the share's kind and cap, never from `viewer_role` (the
+ * strongest share across every panel). */
+function placedCallsNote(a: PinnedApp): string {
+  const n = Object.keys(a.exports?.methods ?? {}).length
+  if (!a.placement || !n) return ''
+  const methods = `its ${n} exported method${n > 1 ? 's' : ''}`
+  const cap = roleLabel(a.placement.role_cap).toLowerCase()
+  if (a.placement.kind === GRANTEE_KIND.PERSON) return ` Your own chats and tasks here may call ${methods} as ${cap}, while they run in your personal space (never on a Shared-only agent).`
+  return ` Chats and tasks of this agent may call ${methods}, up to ${cap}. A task with no person calls only those without a role floor.`
+}
 import SharePopover from '../sharing/SharePopover'
 import AppApprovalCard, { appNeedsApproval } from './AppApprovalCard'
 import AppDeployCard from './AppDeployCard'
@@ -25,11 +41,22 @@ import AppSettingsPanel from './AppSettingsPanel'
  * snap-x row, fade gradients, active-chip auto-scroll) and its ownership
  * colors: personal apps brand-blue, shared apps accent-purple — the same
  * scope language as the workspace view, which also answers "where is this
- * app's file?" at a glance. The ACTIVE chip carries the app's three-dot
- * menu (open full screen, share, hide for me, unpin); unpin is a two-step
- * confirm and soft server-side: file, manifest and approval all survive a
- * re-pin. The active tab rides `?app=<id>` so a reload or a shared link
- * lands on the same dashboard.
+ * app's file?" at a glance. A row a share brought here keeps the fill of
+ * whose it is (blue for the viewer's own share, purple for a team
+ * placement) and wears a teal border and the share mark (`appRow.ts`).
+ * The ACTIVE chip carries the app's three-dot menu (open full screen,
+ * share, hide for me, unpin); unpin is a two-step confirm and soft
+ * server-side: file, manifest and approval all survive a re-pin (an app
+ * whose live release has a server says "Stop app": the soft unpin stops it
+ * and keeps its data). The active tab rides `?app=<id>` so a reload or a
+ * shared link lands on the same dashboard.
+ *
+ * A row placed here by a share (SHARING.md; `placement` set) belongs to
+ * another agent: its frame and cards get the row's own agent, its menu is
+ * the reduced one (open, hide for me, where it comes from, remove from this
+ * agent; on a person's own placement "Remove for me", the revoke of their
+ * share, in place of hide), it is never reordered, and its hide is the
+ * share's, so the home agent's list is untouched.
  */
 
 interface Props {
@@ -61,7 +88,7 @@ export function RollbackConfirm({ app, busy, onConfirm, onCancel }: {
       <span className="text-p-text">
         Roll back “{title}” to the previous release? Everyone switches at once.
         {appKind(app).keepsData && (
-          <> Its data goes back to before this release; newer changes are kept in a snapshot.</>
+          <> Its data goes back to before this release. Newer changes are kept in a snapshot.</>
         )}
       </span>
       <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -71,6 +98,34 @@ export function RollbackConfirm({ app, busy, onConfirm, onCancel }: {
           className="rounded-md bg-amber-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-amber-700 disabled:opacity-60"
         >
           {busy ? 'Rolling back…' : 'Roll back'}
+        </button>
+        <button
+          onClick={onCancel}
+          className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** The unpin confirm, shared by the overlay and the full-screen page: it
+ * names the app and what the soft unpin keeps; an app whose live release
+ * runs a server says it stops (`unpinWords`). */
+export function UnpinConfirm({ app, onConfirm, onCancel }: {
+  app: PinnedApp; onConfirm: () => void; onCancel: () => void
+}) {
+  const words = unpinWords(app)
+  return (
+    <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs" data-testid="app-unpin-confirm">
+      <span className="text-p-text">{words.question} {words.detail}</span>
+      <div className="ml-auto flex shrink-0 items-center gap-2">
+        <button
+          onClick={onConfirm}
+          className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
+        >
+          {words.action}
         </button>
         <button
           onClick={onCancel}
@@ -115,6 +170,9 @@ export default function AppsOverlay({
   const rollback = useRollbackApp(agent)
   const purge = usePurgeApp(agent)
   const reorder = useReorderApps(agent)
+  const hideShare = useHideShare()
+  const unhideShare = useUnhideShare()
+  const patchShare = usePatchShare()
   const qc = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -156,6 +214,14 @@ export default function AppsOverlay({
   // "Delete app and its data": the slug typed back, on the active tab only.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [deleteTyped, setDeleteTyped] = useState('')
+  // A placed row's "Where it comes from" notice and its remove confirm
+  // (the share's revoke: a team placement's, or a person's own), on the
+  // active tab only.
+  const [whereFromId, setWhereFromId] = useState<string | null>(null)
+  // The confirm remembers the share it was opened for: a refetch that gives
+  // the row another identity (a team share made or revoked meanwhile) hides
+  // it rather than revoking a share the person did not choose.
+  const [confirmRemove, setConfirmRemove] = useState<{ appId: string; shareId: string; kind: string } | null>(null)
   const togglePreview = (id: string) => setPreviewIds((prev) => {
     const next = new Set(prev)
     if (next.has(id)) next.delete(id); else next.add(id)
@@ -181,6 +247,8 @@ export default function AppsOverlay({
     setArmedId(null)
     setConfirmUnpinId(null)
     setConfirmRollbackId(null)
+    setConfirmRemove(null)
+    setWhereFromId(null)
   }
   const runRollback = (a: PinnedApp) => {
     setConfirmRollbackId(null)
@@ -238,17 +306,22 @@ export default function AppsOverlay({
   const applyOrder = (ids: string[]) => {
     // Optimistic tab order; the server renumbers within each scope group and
     // the invalidate reconciles (viewers moving shared rows get a 403 toast
-    // state via the mutation error — the refetch restores truth).
+    // state via the mutation error — the refetch restores truth). Placed
+    // rows keep their place at the end and are never sent: their order is
+    // the home agent's.
     qc.setQueryData(['apps', agent], (prev: PinnedApp[] | undefined) => {
       if (!prev) return prev
       const by = new Map(prev.map((a) => [a.id, a]))
-      return ids.map((id) => by.get(id)).filter(Boolean) as PinnedApp[]
+      const ordered = ids.map((id) => by.get(id)).filter(Boolean) as PinnedApp[]
+      return [...ordered, ...prev.filter((a) => a.placement && !ids.includes(a.id))]
     })
     reorder.mutate(ids)
   }
+  const isPlaced = (id: string) => !!list.find((a) => a.id === id)?.placement
 
   const move = (id: string, delta: number) => {
-    const ids = list.map((a) => a.id)
+    if (isPlaced(id)) return
+    const ids = list.filter((a) => !a.placement).map((a) => a.id)
     const i = ids.indexOf(id)
     const j = i + delta
     if (i < 0 || j < 0 || j >= ids.length) return
@@ -260,8 +333,8 @@ export default function AppsOverlay({
   const onDrop = (targetId: string) => {
     const dragId = dragIdRef.current
     dragIdRef.current = null
-    if (!dragId || dragId === targetId) return
-    const ids = list.map((a) => a.id)
+    if (!dragId || dragId === targetId || isPlaced(dragId) || isPlaced(targetId)) return
+    const ids = list.filter((a) => !a.placement).map((a) => a.id)
     const from = ids.indexOf(dragId)
     const to = ids.indexOf(targetId)
     if (from < 0 || to < 0) return
@@ -272,6 +345,7 @@ export default function AppsOverlay({
   }
 
   const startLongPress = (id: string, e: React.TouchEvent) => {
+    if (isPlaced(id)) return
     touchStartRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }
     longPressRef.current = setTimeout(() => setArmedId((v) => (v === id ? null : id)), LONG_PRESS_MS)
   }
@@ -288,13 +362,26 @@ export default function AppsOverlay({
   const hideRow = (a: PinnedApp) => {
     setConfirmUnpinId(null)
     setActiveId(null)
-    hideForMe.mutate(a.id)
+    if (a.placement) hideShare.mutate({ id: a.placement.share_id, agent })
+    else hideForMe.mutate(a.id)
+  }
+  const armRemove = (a: PinnedApp) => {
+    if (!a.placement) return
+    setWhereFromId(null)
+    setConfirmRemove({ appId: a.id, shareId: a.placement.share_id, kind: a.placement.kind })
+  }
+  const restoreRow = (a: PinnedApp) => {
+    if (a.placement) unhideShare.mutate({ id: a.placement.share_id, agent })
+    else unhide.mutate(a.id)
   }
   const menuFor = (a: PinnedApp, onChip: boolean) => (
     <AppMenu
       app={a}
       onChip={onChip}
-      onHideForMe={a.scope === 'shared' || a.granted ? () => hideRow(a) : undefined}
+      onHideForMe={a.scope === 'shared' || a.granted || a.placement ? () => hideRow(a) : undefined}
+      onWhereFrom={a.placement ? () => { setConfirmRemove(null); setWhereFromId(a.id) } : undefined}
+      onRemoveFromAgent={a.placement?.can_remove ? () => armRemove(a) : undefined}
+      onRemoveForMe={a.placement?.kind === GRANTEE_KIND.PERSON ? () => armRemove(a) : undefined}
       onUnpin={a.can_manage ? () => setConfirmUnpinId(a.id) : undefined}
       onShare={a.can_manage ? () => setShareId(a.id) : undefined}
       onRollback={a.can_manage ? () => { setConfirmUnpinId(null); setConfirmRollbackId(a.id) } : undefined}
@@ -332,7 +419,7 @@ export default function AppsOverlay({
             {hiddenList.map((a) => (
               <button
                 key={a.id}
-                onClick={() => unhide.mutate(a.id)}
+                onClick={() => restoreRow(a)}
                 className="rounded-full border border-dashed border-p-border px-3 py-1 text-xs text-p-text-secondary transition-colors hover:bg-p-surface-hover"
                 title="Restore to your strip"
               >
@@ -377,18 +464,8 @@ export default function AppsOverlay({
             const armed = armedId === a.id
             const pending = a.actions.length > 0 && (!a.actions_approved || a.approval_stale)
             const purple = a.scope === 'shared'
-            // Teal: another user's personal app shared with this viewer.
-            const chipClass = a.granted
-              ? isActive
-                ? 'bg-p-accent-teal text-white border-p-accent-teal'
-                : 'bg-p-accent-teal/10 text-p-accent-teal border-p-accent-teal/30 hover:bg-p-accent-teal/20'
-              : purple
-              ? isActive
-                ? 'bg-p-accent-purple text-white border-p-accent-purple'
-                : 'bg-p-accent-purple/10 text-p-accent-purple border-p-accent-purple/30 hover:bg-p-accent-purple/20'
-              : isActive
-                ? 'bg-brand text-white border-brand'
-                : 'bg-brand/10 text-brand border-brand/30 hover:bg-brand/20'
+            const placed = !!a.placement
+            const chipClass = appChipClass(a, isActive)
             return (
               <div key={a.id} className="flex shrink-0 snap-start items-center">
                 {armed && (
@@ -404,7 +481,7 @@ export default function AppsOverlay({
                   ref={isActive ? activeChipRef : undefined}
                   role="button"
                   tabIndex={0}
-                  draggable={IS_DESKTOP}
+                  draggable={IS_DESKTOP && !placed}
                   onDragStart={() => { dragIdRef.current = a.id }}
                   onDragOver={(e) => e.preventDefault()}
                   onDrop={() => onDrop(a.id)}
@@ -418,9 +495,14 @@ export default function AppsOverlay({
                       selectTab(a.id)
                     }
                   }}
-                  title={a.granted ? `${a.title || a.slug} (shared with you)` : purple ? `${a.title || a.slug} (shared)` : `${a.title || a.slug} (personal)`}
+                  title={placed ? `${a.title || a.slug} · from ${a.placement?.from_agent_name || a.placement?.from_agent}` : a.granted ? `${a.title || a.slug} (shared with you)` : purple ? `${a.title || a.slug} (shared)` : `${a.title || a.slug} (personal)`}
                   className={`flex cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs font-medium transition-colors ${chipClass}`}
                 >
+                  {cameByShare(a) && (
+                    <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true" data-testid="placed-mark">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 12v7a1 1 0 001 1h14a1 1 0 001-1v-7M12 4v12m0 0l-4-4m4 4l4-4" />
+                    </svg>
+                  )}
                   {a.title || a.slug}
                   {pending && (
                     <span className={`h-1.5 w-1.5 rounded-full ${isActive ? 'bg-white' : 'bg-amber-500'}`}
@@ -450,7 +532,7 @@ export default function AppsOverlay({
               {showHidden && hiddenList.map((a) => (
                 <button
                   key={a.id}
-                  onClick={() => { unhide.mutate(a.id); setShowHidden(hiddenList.length > 1) }}
+                  onClick={() => { restoreRow(a); setShowHidden(hiddenList.length > 1) }}
                   className="whitespace-nowrap rounded-full border border-dashed border-p-accent-purple/40 px-3 py-1 text-xs text-p-accent-purple/70 transition-colors hover:bg-p-accent-purple/10 hover:text-p-accent-purple"
                   title="Restore to your strip"
                 >
@@ -470,33 +552,62 @@ export default function AppsOverlay({
       )}
 
       {/* Unpin confirmation — always names its target; reached from the
-          menu's Unpin, and a tab switch cancels the pending confirm. The
-          team-wide soft-unpin is editor+ (can_manage); personal rows keep
-          the single unpin. */}
+          menu's Unpin (Stop app for a server app), and a tab switch cancels
+          the pending confirm. The team-wide soft-unpin is editor+
+          (can_manage); personal rows keep the single unpin. */}
       {confirmTarget && (
-        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs">
+        <UnpinConfirm
+          app={confirmTarget}
+          onConfirm={() => {
+            setConfirmUnpinId(null)
+            setActiveId(null)
+            unpin.mutate(confirmTarget.id)
+          }}
+          onCancel={() => setConfirmUnpinId(null)}
+        />
+      )}
+
+      {/* A placed row: where it comes from, and the remove confirm (the
+          share's revoke, never the origin's unpin; on a person's own
+          placement the revoke of their own share, which they cannot undo:
+          only a new share brings the app back). */}
+      {active?.placement && whereFromId === active.id && (
+        <div className="mx-3 mt-2 flex items-start gap-2 rounded-xl border border-p-accent-teal/40 bg-p-accent-teal/5 px-3 py-2.5 text-xs" data-testid="app-where-from" role="status">
+          <span className="flex-1 text-p-text">
+            “{active.title || active.slug}” comes from {active.placement.from_agent_name || active.placement.from_agent}
+            {active.placement.shared_by_name ? `, shared by ${active.placement.shared_by_name}` : ''}
+            {active.placement.kind === GRANTEE_KIND.DEPARTMENT ? ' with your department' : active.placement.kind === GRANTEE_KIND.AGENT ? ' with this agent' : ' with you'}.
+            {' '}You use it as {roleLabel(active.viewer_role).toLowerCase()}.
+            {placedCallsNote(active)}
+          </span>
+          <button onClick={() => setWhereFromId(null)} aria-label="Dismiss"
+            className="shrink-0 rounded-full px-1.5 text-p-text-light transition-colors hover:bg-p-surface-hover hover:text-p-text">×</button>
+        </div>
+      )}
+      {active?.placement && confirmRemove?.appId === active.id
+        && confirmRemove.shareId === active.placement.share_id && confirmRemove.kind === active.placement.kind && (
+        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs" data-testid="app-remove-confirm">
           <span className="text-p-text">
-            {confirmTarget.scope === 'shared'
-              ? `Unpin “${confirmTarget.title || confirmTarget.slug}” for everyone?
-                 The workspace file and the approved actions are kept — ask
-                 the agent to pin it back anytime.`
-              : `Unpin “${confirmTarget.title || confirmTarget.slug}”? The
-                 workspace file and the approved actions are kept — ask the
-                 agent to pin it back anytime.`}
+            {active.placement.kind === GRANTEE_KIND.PERSON
+              ? <>Remove “{active.title || active.slug}” from your apps? {active.placement.shared_by_name || 'The person who shared it'} can share it again.</>
+              : active.placement.kind === GRANTEE_KIND.DEPARTMENT
+              ? <>Remove “{active.title || active.slug}” from every agent of the department? The share ends for all of them. The app stays with {active.placement.from_agent_name || active.placement.from_agent}.</>
+              : <>Remove “{active.title || active.slug}” from this agent? Everyone here loses it. The app stays with {active.placement.from_agent_name || active.placement.from_agent}.</>}
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-2">
             <button
               onClick={() => {
-                setConfirmUnpinId(null)
+                const id = confirmRemove.shareId
+                setConfirmRemove(null)
                 setActiveId(null)
-                unpin.mutate(confirmTarget.id)
+                patchShare.mutate({ id, revoke: true })
               }}
               className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
             >
-              {confirmTarget.scope === 'shared' ? 'Unpin for everyone' : 'Unpin'}
+              {active.placement.kind === GRANTEE_KIND.PERSON ? 'Remove for me' : active.placement.kind === GRANTEE_KIND.DEPARTMENT ? 'Remove from the department' : 'Remove from this agent'}
             </button>
             <button
-              onClick={() => setConfirmUnpinId(null)}
+              onClick={() => setConfirmRemove(null)}
               className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
             >
               Cancel
@@ -521,14 +632,14 @@ export default function AppsOverlay({
         <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/5 px-3 py-2.5 text-xs" data-testid="app-delete-confirm">
           <span className="text-p-text">
             Delete “{active.title || active.slug}” with its data? The app, its releases and its
-            database are removed for good; the folder goes to the recover bin. Type <code className="font-mono">{active.slug}</code> to confirm.
+            database are removed for good. The folder goes to the recover bin. Type <code className="font-mono">{active.slug}</code> to confirm.
           </span>
           <input
             value={deleteTyped}
             onChange={(e) => setDeleteTyped(e.target.value)}
             placeholder={active.slug}
             aria-label="Type the app's slug to confirm"
-            className="w-36 rounded-md border border-p-border-light bg-p-bg px-2 py-1 font-mono text-p-text"
+            className="w-36 rounded-md border border-p-border-light bg-p-bg px-2 py-1 font-mono pointer-coarse:text-base text-p-text"
           />
           <div className="ml-auto flex shrink-0 items-center gap-2">
             <button
@@ -551,16 +662,16 @@ export default function AppsOverlay({
       {/* Declared-actions approval card (shared with the Dock); a folder
           app's pending release takes the slot instead. */}
       {active?.deploy_state === DEPLOY_STATE.PENDING && (
-        <AppDeployCard key={`deploy-${active.id}`} app={active} agent={agent} />
+        <AppDeployCard key={`deploy-${active.id}`} app={active} agent={active.agent ?? agent} />
       )}
       {needsApproval && active && (
-        <AppApprovalCard key={active.id} app={active} agent={agent} />
+        <AppApprovalCard key={active.id} app={active} agent={active.agent ?? agent} />
       )}
       {active && logsId === active.id && (
         <AppLogsPanel key={`logs-${active.id}`} app={active} onClose={() => setLogsId(null)} />
       )}
       {active && settingsId === active.id && (
-        <AppSettingsPanel key={`settings-${active.id}`} app={active} agent={agent} onClose={() => setSettingsId(null)} />
+        <AppSettingsPanel key={`settings-${active.id}`} app={active} agent={active.agent ?? agent} onClose={() => setSettingsId(null)} />
       )}
 
       {/* The app itself. `isolate` caps the internal z-layers (the corner
@@ -579,8 +690,8 @@ export default function AppsOverlay({
           <AppFrame
             key={active.id}
             app={active}
-            agent={agent}
-            onSendPrompt={onSendPrompt}
+            agent={active.agent ?? agent}
+            onSendPrompt={active.placement ? undefined : onSendPrompt}
             preview={previewIds.has(active.id)}
           />
         )}

@@ -8,8 +8,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import config
 from core.config import deployment
@@ -33,6 +34,9 @@ from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_manifest_parse as _mmp
 from services.mcp import mcp_validate_oauth as _mvo
 from services.mcp import mcp_validate_webhooks as _mvw
+
+if TYPE_CHECKING:  # the gateway's types; the module is reached at call time
+    from core.credentials.mcp_gateway import GatewayCredential, TokenRef
 
 # Public alias of the device-capability set — kept on the registry surface for
 # external callers (api/remote/remote_machines.py). One source of truth.
@@ -344,6 +348,33 @@ def get_tool_filter(mcp_name: str) -> tuple[str, str] | None:
     return (manifest.tool_filter.arg_name, regex)
 
 
+def authorization_server_conflict(name: str, oauth: dict | None) -> str:
+    """One provider id, one way of issuing tokens: the reason an incoming
+    manifest ``name`` with ``oauth`` conflicts with an installed manifest of
+    the same ``provider_id`` (one declares ``authorization_server`` and the
+    other does not), or ``""``. Their token files would share a directory
+    while being issued by different servers."""
+    if not oauth:
+        return ""
+    provider_id = oauth.get("provider_id", "")
+    if not provider_id:
+        return ""
+    incoming = bool(oauth.get("authorization_server"))
+    for other in get_mcps_by_provider(provider_id):
+        if other.name == name:
+            continue
+        installed = bool((other.credentials.oauth or {}).get("authorization_server"))
+        if installed != incoming:
+            return (
+                f"provider_id {provider_id!r} is used by the installed MCP "
+                f"{other.name!r}, which "
+                + ("names its own authorization server" if installed
+                   else "uses an admin's OAuth app")
+                + "; one provider id issues its tokens one way"
+            )
+    return ""
+
+
 def get_protected_credentials_subpaths() -> frozenset[str]:
     """Return directory names that hold OAuth-credential files.
 
@@ -621,7 +652,8 @@ def _platform_targets() -> _PlatformTargets:
     start): the control-plane networks, the document-sidecar plane and the
     database and socket-proxy addresses in compose mode, the phone daemon's
     host to resolve per computation, and the ports of the platform listeners
-    on this host, which the bare-metal loopback splice must never open."""
+    on this host and the ports that front the proxy, which the bare-metal
+    loopback splice must never open."""
     from urllib.parse import urlsplit
     compose = deployment.in_docker_compose()
     cached = _platform_targets_cache.get(compose)
@@ -660,6 +692,17 @@ def _platform_targets() -> _PlatformTargets:
     if phone.hostname and _host_is_local(phone.hostname):
         ports.add(phone.port or 9093)
         ports.add(_AUDIOSOCKET_PORT)
+    if not compose:
+        # The ports that front the proxy on this host: its own listener
+        # (the hook forward already lands the sandbox's 127.0.0.1:PORT on
+        # the internal listener) and, when the public URL's host is this
+        # host, the public URL's port (an edge here forwards to the main
+        # listener, where a loopback hop's X-Forwarded-For is walked).
+        ports.add(int(config.PORT))
+        pub = urlsplit(config.DASHBOARD_PUBLIC_URL or "")
+        if pub.hostname and _host_is_local(pub.hostname):
+            with contextlib.suppress(ValueError):
+                ports.add(pub.port or (443 if pub.scheme == "https" else 80))
     targets = _PlatformTargets(
         compose, tuple(networks), frozenset(addresses), frozenset(ports),
         tuple(sidecar_networks), tuple(late_hosts),
@@ -729,9 +772,10 @@ def resolve_sandbox_egress(
     targets = _platform_targets()
 
     def _add_forward(port) -> None:
+        # Judged before the dedup: the hook forward of config.PORT sits in
+        # ``forwards`` already, so a target on it is refused aloud instead of
+        # passing silently (the hook forward itself stays).
         s = str(port)
-        if s in fseen:
-            return
         try:
             refused = int(port) in targets.ports
         except (TypeError, ValueError):
@@ -741,6 +785,8 @@ def resolve_sandbox_egress(
                 "egress for %s: port %s is a platform listener on this host; "
                 "not spliced", agent_name, s,
             )
+            return
+        if s in fseen:
             return
         fseen.add(s)
         forwards.append(s)
@@ -769,6 +815,12 @@ def resolve_sandbox_egress(
             allow_hosts.append(ip)
 
     mcps = get_agent_mcps(agent_name, placement=LOCAL_PLACEMENT) or []
+    # The person's tier decides which audience-gated MCPs carve anything:
+    # a viewer's sandbox gets no route to the SSH hosts an editor's does.
+    if user_sub:
+        from auth import providers
+        role = providers.effective_role_of(user_sub, agent_name)
+        mcps = [m for m in mcps if audience_admits(getattr(m, 'audience', ''), role)]
 
     # 1. Docker MCPs the agent dials.
     for manifest in mcps:
@@ -1150,7 +1202,10 @@ def _rewrite_host_self_targets_to_loopback(
         if not hp:
             continue
         host = hp[0]
-        if host in ("localhost", "127.0.0.1", "::1"):
+        if host == "::1":
+            env[decl.host_key] = _ipv4_loopback(val)
+            continue
+        if host in ("localhost", "127.0.0.1"):
             continue
         try:
             ips = _resolve_to_ips(host)
@@ -1161,6 +1216,15 @@ def _rewrite_host_self_targets_to_loopback(
                 "network_targets: host-self rewrite of %s for MCP %s failed: %s",
                 decl.host_key, manifest.name, e,
             )
+
+
+def _ipv4_loopback(value: str) -> str:
+    """``value`` with its ``::1`` host written ``127.0.0.1``: the sandbox has
+    no IPv6 loopback (``scripts/oto-sandbox-net``), so a host service reached
+    through the loopback splice is dialed over IPv4."""
+    if value.strip() == "::1":
+        return "127.0.0.1"
+    return value.replace("[::1]", "127.0.0.1", 1)
 
 
 def loopback_if_host_self(url: str) -> str:
@@ -1174,7 +1238,9 @@ def loopback_if_host_self(url: str) -> str:
         return url
     from urllib.parse import urlparse
     host = urlparse(url if "://" in url else f"//{url}").hostname or ""
-    if not host or host in ("localhost", "127.0.0.1", "::1"):
+    if host == "::1":
+        return _ipv4_loopback(url)
+    if not host or host in ("localhost", "127.0.0.1"):
         return url
     with contextlib.suppress(Exception):
         if any(_is_local_host_ip(ip) for ip in _resolve_to_ips(host)):
@@ -1310,6 +1376,20 @@ def get_credential_schema(name: str) -> dict | None:
             # settings)…"). Empty = dashboard's generic fallback.
             "pat_description": cred.oauth.get("pat_description", ""),
         }
+        # Manifest values only (the route is open to every role and runs
+        # on the loop): the install's registrations are an admin route.
+        block = cred.oauth.get("authorization_server")
+        if isinstance(block, dict):
+            from urllib.parse import urlsplit
+            result["oauth_meta"]["authorization_server"] = {
+                "registration": block.get("registration", "dynamic"),
+                "issuer": block.get("issuer", "") or "",
+                "resource_host": (
+                    urlsplit(m.server.url_template or "").hostname or ""
+                ).lower(),
+                "confidential": bool(block.get("confidential", False)),
+                "accepts_app_tokens": bool(block.get("accepts_app_tokens", False)),
+            }
         if cred.app_credential_fields:
             result["app_credential"] = cred.oauth.get("app_credential", "")
             result["app_credential_fields"] = cred.app_credential_fields
@@ -1428,6 +1508,7 @@ def build_available_mcps_section(
     placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
+    user_role: str | None = None,
 ) -> str:
     """Build the ``# Available Tools (MCPs)`` prompt section.
 
@@ -1453,10 +1534,15 @@ def build_available_mcps_section(
             the sidecar MCPs a phone Direct-LLM session never connects
             (``core/layers/direct/mcp.py`` skips them), so the prompt does
             not advertise tools the session cannot reach.
+        user_role: the session's person's role on the agent; None lists
+            every audience (no person known).
     """
     manifests = get_agent_mcps(agent_name, placement=placement) or []
     if skip_http_mcps:
         manifests = [m for m in manifests if not _is_http_transport(m)]
+    # ``user_role`` (the session's person) drops the manifests whose
+    # ``audience`` the person is below, as the session config does.
+    manifests = [m for m in manifests if audience_admits(getattr(m, 'audience', ''), user_role)]
     # Sort alphabetically by label for deterministic output — registry scan
     # order is otherwise filesystem-dependent and can drift across reinstalls.
     manifests_sorted = sorted(
@@ -1496,6 +1582,39 @@ def build_available_mcps_section(
     return header + "\n".join(rows) + footer
 
 
+def audience_admits(audience: str, user_role: str | None) -> bool:
+    """Whether a session at ``user_role`` is in ``audience`` (the tier names
+    of ``auth/roles.py``; an empty audience admits everyone). ``None`` is
+    "no person known": the caller did not say, nothing is filtered."""
+    if user_role is None or not audience:
+        return True
+    from auth import roles
+    gate = {
+        "owner": roles.can_manage,
+        "editor": roles.can_edit,
+        "workspace": roles.can_write_workspace,
+    }.get(audience)
+    return bool(gate and gate(user_role))
+
+
+def skill_audience_admits(skill_def, user_role: str | None) -> bool:
+    """:func:`audience_admits` for a skill's ``audience``."""
+    return audience_admits(getattr(skill_def, "audience", ""), user_role)
+
+
+def audience_refusal(manifest, *, user_role: str | None, task_scope: str) -> str | None:
+    """Why a manifest with an ``audience`` is not part of this session, or
+    None: a person below the tier in a user-scope session. An agent-scope
+    session is the agent acting as itself and is admitted; a builder that
+    names no role (an empty string) is "no person known" and admitted, as
+    the skills' gate reads it."""
+    if not getattr(manifest, "audience", "") or task_scope != "user":
+        return None
+    if audience_admits(manifest.audience, user_role or None):
+        return None
+    return f"{manifest.label} is for the {manifest.audience} tier of this agent and above"
+
+
 def get_skills_for_agent(
     agent_name: str,
     context: str = "dashboard",
@@ -1503,6 +1622,7 @@ def get_skills_for_agent(
     placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
+    user_role: str | None = None,
 ) -> list[tuple[str, str, str]]:
     """Return (skill_id, prompt_content, loading) for an agent, context-filtered.
 
@@ -1521,6 +1641,8 @@ def get_skills_for_agent(
     skill text is dropped on sessions that can't run it (fail-closed: the
     local placement by default). ``skip_http_mcps`` drops the
     skills of sidecar (HTTP) MCPs — see ``build_available_mcps_section``.
+    ``user_role`` (the session's role) drops the skills whose ``audience``
+    the role fails (``skill_audience_admits``); ``None`` filters nothing.
     """
     from services.mcp.skill_format import strip_frontmatter
 
@@ -1528,7 +1650,7 @@ def get_skills_for_agent(
     for manifest, skill_def in _iter_agent_skills(
         agent_name, context, placement=placement,
         skip_http_mcps=skip_http_mcps,
-        external=external,
+        external=external, user_role=user_role,
     ):
         # The file must be a regular file inside this MCP's own folder; a
         # value that escapes it is never read.
@@ -1555,6 +1677,7 @@ def _iter_agent_skills(
     placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
+    user_role: str | None = None,
 ):
     """``(manifest, skill_def)`` for every ENABLED skill of the agent's
     assigned MCPs that is not excluded from ``context`` — the one filter
@@ -1563,7 +1686,8 @@ def _iter_agent_skills(
     ``""`` as context excludes nothing; ``skip_http_mcps`` drops sidecar
     MCPs (phone Direct-LLM sessions never connect them); ``external`` drops
     the MCPs an external session never attaches (their skills with them) and
-    honours a skill-level ``"external"`` exclusion."""
+    honours a skill-level ``"external"`` exclusion; ``user_role`` drops the
+    skills whose audience the role fails."""
     db_skills = mcp_store.get_agent_skills(agent_name)
     skill_map: dict[str, dict] = {s["skill_id"]: s for s in db_skills}
 
@@ -1576,6 +1700,8 @@ def _iter_agent_skills(
         ):
             continue
         for skill_def in manifest.skills:
+            if not skill_audience_admits(skill_def, user_role):
+                continue
             db_entry = skill_map.get(skill_def.id)
             if db_entry:
                 if not db_entry["enabled"]:
@@ -1597,19 +1723,20 @@ def get_skill_catalog_for_agent(
     placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
+    user_role: str | None = None,
 ) -> list[tuple[str, str]]:
     """``(skill_id, description)`` of the agent's enabled ON-DEMAND skills in
     this context, sorted by id — the ``# Skills`` catalog of a Direct-LLM
     prompt. The CLI engines index their materialized skills dir themselves;
     the direct layer has a client-side ``Skill`` builtin instead and needs
     the names in the prompt to know what it can load. Same filters as the
-    inline path (``_iter_agent_skills``)."""
+    inline path (``_iter_agent_skills``), the audience included."""
     rows = [
         (skill_def.id, skill_def.description or "")
         for _m, skill_def in _iter_agent_skills(
             agent_name, context, placement=placement,
             skip_http_mcps=skip_http_mcps,
-            external=external,
+            external=external, user_role=user_role,
         )
         if skill_def.loading == "on_demand"
     ]
@@ -1627,8 +1754,22 @@ def find_skill_provider(skill_id: str) -> McpManifest | None:
     return None
 
 
+def _role_of_username(username: str, agent_name: str) -> str | None:
+    """The person's effective role on the agent, read from the users table;
+    ``None`` when the username names nobody (an unknown person gets the
+    unfiltered set, as every caller that passes no username does)."""
+    from auth import providers
+    from storage.identity import db_users
+    sub = db_users.get_user_sub_by_username(username)
+    if not sub:
+        return None
+    return providers.effective_role_of(sub, agent_name)
+
+
 def get_on_demand_skills_for_materialization(
     agent_name: str,
+    *,
+    username: str | None = None,
 ) -> list[tuple[str, Path, str, str, str]]:
     """The on-demand skills to materialize into a session CLI skills dir.
 
@@ -1644,12 +1785,21 @@ def get_on_demand_skills_for_materialization(
     start deleting the folders another just wrote (plan §2.1). Per-context
     precision lives on the INLINE path, where the token cost is; an
     on-demand skill's residual footprint is a one-line CLI index entry.
+
+    ``username`` names the person whose own config dir is being
+    materialized: a skill with an ``audience`` their role on the agent
+    fails is left out. One person has one role, so every session that
+    shares that dir computes the same set; the agent-level dir (no
+    username) keeps the role-free set.
     """
+    user_role = _role_of_username(username, agent_name) if username else None
     db_skills = {s["skill_id"]: s for s in mcp_store.get_agent_skills(agent_name)}
     out: list[tuple[str, Path, str, str, str]] = []
     for manifest in get_agent_mcps_all_placements(agent_name):
         for skill_def in manifest.skills:
             if skill_def.loading != "on_demand":
+                continue
+            if not skill_audience_admits(skill_def, user_role):
                 continue
             row = db_skills.get(skill_def.id)
             if row and not row["enabled"]:
@@ -1868,118 +2018,157 @@ def resolve_server_config(
     return entry
 
 
-def maybe_inject_bearer_header(
-    entry: dict[str, Any],
-    manifest: McpManifest,
-    user_sub: str | None,
-    agent_name: str,
-    task_scope: str,
-) -> dict[str, Any]:
-    """Add ``Authorization: Bearer <token>`` to a remote-HTTP MCP entry
-    IF the manifest opts in AND the URL host is on the allowlist.
+def env_instance_values(manifest, agent_name: str) -> dict[str, str]:
+    """The field values of the instance an env-delivered MCP hands
+    ``agent_name`` (``mcp_store.get_instance_for_agent_env_delivery``, the
+    choice ``build_session_mcp_config`` makes), or ``{}``: no instances,
+    another delivery, none authorized, or a hosted instance (the relay holds
+    its key). What a header-style key's ``value_from`` may name besides a
+    resolver secret, read by the paths that resolve the key outside the
+    session build (a re-adoption, a builder). Synchronous: a store read."""
+    inst = getattr(manifest, "instances", None)
+    if not inst or getattr(inst, "delivery", "") != "env":
+        return {}
+    chosen = mcp_store.get_instance_for_agent_env_delivery(manifest.name, agent_name)
+    if not chosen:
+        return {}
+    hosted = getattr(manifest, "hosted", None)
+    akr = hosted.api_key_relay if hosted else None
+    if chosen.get("hosted_mode") == "hosted" and akr and akr.available:
+        return {}
+    return {str(k): "" if v is None else str(v)
+            for k, v in (chosen.get("field_values") or {}).items()}
 
-    Three gates, in order:
-      1. Manifest declares ``credentials.oauth.bearer_required = true``.
-      2. ``server.url_template`` host is in ``oauth_bearer_allowlist``
-         for the manifest's ``provider_id`` (admin-controlled).
-      3. The session has a valid OAuth token for this user + MCP +
-         bound-account (via ``credential_resolver.pick_account``).
 
-    On allowlist miss: log a warning and skip header injection — the MCP
-    loads anyway and the vendor will return 401, surfacing a clean error.
-    On token miss: same (the MCP would already be excluded by the
-    credential resolver, but defensively handle here for safety).
-
-    Returns the (possibly-mutated) entry. Safe to call for every MCP;
-    no-op for stdio MCPs or those without ``bearer_required``.
-    """
-    if not manifest.credentials.oauth:
-        return entry
-    oauth = manifest.credentials.oauth
-    if not oauth.get("bearer_required", False):
-        return entry
-
-    url = entry.get("url", "")
-    if not url:
-        # stdio entry — not applicable.
-        return entry
-
-    from urllib.parse import urlparse
-    from storage.identity import bearer_allowlist
-
-    host = urlparse(url).hostname or ""
-    provider_id = oauth.get("provider_id", "")
-    # In T2 a local Docker sidecar (github/m365) is dialled by its service-DNS
-    # name, but the bearer allowlist is seeded with the loopback host
-    # (proposed_hosts: ["localhost"]). Normalise a proxy-local sidecar host to
-    # "localhost" for the lookup so the one admin entry covers T1 and T2 — a
-    # public vendor host (slack/linear) is untouched and checked as-is.
-    allowlist_host = (
-        "localhost" if deployment.is_proxy_local_mcp_host(host, manifest) else host
-    )
-    if not bearer_allowlist.is_host_allowed(provider_id, allowlist_host):
-        logger.warning(
-            "Bearer-header skipped for MCP %s: host=%s provider=%s not on "
-            "oauth_bearer_allowlist. MCP will load but vendor will reject "
-            "(no token injected). Admin can approve via "
-            "POST /v1/admin/oauth-bearer-allowlist.",
-            manifest.name, host, provider_id,
-        )
-        return entry
-
-    # Find the bound account and load its token.
+def _gateway_bearer_source(
+    manifest: McpManifest, user_sub: str | None, agent_name: str, task_scope: str,
+) -> tuple["TokenRef | None", str | None]:
+    """The token-file reference a bearer MCP's account resolves to for this
+    session, or the reason it cannot: the person's bound account in user
+    scope, the agent's service binding otherwise (the one rule the resolver
+    applies). The file is read once here so a dead account is refused with
+    its reconnect wording instead of failing on every call; the gateway
+    re-reads it per request."""
+    from core.credentials.mcp_gateway import TokenRef
     from services.oauth import credential_resolver, oauth_account_store
     from storage import database as _db
 
+    provider_id = (manifest.credentials.oauth or {}).get("provider_id", "")
     if user_sub and task_scope == "user":
-        username = _db.get_username_by_sub(user_sub)
-        if not username:
-            return entry
-        ref = credential_resolver.pick_account(
-            manifest.name, agent_name, user_sub=user_sub,
+        ref = credential_resolver.pick_account(manifest.name, agent_name, user_sub=user_sub)
+        owner_sub = user_sub
+    else:
+        ref = credential_resolver.pick_account(manifest.name, agent_name)
+        owner_sub = ref.owner_sub if ref else ""
+    username = _db.get_username_by_sub(owner_sub) if owner_sub else ""
+    if ref is None or not username:
+        return None, f"{manifest.label}: no account is connected for this session"
+    token_dir = oauth_account_store.get_token_dir(username, provider_id=provider_id)
+    raw = oauth_account_store.read_account_token(token_dir, ref.label)
+    if not raw:
+        return None, f"{manifest.label}: the connected account has no token file"
+    dead = credential_resolver.account_unusable_reason(raw, manifest)
+    if dead:
+        return None, f"{manifest.label}: {credential_resolver.reconnect_wording(dead)}"
+    extra = raw.get("extra") or {}
+    preferred = str(extra.get("preferred_bearer") or "") if isinstance(extra, dict) else ""
+    return TokenRef(str(token_dir), ref.label, preferred), None
+
+
+def gateway_entry(
+    entry: dict[str, Any],
+    manifest: McpManifest,
+    *,
+    srv_key: str,
+    user_sub: str | None,
+    agent_name: str,
+    task_scope: str,
+    bundle_env: dict[str, str],
+) -> tuple["GatewayCredential | None", str | None]:
+    """The one writer of a credentialed remote-HTTP entry, for every builder
+    and both config formats: the entry's URL becomes the credential gateway
+    route for this MCP (``mcp_gateway.entry_url``) and its bearer the
+    session-token sentinel every layer swaps; the credential itself is
+    returned for the session's bundle and never written. Returns
+    ``(credential, exclusion reason)``: ``(None, None)`` for an entry that
+    needs no credential (stdio, an uncredentialed HTTP MCP), a reason when
+    the MCP cannot be part of the session (no account, a dead account, an
+    empty key, a host the admin has not approved, a hosted MCP naming a
+    loopback host).
+
+    The credential's source: ``credentials.oauth.bearer_required`` reads the
+    bound account's token file per request; ``credentials.api_key_header``
+    takes the declared key's value from this MCP's resolved secrets (an
+    infra value, the person's own, an env-delivered instance field). A
+    sidecar (a container the proxy reaches itself) is judged under the
+    ``localhost`` allowlist row; a vendor host under its own name. The
+    allowlist is checked again at forward time: this check only keeps an
+    unapproved MCP out of the session with an actionable sentence.
+    """
+    from urllib.parse import urlsplit
+    from core.credentials.mcp_gateway import GatewayCredential, entry_url
+    from storage.identity import bearer_allowlist
+
+    url = entry.get("url", "")
+    if not url:
+        return None, None
+    oauth = manifest.credentials.oauth or {}
+    header_block = manifest.credentials.api_key_header
+    bearer = bool(oauth.get("bearer_required", False))
+    if not bearer and not header_block:
+        return None, None
+
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    origin = f"{parts.scheme}://{parts.netloc}"
+    path = parts.path or "/"
+    proxy_local = deployment.is_proxy_local_mcp_host(host, manifest)
+    if proxy_local and not _mt.is_container(manifest.server):
+        return None, (
+            f"{manifest.label} names a loopback host; a hosted MCP must name its "
+            "vendor's host"
         )
-        if ref is None:
-            return entry
-        account_label = ref.label
-        token_dir = oauth_account_store.get_token_dir(
-            username, provider_id=provider_id,
+
+    if bearer:
+        allowlist_key = oauth.get("provider_id", "")
+        token_ref, reason = _gateway_bearer_source(manifest, user_sub, agent_name, task_scope)
+        if reason:
+            return None, reason
+        cred = GatewayCredential(
+            upstream=origin, path=path, allowlist_key=allowlist_key,
+            token_ref=token_ref, proxy_local=proxy_local, manifest=manifest.name,
         )
     else:
-        # Agent scope: the binding points at a user's own account — read from
-        # the bound user's token dir (owner_sub is always a real user_sub).
-        ref = credential_resolver.pick_account(
-            manifest.name, agent_name,
+        allowlist_key = manifest.name
+        key = str(header_block.get("value_from") or "")
+        value = bundle_env.get(key, "")
+        if not value:
+            return None, (
+                f"{manifest.label}: no {key} value is set for this session; enter "
+                "it in Settings > Integrations or ask an admin"
+            )
+        cred = GatewayCredential(
+            upstream=origin, path=path, allowlist_key=allowlist_key,
+            header=str(header_block.get("name") or ""), prefix="", value=value,
+            proxy_local=False, manifest=manifest.name, value_from=key,
         )
-        if ref is None:
-            return entry
-        account_label = ref.label
-        bound_username = _db.get_username_by_sub(ref.owner_sub) or ""
-        if not bound_username:
-            return entry
-        token_dir = oauth_account_store.get_token_dir(
-            bound_username, provider_id=provider_id,
+
+    allow_host = "localhost" if proxy_local else host
+    if not bearer_allowlist.is_host_allowed(allowlist_key, allow_host):
+        logger.warning(
+            "MCP %s left out of the session: host %s is not on the bearer "
+            "allowlist for %s", manifest.name, host, allowlist_key,
+        )
+        return None, (
+            f"{manifest.label}: the host {host} is not approved for {allowlist_key}; "
+            "an admin can approve it in Admin > Security"
         )
 
-    token_data = oauth_account_store.read_account_token(token_dir, account_label)
-    if not token_data:
-        return entry
-
-    # `extra.preferred_bearer` lets a provider override which token key
-    # is used as the bearer (Slack: bot vs user token). When set, look
-    # up that key inside `extra`; otherwise use canonical `access_token`.
-    extra = token_data.get("extra") or {}
-    preferred_bearer = extra.get("preferred_bearer", "")
-    if preferred_bearer and preferred_bearer in extra:
-        access_token = extra.get(preferred_bearer) or ""
-    else:
-        access_token = oauth_account_store.get_canonical_access_token(token_data)
-    if not access_token:
-        return entry
-
-    headers = dict(entry.get("headers", {}))
-    headers["Authorization"] = f"Bearer {access_token}"
+    entry["url"] = entry_url(srv_key, path)
+    headers = dict(entry.get("headers") or {})
+    headers["Authorization"] = SESSION_JWT_SENTINEL_BEARER
     entry["headers"] = headers
-    return entry
+    return cred, None
 
 
 def _inject_session_jwt_sentinel(
@@ -1995,11 +2184,12 @@ def _inject_session_jwt_sentinel(
     build time (it's bound per-layer for pre-warmed sessions), so we set a
     sentinel here that each per-layer ``?session_id=`` injection site
     (cli/codex/direct/remote) swaps for a real ``create_session_token`` once the
-    session_id is known. Mirrors ``core.credentials.mcp_broker.BROKER_BEARER_PLACEHOLDER``.
+    session_id is known. A credentialed entry already carries the same
+    sentinel from ``gateway_entry``.
 
     No-op for: MCPs that don't opt in, stdio entries (no ``url``), or entries
-    that already carry an ``Authorization`` header (never clobber a vendor
-    bearer). Returns the (possibly-mutated) entry.
+    that already carry an ``Authorization`` header. Returns the
+    (possibly-mutated) entry.
     """
     if (
         manifest.server.proxy_callbacks
@@ -2025,18 +2215,20 @@ def _origin_host(origin: str) -> str:
 def _apply_browser_allowed_origins(entry: dict[str, Any], allowed_origins: list[str]) -> None:
     """Inject a per-agent allow-list into the browser-control MCP entry.
 
-    Empty list ⇒ no allow-list (the manifest's default blocked-origins still
-    applies). @playwright/mcp reads ``PLAYWRIGHT_MCP_ALLOWED_ORIGINS`` directly;
-    its value is a semicolon-separated list of origins.
+    Empty list ⇒ no allow-list: the manifest ships no blocked origins, so the
+    agent reaches what its machine reaches. @playwright/mcp reads
+    ``PLAYWRIGHT_MCP_ALLOWED_ORIGINS`` directly; its value is a
+    semicolon-separated list of origins.
 
-    @playwright/mcp blocks an origin matching BOTH lists (deny wins), so hosts
-    the admin explicitly allow-listed are also SUBTRACTED from the entry's
-    blocked list (the manifest's loopback-safety default) — otherwise the agent
-    could never browse its own dev install at ``localhost``. Safe because a
-    non-empty allow-list flips @playwright/mcp to allowlist mode: everything
-    outside ``allowed_origins`` is unreachable regardless of the blocked list.
-    This is a network-request scope, NOT a hard security boundary — the
-    dedicated profile + per-machine device grant are the real boundary.
+    @playwright/mcp blocks an origin matching BOTH lists (deny wins), so when
+    an admin config value sets ``PLAYWRIGHT_MCP_BLOCKED_ORIGINS``, the hosts
+    the allow-list names are SUBTRACTED from it — otherwise an explicit allow
+    (the agent's own dev install at ``localhost``) could never open. Safe
+    because a non-empty allow-list flips @playwright/mcp to allowlist mode:
+    everything outside ``allowed_origins`` is unreachable regardless of the
+    blocked list. This is a network-request scope, NOT a hard security
+    boundary — the dedicated profile + per-machine device grant are the real
+    boundary.
     """
     if not allowed_origins:
         return
@@ -2085,13 +2277,21 @@ def _apply_browser_mode(
     a token, an unattended session (task / phone / meeting) gets
     ``OTO_BROWSER_UNATTENDED=1`` so the wrapper fails the first browser call
     at once instead of waiting for a click nobody will give.
+
+    An unattended session gets the saved token only when the machine row
+    opts in (``BrowserTargetSettings.unattended``, F47): a token left for an
+    attended person is not spent by a task, a call or a meeting that happens
+    to target the machine unless its owner chose to.
     """
     env = entry.get("env") or {}
     for key in _BROWSER_MODE_ENV_KEYS:
         env.pop(key, None)
     if target_browser is not None and target_browser.mode == "own":
         env["OTO_BROWSER_MODE"] = "own"
-        if target_browser.extension_token:
+        token_allowed = bool(target_browser.extension_token) and (
+            not unattended or getattr(target_browser, "unattended", False)
+        )
+        if token_allowed:
             from core.credentials.mcp_broker import SecretBundle
             env["OTO_BROWSER_TOKEN_EXPECTED"] = "1"
             bundle = secret_bundles.get("local") or SecretBundle()
@@ -2126,8 +2326,14 @@ def build_session_mcp_config(
     target_browser=None,
     external: bool = False,
     only_mcps: list[str] | None = None,
+    session_id: str = "",
 ) -> tuple[Path | None, dict[str, str], dict[str, str], dict, set]:
     """Main entry point: build a complete MCP config for a session.
+
+    ``session_id`` writes the build into the session's own directory (the
+    file keeps the identity's name), so a concurrent build of the same
+    identity never rewrites it between this build and its start; without
+    one the identity's shared file is written (a pooled build).
 
     ``only_mcps`` (CHECKS.md, the judge profile) keeps ONLY the named MCPs
     of what the agent's assignment and the gates above resolved — an
@@ -2177,7 +2383,7 @@ def build_session_mcp_config(
     interceptor re-injects identical values at spawn.
     """
     from services.oauth import credential_resolver
-    from core.credentials.mcp_broker import SecretBundle, BROKER_BEARER_PLACEHOLDER
+    from core.credentials.mcp_broker import SecretBundle
 
     # Determine context for exclusion checks
     context = "dashboard"
@@ -2275,6 +2481,13 @@ def build_session_mcp_config(
             exclusion_reasons[mcp_name] = context_reason
             continue
 
+        # The manifest's audience: a person below the tier it names is not
+        # handed the MCP (the prompt, the egress carve and the sandbox agree).
+        audience_reason = audience_refusal(manifest, user_role=user_role, task_scope=task_scope)
+        if audience_reason:
+            exclusion_reasons[mcp_name] = audience_reason
+            continue
+
         # Check credential exclusion
         if mcp_name in cred_result.excluded_mcps:
             exclusion_reasons[mcp_name] = cred_result.exclusion_reasons.get(
@@ -2323,22 +2536,13 @@ def build_session_mcp_config(
             session_ctx=session_ctx,
         )
 
-        # Bearer-token injection for remote-HTTP MCPs with
-        # `credentials.oauth.bearer_required=true` AND a host on the
-        # `oauth_bearer_allowlist`. No-op for stdio MCPs or those without
-        # bearer_required.
-        server_entry = maybe_inject_bearer_header(
-            server_entry, manifest, user_sub, agent_name, task_scope,
-        )
-
         # Credential broker: collect THIS MCP's secret material into a
         # bundle the stdio interceptor fetches at spawn. Resolver creds come
         # from the per-MCP attribution; the relay token + instance
-        # field_values are added at their injection points below; the bearer is
-        # lifted from the header maybe_inject_bearer_header just wrote (consumed
-        # by the proxy bearer-swap — dormant here). The PURE secrets are
-        # stripped from the flat env + config below; the interceptor re-fetches
-        # them from the broker at spawn.
+        # field_values are added at their injection points below; an HTTP
+        # MCP's credential is the bundle's gateway half (``gateway_entry``).
+        # The PURE secrets are stripped from the flat env + config below;
+        # the interceptor re-fetches them from the broker at spawn.
         # Bundle carries ONLY this MCP's PURE secrets — NOT the
         # credentials_dir paths or env_injection in env_by_mcp, which stay in the
         # flat env (the broker fetch would otherwise overwrite the sandbox-virtual
@@ -2357,38 +2561,9 @@ def build_session_mcp_config(
                 _val = (server_entry.get("env") or {}).pop(_env_key, "")
                 if _val:
                     bundle_env[_env_key] = _val
-        # HTTP bearer-swap: a proxy-terminable HTTP MCP (github/m365 —
-        # localhost Docker sidecar) must NOT ship its real bearer in the config
-        # FILE. Lift it into the bundle and replace the file header with a
-        # sentinel; each spawn path swaps the sentinel for the real token (local)
-        # or the per-session JWT (remote → tunnel `_dispatch`). Vendor HTTP MCPs
-        # (external host: slack/linear/zoom) stay direct-to-vendor with
-        # the real bearer inline — an accepted residual until they too can be
-        # tunnel-routed (gated on the streamable-HTTP-over-tunnel fix). Keying on
-        # the host (not the manifest) mirrors the remote rewriter's own guard, so
-        # `bundle_bearer` is set IFF the MCP is proxy-terminable — every consumer
-        # self-gates on that.
-        bundle_bearer = None
-        _auth = server_entry.get("headers", {}).get("Authorization", "")
-        if _auth.startswith("Bearer "):
-            from urllib.parse import urlparse as _urlparse
-            _bearer_host = _urlparse(server_entry.get("url", "")).hostname or ""
-            # Proxy-local sidecar = loopback (T1) OR this Docker MCP's service-DNS
-            # name (T2). Both are proxy-terminable, so the real vendor bearer is
-            # lifted into the broker and replaced with a sentinel here; a vendor
-            # MCP on a public host (slack/linear) is NOT proxy-local and keeps
-            # its bearer inline. Keying on deployment (not a bare string) is what
-            # keeps github/m365 from shipping their real token to disk in T2.
-            if deployment.is_proxy_local_mcp_host(_bearer_host, manifest):
-                bundle_bearer = _auth[7:]
-                server_entry["headers"]["Authorization"] = (
-                    f"Bearer {BROKER_BEARER_PLACEHOLDER}"
-                )
-
         # Per-session JWT for Docker/HTTP MCPs that call back to the proxy hooks
-        # (manifest ``server.proxy_callbacks``; today only file-tools). Set the
-        # sentinel AFTER the bearer-swap lift above so the localhost-bearer-lift never
-        # mistakes it for a vendor bearer. See _inject_session_jwt_sentinel.
+        # (manifest ``server.proxy_callbacks``; today only file-tools). See
+        # _inject_session_jwt_sentinel.
         server_entry = _inject_session_jwt_sentinel(server_entry, manifest)
 
         # Instance-based MCP config (generalized — replaces SSH-specific block)
@@ -2482,6 +2657,25 @@ def build_session_mcp_config(
                     # never the config file.
                     bundle_env.update(chosen["field_values"])
 
+        # Use server_name (backward-compatible key) for the mcpServers dict
+        srv_key = manifest.server_name or mcp_name
+
+        # The credential gateway: a remote-HTTP MCP with a credential dials
+        # the gateway route with the session token; the credential rides the
+        # bundle and is added per request on the way out. After the instance
+        # block, so an env-delivered key is in ``bundle_env``.
+        gateway_cred, gateway_reason = gateway_entry(
+            server_entry, manifest, srv_key=srv_key, user_sub=user_sub,
+            agent_name=agent_name, task_scope=task_scope, bundle_env=bundle_env,
+        )
+        if gateway_reason:
+            exclusion_reasons[mcp_name] = gateway_reason
+            continue
+        if gateway_cred is not None:
+            # An HTTP MCP has no process to fetch an env: the key's value
+            # lives in the credential alone.
+            bundle_env = {}
+
         # Host-self target rewrite (T1): a homelab MCP configured with one of the
         # proxy host's OWN IPs (a co-located service, e.g. Prometheus on the
         # bare-metal box) must dial 127.0.0.1 — that IP is local inside the
@@ -2497,13 +2691,9 @@ def build_session_mcp_config(
                 user_sub=user_sub, task_scope=task_scope,
             )
 
-        # Use server_name (backward-compatible key) for the mcpServers dict
-        srv_key = manifest.server_name or mcp_name
         servers[srv_key] = server_entry
-        if bundle_env or bundle_bearer:
-            secret_bundles[srv_key] = SecretBundle(
-                env=bundle_env, http_bearer=bundle_bearer,
-            )
+        if bundle_env or gateway_cred is not None:
+            secret_bundles[srv_key] = SecretBundle(env=bundle_env, gateway=gateway_cred)
             # A credentialed (wrapped) stdio MCP drops the bash-only
             # env_injection creds (GH_TOKEN/GIT_CONFIG_*) it would inherit from
             # the CLI env — the interceptor strips OTO_STRIP_KEYS-named vars at
@@ -2521,9 +2711,9 @@ def build_session_mcp_config(
         servers["delegation-mcp"].setdefault("env", {})["DELEGATION_MCP_TARGETS"] = ",".join(delegation_targets)
 
     # Inject the per-agent allowed browser origins into the browser-control
-    # entry (server_name "local"). Empty list = permissive (the manifest's
-    # blocked-origins default still applies). Only hit the DB when the browser
-    # MCP actually attached to this session.
+    # entry (server_name "local"). Empty list = no limit (the manifest ships
+    # no blocked origins). Only hit the DB when the browser MCP actually
+    # attached to this session.
     if "local" in servers:
         from storage.agents import agent_store as _agent_store
         _apply_browser_allowed_origins(
@@ -2543,6 +2733,10 @@ def build_session_mcp_config(
     # Write config file
     sub_hash = hashlib.sha256((user_sub or "agent").encode()).hexdigest()[:12]
     config_out_dir = config.SESSIONS_DIR / "user-mcp-configs"
+    if session_id:
+        _sweep_session_builds(config_out_dir / _SESSION_BUILDS)
+        config_out_dir = (config_out_dir / _SESSION_BUILDS
+                          / hashlib.sha256(session_id.encode()).hexdigest()[:16])
     config_out_dir.mkdir(parents=True, exist_ok=True)
 
     if mcp_config_format == "toml":
@@ -2560,8 +2754,42 @@ def build_session_mcp_config(
         mcp_config = {"mcpServers": servers}
         config_path = config_out_dir / f"{agent_name}-{sub_hash}.json"
         config_path.write_text(json.dumps(mcp_config, indent=2))
+    if session_id:
+        # A rewrite in place leaves the directory's time alone: touched, so
+        # the day-old sweep never takes a resumed session's fresh build.
+        with contextlib.suppress(OSError):
+            os.utime(config_out_dir)
 
     return config_path, flat_env, exclusion_reasons, secret_bundles, cred_result.bash_env_keys
+
+
+# The per-session build directories under ``user-mcp-configs/``: one per
+# session that built, swept once they outlive a session token's day.
+_SESSION_BUILDS = "sessions"
+_SESSION_BUILD_TTL_S = 24 * 3600
+_BUILD_SWEEP_EVERY_S = 3600.0
+_build_sweep_at: float | None = None
+
+
+def _sweep_session_builds(root: Path) -> None:
+    """Remove the session build directories older than a day, at most once
+    an hour (the boot empties the whole tree anyway)."""
+    import shutil
+    import time
+    global _build_sweep_at
+    now = time.monotonic()
+    if _build_sweep_at is not None and now - _build_sweep_at < _BUILD_SWEEP_EVERY_S:
+        return
+    _build_sweep_at = now
+    cutoff = time.time() - _SESSION_BUILD_TTL_S
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        with contextlib.suppress(OSError):
+            if entry.is_dir() and not entry.is_symlink() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def inject_credential_env_into_toml(

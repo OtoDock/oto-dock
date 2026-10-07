@@ -14,7 +14,7 @@
 # Telephony takes calls only once a PBX / SIP trunk or Twilio is configured
 # in the dashboard (Setup → Phone) — until then the service idles fail-closed.
 
-ARG PYTHON_IMAGE=python:3.13.14-slim-bookworm
+ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm
 FROM ${PYTHON_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -66,7 +66,7 @@ EXPOSE 9092 9093
 
 # Liveness — the HTTP API serves /health (open) once the daemon has its config.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=4 \
-  CMD curl -fsS http://localhost:9093/health || exit 1
+  CMD ["sh", "-c", "curl -fsS http://localhost:9093/health || exit 1"]
 
 USER 1000:1000
 

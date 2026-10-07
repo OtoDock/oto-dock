@@ -564,11 +564,32 @@ def script_as_written(text: str) -> str:
     return text if text.endswith("\n") else text + "\n"
 
 
+def judge_envelope_problem(agent: str, judge: dict) -> str | None:
+    """Why a judge's ``engine`` and ``model`` are outside what ``agent`` has
+    enabled (``spawn_authz.validate_spawn_overrides``, the rule a delegated
+    worker's override meets), or None. A retired model is judged as its
+    successor, the model the run would use."""
+    engine = (judge or {}).get("engine") or None
+    model = config.successor_model((judge or {}).get("model") or "") or None
+    if not (engine or model):
+        return None
+    from fastapi import HTTPException
+    from services.delegation.spawn_authz import validate_spawn_overrides
+    try:
+        validate_spawn_overrides(agent, engine, model)
+    except HTTPException as e:
+        return f"judge: {e.detail}"
+    return None
+
+
 def write_check(agent: str, owner: str, doc, script: str | None, *, updated_by: str) -> CheckDoc:
     """Validate, write the folder (the document and, when given, the
     script), commit the config repo, and index. Synchronous; the caller
     fans the write out to satellites (``fan_out``)."""
     clean = validate_check_doc(doc, owner=owner)
+    problem = judge_envelope_problem(agent, clean.get("judge") or {})
+    if problem:
+        raise CheckError(problem)
     name = clean["name"]
     folder = check_folder(agent, owner, name)
     if _linked(agent, folder):

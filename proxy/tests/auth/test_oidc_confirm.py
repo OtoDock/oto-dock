@@ -60,8 +60,12 @@ def _provider(monkeypatch):
     task_store.update_user_auth_fields(SUB, auth_provider="oidc:mock-sso")
     task_store.upsert_user(LOCAL, f"{LOCAL}@test.com", "Local Person", "member")
     task_store.update_user_auth_fields(LOCAL, auth_provider="local")
-    from auth import rate_limiter
+    from auth import providers, rate_limiter
     rate_limiter._attempts.clear()
+    # One client address starts every confirm here: no test inherits the
+    # states (and the per-client count) another test left live.
+    providers._oauth_states.clear()
+    providers._client_states.clear()
     client.cookies.clear()
     _as(_ctx())
     yield
@@ -206,6 +210,41 @@ def test_start_sits_on_the_confirm_bucket():
     assert 200 in codes and 429 in codes
 
 
+def _fill_states(monkeypatch, n: int = 3) -> list[str]:
+    from auth import providers
+    monkeypatch.setattr(providers, "_STATE_MAX", n)
+    monkeypatch.setattr(providers, "_oauth_states", {})
+    return [providers.create_oauth_state() for _ in range(n)]
+
+
+def test_a_confirm_start_at_the_state_bound_is_refused_and_evicts_nothing(monkeypatch):
+    """Confirm states share the sign-in state store and its bound."""
+    from auth import providers
+    live = _fill_states(monkeypatch)
+    r = _start()
+    assert r.status_code == 503 and int(r.headers["Retry-After"]) >= 1
+    assert list(providers._oauth_states) == live
+
+
+def test_a_confirm_start_from_a_client_at_its_cap_is_refused(monkeypatch):
+    """Confirm states share the store and the per-client cap."""
+    from auth import providers
+    for _ in range(8):
+        providers.create_oauth_state(client="testclient")
+    r = _start()
+    assert r.status_code == 429 and int(r.headers["Retry-After"]) >= 1
+
+
+def test_the_bypass_login_at_the_state_bound_is_refused(monkeypatch):
+    from auth import providers
+    monkeypatch.setattr(config, "AUTH_PROVIDER_BYPASS", True)
+    app.dependency_overrides.pop(get_current_user, None)
+    live = _fill_states(monkeypatch)
+    r = TestClient(app).get("/auth/login")
+    assert r.status_code == 503 and int(r.headers["Retry-After"]) >= 1
+    assert list(providers._oauth_states) == live
+
+
 # ── the callback's confirm branch ──────────────────────────────────────────
 
 
@@ -273,15 +312,65 @@ def test_callback_without_auth_time_passes_unless_required(monkeypatch):
     assert r.status_code == 403 and "when you logged in" in r.json()["detail"]
 
 
-def test_callback_accepts_a_list_audience_and_no_id_token(monkeypatch):
+def test_callback_accepts_a_list_audience_and_refuses_no_id_token(monkeypatch):
     state = _state_of(_start().json()["url"])
     monkeypatch.setattr(identity._oidc_provider, "authenticate", AsyncMock(
         return_value=_result(aud=["test-client", "other"], sub=SUB, auth_time=time.time())))
     assert client.post("/auth/callback", json={"code": "c", "state": state}).status_code == 200
-    # A provider that returns no ID token at all: the userinfo sub is the check.
+    # No verified ID token claims, no confirm (F66: authenticate refuses
+    # that already; the confirm holds on its own too).
     state = _state_of(_start().json()["url"])
     monkeypatch.setattr(identity._oidc_provider, "authenticate", AsyncMock(return_value=_result()))
+    assert client.post("/auth/callback", json={"code": "c", "state": state}).status_code == 403
+
+
+def test_callback_hands_the_state_nonce_and_verifier_to_the_provider(monkeypatch):
+    from auth import providers
+    state = _state_of(_start().json()["url"])
+    meta = dict(providers._oauth_states[state])
+    seen = {}
+
+    async def fake(data):
+        seen.update(data)
+        return _result(aud="test-client", sub=SUB, auth_time=time.time())
+
+    monkeypatch.setattr(identity._oidc_provider, "authenticate", fake)
     assert client.post("/auth/callback", json={"code": "c", "state": state}).status_code == 200
+    assert seen["nonce"] == meta["nonce"] and len(seen["nonce"]) >= 32
+    assert seen["code_verifier"] == meta["code_verifier"] and len(seen["code_verifier"]) >= 43
+
+
+def test_a_refused_id_token_is_explained(monkeypatch):
+    state = _state_of(_start().json()["url"])
+    monkeypatch.setattr(identity._oidc_provider, "authenticate", AsyncMock(return_value=AuthResult(
+        success=False, error="The sign-in's signature did not verify.", error_code="bad_signature")))
+    r = client.post("/auth/callback", json={"code": "c", "state": state})
+    assert r.status_code == 403 and "signature did not verify" in r.json()["detail"]
+
+
+def _login_with(monkeypatch, *, sub, email, verified):
+    c = client
+    r = c.get("/auth/oidc-url")
+    state = _state_of(r.json()["url"])
+    monkeypatch.setattr(identity._oidc_provider, "authenticate", AsyncMock(return_value=AuthResult(
+        success=True, sub=sub, email=email, name=sub, role="member",
+        auth_provider="oidc:mock-sso", id_claims={"sub": sub, "aud": "test-client"},
+        email_verified=verified)))
+    return c.post("/auth/callback", json={"code": "c", "state": state})
+
+
+def test_an_unverified_email_that_another_account_uses_is_refused(monkeypatch):
+    """F66, the operator's answer (2026-10-02): an unverified email is kept,
+    unless another account here already uses it."""
+    monkeypatch.setattr(identity, "check_seat_limit", lambda: (True, 1, 99))
+    r = _login_with(monkeypatch, sub="oidc-new-1", email=f"{LOCAL}@test.com", verified=False)
+    assert r.status_code == 403 and "does not confirm this email" in r.json()["detail"]
+    assert task_store.get_user("oidc-new-1") is None
+    # The provider vouching for it, or an address nobody uses, signs in.
+    assert _login_with(monkeypatch, sub="oidc-new-2", email="fresh-address@test.com",
+                       verified=False).status_code == 200
+    assert _login_with(monkeypatch, sub="oidc-new-3", email=f"{LOCAL}@test.com",
+                       verified=True).status_code == 200
 
 
 def test_callback_confirm_state_needs_the_browser_binding(monkeypatch):
@@ -291,16 +380,3 @@ def test_callback_confirm_state_needs_the_browser_binding(monkeypatch):
         return_value=_result(aud="test-client", sub=SUB, auth_time=time.time())))
     r = client.post("/auth/callback", json={"code": "c", "state": state})
     assert r.status_code == 400 and "does not match this browser" in r.json()["detail"]
-
-
-def test_id_token_claims_are_read_defensively():
-    from auth.providers.oidc_provider import _id_token_claims
-    import base64
-    import json
-    payload = base64.urlsafe_b64encode(json.dumps({"sub": "x", "auth_time": 5}).encode()).decode().rstrip("=")
-    assert _id_token_claims(f"h.{payload}.s") == {"sub": "x", "auth_time": 5}
-    assert _id_token_claims("not.a.jwt.at.all") == {}
-    assert _id_token_claims("h.!!!.s") == {}
-    assert _id_token_claims(None) == {}
-    arr = base64.urlsafe_b64encode(b"[1]").decode().rstrip("=")
-    assert _id_token_claims(f"h.{arr}.s") == {}

@@ -215,6 +215,45 @@ def _version_at_least(version: str, minimum: str) -> bool:
     return v_parts >= m_parts
 
 
+def _auth_ok(machine: dict, *, cli_pins: dict[str, str] | None = None) -> dict:
+    """The ``auth_result: ok`` frame. It carries the satellite-host policy so
+    the satellite can re-validate file writes locally: defense in depth, a
+    compromised proxy can't trick a home-only satellite into writing
+    /etc/sudoers because the satellite checks against its own local copy of
+    allow_full_fs before any satellite_host write."""
+    return {
+        "type": "auth_result",
+        "status": "ok",
+        "policy": {
+            "allow_full_fs": bool(machine.get("allow_full_fs") or False),
+            # Device-control consent set, so the
+            # satellite can re-check capability grants at tool time.
+            "device_grants": sorted(
+                placement.parse_device_grants(machine.get("device_grants"))
+            ),
+            # Universal per-file sync cap (OTODOCK_MAX_FILE_MB) — the proxy
+            # config is the single source of truth; 0.5.103+ satellites apply
+            # it to their manifests + inbound writes. Handshake-only delivery:
+            # the cap changes only on proxy restart, which re-auths every WS.
+            "sync_max_file_bytes": app_config.SYNC_MAX_FILE_BYTES,
+            # Marker-confirmed generated-dir exclusions (1.5). 0.5.110+
+            # satellites validate + apply the table to every sync walk;
+            # older ones ignore the unknown key (their set_policy whitelist)
+            # and the proxy's per-machine manifest gate keeps THEIR walks
+            # legacy too (satellite_supports_sync_ignore_rules) — the two
+            # sides must always walk with the same rules. Validated once at
+            # send so a config typo degrades to legacy instead of shipping
+            # asymmetric garbage.
+            "sync_ignore_rules": file_sync_rules.validate_ignore_rules(
+                app_config.SYNC_IGNORE_RULES),
+        },
+        # CLI version pins (VERSIONS.md) — the satellite reconciles its installed
+        # claude/codex to these on auth, so the fleet runs the EXACT versions the
+        # platform verified. Empty value → satellite skips that CLI (fail-open).
+        "cli_pins": _cli_pins() if cli_pins is None else cli_pins,  # {pin_key: version}
+    }
+
+
 async def _refuse(websocket: WebSocket, reason: str, *, code: int, close_reason: str,
                   **extra: str) -> None:
     """Answer a refused handshake with its ``auth_result`` and close. A peer
@@ -228,8 +267,57 @@ async def _refuse(websocket: WebSocket, reason: str, *, code: int, close_reason:
         await websocket.close(code=code, reason=close_reason)
 
 
+# Sockets held in the pre-auth phase per client address: a peer that opens
+# connections and sends nothing holds each for ``_AUTH_TIMEOUT_S``; past the
+# cap a new one is refused at once. The address is the resolved client
+# (``auth/lan_check``), the hop's when no hop is trusted, so the cap is
+# generous: a healthy satellite's auth frame arrives at once.
+_PREAUTH_PER_ADDRESS = 32
+_preauth: dict[str, int] = {}
+
+
+def _preauth_acquire(addr: str) -> bool:
+    if _preauth.get(addr, 0) >= _PREAUTH_PER_ADDRESS:
+        return False
+    _preauth[addr] = _preauth.get(addr, 0) + 1
+    return True
+
+
+def _preauth_release(addr: str) -> None:
+    n = _preauth.get(addr, 0) - 1
+    if n <= 0:
+        _preauth.pop(addr, None)
+    else:
+        _preauth[addr] = n
+
+
 async def ws_satellite_handler(websocket: WebSocket):
     """WebSocket handler for satellite daemon connections."""
+    from auth import lan_check
+    addr = lan_check.resolve(getattr(websocket, "scope", None) or {}).client or "?"
+    if not _preauth_acquire(addr):
+        logger.warning("Satellite socket from %s refused: %d in the auth phase already",
+                       addr, _PREAUTH_PER_ADDRESS)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=1013, reason="try again later")
+        return
+    # One-shot: the slot frees when the auth PHASE ends (authenticated or
+    # refused), never held for the life of a connected socket, so a reconnect
+    # storm of unauthenticated sockets is the only thing the cap bounds.
+    freed = {"done": False}
+
+    def _free() -> None:
+        if not freed["done"]:
+            freed["done"] = True
+            _preauth_release(addr)
+
+    try:
+        await _ws_satellite_handler(websocket, _free)
+    finally:
+        _free()
+
+
+async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
     await websocket.accept()
 
     # --- Authentication (5s timeout) ---
@@ -314,6 +402,9 @@ async def ws_satellite_handler(websocket: WebSocket):
         logger.warning("Satellite auth failed for machine %s", machine_id[:8])
         await _refuse(websocket, "Invalid credentials", code=4001, close_reason="Auth rejected")
         return
+    # Authenticated: the auth phase is over, so the pre-auth slot frees now
+    # (the socket then lives for hours; it must not count against the cap).
+    _free()
 
     # --- version policy + auto-update push ---
     # After authentication so we never send the tarball to an unknown peer.
@@ -362,6 +453,26 @@ async def ws_satellite_handler(websocket: WebSocket):
             logger.exception("Failed to announce update rollback")
         needs_update = False  # connect on the old version; do not re-push
 
+    # A satellite on a plaintext link it opted into (``insecure_transport``
+    # in its capabilities) refuses code it cannot authenticate, so no update
+    # is pushed to it: the operator re-runs the installer on that machine.
+    insecure_link = bool(capabilities.get("insecure_transport"))
+    if (needs_update or must_reject) and insecure_link:
+        logger.warning(
+            "Satellite %s runs %s on a plaintext link: the update to %s is not pushed; "
+            "re-run the installer on that machine",
+            machine_id[:8], sat_version or "unknown", SATELLITE_VERSION_LATEST,
+        )
+        if must_reject:
+            await _refuse(
+                websocket,
+                f"Satellite version {sat_version or 'unknown'} is older than the "
+                f"proxy's minimum {MIN_SATELLITE_VERSION}, and this machine's link is "
+                "plaintext, so no update is pushed to it: re-run the installer there.",
+                code=4001, close_reason="version too old",
+            )
+            return
+        needs_update = False
     if needs_update or must_reject:
         auto_update = bool(machine.get("auto_update_enabled", True))
         pending = bool(machine.get("pending_update", False))
@@ -382,7 +493,17 @@ async def ws_satellite_handler(websocket: WebSocket):
             # Push the new tarball over WS, then close. The satellite
             # extracts, restarts via systemd, and reconnects on the new
             # version. Dashboards are notified by _broadcast_satellite_updating.
+            #
+            # ``auth_result: ok`` goes first: the satellite waits only 5 s
+            # for its answer, and the tarball (about 0.32 MB on the wire)
+            # needs about 0.6 Mbit/s of free uplink per satellite inside
+            # them, a share that shrinks when every satellite reconnects at
+            # once, and a miss reads as a rollback. Past the auth every satellite applies
+            # ``update_required`` from its message loop, with no deadline.
+            # No CLI pins: no reconcile starts on code about to be replaced.
+            # The connection is never registered.
             try:
+                await websocket.send_text(json.dumps(_auth_ok(machine, cli_pins={})))
                 from api.remote.remote_machines import get_satellite_tarball_with_hash
                 import base64 as _b64
                 # Cached after the first build, but that first build tars
@@ -448,42 +569,7 @@ async def ws_satellite_handler(websocket: WebSocket):
         await run_db(remote_store.set_satellite_version, machine_id, sat_version)
     except Exception:
         logger.exception("Failed to record satellite_version")
-    # Include the satellite-host policy in auth_result
-    # so the satellite can re-validate file writes locally. Defense in
-    # depth — a compromised proxy can't trick a home-only satellite into
-    # writing /etc/sudoers because the satellite checks against its own
-    # local copy of allow_full_fs before any satellite_host write.
-    await websocket.send_text(json.dumps({
-        "type": "auth_result",
-        "status": "ok",
-        "policy": {
-            "allow_full_fs": bool(machine.get("allow_full_fs") or False),
-            # Device-control consent set, so the
-            # satellite can re-check capability grants at tool time.
-            "device_grants": sorted(
-                placement.parse_device_grants(machine.get("device_grants"))
-            ),
-            # Universal per-file sync cap (OTODOCK_MAX_FILE_MB) — the proxy
-            # config is the single source of truth; 0.5.103+ satellites apply
-            # it to their manifests + inbound writes. Handshake-only delivery:
-            # the cap changes only on proxy restart, which re-auths every WS.
-            "sync_max_file_bytes": app_config.SYNC_MAX_FILE_BYTES,
-            # Marker-confirmed generated-dir exclusions (1.5). 0.5.110+
-            # satellites validate + apply the table to every sync walk;
-            # older ones ignore the unknown key (their set_policy whitelist)
-            # and the proxy's per-machine manifest gate keeps THEIR walks
-            # legacy too (satellite_supports_sync_ignore_rules) — the two
-            # sides must always walk with the same rules. Validated once at
-            # send so a config typo degrades to legacy instead of shipping
-            # asymmetric garbage.
-            "sync_ignore_rules": file_sync_rules.validate_ignore_rules(
-                app_config.SYNC_IGNORE_RULES),
-        },
-        # CLI version pins (VERSIONS.md) — the satellite reconciles its installed
-        # claude/codex to these on auth, so the fleet runs the EXACT versions the
-        # platform verified. Empty value → satellite skips that CLI (fail-open).
-        "cli_pins": _cli_pins(),  # {pin_key: version} — see _cli_pins
-    }))
+    await websocket.send_text(json.dumps(_auth_ok(machine)))
 
     cm = get_connection_manager()
 

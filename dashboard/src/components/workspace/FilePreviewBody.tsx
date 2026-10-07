@@ -8,6 +8,7 @@ import FileEditor from '../FileEditor'
 import FilePreviewPortal from './FilePreviewPortal'
 import VideoPlayer from '../chat/media/VideoPlayer'
 import AudioPlayer from '../chat/media/AudioPlayer'
+import CollaboraFrame, { type CollaboraFrameData } from '../chat/media/CollaboraFrame'
 
 interface Props {
   agent: string
@@ -204,8 +205,8 @@ function DocumentPreview({
   canWrite: boolean
   onClose: () => void
 }) {
-  // Cache the wopi_url at mount; never re-derive from React Query state.
-  const [wopiUrl, setWopiUrl] = useState<string | null>(null)
+  // Cache the frame at mount; never re-derive from React Query state.
+  const [frame, setFrame] = useState<CollaboraFrameData | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [reloadTs, setReloadTs] = useState(0)
   const reload = useCallback(() => setReloadTs(Date.now()), [])
@@ -228,20 +229,14 @@ function DocumentPreview({
         if (!res.ok) throw new Error(await res.text())
         return res.json()
       })
-      .then((data) => !cancelled && setWopiUrl(data.wopi_url))
+      .then((data) => !cancelled && setFrame({
+        url: data.wopi_url, token: data.access_token, ttl: data.access_token_ttl,
+      }))
       .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
     return () => {
       cancelled = true
     }
   }, [agent, node.path, canWrite])
-
-  const effectiveUrl = wopiUrl
-    ? reloadTs
-      ? wopiUrl.includes('?')
-        ? `${wopiUrl}&_r=${reloadTs}`
-        : `${wopiUrl}?_r=${reloadTs}`
-      : wopiUrl
-    : null
 
   return (
     <FilePreviewPortal
@@ -267,20 +262,19 @@ function DocumentPreview({
             {error}
           </div>
         )}
-        {!error && !effectiveUrl && (
+        {!error && !frame && (
           <div className="h-full flex items-center justify-center text-white/70 text-sm">
             Loading preview…
           </div>
         )}
-        {effectiveUrl && (
-          <iframe
-            ref={iframeRef}
-            key={effectiveUrl}
-            src={effectiveUrl}
+        {frame && (
+          <CollaboraFrame
+            iframeRef={iframeRef}
+            url={frame.url}
+            accessToken={frame.token}
+            accessTokenTtl={frame.ttl}
+            frameKey={reloadTs}
             className="w-full h-full border-0"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
-            allow="clipboard-read; clipboard-write; fullscreen"
-              allowFullScreen
           />
         )}
       </div>

@@ -8,19 +8,21 @@ import { DEPLOY_STATE } from '../../lib/status/appDeploy'
 import { useDashboardWs } from '../../hooks/useDashboardWs'
 import AppFrame from '../../components/apps/AppFrame'
 import AppMenu from '../../components/apps/AppMenu'
-import { RollbackConfirm, RollbackNotice } from '../../components/apps/AppsOverlay'
+import { RollbackConfirm, RollbackNotice, UnpinConfirm } from '../../components/apps/AppsOverlay'
 import AppApprovalCard, { appNeedsApproval } from '../../components/apps/AppApprovalCard'
 import AppDeployCard from '../../components/apps/AppDeployCard'
 import AppLogsPanel from '../../components/apps/AppLogsPanel'
 import AppSettingsPanel from '../../components/apps/AppSettingsPanel'
 import SharePopover from '../../components/sharing/SharePopover'
+import { GRANTEE_KIND, useHideShare, usePatchShare } from '../../api/shares'
 
 /**
  * /apps/:appId — one app full screen. Every app has this URL: the menu's
  * "Open full screen", navigation from other apps, notification taps. Access
- * is the serve rule (owner, agent member, admin; a Dock pin also needs its
- * chat) and a stranger gets the same absence a missing id gets. Signed out,
- * RequireAuth renders the login page in place and returns here.
+ * is the serve rule (owner, agent member, admin, a person a share admits —
+ * their own share, or a placement in an agent they hold; a Dock pin also
+ * needs its chat) and a stranger gets the same absence a missing id gets.
+ * Signed out, RequireAuth renders the login page in place and returns here.
  *
  * The page mounts its own dashboard socket so live reload (file_updated)
  * and the platform feeds keep working without a chat page underneath.
@@ -49,6 +51,9 @@ export default function AppPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   const [confirmUnpin, setConfirmUnpin] = useState(false)
+  // "Remove for me" on a person's own placement: the revoke of their share,
+  // bound to the share it was opened for (a refetch may change the row).
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
   const [confirmRollback, setConfirmRollback] = useState(false)
   const [rollbackNotice, setRollbackNotice] = useState<{ text: string; error: boolean } | null>(null)
   const [sharing, setSharing] = useState(false)
@@ -86,8 +91,21 @@ export default function AppPage() {
   const hideForMe = useHideAppForMe(app?.agent ?? '')
   const rollback = useRollbackApp(app?.agent ?? '')
   const purge = usePurgeApp(app?.agent ?? '')
+  const hideShare = useHideShare()
+  const patchShare = usePatchShare()
 
   const member = !!app && !!user && (isAdmin(user) || user.agents.includes(app.agent))
+  // Where "back", a hide and a removal land: the app's agent for a member,
+  // else the agent a share placed it in for this viewer (SHARING.md), else
+  // home.
+  const home = !app ? '/' : member ? `/chat/${app.agent}` : app.placement ? `/chat/${app.placement.agent}` : '/'
+  const hideForViewer = () => {
+    if (!app) return
+    if (app.placement) hideShare.mutate({ id: app.placement.share_id, agent: app.placement.agent })
+    else if (app.share_id) hideShare.mutate({ id: app.share_id })
+    else hideForMe.mutate(app.id)
+    navigate(home)
+  }
   const onSendPrompt = useCallback(
     async (row: PinnedApp, action: { id: string; label: string; prompt: string }, args: unknown) => {
       if (!app) return { status: 'unavailable', reason: 'not available in this view' }
@@ -129,7 +147,7 @@ export default function AppPage() {
         style={{ paddingTop: 'max(0.375rem, env(safe-area-inset-top))' }}
       >
         <button
-          onClick={() => navigate(`/chat/${app.agent}`)}
+          onClick={() => navigate(home)}
           aria-label="Back to the agent"
           title="Back to the agent"
           className="flex h-7 w-7 items-center justify-center rounded-full text-p-text-secondary transition-colors hover:bg-p-surface-hover hover:text-p-text"
@@ -139,16 +157,15 @@ export default function AppPage() {
           </svg>
         </button>
         <h1 className="min-w-0 flex-1 truncate text-sm font-medium text-p-text">{title}</h1>
-        <span className={`hidden text-[10px] uppercase tracking-wide sm:inline ${app.scope === 'shared' ? 'text-p-accent-purple' : 'text-brand'}`}>
-          {app.scope === 'shared' ? 'shared' : 'personal'}
+        <span className={`hidden text-[10px] uppercase tracking-wide sm:inline ${app.granted || app.placement ? 'text-p-accent-teal' : app.scope === 'shared' ? 'text-p-accent-purple' : 'text-brand'}`}>
+          {app.granted || app.placement ? 'shared with you' : app.scope === 'shared' ? 'shared' : 'personal'}
         </span>
         <AppMenu
           app={app}
           fullScreen
-          onHideForMe={app.scope === 'shared' || app.granted
-            ? () => { hideForMe.mutate(app.id); navigate(member ? `/chat/${app.agent}` : '/agents') }
-            : undefined}
+          onHideForMe={app.scope === 'shared' || app.granted || app.placement ? hideForViewer : undefined}
           onUnpin={app.can_manage ? () => setConfirmUnpin(true) : undefined}
+          onRemoveForMe={app.placement?.kind === GRANTEE_KIND.PERSON ? () => setConfirmRemove(app.placement!.share_id) : undefined}
           onShare={app.can_manage ? () => setSharing(true) : undefined}
           onRollback={app.can_manage ? () => { setConfirmUnpin(false); setConfirmRollback(true) } : undefined}
           onLogs={appKind(app).mayServe && app.can_manage ? () => setLogsOpen(true) : undefined}
@@ -162,7 +179,7 @@ export default function AppPage() {
         <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/5 px-3 py-2.5 text-xs" data-testid="app-delete-confirm">
           <span className="text-p-text">
             Delete “{title}” with its data? The app, its releases and its database are removed
-            for good; the folder goes to the recover bin. Type <code className="font-mono">{app.slug}</code> to confirm.
+            for good. The folder goes to the recover bin. Type <code className="font-mono">{app.slug}</code> to confirm.
           </span>
           <input
             value={deleteTyped}
@@ -213,21 +230,26 @@ export default function AppPage() {
       )}
       {rollbackNotice && <RollbackNotice notice={rollbackNotice} onClose={() => setRollbackNotice(null)} />}
       {confirmUnpin && (
-        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs">
+        <UnpinConfirm
+          app={app}
+          onConfirm={() => { setConfirmUnpin(false); unpin.mutate(app.id); navigate(`/chat/${app.agent}`) }}
+          onCancel={() => setConfirmUnpin(false)}
+        />
+      )}
+      {confirmRemove && app.placement?.kind === GRANTEE_KIND.PERSON && app.placement.share_id === confirmRemove && (
+        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs" data-testid="app-remove-confirm">
           <span className="text-p-text">
-            {app.scope === 'shared'
-              ? `Unpin “${title}” for everyone? The workspace file and the approved actions are kept — ask the agent to pin it back anytime.`
-              : `Unpin “${title}”? The workspace file and the approved actions are kept — ask the agent to pin it back anytime.`}
+            Remove “{title}” from your apps? {app.placement.shared_by_name || 'The person who shared it'} can share it again.
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-2">
             <button
-              onClick={() => { setConfirmUnpin(false); unpin.mutate(app.id); navigate(`/chat/${app.agent}`) }}
+              onClick={() => { setConfirmRemove(null); patchShare.mutate({ id: confirmRemove, revoke: true }); navigate(home) }}
               className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
             >
-              {app.scope === 'shared' ? 'Unpin for everyone' : 'Unpin'}
+              Remove for me
             </button>
             <button
-              onClick={() => setConfirmUnpin(false)}
+              onClick={() => setConfirmRemove(null)}
               className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
             >
               Cancel

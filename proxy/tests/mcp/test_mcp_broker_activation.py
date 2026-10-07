@@ -37,13 +37,14 @@ from core.credentials import mcp_broker # noqa: E402
 
 class _FakeManifest:
     def __init__(self, name, *, server_name=None, instances=None, hosted=None,
-                 proxy_callbacks=False):
+                 proxy_callbacks=False, runtime="python", oauth=None):
         self.name = name
         self.label = name
         self.server_name = server_name
         self.exclude_from = []
         self.instances = instances
         self.hosted = hosted
+        self.audience = ""
         # Mirror the McpManifest fields the local build path reads, with the
         # real dataclass defaults. server.proxy_callbacks gates the bearer-swap
         # lifting (true for proxy-terminable localhost MCPs like github/m365);
@@ -51,8 +52,9 @@ class _FakeManifest:
         # eligibility / device / network axes build_session_mcp_config consults.
         # transport "stdio" (NOT "none" — that now means a context-only MCP,
         # which build_session_mcp_config skips before any bundle assembly).
-        self.server = SimpleNamespace(proxy_callbacks=proxy_callbacks, port=0, transport="stdio")
-        self.credentials = SimpleNamespace(oauth=None)
+        self.server = SimpleNamespace(proxy_callbacks=proxy_callbacks, port=0, transport="stdio",
+                                      runtime=runtime)
+        self.credentials = SimpleNamespace(oauth=oauth, api_key_header=None)
         self.agent_env = {}
         self.env = {}
         self.network_targets = []
@@ -74,10 +76,11 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
                    secret_keys=None, bash_env_keys=None):
     """Stub build_session_mcp_config's heavy collaborators. ``server_entries``
     maps mcp name → the dict resolve_server_config returns (default: a plain
-    stdio entry). ``bearer_by_mcp`` maps mcp name → an access token that
-    maybe_inject_bearer_header writes into the entry's Authorization header.
-    ``secret_keys`` defaults to EVERY resolver cred (the infra/per-user case);
-    pass it + ``bash_env_keys`` to model OAuth paths / env_injection."""
+    stdio entry). ``bearer_by_mcp`` maps mcp name → the account label whose
+    token file the gateway's bearer source resolves to (a bearer manifest
+    then gets a gateway entry). ``secret_keys`` defaults to EVERY resolver
+    cred (the infra/per-user case); pass it + ``bash_env_keys`` to model
+    OAuth paths / env_injection."""
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver
 
@@ -111,13 +114,14 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
 
     bearers = bearer_by_mcp or {}
 
-    def _fake_bearer(entry, manifest, *a, **k):
-        tok = bearers.get(manifest.name)
-        if tok:
-            entry.setdefault("headers", {})["Authorization"] = f"Bearer {tok}"
-        return entry
+    def _fake_source(manifest, *a, **k):
+        from core.credentials.mcp_gateway import TokenRef
+        label = bearers.get(manifest.name)
+        if label:
+            return TokenRef(str(tmp_path), label, ""), None
+        return None, f"{manifest.label}: no account is connected for this session"
 
-    monkeypatch.setattr(mcp_registry, "maybe_inject_bearer_header", _fake_bearer)
+    monkeypatch.setattr(mcp_registry, "_gateway_bearer_source", _fake_source)
     monkeypatch.setattr(mcp_registry.config, "SESSIONS_DIR", tmp_path)
     # Keep the assembly DB-free: server_name "local" (browser-mcp) would
     # otherwise hit get_browser_allowed_origins, opening an app DB connection
@@ -182,49 +186,75 @@ def test_bundle_keyed_by_server_name_override(monkeypatch, tmp_path):
     assert bundles["local"].env == {"B": "1"}
 
 
-def test_localhost_bearer_to_bundle_sentinel_in_file(monkeypatch, tmp_path):
-    """A proxy-terminable HTTP MCP (localhost sidecar — github/m365) has its
-    real bearer lifted into the bundle; the config FILE carries only a sentinel."""
+def test_a_sidecar_bearer_becomes_a_gateway_entry_with_no_secret_in_the_file(monkeypatch, tmp_path):
+    """A proxy-terminable HTTP MCP (localhost sidecar — github/m365): the
+    file names the gateway route with the session-token sentinel; the
+    credential is the bundle's gateway half, judged under localhost."""
+    from auth.session_token import SESSION_JWT_SENTINEL_BEARER
     from services.mcp import mcp_registry
-    from core.credentials.mcp_broker import BROKER_BEARER_PLACEHOLDER
+    from storage.identity import bearer_allowlist
+    bearer_allowlist.add_allowed("gh-act", "localhost", "test")
     _stub_assembly(
         monkeypatch,
-        [_FakeManifest("gh", proxy_callbacks=True)],
+        [_FakeManifest("gh", proxy_callbacks=True, runtime="docker",
+                       oauth={"provider_id": "gh-act", "bearer_required": True})],
         env_by_mcp={},  # no stdio resolver creds
-        bearer_by_mcp={"gh": "ghp_secret"},
+        bearer_by_mcp={"gh": "acct"},
         server_entries={"gh": {"type": "http", "url": "http://localhost:8935/mcp"}},
         tmp_path=tmp_path,
     )
 
     _p, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None)
 
-    # Real bearer → bundle only; the file gets the sentinel (no real token).
-    assert bundles["gh"].http_bearer == "ghp_secret"
+    cred = bundles["gh"].gateway
+    assert cred is not None and cred.proxy_local is True
+    assert cred.upstream == "http://localhost:8935" and cred.path == "/mcp"
     assert bundles["gh"].env == {}
     file_text = _p.read_text()
-    assert "ghp_secret" not in file_text
-    assert BROKER_BEARER_PLACEHOLDER in file_text
+    assert "/v1/mcp-gateway/gh/mcp" in file_text
+    assert SESSION_JWT_SENTINEL_BEARER in file_text
+    assert "localhost:8935" not in file_text
 
 
-def test_external_vendor_bearer_stays_in_file(monkeypatch, tmp_path):
-    """A vendor HTTP MCP (external host — slack/notion/…) keeps its bearer
-    inline (direct-to-vendor; not yet tunnel-routable) → bundle.http_bearer None."""
+def test_a_vendor_bearer_becomes_a_gateway_entry_too(monkeypatch, tmp_path):
+    """A vendor HTTP MCP (external host — slack/notion/…) no longer keeps its
+    bearer inline: the file names the gateway route, the credential rides
+    the bundle as a token-file reference, and the raw key the resolver
+    produced for the entry stays out of the file and the bundle env."""
     from services.mcp import mcp_registry
+    from storage.identity import bearer_allowlist
+    bearer_allowlist.add_allowed("slack-act", "mcp.slack.com", "test")
     _stub_assembly(
         monkeypatch,
-        [_FakeManifest("slack")],
-        env_by_mcp={"slack": {"SLACK_X": "s"}},  # force a bundle to exist
-        bearer_by_mcp={"slack": "xoxb-real"},
+        [_FakeManifest("slack", oauth={"provider_id": "slack-act", "bearer_required": True})],
+        env_by_mcp={"slack": {"SLACK_X": "s"}},
+        bearer_by_mcp={"slack": "acct"},
         server_entries={"slack": {"type": "http", "url": "https://mcp.slack.com/mcp"}},
         tmp_path=tmp_path,
     )
 
     _p, _e, _x, bundles, _ = mcp_registry.build_session_mcp_config("agent", None)
 
-    # Bundle exists (for SLACK_X) but carries NO http_bearer; the real bearer
-    # stays inline in the config file (the accepted residual until tunnel-routing).
-    assert bundles["slack"].http_bearer is None
-    assert "Bearer xoxb-real" in _p.read_text()
+    cred = bundles["slack"].gateway
+    assert cred is not None and cred.proxy_local is False
+    assert cred.upstream == "https://mcp.slack.com" and cred.token_ref.account_label == "acct"
+    assert bundles["slack"].env == {}
+    text = _p.read_text()
+    assert "mcp.slack.com" not in text and "/v1/mcp-gateway/slack/mcp" in text
+
+
+def test_a_bearer_mcp_with_no_account_is_left_out_with_a_reason(monkeypatch, tmp_path):
+    from services.mcp import mcp_registry
+    _stub_assembly(
+        monkeypatch,
+        [_FakeManifest("slack", oauth={"provider_id": "slack-act", "bearer_required": True})],
+        env_by_mcp={},
+        server_entries={"slack": {"type": "http", "url": "https://mcp.slack.com/mcp"}},
+        tmp_path=tmp_path,
+    )
+    _p, _e, excluded, bundles, _ = mcp_registry.build_session_mcp_config("agent", None)
+    assert "slack" in excluded and "no account" in excluded["slack"]
+    assert "slack" not in bundles
 
 
 def test_bundle_includes_instance_field_values(monkeypatch, tmp_path):
@@ -416,3 +446,65 @@ def test_rewrite_toml_no_token_when_not_in_bundle(_isolate_remote_paths):
     assert "OTO_MCP_FETCH_TOKEN" not in out
     # PROXY callback creds are still injected (unchanged behavior)
     assert "PROXY_API_KEY" in out
+
+
+def test_two_sessions_of_one_identity_get_their_own_build(monkeypatch, tmp_path):
+    """Two agent-scope sessions of one agent build at once: each writes its
+    own file (and TOML sidecar), so neither starts from the other's build or
+    the other's injected token. The file name stays the identity's, so the
+    per-session sandbox copy keeps its name and its host-local pattern."""
+    from core.remote import file_sync
+    from services.mcp import mcp_registry
+    _stub_assembly(monkeypatch, [_FakeManifest("alpha")], env_by_mcp={"alpha": {}},
+                   tmp_path=tmp_path)
+    paths = []
+    for sid in ("aaaa1111-2222-3333-4444-555555555555", "bbbb1111-2222-3333-4444-555555555555"):
+        path, *_ = mcp_registry.build_session_mcp_config(
+            "agent", None, mcp_config_format="toml", session_id=sid)
+        paths.append(path)
+    assert paths[0] != paths[1] and paths[0].name == paths[1].name
+    assert all(p.with_suffix(".servers.json").exists() for p in paths)
+    mcp_registry.inject_credential_env_into_toml(paths[0], {"PROXY_API_KEY": "tok-a"})
+    assert "tok-a" not in paths[1].read_text()
+    assert paths[1].with_suffix(".servers.json").exists()
+    json_path, *_ = mcp_registry.build_session_mcp_config(
+        "agent", None, session_id="aaaa1111-2222-3333-4444-555555555555")
+    copy_name = f"{json_path.stem}-aaaa1111-222{json_path.suffix}"
+    assert file_sync._CLAUDE_HOST_LOCAL_RE.match(copy_name)
+
+
+def test_session_builds_older_than_a_day_are_swept(monkeypatch, tmp_path):
+    import os
+    import time
+    import config
+    from services.mcp import mcp_registry
+    monkeypatch.setattr(mcp_registry, "_build_sweep_at", None)
+    _stub_assembly(monkeypatch, [_FakeManifest("alpha")], env_by_mcp={"alpha": {}},
+                   tmp_path=tmp_path)
+    old, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="old-session")
+    instance_file = config.SESSIONS_DIR / "user-mcp-configs" / "agent-inst-config.json"
+    instance_file.write_text("{}")
+    day_ago = time.time() - 25 * 3600
+    os.utime(old.parent, (day_ago, day_ago))
+    os.utime(instance_file, (day_ago, day_ago))
+    monkeypatch.setattr(mcp_registry, "_build_sweep_at", None)
+    new, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="new-session")
+    assert not old.parent.exists() and new.exists()
+    assert instance_file.exists()
+
+
+def test_a_rebuild_into_its_directory_keeps_it_from_the_sweep(monkeypatch, tmp_path):
+    """A resumed session builds into its existing directory: the directory's
+    time moves with the build, so the day-old sweep never takes a live
+    session's build between the build and the start."""
+    import os
+    import time
+    from services.mcp import mcp_registry
+    monkeypatch.setattr(mcp_registry, "_build_sweep_at", None)
+    _stub_assembly(monkeypatch, [_FakeManifest("alpha")], env_by_mcp={"alpha": {}},
+                   tmp_path=tmp_path)
+    first, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="resumed")
+    day_ago = time.time() - 25 * 3600
+    os.utime(first.parent, (day_ago, day_ago))
+    again, *_ = mcp_registry.build_session_mcp_config("agent", None, session_id="resumed")
+    assert again.parent.stat().st_mtime > day_ago + 3600

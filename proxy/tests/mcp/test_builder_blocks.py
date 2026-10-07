@@ -278,7 +278,9 @@ class TestBuilderExecutor:
             trigger_payload={"phone": "+15551234"},
             mcp_name="owner", agent_name="agent",
         )
-        assert rendered == "id=x"
+        # The tool ran on the sender's value: its result is fenced in the prompt.
+        from services.infra import external_data
+        assert rendered == external_data.with_note(f"id={external_data.fence('x')}")
         assert received["phone"] == "+15551234"
 
     async def test_returns_none_on_timeout(self, mock_mcp, reset_manifests):
@@ -537,3 +539,97 @@ class TestResultFlatten:
     def test_empty_input_returns_empty_dict(self):
         assert builder_executor._flatten_result("") == {}
         assert builder_executor._flatten_result("   ") == {}
+
+
+@pytest.mark.asyncio
+async def test_a_header_style_key_builder_runs_with_the_resolved_key(
+    mock_mcp, reset_manifests, monkeypatch,
+):
+    """A builder on an ``api_key_header`` MCP takes the key's value from the
+    MCP's resolved secrets (the value the session bundle would carry), so
+    the gateway entry is built and the call runs instead of being skipped."""
+    from core.config import deployment
+    from core.credentials import mcp_gateway
+    from services.oauth import credential_resolver
+    from storage.identity import bearer_allowlist
+
+    slug = f"mock-{uuid.uuid4().hex[:6]}"
+    _register_mock_as_mcp(mock_mcp, slug)
+    m = mcp_registry._manifests[slug]
+    m.credentials = CredentialConfig(type="per_user", api_key_header={
+        "name": "X-Test-Key", "value_from": "TEST_KEY", "proposed_hosts": ["127.0.0.1"],
+    })
+
+    async def lookup() -> str:
+        return json.dumps({"ok": "yes"})
+
+    mock_mcp.register("lookup", lookup, schema={"type": "object", "properties": {}})
+
+    seen: dict = {}
+
+    def resolve(agent, user_sub, *, task_scope="user"):
+        seen["call"] = (agent, user_sub, task_scope)
+        return credential_resolver.ResolvedCredentials(
+            env_by_mcp={slug: {"TEST_KEY": "sekret", "PLAIN": "x"}},
+            secret_keys={"TEST_KEY"},
+        )
+
+    monkeypatch.setattr(credential_resolver, "resolve_credentials", resolve)
+    monkeypatch.setattr(deployment, "is_proxy_local_mcp_host", lambda host, manifest: False)
+    monkeypatch.setattr(bearer_allowlist, "is_host_allowed", lambda key, host: True)
+    monkeypatch.setattr(mcp_gateway, "_egress_refusal", lambda upstream: None)
+    mcp_gateway.forget_memos()
+
+    rendered = await builder_executor.execute_builder(
+        block=_block("Got ${result.ok}", tool=f"mcp__{slug}__lookup"),
+        tokens={}, trigger_payload=None,
+        mcp_name="caller-mcp", agent_name="some-agent", user_sub="u-1",
+    )
+    assert rendered == "Got yes"
+    assert seen["call"] == ("some-agent", "u-1", "user")
+
+
+@pytest.mark.asyncio
+async def test_a_header_style_key_builder_reads_an_env_delivered_instance_field(
+    mock_mcp, reset_manifests, monkeypatch,
+):
+    """``value_from`` naming an env-delivered ``instances.fields`` key: the
+    builder takes the value from the agent's instance as the session build
+    does, instead of skipping the block for a key the resolver never holds."""
+    from types import SimpleNamespace
+    from core.config import deployment
+    from core.credentials import mcp_gateway
+    from services.oauth import credential_resolver
+    from storage.identity import bearer_allowlist
+    from storage.mcp import mcp_store
+
+    slug = f"mock-{uuid.uuid4().hex[:6]}"
+    _register_mock_as_mcp(mock_mcp, slug)
+    m = mcp_registry._manifests[slug]
+    m.credentials = CredentialConfig(type="none", api_key_header={
+        "name": "X-Test-Key", "value_from": "INST_KEY", "proposed_hosts": ["127.0.0.1"],
+    })
+    m.instances = SimpleNamespace(delivery="env", fields=[])
+
+    async def lookup() -> str:
+        return json.dumps({"ok": "inst"})
+
+    mock_mcp.register("lookup", lookup, schema={"type": "object", "properties": {}})
+    monkeypatch.setattr(
+        credential_resolver, "resolve_credentials",
+        lambda agent, user_sub, *, task_scope="user":
+        credential_resolver.ResolvedCredentials(env_by_mcp={}, secret_keys=set()))
+    monkeypatch.setattr(mcp_store, "get_instance_for_agent_env_delivery",
+                        lambda mcp_name, agent_name: {"field_values": {"INST_KEY": "inst-key"}}
+                        if (mcp_name, agent_name) == (slug, "some-agent") else None)
+    monkeypatch.setattr(deployment, "is_proxy_local_mcp_host", lambda host, manifest: False)
+    monkeypatch.setattr(bearer_allowlist, "is_host_allowed", lambda key, host: True)
+    monkeypatch.setattr(mcp_gateway, "_egress_refusal", lambda upstream: None)
+    mcp_gateway.forget_memos()
+
+    rendered = await builder_executor.execute_builder(
+        block=_block("Got ${result.ok}", tool=f"mcp__{slug}__lookup"),
+        tokens={}, trigger_payload=None,
+        mcp_name="caller-mcp", agent_name="some-agent", user_sub="u-1",
+    )
+    assert rendered == "Got inst"

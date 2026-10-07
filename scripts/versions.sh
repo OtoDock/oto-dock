@@ -7,7 +7,7 @@
 #
 # Sourceable:
 #     source scripts/versions.sh        # exports the keys into the environment
-#     echo "$PYTHON_IMAGE"              # -> python:3.13.14-slim-bookworm
+#     echo "$PYTHON_IMAGE"              # -> python:3.13.16-slim-bookworm
 #
 # Or query a single key:
 #     scripts/versions.sh PYTHON_IMAGE   # prints the value (or nothing)

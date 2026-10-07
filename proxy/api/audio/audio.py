@@ -30,7 +30,7 @@ from audio.providers.tts.base import UnsupportedProviderOperation
 from audio.streaming.text_chunks import split_sentences
 from audio.streaming import tts_stream
 from audio.streaming import lang
-from auth.providers import UserContext, get_current_user, mask_email, require_admin
+from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_user
 from services.media import audio_service
 from services.media import wake_keywords
 from services.media import ws_audio_token
@@ -46,7 +46,8 @@ from storage.prefs.audio_provider_store import (
 from services.phone.phone_config import notify_phone_config_changed, groq_classifier_configured
 
 logger = logging.getLogger("claude-proxy")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 def _int_setting(key: str, default: int) -> int:

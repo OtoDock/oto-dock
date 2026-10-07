@@ -19,7 +19,7 @@ pycparser==3.0
 pydantic==2.12.5
 pydantic-core==2.41.5
 pydantic-settings==2.14.2
-pyjwt==2.13.0
+pyjwt==2.15.1
 python-dotenv==1.2.2
 python-multipart==0.0.32
 referencing==0.37.0

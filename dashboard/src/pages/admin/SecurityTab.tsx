@@ -8,7 +8,8 @@ import {
 } from '../../api/oauth'
 import { usePlatformSettings, useSavePlatformSettings } from './PlatformPage.hooks'
 import { SavedBadge } from './PlatformPage.shared'
-import type { ForwardingWarning } from './PlatformPage.types'
+import { FORWARDING_CONSEQUENCE, forwardingAdvice, forwardingSeen } from '../../components/admin/forwardingAdvice'
+import type { ForwardingWarning } from '../../components/admin/forwardingAdvice'
 
 // ---------------------------------------------------------------------------
 // Security tab
@@ -128,35 +129,6 @@ function BearerAllowlistSection() {
 }
 
 
-// The proxy stamps a warning with epoch seconds; an ISO string is accepted too.
-function lastSeen(v: number | string): string {
-  const d = typeof v === 'number' ? new Date(v * 1000) : new Date(v)
-  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString()
-}
-
-// The proxy marks a warning whose address is the container's gateway.
-type Warning = ForwardingWarning
-
-// Headers from an address that is not a trusted proxy. The container's
-// gateway may be trusted only while the port is published on 127.0.0.1:
-// direct connections to a published port arrive from it too, so trusting it
-// otherwise lets any such client forge its address. TRUSTED_PROXY is a list,
-// so an address is added to it, never set over it. On the OtoDock cloud the
-// operator owns the configuration, so the admin gets no instruction.
-function untrustedForwarderAdvice(w: Warning, cloud: boolean): string {
-  const head = `Forwarding headers arrive from ${w.peer}`
-  if (cloud) return `${head}, which is not a trusted proxy.`
-  const list = '(a comma-separated list: that address, never a subnet)'
-  if (w.gateway) {
-    return `${head}, the container's gateway, which is not a trusted proxy. `
-      + 'Trust it only with PROXY_BIND_IP=127.0.0.1 (the port published on this '
-      + "host's loopback only): direct connections to a published port arrive from "
-      + `the gateway too. Then add ${w.peer} to TRUSTED_PROXY in .env ${list}.`
-  }
-  return `${head}, which is not a trusted proxy: if it is your reverse proxy, add `
-    + `${w.peer} to TRUSTED_PROXY in config.env, or .env on a Docker install ${list}.`
-}
-
 export default function SecurityTab() {
   const { data, isLoading } = usePlatformSettings()
   const saveMutation = useSavePlatformSettings()
@@ -236,7 +208,7 @@ export default function SecurityTab() {
 
   if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
 
-  const warnings: Warning[] = data?.forwarding_warnings || []
+  const warnings: ForwardingWarning[] = data?.forwarding_warnings || []
 
   return (
     <div className="space-y-6">
@@ -246,14 +218,12 @@ export default function SecurityTab() {
           <ul className="mt-1 list-disc pl-5 space-y-0.5">
             {warnings.map((w) => (
               <li key={`${w.case}:${w.peer}`}>
-                {w.case === 'edge_without_xff'
-                  ? `The trusted proxy ${w.peer} does not append X-Forwarded-For.`
-                  : untrustedForwarderAdvice(w, !!data?.cloud)}
-                {' '}({w.count} request{w.count === 1 ? '' : 's'}, last {lastSeen(w.last_seen)})
+                {forwardingAdvice(w, !!data?.cloud)}
+                {forwardingSeen(w) && ` ${forwardingSeen(w)}`}
               </li>
             ))}
           </ul>
-          <p className="mt-1 text-xs">Until the address is trusted, everyone behind it shares one sign-in bucket and local-network-only accounts cannot sign in through it.</p>
+          <p className="mt-1 text-xs">{FORWARDING_CONSEQUENCE}</p>
         </div>
       )}
       {saveError && <div role="alert" className="text-sm text-p-accent-red">{saveError}</div>}
@@ -399,19 +369,23 @@ export default function SecurityTab() {
 
       </>}
 
-      {/* Sharing (SHARING.md): the platform-wide switches for links. */}
+      {/* Sharing (SHARING.md): the platform-wide switches for shares to
+          agents and departments and for links. */}
       <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4 space-y-4">
         <div>
           <h3 className="text-sm font-semibold text-p-text">Sharing</h3>
           <p className="text-xs text-p-text-light mt-1">
-            Members share apps with colleagues by default. These switches govern links to people
-            outside the platform; every external link is listed under Admin → Shares.
+            People share apps with colleagues by default. These switches govern shares to whole
+            agents and departments, and links to people outside the platform. Every share and every
+            link is listed under Admin → Shares.
           </p>
         </div>
         {([
+          ['sharing_to_agents_enabled', 'Sharing to agents', 'An editor or manager of an agent may place an app of another agent in its Apps panel for every member. Off refuses new ones.'],
+          ['sharing_to_departments_enabled', 'Sharing to departments', 'An admin may place an app in every agent of a department, following the department as it changes. Off refuses new ones.'],
           ['sharing_external_enabled', 'External links', 'Members may make links that open an app for someone without an account (password-protected by default).'],
           ['sharing_public_links_enabled', 'Links without a password', 'A link may be made public — anyone holding the URL opens it. Off keeps every link behind a password.'],
-          ['user_directory_visible_to_members', 'User directory when sharing', 'Members pick colleagues from a list. Off means they type an exact username or email, and the platform never confirms whether it matched.'],
+          ['user_directory_visible_to_members', 'User directory when sharing', 'Members pick colleagues and agents from a list. Off means they type an exact username or email, see only their own agents, and the platform never confirms whether a name matched.'],
         ] as const).map(([key, label, help]) => (
           <div key={key} className="flex items-center justify-between gap-3">
             <div>
@@ -431,14 +405,14 @@ export default function SecurityTab() {
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-sm text-p-text">Longest link expiry</span>
+              <span className="text-sm text-p-text">Longest share expiry</span>
               <SavedBadge show={savedField === 'sharing_max_expiry_days'} />
             </div>
-            <p className="text-xs text-p-text-light mt-0.5">In days; empty lets a member choose “never”.</p>
+            <p className="text-xs text-p-text-light mt-0.5">In days: caps every share and link. A share left on “Never expires” gets this length. Empty lets a member choose “never”.</p>
           </div>
           <input type="text" inputMode="numeric" defaultValue={data?.sharing_max_expiry_days || ''}
             key={data?.sharing_max_expiry_days || 'unset'}
-            aria-label="Longest link expiry in days" placeholder="no cap"
+            aria-label="Longest share expiry in days" placeholder="no cap"
             onBlur={(e) => { if (e.target.value !== (data?.sharing_max_expiry_days || '')) save('sharing_max_expiry_days', e.target.value.trim()) }}
             className="w-24 px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
         </div>

@@ -7,7 +7,14 @@ table is the platform-controlled REALITY. Admins approve which
 HTTP ``Authorization: Bearer`` injection.
 
 Seeded at startup with vendor-official hosts (see ``schema.init_schema``
-seed loop). Admins can extend via /v1/admin/oauth-bearer-allowlist.
+seed loop), each default once: a ledger table of this module's own records
+the pairs the seed inserted, so a default an admin deleted stays deleted
+across restarts, as the Security tab says; "Restore defaults" re-inserts
+them. Admins can extend via /v1/admin/oauth-bearer-allowlist.
+
+The gateway (``core/credentials/mcp_gateway.py``) judges every forward
+against this table and memoises the answer briefly; ``generation`` moves at
+every change so a removed row refuses at the next request.
 
 Matcher supports two wildcard patterns:
   * Exact host: ``mcp.slack.com``
@@ -47,16 +54,27 @@ DEFAULT_ALLOWLIST: tuple[tuple[str, str], ...] = (
     # Postiz Cloud's hosted MCP (postiz-mcp, remote streamable_http) — the
     # user's Postiz API key is injected as the bearer toward api.postiz.com.
     ("postiz", "api.postiz.com"),
+    # GitHub's hosted MCP server, reached through the credential gateway
+    # with the person's own GitHub token.
+    ("github", "api.githubcopilot.com"),
 )
 
+# Moves at every change of the table in this process; the gateway's memo
+# compares it so a removed row refuses at the next request.
+_generation = 0
 
-def seed_defaults(conn) -> None:
-    """Insert the vendor-official defaults using an EXISTING connection.
 
-    Idempotent (``ON CONFLICT DO NOTHING``) — keeps any admin-added entries
-    intact. Caller owns the transaction (commit). Used by the boot seed.
-    """
-    for provider_id, host in DEFAULT_ALLOWLIST:
+def generation() -> int:
+    return _generation
+
+
+def _bump() -> None:
+    global _generation
+    _generation += 1
+
+
+def _insert_defaults(conn, pairs) -> None:
+    for provider_id, host in pairs:
         conn.execute(
             "INSERT INTO oauth_bearer_allowlist "
             "(provider_id, host_pattern, added_by, added_at) "
@@ -64,17 +82,44 @@ def seed_defaults(conn) -> None:
             "ON CONFLICT (provider_id, host_pattern) DO NOTHING",
             (provider_id, host, _now()),
         )
+        conn.execute(
+            "INSERT INTO oauth_bearer_allowlist_seeded "
+            "(provider_id, host_pattern, seeded_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (provider_id, host_pattern) DO NOTHING",
+            (provider_id, host, _now()),
+        )
+
+
+def seed_defaults(conn) -> None:
+    """Insert the vendor-official defaults not seeded before, using an
+    EXISTING connection: the ledger table records every pair this seed ever
+    inserted, so a default an admin deleted is not re-added at the next
+    boot. Caller owns the transaction (commit). Used by the boot seed."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS oauth_bearer_allowlist_seeded ("
+        "provider_id TEXT NOT NULL, host_pattern TEXT NOT NULL, "
+        "seeded_at TEXT NOT NULL, PRIMARY KEY (provider_id, host_pattern))"
+    )
+    seen = {
+        (r["provider_id"], r["host_pattern"])
+        for r in conn.execute(
+            "SELECT provider_id, host_pattern FROM oauth_bearer_allowlist_seeded"
+        ).fetchall()
+    }
+    _insert_defaults(conn, [p for p in DEFAULT_ALLOWLIST if p not in seen])
+    _bump()
 
 
 def restore_defaults() -> list[dict]:
     """Re-insert any missing vendor-official defaults; return the full list.
 
-    Idempotent — re-adds defaults an admin deleted without touching their
-    own custom entries or duplicating existing rows.
+    The admin's action: re-adds defaults an admin deleted without touching
+    their own custom entries or duplicating existing rows.
     """
     with get_conn() as conn:
-        seed_defaults(conn)
+        _insert_defaults(conn, DEFAULT_ALLOWLIST)
         conn.commit()
+    _bump()
     return list_allowed()
 
 
@@ -102,7 +147,8 @@ def add_allowed(provider_id: str, host_pattern: str, added_by: str = "admin") ->
             (provider_id, host_pattern, added_by, _now()),
         ).fetchone()
         conn.commit()
-        return row["id"]
+    _bump()
+    return row["id"]
 
 
 def delete_allowed(row_id: int) -> bool:
@@ -112,7 +158,8 @@ def delete_allowed(row_id: int) -> bool:
             "DELETE FROM oauth_bearer_allowlist WHERE id = %s", (row_id,),
         )
         conn.commit()
-        return (cur.rowcount or 0) > 0
+    _bump()
+    return (cur.rowcount or 0) > 0
 
 
 def is_host_allowed(provider_id: str, host: str) -> bool:

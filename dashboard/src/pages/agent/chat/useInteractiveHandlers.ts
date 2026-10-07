@@ -87,20 +87,31 @@ export function useInteractiveHandlers({
     } catch { /* network error — stay on the terminal */ }
   }, [chatId, interactive.showRichView, interactive.setShowRichView, seedDbHistory])
 
+  // A chip leaves on the proxy's queue_removed, not before (a teammate's
+  // chip the proxy refuses stays). A chip a 1.7.0 proxy minted has no id:
+  // it is removed here and cancelled by its index, as that proxy expects.
   const handleCancelQueued = useCallback(
     (i: number) => {
-      ws.cancelQueued(i)
-      if (draftKey) useChatStore.getState().removeQueuedMessageByIndex(draftKey, i)
+      const item = queuedMessages[i]
+      ws.cancelQueued({ queueId: item?.queueId, index: i }, chatId ?? undefined)
+      if (!item?.queueId && draftKey) {
+        useChatStore.getState().removeQueuedMessage(draftKey, { index: i })
+      }
     },
-    [ws, draftKey],
+    [ws, draftKey, chatId, queuedMessages],
   )
 
-  // Pull ALL queued messages back to input for editing (they're combined on
-  // the backend). Their attachments come back too, from the local items —
-  // the queue_cleared frame carries only the combined text.
+  // Pull this person's queued messages back to input for editing. The proxy
+  // returns them, text and attachments, on the author's queue_cleared (the
+  // chat's queue is the proxy's). A 1.7.0 proxy's chips carry no id: their
+  // texts and attachments are joined here, as that proxy expects.
   const handleEditQueued = useCallback(
     () => {
       if (queuedMessages.length === 0) return
+      if (queuedMessages.some(q => q.queueId)) {
+        ws.cancelAllQueued(chatId ?? undefined)
+        return
+      }
       const combined = queuedMessages.map(q => q.text).join('\n\n')
       ws.cancelAllQueued()
       if (draftKey) {

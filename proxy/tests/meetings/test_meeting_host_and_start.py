@@ -205,7 +205,7 @@ def test_a_moderator_outside_the_participants_still_ends_the_producer(agents):
     async def scenario():
         queue: asyncio.Queue = asyncio.Queue()
         await MO.meeting_produce("mtg-hs-2", {}, queue,
-                                 SimpleNamespace(message_queue=[], system_queue=None))
+                                 SimpleNamespace(chat_id="chat-mtg", system_queue=None))
         return [queue.get_nowait() for _ in range(queue.qsize())]
 
     events = asyncio.run(asyncio.wait_for(scenario(), 5))

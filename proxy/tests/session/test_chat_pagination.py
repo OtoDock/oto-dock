@@ -7,6 +7,7 @@ helper, and the GET /v1/chats/{id}?before_id= older-page endpoint.
 """
 
 from core.events import tool_roles
+import asyncio
 import json
 
 from fastapi.testclient import TestClient
@@ -117,5 +118,27 @@ def test_rest_before_id_returns_older_page(temp_db):
         page = client.get(f"/v1/chats/{cid}?before_id={ids[2]}&limit=2").json()
         assert [m["content"] for m in page["messages"]] == ["msg 0", "msg 1"]
         assert page["has_more"] is False and "chat" not in page
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def _off_loop(fn):
+    def guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*a, **kw)
+        raise AssertionError(f"{fn.__name__} ran on the event loop")
+    return guarded
+
+
+def test_rest_reads_the_chat_and_its_page_off_the_loop(temp_db, monkeypatch):
+    cid, _ids = _mk_chat("c-lane", n=3)
+    monkeypatch.setattr(db, "get_chat", _off_loop(db.get_chat))
+    monkeypatch.setattr(db, "get_chat_messages_page", _off_loop(db.get_chat_messages_page))
+    app.dependency_overrides[get_current_user] = _admin()
+    try:
+        body = client.get(f"/v1/chats/{cid}").json()
+        assert body["chat"]["id"] == cid and len(body["messages"]) == 3
     finally:
         app.dependency_overrides.pop(get_current_user, None)

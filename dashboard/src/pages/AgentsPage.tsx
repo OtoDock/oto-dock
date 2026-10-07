@@ -15,7 +15,6 @@ import AgentsMap3D from '../components/agents-map/AgentsMap3D'
 import DepartmentsEditor from '../components/departments/DepartmentsEditor'
 import AgentInstallModal from '../components/AgentInstallModal'
 import CommunityAgentsBrowser from '../components/CommunityAgentsBrowser'
-import SharedWithMe from '../components/sharing/SharedWithMe'
 
 type View = 'map' | 'grid' | 'departments'
 
@@ -128,8 +127,6 @@ export default function AgentsPage() {
           )}
         </div>
       </div>
-
-      <SharedWithMe />
       </div>
 
       <div className={`flex-1 min-h-0 ${view === 'map' ? 'overflow-hidden' : 'overflow-y-auto'}`}>

@@ -183,6 +183,10 @@ class _CapturingWS:
     async def enqueue_send(self, msg):
         self.sent.append(msg)
 
+    async def enqueue_bulk(self, msg):
+        self.sent.append(msg)
+        return True
+
 
 class TestCredentialsUpdate:
     """Rotation fan-out: the platform pushes a rewritten CLI credential file
@@ -358,6 +362,129 @@ class TestModeCTurnRetention:
         assert types[-1][0] == "turn_ended"
         # The sentinel itself is NOT forwarded as a session_event.
         assert ("session_event", "_turn_sentinel") not in types
+
+
+class _HeldCodexSession:
+    """A headless session of an engine without turn replay, as the report
+    reads it."""
+    execution_path = "codex-cli"
+    agent_slug = "agent-c"
+
+    def __init__(self, *, alive=True, turn_active=False, handle="th-1"):
+        self.is_alive = alive
+        self.turn_active = turn_active
+        self.resume_handle = handle
+        self.mcp_server_names = ["file-tools", "memory"]
+        self.config = {"model": "gpt-6.1-sol", "use_native_permissions": False}
+        self.incarnation = "boot-7"
+
+
+class TestOtherSessionsHeld:
+    """Every headless session the satellite holds that the turn-replay list
+    does not name: the platform takes an idle one back or closes it, so none
+    stays counted against the machine after a platform restart."""
+
+    def test_lists_engines_without_replay_and_dead_replay_sessions(self, sat_config):
+        from satellite.sessions import alive_report
+        sm = SessionManager(sat_config)
+        sm.sessions["c-idle"] = _HeldCodexSession()
+        sm.sessions["c-turn"] = _HeldCodexSession(turn_active=True)
+        sm.sessions["c-dead"] = _HeldCodexSession(alive=False, handle="")
+        sm.sessions["cli-live"] = _FakeCLISession([])
+        sm.sessions["cli-dead"] = _DeadCLISession()
+        report = {e["session_id"]: e for e in alive_report.other_sessions_held(sm)}
+        assert set(report) == {"c-idle", "c-turn", "c-dead", "cli-dead"}
+        assert report["c-idle"] == {
+            "session_id": "c-idle", "execution_path": "codex-cli", "agent_slug": "agent-c",
+            "alive": True, "turn_active": False, "incarnation": "boot-7",
+            "resume_handle": "th-1", "model": "gpt-6.1-sol",
+            "mcp_servers": ["file-tools", "memory"], "use_native_permissions": False,
+        }
+        assert report["c-turn"]["turn_active"] is True
+        assert report["c-dead"]["alive"] is False
+        assert report["cli-dead"]["alive"] is False
+        assert report["cli-dead"]["resume_handle"] == ""
+
+    def test_the_frame_keeps_the_replay_list_when_the_new_one_fails(self, sat_config):
+        from satellite.sessions import alive_report
+        sm = SessionManager(sat_config)
+        sm.sessions["cli-live"] = _FakeCLISession([])
+        with patch.object(alive_report, "other_sessions_held", side_effect=RuntimeError("x")):
+            frame = alive_report.sessions_alive_frame(sm)
+        assert frame["type"] == "sessions_alive"
+        assert [e["session_id"] for e in frame["sessions"]] == ["cli-live"]
+        assert "other_sessions" not in frame
+
+    def test_no_frame_when_the_replay_list_fails(self, sat_config):
+        from satellite.sessions import alive_report
+        sm = SessionManager(sat_config)
+        with patch.object(sm, "headless_sessions_alive", side_effect=RuntimeError("x")):
+            assert alive_report.sessions_alive_frame(sm) is None
+
+    def test_a_complete_frame_carries_both_lists(self, sat_config):
+        from satellite.sessions import alive_report
+        sm = SessionManager(sat_config)
+        sm.sessions["c-idle"] = _HeldCodexSession()
+        frame = alive_report.sessions_alive_frame(sm)
+        assert frame["sessions"] == []
+        assert [e["session_id"] for e in frame["other_sessions"]] == ["c-idle"]
+
+    def test_every_session_reports_its_incarnation(self, sat_config):
+        sm = SessionManager(sat_config)
+        live = _FakeCLISession([])
+        live.incarnation = "boot-1"
+        sm.sessions["s1"] = live
+        assert sm.headless_sessions_alive()[0]["incarnation"] == "boot-1"
+
+    def test_incarnations_are_unique_and_carry_the_boot(self):
+        from satellite.sessions import alive_report
+        a, b = alive_report.next_incarnation(), alive_report.next_incarnation()
+        assert a != b
+        assert a.split("-")[0] == b.split("-")[0]
+
+
+class TestCloseByIncarnation:
+    @pytest.mark.asyncio
+    async def test_a_close_for_an_earlier_object_leaves_the_live_one(self, sat_config):
+        sm = SessionManager(sat_config)
+        live = AsyncMock()
+        live.incarnation = "boot-2"
+        sm.sessions["s1"] = live
+        ws = _CapturingWS()
+        await sm.close_session({"session_id": "s1", "command_id": "c1",
+                                "incarnation": "boot-1"}, ws)
+        live.close.assert_not_awaited()
+        assert sm.sessions["s1"] is live
+        assert ws.sent[0]["status"] == "ok"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("incarnation", ["boot-2", None])
+    async def test_a_matching_or_unnamed_close_ends_it(self, sat_config, incarnation):
+        sm = SessionManager(sat_config)
+        live = AsyncMock()
+        live.incarnation = "boot-2"
+        sm.sessions["s1"] = live
+        ws = _CapturingWS()
+        msg = {"session_id": "s1", "command_id": "c1"}
+        if incarnation:
+            msg["incarnation"] = incarnation
+        await sm.close_session(msg, ws)
+        live.close.assert_awaited_once()
+        assert "s1" not in sm.sessions
+
+    @pytest.mark.asyncio
+    async def test_a_started_session_gets_an_incarnation(self, sat_config):
+        sm = SessionManager(sat_config)
+        replacement = AsyncMock()
+        replacement.pid = 5
+        replacement.thread_id = ""
+        with patch("satellite.sessions.codex_session.CodexSession", return_value=replacement):
+            await sm.start_session({
+                "session_id": "s-new", "execution_path": "codex-cli", "config": {},
+                "command_id": "cmd-n", "agent_slug": "test-agent",
+            }, AsyncMock())
+        assert isinstance(sm.sessions["s-new"].incarnation, str)
+        assert sm.sessions["s-new"].incarnation
 
 
 class TestCheckSessionProcess:
@@ -1215,3 +1342,50 @@ class TestPullAndStatOpenBeneathTheRoot:
         await sm.file_stat({"agent_slug": "test-agent", "path": "workspace/none.txt",
                             "command_id": "s3"}, ws)
         assert ws.sent[0]["status"] == "ok" and ws.sent[0]["exists"] is False
+
+
+class TestSyncMcpsRemovals:
+    """A 1.7.1 platform removes only MCPs it no longer ships and says so with
+    ``remove_any_category``: those go from any category. Without the flag
+    (an older platform, which also names MCPs a session merely left out) a
+    ``core`` folder stays, as in 0.5.136."""
+
+    def _installed(self, sat_config, category, name):
+        d = sat_config.mcps_dir / category / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text("{}")
+        return d
+
+    @pytest.mark.asyncio
+    async def test_a_core_folder_goes_when_asked_for_any_category(self, sat_config, caplog):
+        d = self._installed(sat_config, "core", "gone-mcp")
+        sm = SessionManager(sat_config)
+        ws = AsyncMock()
+        with caplog.at_level("INFO"):
+            await sm.sync_mcps({"command_id": "c1", "mcps_to_install": [],
+                                "mcps_to_remove": ["gone-mcp"], "remove_any_category": True}, ws)
+        assert not d.exists()
+        ack = ws.enqueue_send.await_args.args[0]
+        assert ack["results"]["gone-mcp"]["status"] == "removed"
+        assert "sync_mcps: removed core/gone-mcp" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_without_the_flag_a_core_folder_is_left(self, sat_config):
+        d = self._installed(sat_config, "core", "task-left-mcp")
+        sm = SessionManager(sat_config)
+        ws = AsyncMock()
+        await sm.sync_mcps({"command_id": "c1", "mcps_to_install": [],
+                            "mcps_to_remove": ["task-left-mcp"]}, ws)
+        assert d.is_dir()
+        ack = ws.enqueue_send.await_args.args[0]
+        assert ack["results"]["task-left-mcp"]["status"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_a_custom_removal_is_logged_either_way(self, sat_config, caplog):
+        d = self._installed(sat_config, "custom", "old-mcp")
+        sm = SessionManager(sat_config)
+        with caplog.at_level("INFO"):
+            await sm.sync_mcps({"command_id": "c1", "mcps_to_install": [],
+                                "mcps_to_remove": ["old-mcp"]}, AsyncMock())
+        assert not d.exists()
+        assert "sync_mcps: removed custom/old-mcp" in caplog.text

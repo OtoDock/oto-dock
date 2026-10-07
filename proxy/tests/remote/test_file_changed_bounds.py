@@ -285,6 +285,41 @@ async def test_a_pulled_file_fans_out_a_path_after_the_path_lock_is_released(tmp
 
 
 @pytest.mark.asyncio
+async def test_a_pulled_file_lands_at_the_named_path_and_fans_out_only_from_it(tmp_path, monkeypatch):
+    """The pull and the fan-out source are the path as named: through an
+    in-tree link on the way, the pull is handed the named path (which it
+    refuses) and nothing fans out from the link's target."""
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    ws = tmp_path / "my-agent" / "workspace"
+    (ws / "real").mkdir(parents=True)
+    (ws / "real" / "big.bin").write_bytes(b"y" * 8)
+    (ws / "alias").symlink_to("real")
+    (ws / "big.bin").write_bytes(b"z" * 8)
+    cm = SatelliteConnectionManager()
+    sources = []
+
+    async def fan_out(agent_slug, rel_path, source, **kw):
+        sources.append(source)
+    pull = AsyncMock(return_value=True)
+    patches = _real_applier_patches(fan_out, ["m2"]) + [
+        patch.object(cm, "pull_file_to_path", new=pull),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        for rel in ("workspace/alias/big.bin", "workspace/big.bin"):
+            await cm._apply_file_changed("machine-1", {
+                "type": "file_changed", "agent_slug": "my-agent", "path": rel,
+                "action": "write", "session_id": "sess-1", "hash": "sha256:" + "0" * 64,
+                "size": 8})
+    finally:
+        for p in patches:
+            p.stop()
+    assert [c.args[2] for c in pull.await_args_list] == [ws / "alias" / "big.bin", ws / "big.bin"]
+    assert sources == [ws / "big.bin"]
+
+
+@pytest.mark.asyncio
 async def test_the_shared_only_read_of_a_personal_path_leaves_the_loop(tmp_path, monkeypatch):
     import threading
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)

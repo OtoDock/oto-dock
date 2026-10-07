@@ -130,7 +130,7 @@ describe('AppDeployCard', () => {
     renderIn(<AppDeployCard app={mkApp({ actions_approved: true, release: 0, pending_release: 1, egress: ['api.example.test'] })} agent="dev" />)
     await waitFor(() => expect(screen.getByTestId('deploy-waiting')).toBeTruthy())
     expect(screen.getByTestId('deploy-waiting').textContent).toContain('Waiting for a secret: STRIPE_SECRET_KEY is not set')
-    expect(screen.getByText(/a secret it needs has no value yet/)).toBeTruthy()
+    expect(screen.getByText(/The manifest is approved\. A secret it needs has no value yet\./)).toBeTruthy()
     const approve = screen.getByText('Approve and go live') as HTMLButtonElement
     expect(approve.disabled).toBe(true)
     // An approved manifest is not said again: the secrets line alone, then

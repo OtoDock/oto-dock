@@ -2,6 +2,7 @@
 platform-settings payload. Real test DB; relay seams mocked; admin overridden.
 """
 
+import asyncio
 import base64
 import json
 from datetime import datetime, timezone, timedelta
@@ -198,6 +199,45 @@ def test_platform_settings_payload_has_2m_fields(admin, clean_license, sign, mon
     # is False → air_gapped True, even though OTODOCK_AIR_GAPPED is unset.
     assert data["air_gapped"] is True
     assert "license_activation_state" in data and "license_last_check_at" in data
+
+
+def _off_loop(fn):
+    """``fn``, refusing to run on a thread with a running event loop (a
+    worker thread has none)."""
+    def guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*a, **kw)
+        raise AssertionError(f"{fn.__name__} ran on the event loop")
+    return guarded
+
+
+def test_settings_and_license_read_the_relay_off_the_loop(admin, clean_license, sign, monkeypatch):
+    from api.auth import platform as platform_api
+    monkeypatch.setattr(config, "OTODOCK_CLOUD", False)
+    monkeypatch.setattr(config, "OTODOCK_AIR_GAPPED", False)
+    monkeypatch.setattr(platform_api, "get_license_key", _off_loop(platform_api.get_license_key))
+    for name in ("relay_offered", "is_connected", "api_relay_enabled",
+                 "system_relay_active", "is_available"):
+        monkeypatch.setattr(relay_client, name, _off_loop(getattr(relay_client, name)))
+    data = client.get("/v1/admin/platform-settings").json()
+    assert data["has_license_key"] is False
+    assert data["air_gapped"] is False and data["otodock_connection"]["air_gapped"] is False
+    assert data["otodock_connection"]["connected"] is False
+    assert data["otodock_connection"]["active"] is False
+
+    monkeypatch.setattr(relay_client, "is_available", _off_loop(lambda: True))
+    monkeypatch.setattr(relay_client, "get_install_id", lambda: "test-install")
+    key = _sub_key(sign)
+    rec = _receipt(sign, key)
+
+    async def _activate(k):
+        return rec
+
+    monkeypatch.setattr(relay_client, "activate_license", _activate)
+    r = client.post("/v1/admin/license", json={"license_key": key}).json()
+    assert r["activation_state"] == "activated"
 
 
 def test_mcp_list_surfaces_hosted_for_type_none(admin, monkeypatch):

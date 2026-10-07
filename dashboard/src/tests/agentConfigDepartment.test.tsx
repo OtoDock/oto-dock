@@ -58,6 +58,8 @@ vi.mock('@/api/agents', () => ({
   useSetDelegationTargets: () => ({ mutate: h.setTargetsMock, isPending: false }),
   useExecutionLayers: () => ({ data: undefined }),
   useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
+  useAgentUsers: () => ({ data: [] }),
+  AgentUpdateError: class AgentUpdateError extends Error {},
   useKnowledgeAttachments: () => ({ data: undefined }),
   useKnowledgeLibraries: () => ({ data: undefined }),
   useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),

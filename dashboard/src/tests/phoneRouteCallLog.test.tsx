@@ -8,7 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import * as authApi from '@/api/auth'
 import CallLogModal from '@/components/phone/CallLogModal'
-import type { PhoneRoute } from '@/api/phone'
+import { PHONE_INBOUND, PHONE_OUTBOUND, type PhoneRoute } from '@/api/phone'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -81,6 +81,11 @@ describe('CallLogModal', () => {
     // A refused call never had a session: no identity, no tools.
     const refused = screen.getByText('+15550004444').closest('tr')!
     expect(refused).toHaveTextContent('—')
+  })
+
+  it('compares directions by the API words the constants name', () => {
+    // The proxy validates the spelling on every save (adapters/phone.py).
+    expect([PHONE_INBOUND, PHONE_OUTBOUND]).toEqual(['inbound', 'outbound'])
   })
 
   it('empty log explains that PIN failures will show up here', async () => {

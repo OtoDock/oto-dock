@@ -23,7 +23,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.events.common_events import DONE
+from core.events import turn_ending
+from core.events.common_events import DONE, ERROR
 from core.layers.cli import remote as cli_remote
 from core.layers.cli.remote import ClaudeRemoteState
 from core.layers.cli.settle import SettleController
@@ -79,8 +80,10 @@ async def test_stale_turn_ended_is_discarded_until_real_one_arrives():
 
     # Stream should yield exactly one DONE — the stale turn_ended is dropped,
     # the matching one terminates the turn.
-    assert len(events) == 1
-    assert events[0].type == DONE
+    # The satellite closed the turn before any result: the typed ``lost``
+    # ending, then the turn's end.
+    assert [e.type for e in events] == [ERROR, DONE]
+    assert turn_ending.from_dict(events[0].data["ending"]).reason == turn_ending.LOST
 
 
 @pytest.mark.asyncio
@@ -98,8 +101,10 @@ async def test_matching_turn_ended_terminates_turn():
     async for event in _stream(layer, info):
         events.append(event)
 
-    assert len(events) == 1
-    assert events[0].type == DONE
+    # The satellite closed the turn before any result: the typed ``lost``
+    # ending, then the turn's end.
+    assert [e.type for e in events] == [ERROR, DONE]
+    assert turn_ending.from_dict(events[0].data["ending"]).reason == turn_ending.LOST
 
 
 @pytest.mark.asyncio
@@ -120,8 +125,10 @@ async def test_turn_ended_without_command_id_still_honored():
     async for event in _stream(layer, info):
         events.append(event)
 
-    assert len(events) == 1
-    assert events[0].type == DONE
+    # The satellite closed the turn before any result: the typed ``lost``
+    # ending, then the turn's end.
+    assert [e.type for e in events] == [ERROR, DONE]
+    assert turn_ending.from_dict(events[0].data["ending"]).reason == turn_ending.LOST
 
 
 @pytest.mark.asyncio
@@ -187,8 +194,10 @@ async def test_codex_turn_filters_stale_turn_ended():
     async for event in _stream(layer, info):
         events.append(event)
 
-    assert len(events) == 1
-    assert events[0].type == DONE
+    # The satellite closed the turn before any result: the typed ``lost``
+    # ending, then the turn's end.
+    assert [e.type for e in events] == [ERROR, DONE]
+    assert turn_ending.from_dict(events[0].data["ending"]).reason == turn_ending.LOST
 
 
 def _text_event(text: str) -> dict:

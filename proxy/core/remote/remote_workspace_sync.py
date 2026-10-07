@@ -19,7 +19,7 @@ from pathlib import Path
 from auth import roles as _roles
 from core import placement
 from core import layout
-from services.infra import safe_fs
+from services.infra import path_confinement, safe_fs
 
 logger = logging.getLogger("remote-layer")
 
@@ -402,7 +402,7 @@ class RemoteWorkspaceSyncMixin:
         so a back-to-back session's warmup isn't blocked behind it."""
         import asyncio as _asyncio
         import config as _cfg
-        from core.remote import remote_file_flow
+        from core.remote import file_sync, remote_file_flow
         from services.notifications import notification_manager
         from services.path_policy_v2 import PathRef
         from storage.files import file_author_store
@@ -416,12 +416,12 @@ class RemoteWorkspaceSyncMixin:
             try:
                 lock = await remote_file_flow._acquire_global_path_lock(agent_slug, rp)
                 async with lock:
-                    dest = (agent_dir / rp).resolve()
-                    try:
-                        dest.relative_to(agent_dir.resolve())
-                    except ValueError:
+                    # The named path, never resolved: the pull opens it by
+                    # components and refuses a link at any one.
+                    if not file_sync.is_canonical_rel_path(rp):
                         logger.warning("deferred-sync pull traversal blocked: %s", rp)
                         continue
+                    dest = path_confinement.join_under(agent_dir, rp)
                     ok = await self._cm.pull_file_to_path(
                         machine_id, PathRef("agent_tree", rp), dest,
                         agent_slug=agent_slug,
@@ -691,6 +691,9 @@ class RemoteWorkspaceSyncMixin:
             import time as _time_mod
             _total = len(foreground_actions)
             _last_tick = {"t": 0.0}
+            # The share of each push still on its way: a large file moves
+            # the row by its bytes, not only when it lands.
+            partial: dict[str, float] = {}
 
             async def _progress_tick(final: bool = False) -> None:
                 if progress_cb is None or _total == 0:
@@ -700,7 +703,8 @@ class RemoteWorkspaceSyncMixin:
                     return
                 _last_tick["t"] = now
                 try:
-                    await progress_cb(n["done"], _total)
+                    done = n["done"] + (0.0 if final else sum(partial.values()))
+                    await progress_cb(done, _total)
                 except Exception:
                     logger.debug("sync progress_cb failed", exc_info=True)
 
@@ -754,16 +758,25 @@ class RemoteWorkspaceSyncMixin:
                         if action.capture_side:
                             await _capture_loser(action)
                         # Pass the PATH — push_file streams from disk (memory
-                        # O(window) even at 1GB; a vanished file returns False
-                        # into the existing failure path). 60s window timeout:
-                        # 30s/8MB window needs ≥364KB/s on the b64 wire — too
-                        # tight for big files on slow links. The global
-                        # transfer gate (innermost — see its lock-order
-                        # invariant) bounds concurrent LARGE pushes across
-                        # machines; sub-threshold files bypass it so a
+                        # O(chunk) even at 1GB; a vanished file returns False
+                        # into the existing failure path). It runs while the
+                        # file moves (the connection's credit paces it), and
+                        # its byte progress drives the row and keeps the
+                        # session starting. The transfer gate (innermost,
+                        # see its lock-order invariant) bounds the machine's
+                        # concurrent LARGE pushes; sub-threshold files
+                        # bypass it so a
                         # tiny-file warmup storm never queues behind a big
-                        # fan-out.
+                        # fan-out. The push is pinned to the platform hash
+                        # the merge planned on (the base it records): bytes
+                        # changed since the manifest fail the push instead,
+                        # and the failure drops the cached hash of the path.
                         from core.remote import transfer_gate
+
+                        async def _bytes(sent: int, total: int, _rp=rp) -> None:
+                            partial[_rp] = sent / max(total, 1)
+                            await _progress_tick()
+
                         async with transfer_gate.slot(
                             machine_id, agent_slug, rp,
                             local_size.get(rp, 0),
@@ -771,11 +784,18 @@ class RemoteWorkspaceSyncMixin:
                             ok = await self._cm.push_file(
                                 machine_id, PathRef("agent_tree", rp),
                                 agent_dir / rp,
-                                agent_slug=agent_slug, timeout=60.0,
+                                agent_slug=agent_slug, progress_cb=_bytes,
+                                content_hash=action.base_hash or None,
                             )
                         if not ok:
+                            # A push pinned to a stale cached hash fails at
+                            # every sync until the next merge hashes it again.
+                            file_sync.forget_hash(agent_dir / rp)
                             logger.warning("Push failed during initial sync: %s", rp)
                             return
+                        # The machine holds the platform copy: no read there
+                        # may take it for a missed push (lane D's marker).
+                        remote_file_flow.clear_platform_ahead(machine_id, agent_slug, rp)
                         n["push"] += 1
                         if action.base_hash:
                             await _asyncio.to_thread(
@@ -788,18 +808,15 @@ class RemoteWorkspaceSyncMixin:
                     elif action.op == "pull":
                         if action.capture_side:
                             await _capture_loser(action)
-                        dest = (agent_dir / rp).resolve()
-                        try:
-                            dest.relative_to(agent_dir.resolve())
-                        except ValueError:
+                        # The named path, never resolved: the pull opens it
+                        # by components and refuses a link at any one.
+                        if not file_sync.is_canonical_rel_path(rp):
                             logger.warning("initial-sync pull traversal blocked: %s", rp)
                             return
+                        dest = path_confinement.join_under(agent_dir, rp)
                         ok = await self._cm.pull_file_to_path(
                             machine_id, PathRef("agent_tree", rp), dest,
                             agent_slug=agent_slug,
-                            timeout=file_sync.pull_timeout_for_size(
-                                remote_size.get(rp, 0)
-                            ),
                         )
                         if not ok:
                             logger.warning("Pull failed during initial sync: %s", rp)
@@ -863,20 +880,24 @@ class RemoteWorkspaceSyncMixin:
                         # the global per-(agent, path) lock already held here.
                         if action.capture_side:
                             await _capture_loser(action)
-                        dest = (agent_dir / rp).resolve()
-                        try:
-                            dest.relative_to(agent_dir.resolve())
-                        except ValueError:
+                        if not file_sync.is_canonical_rel_path(rp):
                             logger.warning("delete_platform traversal blocked: %s", rp)
                             return
+                        # The name is removed beneath the agent's folder: a
+                        # link at it goes (its target stays). A missing parent
+                        # means the file is gone already. A link above it or a
+                        # directory at it refuses, and a refused delete claims
+                        # nothing: no tombstone, the base and the author kept,
+                        # no fan-out, no dashboard refresh.
                         try:
-                            if dest.is_file():
-                                dest.unlink()
+                            await _asyncio.to_thread(
+                                file_sync.apply_incoming_file, agent_dir, rp, "delete",
+                            )
+                        except FileNotFoundError:
+                            pass
                         except OSError as e:
-                            logger.warning("delete_platform unlink failed for %s: %s", rp, e)
+                            logger.warning("delete_platform refused for %s: %s", rp, e)
                             return
-                        from core.remote import file_sync as _fs
-                        _fs.prune_empty_parents(dest, agent_dir)
                         n["delete"] += 1
                         import time as _t
                         await _asyncio.to_thread(
@@ -943,6 +964,9 @@ class RemoteWorkspaceSyncMixin:
                             agent_slug, action.rel_path,
                         )
                     finally:
+                        # The push's share leaves as its file counts done, so
+                        # the row never steps back.
+                        partial.pop(action.rel_path, None)
                         n["done"] += 1
                         await _progress_tick()
 

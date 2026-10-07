@@ -1,8 +1,9 @@
 codex_base_instructions.md is a verbatim copy of
 
     codex-rs/models-manager/prompt.md
-    from https://github.com/openai/codex at tag rust-v0.156.1 (the pinned
-    Codex; byte-identical to the file at rust-v0.149.1 and rust-v0.153.4)
+    from https://github.com/openai/codex at tag rust-v0.160.0 (the pinned
+    Codex; byte-identical to the file at rust-v0.149.1, rust-v0.153.4 and
+    rust-v0.156.1)
 
 Copyright OpenAI. Licensed under the Apache License, Version 2.0; a copy of the
 license is at https://github.com/openai/codex/blob/main/LICENSE and at

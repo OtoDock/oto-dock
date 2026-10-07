@@ -186,7 +186,20 @@ ok "Python dependencies installed"
 # the platform default is 3.13. The satellite's mcp_installer auto-fetches
 # the right interpreter via uv. Without uv, those MCPs silently soft-fail
 # at install time. uv is small (~50MB) and installs into ~/.local/bin.
-if ! [ -x "${HOME}/.local/bin/uv" ] && ! [ -x "/usr/local/bin/uv" ]; then
+# The baseline step above put a uv on this shell's PATH: the pinned one in
+# /usr/local/bin on Linux, brew's on macOS (/opt/homebrew/bin on Apple
+# Silicon). That one is used, never replaced by Astral's latest. The daemon
+# looks in ~/.local/bin, /usr/local/bin and /usr/bin before its own PATH,
+# and launchd gives it no /opt/homebrew/bin, so a uv found only on PATH is
+# linked into ~/.local/bin. Astral's installer runs only when none is found.
+uv_on_path="$(command -v uv 2>/dev/null || true)"
+if [ -x "${HOME}/.local/bin/uv" ] || [ -x "/usr/local/bin/uv" ] || [ -x "/usr/bin/uv" ]; then
+    ok "uv already present"
+elif [ -n "$uv_on_path" ]; then
+    mkdir -p "${HOME}/.local/bin"
+    ln -sf "$uv_on_path" "${HOME}/.local/bin/uv"
+    ok "uv found at $uv_on_path (linked into ~/.local/bin for the satellite)"
+else
     info "Installing uv (needed for Python-version-pinned MCPs)..."
     if command -v curl &>/dev/null; then
         curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -195,8 +208,6 @@ if ! [ -x "${HOME}/.local/bin/uv" ] && ! [ -x "/usr/local/bin/uv" ]; then
         warn "curl not available; skipping uv install. Python-3.13-pinned MCPs"
         warn "(e.g. unifi-network, ha-mcp) will not install on this satellite."
     fi
-else
-    ok "uv already present"
 fi
 
 # --- Step 6: write satellite.conf ---
@@ -252,6 +263,8 @@ ExecStart=$SATELLITE_DIR/venv/bin/python -m satellite
 WorkingDirectory=$SATELLITE_DIR
 Restart=always
 RestartSec=5
+# One child the OOM killer ends must not stop every session the unit parents.
+OOMPolicy=continue
 Environment=HOME=$HOME
 
 [Install]

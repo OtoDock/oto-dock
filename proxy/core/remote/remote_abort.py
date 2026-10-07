@@ -98,6 +98,7 @@ class RemoteAbortMixin:
         info = self._sessions.get(session_id)
         if not info:
             return False
+        info.proxy_killed = True
         # If the session was held in reconnect-grace, drop it — the
         # user aborted, so a reconnect must NOT re-adopt + resume this turn.
         self._cm.drop_grace_session(info.machine_id, session_id)

@@ -91,6 +91,21 @@ def test_manifest_takes_every_catalog_feed_and_method_and_nothing_else():
     assert all(e["description"] for e in list(catalog.FEEDS.values()) + list(catalog.METHODS.values()))
 
 
+def test_the_audience_floor_is_clamped_to_editor_and_the_new_methods_are_described():
+    for m in ("app.audience", "viewer.data.read", "viewer.data.write"):
+        assert catalog.METHODS[m]["description"]
+    assert catalog.AUDIENCE_METHOD == "app.audience"
+    assert catalog.PERSON_METHODS == catalog.SETUP_METHODS | catalog.VIEWER_DATA_METHODS
+    import json
+    for declared, stored in ((None, "editor"), ("contributor", "editor"), ("editor", "editor"),
+                             ("manager", "manager")):
+        action = _method("app.audience", **({"min_role": declared} if declared else {}))
+        ok, err = _mf.validate_actions([action], AGENT, True)
+        assert err == "" and json.loads(ok)[0]["min_role"] == stored, (declared, err)
+    ok, _ = _mf.validate_actions([_method("viewer.data.read")], AGENT, True)
+    assert "min_role" not in json.loads(ok)[0]
+
+
 # ───────────────────────── snapshots ────────────────────────────────────────
 
 
@@ -254,7 +269,7 @@ def test_the_emit_sites_read_the_audience_cache_and_no_chat_row(monkeypatch):
     manager's audience cache (no store read per emit), and a title change
     that names its owner and agent reads no chat row."""
     calls: list[str] = []
-    monkeypatch.setattr(nm, "agent_audience", lambda agent: calls.append(agent) or [VIEWER, OWNER])
+    monkeypatch.setattr(nm, "agent_audience", lambda agent, **_: calls.append(agent) or [VIEWER, OWNER])
     monkeypatch.setattr("storage.automation.notification_store.get_admin_user_subs",
                         lambda: (_ for _ in ()).throw(AssertionError("no admin read per emit")))
     assert catalog._members_and_admins(AGENT) == sorted([OWNER, VIEWER]) and calls == [AGENT]
@@ -393,6 +408,10 @@ def _checks_world(tmp_path, monkeypatch) -> None:
     with get_conn() as conn:
         conn.execute("UPDATE users SET username=%s WHERE sub=%s", ("catviewer", VIEWER))
         conn.commit()
+    # The catalog's deltas read the audience as a fan-out: fill the agent's
+    # entry the way the boot fill does, so the first delta has its audience.
+    from services.notifications.notification_manager import agent_audience
+    agent_audience(AGENT)
     (root / AGENT / "users" / "catviewer" / "workspace").mkdir(parents=True, exist_ok=True)
 
 

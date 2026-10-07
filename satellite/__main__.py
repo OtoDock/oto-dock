@@ -567,6 +567,15 @@ async def _main(config_path: Path | None = None) -> None:
     _verify_installer_drift()
     config = load_config(config_path)
 
+    # An install written before the unit carried OOMPolicy=continue gets it
+    # as a drop-in (its own unit only; the reload applies it to the running
+    # unit, verified on systemd 249).
+    from .host import service_unit
+    try:
+        await asyncio.to_thread(service_unit.ensure_oom_policy)
+    except Exception:
+        logger.warning("OOM policy check failed", exc_info=True)
+
     # CLIs installed via the reconcile's per-user npm-prefix fallback
     # (~/.npm-global/bin — sudo-less Linux can't write NodeSource's /usr
     # prefix) must resolve for every child this process spawns; augment
@@ -613,6 +622,7 @@ async def _main(config_path: Path | None = None) -> None:
         from .sessions import session_files
         session_files.wipe_all()
         session_files.purge_agent_tree_credentials(sm.config.agents_dir)
+        session_files.purge_agent_tree_mcp_configs(sm.config.agents_dir)
     except Exception:
         logger.exception("session-secrets sweep failed (non-fatal)")
 

@@ -445,3 +445,20 @@ def test_a_link_password_over_72_bytes_is_refused_with_400():
     r = client.patch(f"/v1/shares/{out['share']['id']}", json={"link_password": long_pw})
     assert r.status_code == 400 and "72 bytes" in r.json()["detail"]
     assert _unlock(_token(out["link"]), out["password"]).status_code == 200
+
+
+def test_wrong_passwords_over_the_internal_listener_count_under_its_own_key(monkeypatch):
+    """Sandboxes and the satellite tunnel reach the proxy on the internal
+    listener from 127.0.0.1: their failures count under that listener's own
+    key, never against a person on the host's loopback (AUTH.md "Bucket
+    key")."""
+    from auth import rate_limiter
+    from auth.lan_check import INTERNAL_LISTENER_KEY
+    monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 45123)
+    token = _token(_link(_app()["id"])["link"])
+    inner = TestClient(app, base_url="http://127.0.0.1:45123", client=("127.0.0.1", 40000))
+    r = inner.post(f"/s/{token}/unlock", json={"password": "bad-1"},
+                   headers={"Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 403
+    assert rate_limiter._attempts[("share_unlock_ip", INTERNAL_LISTENER_KEY)]["count"] == 1
+    assert ("share_unlock_ip", "127.0.0.1") not in rate_limiter._attempts

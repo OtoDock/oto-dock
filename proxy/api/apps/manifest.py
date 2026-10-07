@@ -48,7 +48,11 @@ MAX_SCHEMA_DESC_CHARS = 500
 # sandboxed frame itself. Declared in the manifest so the approval card
 # surfaces them; the catalog (``api/apps/catalog.py``) is the entire attack
 # surface, so additions need their own review.
-from api.apps.catalog import FEEDS as _CATALOG_FEEDS, METHODS as _CATALOG_METHODS  # noqa: E402
+from api.apps.catalog import (  # noqa: E402
+    AUDIENCE_METHOD as _CATALOG_AUDIENCE,
+    FEEDS as _CATALOG_FEEDS,
+    METHODS as _CATALOG_METHODS,
+)
 
 ALLOWED_DATA_FEEDS = frozenset(_CATALOG_FEEDS)
 ALLOWED_PLATFORM_METHODS = frozenset(_CATALOG_METHODS)
@@ -60,18 +64,29 @@ ACTION_ROLES = roles.AGENT_ROLES
 
 def caller_role(row: dict, user: UserContext | None) -> str:
     """The role an action floor is judged against. A cookie principal's
-    per-agent role (the owner of a personal app is its manager; a grantee
-    or a non-member is a viewer); every bearer principal (session JWT,
-    master key, delegation callers) clamps to viewer whatever its owner's
-    role, so a prompt never drives a floored button; admin passes every
-    floor."""
+    per-agent role (the owner of a personal app is its manager; a member of
+    the app's agent acts at their row there); a person a share admits holds
+    the role the share gives them (SHARING.md: a person share's cap; an
+    agent or department placement's cap, capped by their role on the
+    receiving agent; the strongest share admitting them, whichever panel
+    lists the app), read from the store; anyone else is a viewer. Every bearer principal
+    (session JWT, master key, delegation callers) clamps to viewer whatever
+    its owner's role, so a prompt never drives a floored button; admin
+    passes every floor. The share read is a DB round trip: call it off the
+    loop for a viewer who is neither owner nor member."""
     if user is None or getattr(user, "is_api_key", False):
         return roles.VIEWER
     if user.is_admin:
         return roles.ADMIN
     if row.get("username"):
-        return roles.MANAGER if (row.get("owner_sub") or "") == user.sub else roles.VIEWER
-    return user.acting_role(row.get("agent") or "")
+        if (row.get("owner_sub") or "") == user.sub:
+            return roles.MANAGER
+    elif user.can_access_agent(row.get("agent") or ""):
+        return user.acting_role(row.get("agent") or "")
+    from storage.sharing import share_store
+    role = share_store.effective_share_role(row.get("id") or "", user.sub,
+                                            user.agent_roles or {}, False)
+    return role or roles.VIEWER
 
 
 def meets_floor(action: dict, role: str) -> bool:
@@ -87,7 +102,7 @@ def _min_role(a: dict, aid: str) -> tuple[str | None, str]:
     if raw in (None, roles.NO_ACCESS, roles.VIEWER):
         return None, ""
     if raw not in ACTION_ROLES:
-        return None, f"action {aid!r}: min_role must be viewer, editor or manager"
+        return None, f"action {aid!r}: min_role must be viewer, contributor, editor or manager"
     return raw, ""
 
 
@@ -394,6 +409,11 @@ def validate_actions(actions, agent: str, shared: bool) -> tuple[str | None, str
             # the caller's own role at the file API.
             if method == "files.write" and not min_role:
                 min_role = "contributor"
+            # The audience names other people: a person reads it at editor
+            # or above whatever the author declared (the app itself reads
+            # it unattended), so the card's chip says so.
+            if method == _CATALOG_AUDIENCE and roles.rank(min_role) < roles.rank(roles.EDITOR):
+                min_role = roles.EDITOR
             if a.get("args_schema") is not None:
                 schema, err = validate_args_schema(a["args_schema"])
                 if err:
@@ -511,6 +531,16 @@ def parse_exports(row: dict) -> dict:
     """``{"methods": {…}, "snapshots": {…}, "events": {…}}`` (APPS.md
     "Bindings"), each value ``{"description": …, "min_role"?: …}``."""
     return _parse_block(row, "exports", dict)
+
+
+def exported_method(row: dict, path: str) -> dict | None:
+    """The signed ``exports.methods`` entry the FIRST segment of ``path``
+    names, for the broker and for a placed agent's session (APPS.md
+    "Bindings", "Agents call apps"): split as sent, no ``lstrip``, so ``/x``
+    and ``//x`` name nothing; None for an unexported path."""
+    methods = parse_exports(row).get("methods") or {}
+    entry = methods.get(path.split("/", 1)[0])
+    return entry if isinstance(entry, dict) else None
 
 
 def parse_bindings(row: dict) -> list[dict]:

@@ -14,11 +14,11 @@ import hashlib
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_auth, require_user
 from services.community import community_icons
 from auth import roles
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # An icon costs one request per hour per browser. A miss is cached for five
 # minutes only: the URL never changes, and the MCP may get installed (or its

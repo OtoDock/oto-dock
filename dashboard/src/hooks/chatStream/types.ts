@@ -78,6 +78,9 @@ export interface UseChatStreamOptions {
   /** Early restore from chat_history that the hook doesn't own (chat: restore
    * chatActiveLayer + model from execution_path). */
   onChatHistoryMeta?: (data: any) => void
+  /** The viewed chat's stored execution mode: the ack of a terminal pick or
+   *  the echo of a refused one. */
+  onExecutionModeChanged?: (executionMode: string) => void
   /** Fires after chat_history is applied (chat: deferred find-bar; task:
    * setChatReady(true)). */
   onChatHistoryLoaded?: (data: any) => void

@@ -5,9 +5,11 @@ its lifetime, so an active session never expires — but logout must stay
 authoritative (a logged-out session is never resurrected).
 """
 
+import secrets
 import time
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 import config
@@ -30,6 +32,17 @@ def _cookie_value(set_cookie: str) -> str:
     return set_cookie.split("session=", 1)[1].split(";", 1)[0]
 
 
+@pytest.fixture(autouse=True)
+def _row_predates_the_stale_cookies():
+    # The seeded row is created at test start and the stale cookies below
+    # are hours old; a cookie older than its person's row is refused.
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET created_at=%s WHERE sub='user-admin'",
+                     ("2020-01-01T00:00:00+00:00",))
+        conn.commit()
+
+
 def _stale_token(sub: str = "user-admin") -> str:
     """A valid session JWT that is past the halfway mark of its life."""
     now = int(time.time())
@@ -40,6 +53,7 @@ def _stale_token(sub: str = "user-admin") -> str:
             "auth_provider": "local",
             "iat": now - 10 * 3600,  # 10h old
             "exp": now + 3600,       # 1h left → well past halfway
+            "jti": secrets.token_urlsafe(8),  # its own sign-in
         },
         config.JWT_SECRET, algorithm="HS256",
     )
@@ -142,3 +156,35 @@ def test_a_deleted_users_cookie_is_not_reminted():
     r = client.get("/auth/config", headers={"Cookie": f"session={_stale_token('local:gone')}"})
     assert r.status_code == 200
     assert _session_set_cookies(r) == []
+
+
+@pytest.mark.asyncio
+async def test_a_remint_is_dated_to_the_routes_check_so_a_later_epoch_refuses_it(monkeypatch):
+    """The route judged the cookie current, then a "sign out everywhere"
+    moved the person's epoch while the request ran: the refresh re-mints
+    without a second read, dated to the route's check, so the new cookie
+    predates the epoch and is refused like the old one."""
+    from datetime import datetime, timezone
+    from starlette.datastructures import MutableHeaders
+    from auth.providers import session_cookie_current
+    from storage import database as task_store
+    from storage.pg import get_conn
+
+    monkeypatch.setattr(middleware, "_expiry_cache", (0, 0.0))
+    now = int(time.time())
+    cookie = _stale_token()
+    scope = {"type": "http", "path": "/v1/users/me/passkeys", "state": {
+        "otodock_session_cookie": cookie, "otodock_session_cookie_checked_at": now - 20,
+    }}
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET token_epoch_at=%s WHERE sub='user-admin'",
+                     (datetime.fromtimestamp(now - 10, timezone.utc).isoformat(),))
+        conn.commit()
+    headers = MutableHeaders()
+    await middleware._refresh_session_cookie(scope, headers, cookie)
+    minted = [v for v in headers.getlist("set-cookie") if v.startswith("session=")]
+    assert len(minted) == 1
+    payload = validate_session_jwt(_cookie_value(minted[0]))
+    assert payload["iat"] == now - 20
+    assert not session_cookie_current(task_store.get_user("user-admin"), payload)
+    assert client.get("/auth/me", headers={"Cookie": f"session={_cookie_value(minted[0])}"}).status_code == 401

@@ -24,6 +24,7 @@ import config
 from app import app
 from auth.providers import _resolve_principal
 from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from storage import database as db
 
 client = TestClient(app)
@@ -42,8 +43,11 @@ def _bearer(token: str) -> dict:
 
 
 def _legacy_token(sub: str) -> str:
-    """A token as minted before this release: no ``iat``."""
-    return jwt.encode({"type": "session", "sid": str(uuid.uuid4()), "agent": AGENT,
+    """A token as minted before 1.7.0: no ``iat``, its session live."""
+    from core.session import session_state
+    sid = str(uuid.uuid4())
+    session_state.mark_starting(sid, 3600)
+    return jwt.encode({"type": "session", "sid": sid, "agent": AGENT,
                        "user_sub": sub, "exp": int(time.time()) + 3600},
                       config.JWT_SECRET, algorithm="HS256")
 
@@ -64,7 +68,7 @@ def test_a_minted_token_carries_an_integer_iat():
 
 
 def test_a_deleted_users_token_resolves_to_nobody():
-    token = create_session_token(str(uuid.uuid4()), AGENT, "user-viewer")
+    token = live_session_token(str(uuid.uuid4()), AGENT, "user-viewer")
     assert asyncio.run(_resolve_principal(_req(token))).sub == "user-viewer"
     assert db.delete_user("user-viewer")
     assert asyncio.run(_resolve_principal(_req(token))) is None
@@ -72,13 +76,13 @@ def test_a_deleted_users_token_resolves_to_nobody():
 
 
 def test_a_no_user_token_is_unchanged():
-    token = create_session_token(str(uuid.uuid4()), AGENT, "")
+    token = live_session_token(str(uuid.uuid4()), AGENT, "")
     p = asyncio.run(_resolve_principal(_req(token)))
     assert p is not None and p.is_no_user_session and p.agent == AGENT
 
 
 def test_a_password_change_ends_older_session_tokens():
-    old = create_session_token(str(uuid.uuid4()), AGENT, "user-viewer")
+    old = live_session_token(str(uuid.uuid4()), AGENT, "user-viewer")
     assert client.get("/v1/tasks", headers=_bearer(old)).status_code == 200
     _stamp_password_change("user-viewer", datetime.now(timezone.utc) + timedelta(seconds=60))
     assert client.get("/v1/tasks", headers=_bearer(old)).status_code == 401
@@ -86,7 +90,7 @@ def test_a_password_change_ends_older_session_tokens():
 
 def test_a_token_minted_after_the_change_works():
     _stamp_password_change("user-viewer", datetime.now(timezone.utc) - timedelta(seconds=60))
-    fresh = create_session_token(str(uuid.uuid4()), AGENT, "user-viewer")
+    fresh = live_session_token(str(uuid.uuid4()), AGENT, "user-viewer")
     assert client.get("/v1/tasks", headers=_bearer(fresh)).status_code == 200
 
 

@@ -37,7 +37,9 @@ MONTHLY = {"slug": "monthly", "title": "Tidy up", "body": "b1", "scope": "user",
 def _clean():
     from services.apps import app_supervisor
     from services.community import community_agent_updater as upd, template_app_seeder
+    last_sweep = upd._last_notify_sweep
     yield
+    upd._last_notify_sweep = last_sweep
     template_app_seeder._locks.clear()
     template_app_seeder._healed.clear()
     template_app_seeder._failure_told.clear()
@@ -472,14 +474,24 @@ def test_the_daily_sweep_tells_the_managers_once_per_version(tmp_path, temp_db):
     with patch("services.community.community_agents_catalog.fetch_registry",
                new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
             patch("services.notifications.notification_manager.fire_notification", new=fired):
-        # Minus infinity, not 0: the marker is a time.monotonic() stamp, which counts
-        # from boot, and on a host up less than a day (a fresh CI runner) 0 is recent.
-        upd._last_notify_sweep = float("-inf")
         assert asyncio.run(upd.maybe_notify_updates()) == 1
         assert fired.call_args.kwargs["target"] == ADMIN_SUB and "2.0.0" in fired.call_args.kwargs["title"]
         assert agent_store.get_community_template_data(AGENT)["update_notified"] == "2.0.0"
         upd._last_notify_sweep = float("-inf")
         assert asyncio.run(upd.maybe_notify_updates()) == 0
+
+
+def test_the_first_sweep_after_a_reboot_runs_at_once(tmp_path, temp_db):
+    # The sweep's clock is time.monotonic(), which counts from boot: a host
+    # up five minutes must not wait a day for its first sweep.
+    from types import SimpleNamespace
+    from services.community import community_agent_updater as upd
+    _install_v1(tmp_path)
+    with patch("services.community.community_agents_catalog.fetch_registry",
+               new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
+            patch("services.notifications.notification_manager.fire_notification", new=AsyncMock()), \
+            patch.object(upd, "time", SimpleNamespace(monotonic=lambda: 300.0)):
+        assert asyncio.run(upd.maybe_notify_updates()) == 1
 
 
 def test_the_home_app_test_data_is_json(tmp_path):
@@ -598,6 +610,69 @@ def test_the_update_and_take_never_go_through_a_link(tmp_path, temp_db):
     assert e.value.status_code == 400 and outside.read_text() == "HOST SECRET"
 
 
+def test_the_app_copies_are_hashed_and_seeded_without_following_a_link(tmp_path, temp_db, monkeypatch):
+    # The seed copy and a member's working copy sit in trees a session
+    # writes: a file swapped for a link after the walk judged the tree is
+    # refused, never read through (even one naming the same bytes), and a
+    # seed destination re-created as a link is never written through.
+    import shutil
+    from services.apps import releases
+    from services.community import community_agent_updater as upd
+    from services.community import template_app_seeder as seeder
+    from storage import database as db
+    from storage.agents import agent_store
+    from storage.agents.community_agent_template_store import load_template_from_dict, load_template_from_dir
+    _install_v1(tmp_path)
+    item = load_template_from_dict(agent_store.get_community_template_data(AGENT)).apps[0]
+    sources = [load_template_from_dir(_template(tmp_path / f"src{n}", "1.0.0")).apps[0] for n in (1, 2)]
+    seed = seeder.seed_source_dir(AGENT, "home")
+    working = _agent_dir() / "users" / db.get_username_by_sub(ADMIN_SUB) / "workspace" / "apps" / "home"
+    doc = json.loads((seed / "app.json").read_text())
+    assert seeder.copy_matches(item, seed) and upd._tree_unchanged(working, item, doc)
+    twin = tmp_path / "twin.html"
+    twin.write_text((seed / "client" / "index.html").read_text())
+    secret = tmp_path / "secret.html"
+    secret.write_text("SECRET-CONTENT")
+    real_walk = releases.walk_tree
+    link_to = [twin]
+
+    def swapping(source):
+        files = real_walk(source)
+        page = Path(source) / "client" / "index.html"
+        if not page.is_symlink():
+            page.unlink()
+            page.symlink_to(link_to[0])
+        return files
+
+    monkeypatch.setattr(releases, "walk_tree", swapping)
+    assert not seeder.copy_matches(item, seed)
+    assert not upd._tree_unchanged(working, item, doc)
+    # The seed copy written from a template folder whose page turned into a
+    # link after the walk: refused, the link's bytes land nowhere.
+    link_to[0] = secret
+    with pytest.raises(OSError):
+        seeder.write_seed_source(AGENT, sources[0])
+    for p in seed.rglob("*") if seed.is_dir() else []:
+        assert not p.is_file() or "SECRET-CONTENT" not in p.read_text(errors="replace"), p
+    # The seed destination re-created as a link while the walk ran.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    def relinking(source):
+        files = real_walk(source)
+        if seed.is_dir() and not seed.is_symlink():
+            shutil.rmtree(seed)
+        if not seed.is_symlink():
+            seed.parent.mkdir(parents=True, exist_ok=True)
+            seed.symlink_to(outside, target_is_directory=True)
+        return files
+
+    monkeypatch.setattr(releases, "walk_tree", relinking)
+    with pytest.raises(OSError):
+        seeder.write_seed_source(AGENT, sources[1])
+    assert list(outside.iterdir()) == []
+
+
 def test_a_catalog_version_is_a_release_number():
     # The version names a folder under config/community.
     from services.community import community_agent_updater as upd
@@ -653,6 +728,30 @@ def test_auto_attach_an_admin_turned_off_stays_off(tmp_path, temp_db):
         report = asyncio.run(upd._apply_now(AGENT, v2, ADMIN_SUB, "admin", app_consent=None, check_consent=None))
     assert not agent_store.get_agent(AGENT)["default_for_new_users_role"]
     assert "auto-attach for new users" not in report["added"]
+
+
+def test_an_update_offers_no_below_editor_default_on_a_shared_only_agent(tmp_path, temp_db):
+    from storage.agents import agent_store
+    from storage.agents.community_agent_template_store import load_template_from_dir
+    from services.community import community_agent_updater as upd
+    from services.community.community_agent_installer import install_from_extracted_template
+    _make_user(ADMIN_SUB, "admin@test.com", "admin")
+    v1 = load_template_from_dir(_write_template(tmp_path / "s1", slug="stpl",
+                                                agent_json_extra={"version": "1.0.0"}))
+    p = _patches()
+    with p[0], p[1], p[2], p[3]:
+        asyncio.run(install_from_extracted_template(
+            template=v1, target_slug=AGENT, installer_user_sub=ADMIN_SUB, installer_role="admin",
+            source_label="stpl"))
+    agent_store.update_agent(AGENT, collaborative=False, default_scope="agent")
+    v2 = load_template_from_dir(_write_template(
+        tmp_path / "s2", slug="stpl",
+        agent_json_extra={"version": "2.0.0",
+                          "default_for_new_users": {"enabled": True, "role": "viewer"}}))
+    with p[0], p[1], p[2], p[3]:
+        report = asyncio.run(upd._apply_now(AGENT, v2, ADMIN_SUB, "admin", app_consent=None, check_consent=None))
+    assert not agent_store.get_agent(AGENT)["default_for_new_users_role"]
+    assert "default_for_new_users" in report["ignored_fields"]
 
 
 def test_a_managers_mandatory_choice_survives_an_update(tmp_path, temp_db):
@@ -768,7 +867,6 @@ def test_the_daily_sweep_never_undoes_a_record_saved_meanwhile(tmp_path, temp_db
                new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
             patch("services.notifications.notification_manager.fire_notification",
                   new=AsyncMock(side_effect=an_update_lands)):
-        upd._last_notify_sweep = float("-inf")
         asyncio.run(upd.maybe_notify_updates())
     data = agent_store.get_community_template_data(AGENT)
     assert data["version"] == "2.0.0" and data["saved_by"] == "the update"

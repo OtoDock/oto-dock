@@ -31,13 +31,29 @@ from core.events.bg_command_state import (
 from core.layers.codex.app_server_client import (
     AppServerClient, AppServerError, wait_for_mcp_startup,
 )
+from core.layers.codex.helpers import will_retry
+from core.events import turn_ending, turn_life
 from core.layers.codex.codex_approvals import (
     UNTRUSTED_POLICY, approval_for_sandbox, build_sandbox_policy,
     is_untrusted_policy_rejection, make_server_request_handler,
 )
+# One wait slice of the main turn's loop: on every silent slice the life
+# check decides whether the silence passed its ceiling (turn_life).
+_SILENCE_SLICE_S = 60.0
+# The item types that are the turn's life while the daemon streams nothing
+# (a tool, a command, a patch, a search, a delegated agent): an open message
+# or reasoning item is a stalled stream, not work.
+_TOOL_ITEM_TYPES = frozenset({
+    "commandExecution", "fileChange", "mcpToolCall", "webSearch",
+    "collabAgentToolCall", "dynamicToolCall",
+})
+# The synthetic event the session yields for a typed ending it decided itself
+# (a silent turn interrupted, the daemon gone): the translator maps it to the
+# ERROR with the ending and the turn's DONE.
+TURN_ENDING_EVENT = "__turn_ending__"
 from core.session.session_state import (
-    clear_session_liveness, get_session_user_tz, has_pending_question,
-    resolve_bg_command, resolve_session_permissions,
+    clear_session_liveness, get_session_user_tz, has_pending_prompt,
+    resolve_bg_command, resolve_session_permissions, mark_closing,
 )
 
 logger = logging.getLogger("codex-session")
@@ -49,10 +65,8 @@ logger = logging.getLogger("codex-session")
 # daemon blocks on the server-request while the human decides, so `last_activity`
 # alone reads as idle and reaping it drops the waiter — the eventual answer then
 # hits a closed transport and is LOST (live 2026-08-06, T1). Waiting on a human is
-# not idleness, so grant ONE extra idle window (the same multiple the interactive
-# reaper uses); past it reap as before — the answer path falls back to a chat
-# message on the revived session (ws/dashboard_dispatch question_response).
-_QUESTION_PARK_TIMEOUT_MULT = 2
+# not idleness: the reaper spares a session with a pending prompt, bounded by the
+# prompt's own wait (``session_state.PROMPT_WAIT_S``).
 
 # Bounded warm-gate for MCP startup before the first turn (the analog of the
 # CLI's _wait_for_init): ``app_server_client.wait_for_mcp_startup`` — shared
@@ -178,6 +192,12 @@ class CodexAppServerSession:
         # nudges.
         self._router_task: asyncio.Task | None = None
         self._default_consumer: asyncio.Queue | None = None      # active main turn
+        self.open_items: set[str] = set()                        # the live turn's open tool items
+        # The live turn's own silence clock (its consumer's last event; a
+        # steer moves last_activity, never this) and whether it is a task
+        # run's turn (its ceiling is the turn ceiling).
+        self._last_event_at = time.monotonic()
+        self._task_turn = False
         self._thread_consumers: dict[str, asyncio.Queue] = {}    # sub_tid → buffer
         self._bg_supervisors: dict[str, asyncio.Task] = {}       # sub_tid → supervisor
         # Monotonic stamp of the last thread/backgroundTerminals/list RPC —
@@ -282,7 +302,7 @@ class CodexAppServerSession:
         self.last_activity = time.monotonic()
 
     async def send_message(
-        self, prompt: str, *, inject_time: bool = False,
+        self, prompt: str, *, inject_time: bool = False, task: bool = False,
     ) -> AsyncIterator[CodexEvent]:
         """Run one turn: ``turn/start`` → stream notifications → ``turn/completed``.
 
@@ -350,21 +370,59 @@ class CodexAppServerSession:
             turn_params["approvalPolicy"] = self.approval_policy
             res = await self._client.request("turn/start", turn_params)
         self._current_turn_id = (res.get("turn") or {}).get("id")
-        self.last_activity = time.monotonic()
+        self.last_activity = self._last_event_at = time.monotonic()
+        self._task_turn = task
 
+        # The main thread's tool items whose completion has not arrived: the
+        # turn's life while the daemon streams nothing (turn_life).
+        self.open_items.clear()
         try:
             while True:
-                method, params = await consumer.get()
-                self.last_activity = time.monotonic()
+                try:
+                    method, params = await asyncio.wait_for(
+                        consumer.get(), timeout=_SILENCE_SLICE_S,
+                    )
+                except asyncio.TimeoutError:
+                    if not self._silent_past_ceiling():
+                        continue
+                    # Nothing keeps the turn and the silence passed its
+                    # ceiling: the turn is interrupted and ends typed, so the
+                    # chat offers the message again instead of a timer. The
+                    # rollout keeps what ran. A daemon that does not answer
+                    # the interrupt is closed: the next turn re-warms it with
+                    # thread/resume instead of meeting the same wedge.
+                    silent_for = time.monotonic() - self._last_event_at
+                    logger.warning(
+                        f"Codex [{self.session_id[:8]}] no notification for "
+                        f"{silent_for:.0f}s with nothing running — ending the turn"
+                    )
+                    if not await self.abort():
+                        logger.warning(
+                            f"Codex [{self.session_id[:8]}] the interrupt was not "
+                            f"answered, closing the daemon"
+                        )
+                        if self._client is not None:
+                            with contextlib.suppress(Exception):
+                                await self._client.close()
+                    ending = turn_ending.TurnEnding(
+                        reason=turn_ending.SILENT,
+                        detail=f"no output for {int(silent_for)} s", graceful=True,
+                    )
+                    yield CodexEvent(type=TURN_ENDING_EVENT, data=ending.as_dict())
+                    return
+                self.last_activity = self._last_event_at = time.monotonic()
                 if method == "__daemon_exit__":
                     # Daemon died mid-turn → it will never send serverRequest/
                     # resolved, so release any pending in-process approval /
                     # MCP-gate waiter for this session (deny) before we bail.
                     resolve_session_permissions(self.session_id, approved=False)
-                    yield CodexEvent(type="error", data={
-                        "message": "Codex app-server exited unexpectedly",
-                    })
+                    ending = turn_ending.TurnEnding(
+                        reason=turn_ending.EXITED,
+                        detail="Codex app-server exited unexpectedly",
+                    )
+                    yield CodexEvent(type=TURN_ENDING_EVENT, data=ending.as_dict())
                     return
+                self._note_item_life(method, params)
                 yield CodexEvent(type=method, data=params)
                 # The router only feeds this consumer the MAIN thread's (and any
                 # untagged) notifications — a spawned sub-agent's events go to its
@@ -377,20 +435,49 @@ class CodexAppServerSession:
                 if method == "turn/completed" and is_main_thread:
                     return
                 if (method == "error" and is_main_thread
-                        and not params.get("error", {}).get("willRetry")):
+                        and not will_retry(params)):
                     # Stream-level failure on the MAIN thread that won't retry.
                     return
         finally:
             self._current_turn_id = None
+            self.open_items.clear()
             # Hand off any still-running background sub-agents to supervisors and
             # clear this turn's consumer. Synchronous (no await) so the router
             # can't observe a partial hand-off.
             self._handoff_bg_subagents()
 
-    async def abort(self) -> None:
-        """Interrupt the in-flight turn; keep the daemon warm (no trim hack)."""
-        if self._client is None or not self._client.is_alive:
+    def _silent_past_ceiling(self) -> bool:
+        """Whether the live turn's silence (since its consumer's last
+        event) has passed its ceiling with nothing keeping the turn: the loop
+        ends the turn on it and ``steer`` refuses input that would be lost."""
+        if not self._current_turn_id and self._default_consumer is None:
+            return False
+        return turn_life.ends(
+            self.session_id, tools_open=bool(self.open_items),
+            silent_for=time.monotonic() - self._last_event_at, task=self._task_turn,
+        )
+
+    def _note_item_life(self, method: str, params) -> None:
+        """Track the main thread's open tool items: a started tool call, a
+        command, a patch, an MCP call is the turn's life until its
+        completion. A message or reasoning item is not."""
+        if method not in ("item/started", "item/completed") or not isinstance(params, dict):
             return
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        iid = item.get("id") or ""
+        if not iid or item.get("type") not in _TOOL_ITEM_TYPES:
+            return
+        if method == "item/started":
+            self.open_items.add(iid)
+        else:
+            self.open_items.discard(iid)
+
+    async def abort(self) -> bool:
+        """Interrupt the in-flight turn; keep the daemon warm (no trim hack).
+        False when the daemon did not answer the interrupt (an error or its
+        timeout), True otherwise (nothing to interrupt included)."""
+        if self._client is None or not self._client.is_alive:
+            return True
         if not self._current_turn_id and self._default_consumer is not None:
             # A turn is mid turn/start (consumer registered, id not yet
             # assigned) — wait out the RPC so the interrupt can't miss the
@@ -400,14 +487,16 @@ class CodexAppServerSession:
                 if self._current_turn_id or self._default_consumer is None:
                     break
         if not self._current_turn_id:
-            return
+            return True
         try:
             await self._client.request("turn/interrupt", {
                 "threadId": self.thread_id, "turnId": self._current_turn_id,
             }, timeout=10.0)
             logger.info(f"Codex [{self.session_id[:8]}] interrupted turn {self._current_turn_id}")
-        except AppServerError as e:
+        except (AppServerError, asyncio.TimeoutError) as e:
             logger.warning(f"Codex [{self.session_id[:8]}] interrupt failed: {e}")
+            return False
+        return True
 
     async def steer(self, text: str) -> bool:
         """Inject user input into the RUNNING turn via ``turn/steer``.
@@ -423,6 +512,10 @@ class CodexAppServerSession:
         """
         if (self._closed or self._client is None or not self._client.is_alive
                 or not self._current_turn_id):
+            return False
+        if self._silent_past_ceiling():
+            # The turn is about to end silent: the caller queues the input
+            # for the next turn instead.
             return False
         try:
             await self._client.request("turn/steer", {
@@ -523,8 +616,7 @@ class CodexAppServerSession:
                         f"without a contextCompaction item"
                     )
                     return None
-                if method == "error" and not (
-                        (params.get("error") or {}).get("willRetry")):
+                if method == "error" and not will_retry(params):
                     logger.warning(
                         f"Codex [{self.session_id[:8]}] compaction failed: "
                         f"{(params.get('error') or {}).get('message', '?')}"
@@ -930,8 +1022,7 @@ class CodexAppServerSession:
                     break
                 if method == "turn/completed":
                     break
-                if (method == "error"
-                        and not (params or {}).get("error", {}).get("willRetry")):
+                if method == "error" and not will_retry(params):
                     break
             else:
                 if q is not None:
@@ -1107,7 +1198,9 @@ async def create_codex_session(
         await session.start()
     except Exception:
         async with _codex_sessions_lock:
-            _codex_sessions.pop(session_id, None)
+            dropped = _codex_sessions.pop(session_id, None) is not None
+        if dropped:
+            mark_closing(session_id)
         await session.close()
         raise
     return session
@@ -1121,6 +1214,7 @@ async def get_codex_session(session_id: str) -> CodexAppServerSession | None:
             return session
         if session and session._closed:
             _codex_sessions.pop(session_id, None)
+            mark_closing(session_id)
         return session if session else None
 
 
@@ -1130,6 +1224,7 @@ async def close_codex_session(session_id: str) -> bool:
         session = _codex_sessions.pop(session_id, None)
     if not session:
         return False
+    mark_closing(session_id)
     await session.close()
     # Any background sub-agent threads died with the daemon — clear their
     # badges (the dead daemon's supervisor can never emit the clears itself).
@@ -1150,21 +1245,21 @@ async def close_codex_session(session_id: str) -> bool:
 def _codex_reap_candidates(now: float, idle_timeout: float) -> list[str]:
     """Session ids the idle sweep must close.
 
-    Dead sessions always; over-idle ones unless the turn is parked on an
-    unanswered `request_user_input` and still inside the extra window
-    (``_QUESTION_PARK_TIMEOUT_MULT``).
+    Dead sessions always; over-idle ones unless a prompt waits on a person
+    (a permission card, a question), whose own wait bounds the spare.
     """
     reap: list[str] = []
     for sid, s in list(_codex_sessions.items()):
         if not s.is_alive:
             reap.append(sid)
             continue
+        if s._current_turn_id:
+            continue  # a live turn: its own silence ceiling governs it
         idle = now - s.last_activity
         if idle <= idle_timeout:
             continue
-        if (has_pending_question(sid)
-                and idle < _QUESTION_PARK_TIMEOUT_MULT * idle_timeout):
-            continue
+        if has_pending_prompt(sid):
+            continue  # a prompt waits on a person; its own wait bounds it
         # Background terminals and background subagents feed the same
         # registries the CLI layer keeps; a running one keeps the daemon.
         from core.session import background_leash

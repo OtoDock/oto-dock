@@ -119,6 +119,13 @@ def test_spawn_write_pdf_core(tmp_path, spawn):
     assert out.exists() and out.read_bytes()[:5] == b"%PDF-"
 
 
+def test_spawn_temp_pdf_core(tmp_path, spawn):
+    out = tmp_path / "shot.pdf"
+    html = "<!DOCTYPE html><html><head></head><body><p>hello</p></body></html>"
+    asyncio.run(isolation.run_parse(pdf_mod._render_temp_pdf_core, html, str(out)))
+    assert out.read_bytes()[:5] == b"%PDF-"
+
+
 def test_spawn_write_xlsx_core(tmp_path, spawn):
     import excel as excel_mod
     out = tmp_path / "book.xlsx"

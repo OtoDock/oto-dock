@@ -1,8 +1,8 @@
 {
   "name": "delegation-mcp",
   "label": "Delegation",
-  "description": "Delegate work to parallel agent sessions and monitor them",
-  "version": "1.2.7",
+  "description": "Delegate work to parallel agent sessions, monitor them, and hand files back with a result",
+  "version": "1.3.0",
   "category": "core",
 
   "server": {
@@ -44,6 +44,13 @@
       "input_type": "number",
       "default": "50",
       "user_overridable": false
+    },
+    {
+      "key": "RESULT_FILES_MAX_PER_RUN",
+      "label": "Max files a delegated run attaches to its result",
+      "input_type": "number",
+      "default": "60",
+      "user_overridable": false
     }
   ],
 
@@ -62,14 +69,14 @@
       "id": "delegation",
       "loading": "always",
       "file": "skills/delegation.md",
-      "description": "Delegating work to parallel sessions, choosing chat vs task surface, monitoring lanes, project orchestration",
+      "description": "Delegating work to parallel sessions, choosing chat vs task surface, monitoring lanes, project orchestration, attaching files to a result as a worker",
       "default_exclude_from": []
     },
     {
       "id": "delegation-guide",
       "loading": "on_demand",
       "file": "skills/delegation-guide/SKILL.md",
-      "description": "Reference for the delegation tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, reading other agents' sessions. Use before delegating work or running a multi-lane project.",
+      "description": "Reference for the delegation tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, attach_result_files (a worker's deliverables), reading other agents' sessions. Use before delegating work or running a multi-lane project.",
       "default_exclude_from": []
     }
   ],

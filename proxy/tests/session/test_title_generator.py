@@ -64,7 +64,7 @@ def test_select_auto_ladder_prefers_groq(temp_db, monkeypatch):
 def test_select_auto_ladder_falls_to_anthropic(temp_db, monkeypatch):
     from services import title_generator as tg
     _configure(monkeypatch, {"anthropic"})
-    assert tg._select_provider() == ("anthropic", "claude-haiku-4-5")
+    assert tg._select_provider() == ("anthropic", "claude-sonnet-5-5")
 
 
 def test_select_admin_pin_overrides_ladder(temp_db, monkeypatch):
@@ -91,6 +91,50 @@ def test_status_shape(temp_db, monkeypatch):
     assert st["active"] is True
     assert st["active_provider"] == "groq"
     assert {o["provider"] for o in st["options"]} == {"groq", "anthropic"}
+
+
+def test_status_lists_a_pinned_model_the_ladder_no_longer_offers(temp_db, monkeypatch):
+    # An admin's pin of Haiku 4.5 (the Anthropic title row before 1.7.1)
+    # still runs, so the dropdown must offer it or it shows Auto instead.
+    from storage import database as db
+    from services import title_generator as tg
+    _configure(monkeypatch, {"anthropic"})
+    db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
+    st = tg.title_generation_status()
+    assert st["selected_model"] == "claude-haiku-4-5"
+    assert st["active_model"] == "claude-haiku-4-5"
+    assert [o["model"] for o in st["options"]] == ["claude-sonnet-5-5", "claude-haiku-4-5"]
+
+
+def test_status_reports_a_retired_pin_by_the_successor_that_runs(temp_db, monkeypatch):
+    # A retired-id pin titles on its successor (config.successor_model), so
+    # the page must select that model; the raw id matches no option and the
+    # dropdown would show Auto, which here would mean Groq.
+    from storage import database as db
+    from services import title_generator as tg
+    _configure(monkeypatch, {"groq", "openai"})
+    db.set_platform_setting("title_generation_model", "gpt-5.6-luna")
+    st = tg.title_generation_status()
+    assert st["selected_model"] == "gpt-6-luna"
+    assert st["active"] is True
+    assert st["active_provider"] == "openai"
+    assert st["active_model"] == "gpt-6-luna"
+    assert [o["model"] for o in st["options"]] == ["openai/gpt-oss-120b", "gpt-6-luna"]
+
+
+def test_status_lists_a_pin_the_ladder_dropped_while_titles_are_off(temp_db, monkeypatch):
+    # The disabled <select> still shows the pin; with no option for it, it
+    # would show Auto, and switching titles back on titles with the pin.
+    from storage import database as db
+    from services import title_generator as tg
+    _configure(monkeypatch, {"anthropic"})
+    db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
+    db.set_platform_setting("title_generation_enabled", "0")
+    st = tg.title_generation_status()
+    assert st["enabled"] is False
+    assert st["active"] is False
+    assert st["selected_model"] == "claude-haiku-4-5"
+    assert [o["model"] for o in st["options"]] == ["claude-sonnet-5-5", "claude-haiku-4-5"]
 
 
 # ---------------------------------------------------------------------------

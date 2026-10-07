@@ -226,14 +226,20 @@ def _quarantine(skills_rel: str, name: str) -> None:
         _remove_entry(f"{q_rel}/{entry}")
 
 
-def materialize_skills_for_sandbox(agent_name: str, config_dir: Path) -> None:
+def materialize_skills_for_sandbox(agent_name: str, config_dir: Path, *,
+                                   username: str = "") -> None:
     """Reconcile ``<config_dir>/skills/`` to the agent's enabled on-demand set.
+
+    ``username`` is the person whose own config dir this is: a skill whose
+    ``audience`` their role on the agent fails is left out (one person, one
+    role, so every session sharing the dir computes the same set); the
+    agent-level dir keeps the role-free set.
 
     Fail-soft at every level: any error logs and leaves the session start
     unaffected (hooks stay fail-hard; skills never block a session).
     """
     try:
-        _materialize_locked(agent_name, Path(config_dir))
+        _materialize_locked(agent_name, Path(config_dir), username=username)
     except Exception:
         logger.exception(
             "skills materialization failed for agent=%s dir=%s — session "
@@ -251,11 +257,12 @@ def _lock_path(config_dir: Path) -> Path:
     return locks / f"{digest}.lock"
 
 
-def _materialize_locked(agent_name: str, config_dir: Path) -> None:
+def _materialize_locked(agent_name: str, config_dir: Path, *, username: str = "") -> None:
     import config
     from services.mcp import mcp_registry
 
-    wanted = mcp_registry.get_on_demand_skills_for_materialization(agent_name)
+    wanted = mcp_registry.get_on_demand_skills_for_materialization(
+        agent_name, username=username or None)
     skills_dir = config_dir / "skills"
     if not wanted and not skills_dir.is_dir():
         return  # nothing to add, nothing to reconcile — don't create churn

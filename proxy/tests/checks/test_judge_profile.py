@@ -487,6 +487,9 @@ def test_a_retired_judge_model_follows_its_successor(judged, monkeypatch):
     # document): a retired id resolves through MODEL_SUCCESSORS at read time,
     # a current or custom id passes through unchanged.
     from services.checks.kinds import judge_kind
+    from storage.billing import subscription_store
+    monkeypatch.setattr(subscription_store, "list_models", lambda path: [
+        {"model_id": "claude-opus-5-5", "enabled": True}, {"model_id": "judge-model", "enabled": True}])
     ok = "```json\n{\"pass\": true, \"summary\": \"fine\"}\n```"
     seen = _fake_scheduler(monkeypatch, [ok])
     asyncio.run(judge_kind.run(_check(model="claude-opus-5"), judged, _changed(judged), round_no=1))
@@ -497,6 +500,10 @@ def test_a_retired_judge_model_follows_its_successor(judged, monkeypatch):
     seen = _fake_scheduler(monkeypatch, [ok])
     asyncio.run(judge_kind.run(_check(), judged, _changed(judged), round_no=1))
     assert seen[0].override_model is None
+    # F67: a pin the agent does not enable ends as an error, never a run.
+    seen = _fake_scheduler(monkeypatch, [ok])
+    v = asyncio.run(judge_kind.run(_check(model="not-enabled"), judged, _changed(judged), round_no=1))
+    assert v.status == "error" and "not available" in v.reason and seen == []
 
 
 def test_a_missing_verdict_is_asked_for_once_then_an_error(judged, monkeypatch):

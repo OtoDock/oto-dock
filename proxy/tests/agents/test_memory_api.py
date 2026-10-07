@@ -26,8 +26,8 @@ def client(temp_db):
 
 
 def _mint_jwt(session_id: str, agent: str, user_sub: str | None = None) -> str:
-    from auth.session_token import create_session_token
-    return create_session_token(session_id, agent, user_sub or "")
+    from tests.conftest import live_session_token
+    return live_session_token(session_id, agent, user_sub or "")
 
 
 def _admin_cookie() -> dict[str, str]:

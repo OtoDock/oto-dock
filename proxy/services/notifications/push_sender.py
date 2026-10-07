@@ -6,6 +6,7 @@ Both are optional — if libraries/config are missing, calls are no-ops.
 """
 
 import asyncio
+import time
 import functools
 import json
 import logging
@@ -291,6 +292,31 @@ async def _send_fcm_relay(platform: str, token: str, payload: dict) -> bool:
         return False
 
 
+_RELAY_VERDICT_TTL_S = 60.0
+_relay_verdict: tuple[bool, float] | None = None
+
+
+async def _relay_available() -> bool:
+    """``relay_client.is_available()`` (a licence read and check) served
+    from a 60 s cache, refreshed on ``run_db``: a fan-out of N pushes reads
+    it once, not per push."""
+    global _relay_verdict
+    now = time.monotonic()
+    if _relay_verdict is not None and now - _relay_verdict[1] < _RELAY_VERDICT_TTL_S:
+        return _relay_verdict[0]
+    from services.billing import relay_client
+    from storage.pg import run_db
+
+    verdict = bool(await run_db(relay_client.is_available))
+    _relay_verdict = (verdict, now)
+    return verdict
+
+
+def reset_relay_verdict() -> None:
+    global _relay_verdict
+    _relay_verdict = None
+
+
 async def send_fcm(token: str, payload: dict, platform: str = "android") -> bool:
     """Send a native (Android/iOS) push. **BYO direct → relay → no-op.**
 
@@ -300,28 +326,48 @@ async def send_fcm(token: str, payload: dict, platform: str = "android") -> bool
     is handled separately (:func:`send_web_push`) and is always local."""
     if _fcm_available:
         return await _send_fcm_direct(token, payload)
-    from services.billing import relay_client
-
-    if relay_client.is_available():
+    if await _relay_available():
         return await _send_fcm_relay(platform, token, payload)
     return False
 
 
 # --- Unified sender ---
 
+# The sends' concurrency, per loop: a semaphore of its own, never the
+# notification fan-out's recipient slot (``fire_notification`` holds one
+# across ``send_to_user``; the same semaphore inside would deadlock once
+# every recipient slot waits on a send slot).
+_PUSH_CONCURRENCY = 8
+_push_slots: dict[int, asyncio.Semaphore] = {}
+
+
+def _push_slot() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    slot = _push_slots.get(id(loop))
+    if slot is None:
+        _push_slots.clear()
+        slot = _push_slots[id(loop)] = asyncio.Semaphore(_PUSH_CONCURRENCY)
+    return slot
+
+
 async def send_to_user(user_sub: str, payload: dict) -> None:
-    """Send push notification to all of a user's registered subscriptions."""
-    subscriptions = await asyncio.to_thread(
-        notification_store.get_push_subscriptions, user_sub
-    )
+    """Send push notification to all of a user's registered subscriptions,
+    at once (a Web Push send holds a thread for up to 10 s; the sends'
+    bound keeps that in check)."""
+    from storage.pg import run_db
+
+    subscriptions = await run_db(notification_store.get_push_subscriptions, user_sub)
     if not subscriptions:
         return
+    slot = _push_slot()
 
-    for sub in subscriptions:
+    async def _one(sub: dict) -> None:
         platform = sub["platform"]
         data = sub["subscription_data"]
+        async with slot:
+            if platform == "web":
+                await send_web_push(data, payload)
+            elif platform in ("android", "ios"):
+                await send_fcm(data, payload, platform)
 
-        if platform == "web":
-            await send_web_push(data, payload)
-        elif platform in ("android", "ios"):
-            await send_fcm(data, payload, platform)
+    await asyncio.gather(*(_one(s) for s in subscriptions), return_exceptions=True)

@@ -16,6 +16,7 @@ from storage.automation import run_status
 from core.session import visibility as _vis
 from ws import chat_phase
 from ws import wire_events as wire
+from ws.dashboard_chat_text import TurnDeferred
 
 if TYPE_CHECKING:  # the annotation below is a string; nothing runs at import
     from core.execution_layer import ExecutionLayer
@@ -27,6 +28,35 @@ logger = logging.getLogger("claude-proxy")
 # they always were — the golden masters pin one copy — until the broadcast
 # names its origin connection.
 _DIRECT_COPY_ONLY = frozenset({wire.TITLE_UPDATED, wire.ENGINE_SWITCHED})
+
+
+# What a delegate result carries beyond its base keys: the worker's typed
+# ending, a failed run's check verdict, the files the worker attached (both
+# lists together, as the ladder writes them, an empty one included). Every
+# rebuild of the event from a notify item copies them through here, so no
+# rung drops a key another keeps.
+_RESULT_ENDING_KEYS = ("reason", "resets_at")
+_RESULT_LIST_KEYS = ("files", "files_skipped")
+
+
+def result_event_from_notify(notification: dict) -> dict:
+    """The ``delegate_result`` event (the persisted row's data and the frame
+    without its ``type``) rebuilt from a ``task_result_prompt`` notify item:
+    the base keys, the typed ending when the item has a reason, and every
+    other extra present on it."""
+    event = {
+        "task_id": notification.get("task_id", ""),
+        "task_name": notification.get("task_name", ""),
+        "agent": notification.get("delegate_agent", ""),
+        "output_text": notification.get("output_text", ""),
+        "status": notification.get("status", run_status.COMPLETED),
+    }
+    if notification.get("reason"):
+        event.update({k: notification[k] for k in _RESULT_ENDING_KEYS if k in notification})
+    if notification.get("verdict"):
+        event["verdict"] = notification["verdict"]
+    event.update({k: notification[k] for k in _RESULT_LIST_KEYS if k in notification})
+    return event
 
 
 class ServerNotificationController:
@@ -180,7 +210,7 @@ class ServerNotificationController:
                 await self._send({"type": wire.BG_AGENTS_COMPLETE, "count": count})
             # Drive the review turn on the originating chat (headless if unviewed).
             nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(nudge_chat_id)
-            await self._run_server_turn(
+            await self._run_server_turn_or_keep(
                 nudge,
                 target_session_id=nudge_sid,
                 target_chat_id=nudge_chat_id,
@@ -208,7 +238,7 @@ class ServerNotificationController:
             if nudge_chat_id == self.chat_id:
                 await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": count})
             nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(nudge_chat_id)
-            await self._run_server_turn(
+            await self._run_server_turn_or_keep(
                 nudge,
                 target_session_id=nudge_sid,
                 target_chat_id=nudge_chat_id,
@@ -245,56 +275,45 @@ class ServerNotificationController:
                     await self._send(frame)
 
         elif ntype == wire.NOTIFY_TASK_RESULT_PROMPT:
-            task_id = notification.get("task_id", "")
-            task_name = notification["task_name"]
             result_prompt = notification["result_prompt"]
-            delegate_agent = notification.get("delegate_agent", "")
-            output_preview = notification.get("output_text", "")
-            # A run_status.DELEGATE_RESULTS word — drives the badge icon;
-            # user_interrupted marks a lane the user stopped/steered.
-            result_status = notification.get("status", run_status.COMPLETED)
             # Delegating chat/session from the notification (scheduler.py now
             # includes them); fall back to the viewed chat only if absent.
             res_chat_id = notification.get("chat_id") or self.chat_id
             res_sid = notification.get("session_id") or self.session_id
-            delegate_event_data = json.dumps({
-                "task_id": task_id,
-                "task_name": task_name,
-                "agent": delegate_agent,
-                "output_text": output_preview,
-                "status": result_status,
-            })
+            # The event as the ladder would persist it (the status drives the
+            # badge icon; user_interrupted marks a lane the user stopped).
+            event = result_event_from_notify(notification)
             # Save the delegate_result event on the DELEGATING chat.
             if res_chat_id:
                 task_store.add_chat_message(res_chat_id, "event", "",
                     event_type=wire.DELEGATE_RESULT,
-                    event_data=delegate_event_data)
+                    event_data=json.dumps(event, default=str))
             # Notify the frontend (delegate block status + result) — only when
             # this socket is viewing the delegating chat.
             if res_chat_id == self.chat_id:
-                await self._send({
-                    "type": wire.DELEGATE_RESULT,
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "agent": delegate_agent,
-                    "output_text": output_preview,
-                    "status": result_status,
-                })
+                await self._send({"type": wire.DELEGATE_RESULT, **event})
             # Drive the synthesis turn on the delegating chat (headless if unviewed).
             res_layer = self.layer if res_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(res_chat_id)
-            turn_pump = await self._run_server_turn(
-                result_prompt,
-                target_session_id=res_sid,
-                target_chat_id=res_chat_id,
-                target_layer=res_layer,
-            )
+            try:
+                turn_pump = await self._run_server_turn(
+                    result_prompt,
+                    target_session_id=res_sid,
+                    target_chat_id=res_chat_id,
+                    target_layer=res_layer,
+                )
+            except TurnDeferred:
+                turn_pump = None
             if turn_pump is None and res_chat_id and result_prompt:
-                # No turn ran (dead target that couldn't warm, layer gone) —
-                # the event row above is only a bubble. Park the prompt as a
-                # durable wake so the next warmup/turn on the chat replays it
-                # (the _start_new_stream chokepoint claims pending wakes).
-                stored = task_store.append_pending_delegate_wake(
-                    res_chat_id, result_prompt)
+                # No turn ran (dead target that couldn't warm, layer gone, its
+                # machine still reconnecting): the event row above is only a
+                # bubble. Park the prompt as a
+                # durable wake, for the person this socket's turn runs as, so
+                # the next warmup/turn on the chat replays it (the
+                # _start_new_stream chokepoint claims pending wakes).
+                from core.events.stream_pump import store_chat_wake
+                from storage.pg import run_db
+                stored = await run_db(store_chat_wake, res_chat_id, result_prompt,
+                                      self.user_sub or "")
                 logger.warning(
                     f"WS dashboard: delegate-result turn could not start for "
                     f"chat={res_chat_id[:8]} — wake "
@@ -317,7 +336,7 @@ class ServerNotificationController:
                         "task_id": notification.get("task_id", ""),
                     }))
             wake_layer = self.layer if wake_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(wake_chat_id)
-            await self._run_server_turn(
+            await self._run_server_turn_or_keep(
                 wake_prompt,
                 target_session_id=wake_sid,
                 target_chat_id=wake_chat_id,
@@ -349,13 +368,27 @@ class ServerNotificationController:
         runs the turn headless even when the target IS the viewed chat — used
         when the WS is gone (no socket to stream to, no main loop to attach)."""
         is_viewed = target_chat_id == self.chat_id and not force_headless
-        pump = await self._start_new_stream(
-            prompt,
-            target_session_id=target_session_id,
-            target_chat_id=target_chat_id,
-            target_layer=target_layer,
-            images=images,
-        )
+        # The chat's claim covers this starter too: a send, a drain or a
+        # queued delivery holding the chat for the turn it is starting, or a
+        # pump driving it, means this prompt is the caller's to keep (a
+        # stored wake, a parked result), never a second pump on the chat.
+        from core.events import input_queue
+        q = input_queue.get(target_chat_id)
+        claim = q.try_claim()
+        if claim is None:
+            logger.info(f"WS dashboard: server turn on chat={target_chat_id[:8]} not started, "
+                        f"another starter holds the chat")
+            return None
+        try:
+            pump = await self._start_new_stream(
+                prompt,
+                target_session_id=target_session_id,
+                target_chat_id=target_chat_id,
+                target_layer=target_layer,
+                images=images,
+            )
+        finally:
+            q.release(claim)
         if not pump:
             # Warm FAILED (a dead non-viewed target that couldn't resume), or a
             # genuine failure on the viewed chat → reset the viewed UI. Returns
@@ -379,6 +412,26 @@ class ServerNotificationController:
             # _start_new_stream already armed its bg-monitor watcher.
             pass
         return pump
+
+    async def _run_server_turn_or_keep(self, prompt: str, **target) -> None:
+        """``_run_server_turn`` for a platform prompt (a check-back, a job
+        review): when the chat's machine is still reconnecting, or another
+        starter holds the chat, the prompt is kept as the chat's stored wake,
+        which the reconnect or the chat's next turn start replays."""
+        try:
+            pump = await self._run_server_turn(prompt, **target)
+        except TurnDeferred:
+            pump = None
+        if pump is not None:
+            return
+        chat_id = target.get("target_chat_id") or ""
+        if not chat_id or not prompt:
+            return
+        from core.events.stream_pump import store_chat_wake
+        from storage.pg import run_db
+        stored = await run_db(store_chat_wake, chat_id, prompt, self.user_sub or "")
+        logger.info(f"WS dashboard: server turn on chat={chat_id[:8]} did not start — "
+                    f"wake {'stored for the next start' if stored else 'NOT stored'}")
 
     async def _run_kick_headless(self,
         wcid: str, sid: str | None, text: str,
@@ -419,11 +472,25 @@ class ServerNotificationController:
         except AttachmentsRefused as e:
             await self._send_error(str(e))
             return
-        await self._run_server_turn(
-            cli_text,
-            target_session_id=sid,
-            target_chat_id=wcid,
-            target_layer=k_layer,
-            images=attached_images or None,
-            force_headless=force_headless,
-        )
+        try:
+            pump = await self._run_server_turn(
+                cli_text,
+                target_session_id=sid,
+                target_chat_id=wcid,
+                target_layer=k_layer,
+                images=attached_images or None,
+                force_headless=force_headless,
+            )
+        except TurnDeferred:
+            pump = None
+        if pump is None:
+            # The prompt's row is written and nobody views the chat, so the
+            # live line would reach no one: the undelivered card stays under
+            # the row for the person's return (nothing sends it later; the
+            # queue holds typed input only while a socket queued it).
+            from core.events.common_events import TurnInput
+            from core.events.stream_pump import shelve_undelivered
+            shelve_undelivered(wcid, [TurnInput(text, image_meta=list(_meta or []),
+                                                 files=list(_vfiles or []))])
+            logger.info(f"WS dashboard: headless server kick for chat={wcid[:8]} not run "
+                        f"(its machine is reconnecting, or the chat is held); the card is written")

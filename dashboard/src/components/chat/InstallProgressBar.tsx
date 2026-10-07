@@ -8,6 +8,10 @@ import {
 } from '../../store/installStore'
 import { useDelayMount } from '../../hooks/useDelayMount'
 
+// The proxy's row for the session start's workspace sync. A sync alone ends
+// with no grace strip: only an install or update earns "Install complete".
+const WORKSPACE_ROW = 'workspace files'
+
 interface Props {
   // Lookup precedence: chatId → (machineId+agent) → agent. chatId is
   // preferred for existing chats; the pair handles known new-chat targets;
@@ -49,8 +53,9 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
     install?.status === 'installing' ||
     install?.status === 'verifying' ||
     install?.status === 'failed'
+  const installedMcps = !!install?.mcps.some((m) => m !== WORKSPACE_ROW)
   const installDoneRecent =
-    install?.status === 'done' && install.mcps.length > 0 &&
+    install?.status === 'done' && installedMcps &&
     install.doneAt && Date.now() - install.doneAt < 1500
   const anyShowing = installShowing || installDoneRecent
   const visible = useDelayMount(!!anyShowing, 500)
@@ -146,9 +151,9 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   }
 
   // ── 3. done grace window (only when MCPs were actually involved — an
-  //       empty/no-op sync emits no lifecycle, but guard here too so it can
-  //       never flash "100%" on an already-synced remote chat) ──
-  if (install?.status === 'done' && install.mcps.length > 0 && install.doneAt && Date.now() - install.doneAt < 1500) {
+  //       empty/no-op sync emits no lifecycle, and a workspace sync alone
+  //       is not an install, so it never flashes "100%") ──
+  if (install?.status === 'done' && installedMcps && install.doneAt && Date.now() - install.doneAt < 1500) {
     const warnCount = install.warmupFailures?.length ?? 0
     return (
       <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-p-text-light">

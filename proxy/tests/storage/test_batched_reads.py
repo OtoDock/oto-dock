@@ -100,3 +100,23 @@ def test_display_names_follow_the_single_resolver(temp_db):
 def test_display_names_with_no_subs_makes_no_query(temp_db, monkeypatch):
     _no_conn(monkeypatch, notification_store)
     assert notification_store.resolve_subs_to_display_names([]) == {}
+
+
+# --- the delta read: a floor per chat --------------------------------------
+
+def test_messages_since_apply_each_chats_own_floor(temp_db):
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    task_store.create_chat(a, "user-alice", AGENT)
+    task_store.create_chat(b, "user-alice", AGENT)
+    ids = {}
+    for chat, n in ((a, 3), (b, 3)):
+        for i in range(n):
+            ids.setdefault(chat, []).append(
+                int(db_chats.add_chat_message(chat, "assistant", f"{chat[:4]}-{i}")))
+    # Chat a above its second row, chat b from the start (a sibling run
+    # the view has not seen): b's rows come whole, a's only the third.
+    rows = db_chats.get_chat_messages_since({a: ids[a][1], b: 0})
+    assert [int(r["id"]) for r in rows] == sorted([ids[a][2]] + ids[b])
+    # A floor at the last row answers nothing, an empty map makes no query.
+    assert db_chats.get_chat_messages_since({a: ids[a][2], b: ids[b][2]}) == []
+    assert db_chats.get_chat_messages_since({}) == []

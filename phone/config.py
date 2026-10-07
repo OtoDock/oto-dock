@@ -5,8 +5,11 @@ WebSocket. All other configuration is received from the proxy DB
 via the management WebSocket and managed through ConfigManager.
 """
 
+import ipaddress
 import os
+import socket
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -37,6 +40,49 @@ PROXY_WS_HOST_PORT = PROXY_URL.rstrip("/").replace("http://", "").replace("https
 # plaintext ws (the single-host / trusted-LAN default). Keeps the API key and
 # call audio off the wire in clear when the proxy is remote + TLS-fronted.
 PROXY_WS_SCHEME = "wss" if PROXY_URL.lower().startswith("https://") else "ws"
+
+
+def _routable(address: str) -> bool:
+    try:
+        return ipaddress.ip_address(address.split("%", 1)[0]).is_global
+    except ValueError:
+        return False
+
+
+def plaintext_proxy_refusal(url: str, resolve=socket.getaddrinfo) -> str | None:
+    """Why the daemon must not start on ``url`` (None when it may): the
+    proxy key and every call's audio cross this link, so plain http goes
+    only to an address that is not globally routable (this machine, a
+    private network, the shared 100.64/10 range a tailnet uses). A
+    single-label name (the Docker service, ``otodock-proxy``) counts as
+    private; another name is refused only when none of its addresses is
+    private (a LAN host with a global IPv6 address beside its private one
+    stays on the LAN); a name that does not resolve is left to the
+    connection, which fails on its own.
+    The proxy applies the same rule to its ``PHONE_SERVER_URL``."""
+    parts = urlsplit(url or "")
+    if (parts.scheme or "").lower() != "http":
+        return None
+    host = parts.hostname or ""
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+        addresses = [host]
+    except ValueError:
+        if "." not in host.rstrip("."):
+            return None
+        try:
+            addresses = sorted({info[4][0] for info in resolve(host, None)})
+        except OSError:
+            return None
+    public = [a for a in addresses if _routable(a)]
+    if not public or len(public) < len(addresses):
+        return None
+    return (f"PROXY_URL is plain http to {host} ({public[0]}), an address reachable "
+            "from the internet, and the proxy key and call audio would cross it "
+            "unencrypted: use https, or the proxy's address on this machine or a "
+            "private network")
 
 # Audio constants (Asterisk AudioSocket = 8kHz 16-bit signed LE mono)
 # These are protocol constants that never change.

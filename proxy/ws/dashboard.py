@@ -31,15 +31,39 @@ from fastapi import WebSocket, WebSocketDisconnect
 from storage import database as task_store
 from storage.automation import notification_store, run_status
 from services.notifications import notification_manager
-from auth.providers import acting_role_of, auth_gate, validate_session_jwt, session_iat_after_password_change
+from auth.providers import acting_role_of, auth_gate, validate_session_jwt, session_cookie_current
 from auth import roles
 from ws import wire_events as wire
 
 # A dashboard socket outlives a single request; re-validate its session +
-# re-read the user's role/agents at most this often (on client activity) so a
-# demotion, logout, password change, or expiry takes effect within the window
-# instead of persisting until the browser reconnects.
+# re-read the user's role/agents at most this often, on client activity and
+# on the connection's own tick, so a change of standing takes effect within
+# the window on an idle socket too.
 _AUTHZ_REVALIDATE_S = 60
+# The open connections per person, for a re-check on demand.
+_connections_by_user: dict[str, set["DashboardConnection"]] = {}
+# Strong refs for the queue drops a revalidation close schedules.
+_refusal_tasks: set[asyncio.Task] = set()
+
+
+def revalidate_user(user_sub: str) -> int:
+    """Run the throttled revalidation of every open socket of ``user_sub``
+    now instead of at its next tick. Returns how many sockets were woken."""
+    conns = list(_connections_by_user.get(user_sub, ()))
+    for conn in conns:
+        conn._last_authz_check = 0.0
+        conn._recheck_wake.set()
+    return len(conns)
+
+
+async def _on_offboard(event) -> None:
+    revalidate_user(event.sub)
+
+
+def register_offboarding() -> None:
+    """Subscribe the sockets to the offboarding event (called by the lifespan)."""
+    from services.agents import offboarding
+    offboarding.subscribe("dashboard-sockets", _on_offboard, priority=15)
 from core.session.session_state import (
     _dashboard_notify_queues,
 )
@@ -49,7 +73,7 @@ from core.config.task_config_builder import (
     resolve_task_identity, run_allows_knowledge_rw,
 )
 from core.events.stream_pump import (
-    _active_pumps,
+    _active_pumps, store_chat_wake,
 )
 from core.events.common_events import TurnInput
 from core.remote import install_registry
@@ -81,6 +105,13 @@ def _build_chat_restore(chat_id: str) -> dict:
     ACTIVE session the pump's live_state overrides this (sent after chat_history)."""
     meeting = None
     m = task_store.get_active_meeting_for_chat(chat_id)
+    # The row turns ``concluded`` only after the meeting's pump and its
+    # sessions are torn down, while the pump persisted ``meeting_concluded``
+    # before its all_done: a meeting whose end the chat already holds is over
+    # (the post-turn re-send must not bring the indicator back).
+    if m and task_store.chat_has_meeting_event(
+            chat_id, wire.SUBTYPE_MEETING_CONCLUDED, m.get("id") or ""):
+        m = None
     if m:
         try:
             participants = json.loads(m.get("participants") or "[]")
@@ -204,7 +235,8 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
     with transparency or a palette, or one deeper than 8 bits, is saved as a
     PNG (default compression); anything else becomes a JPEG. The re-encode
     drops every metadata block but the colour profile (EXIF, GPS, comments),
-    after applying the EXIF orientation to the pixels.
+    after applying the EXIF orientation to the pixels; the profile goes too
+    when the pixels change mode on the way to a JPEG.
 
     Args:
         data_url: Base64 data URL (data:image/...;base64,...)
@@ -277,6 +309,9 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
             ext, media_type = "jpg", "image/jpeg"
             if img.mode != "RGB" and img.mode != "L":
                 img = img.convert("RGB")
+                # The conversion does not use the profile: one written for
+                # the old mode (a CMYK profile) would misdescribe the pixels.
+                icc = None
             img.save(buf, format="JPEG", quality=85, optimize=True,
                      **({"icc_profile": icc} if icc else {}))
         out_bytes = buf.getvalue()
@@ -299,46 +334,17 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
         return None
 
 
-def _host_to_sandbox_path(host_path: str, agent_dir: Path) -> str:
-    """Translate a host-absolute path under ``agent_dir`` to a sandbox-virtual path.
-
-    Sandbox-virtual paths are what the agent sees in its prompt and tool calls:
-    they start with ``/`` and are relative to the agent's bwrap-mount root
-    (local) or get translated to satellite-absolute on remote (see
-    ``satellite/path_translator.translate_paths_in_text``).
-
-    Examples:
-        ``<agent_dir>/users/alice/workspace/uploads/photos/img.jpg``
-            → ``/users/alice/workspace/uploads/photos/img.jpg``
-        ``<agent_dir>/workspace/uploads/photos/img.jpg``
-            → ``/workspace/uploads/photos/img.jpg``
-    """
-    p = Path(host_path).resolve()
-    rel = p.relative_to(agent_dir.resolve())
-    return "/" + str(rel)
-
-
-def _park_delegate_result(item: dict) -> bool:
-    """Persist an undrained ``task_result_prompt`` as a chat event + a durable
-    wake (close-rescue). Synchronous store work — run via ``run_db``."""
+def _park_delegate_result(item: dict, person: str = "") -> bool:
+    """Persist an undrained ``task_result_prompt`` as a chat event (its handler
+    never ran) + a durable wake for ``person``, the closing socket's
+    (close-rescue). Synchronous store work: run via ``run_db``."""
     _cid = item.get("chat_id") or ""
-    _prompt = item.get("result_prompt") or ""
-    # The WS route leaves event persistence to the handler — which never ran
-    # for this item. Persist the bubble row here, then park the prompt for
-    # replay.
-    task_store.add_chat_message(_cid, "event", "",
-        event_type=wire.DELEGATE_RESULT,
-        event_data=json.dumps({
-            "task_id": item.get("task_id", ""),
-            "task_name": item.get("task_name", ""),
-            "agent": item.get("delegate_agent", ""),
-            "output_text": item.get("output_text", ""),
-            "status": item.get("status", run_status.COMPLETED),
-        }))
-    return bool(task_store.append_pending_delegate_wake(_cid, _prompt))
+    task_store.add_chat_message(_cid, "event", "", event_type=wire.DELEGATE_RESULT,
+                                event_data=json.dumps(result_event_from_notify(item), default=str))
+    return store_chat_wake(_cid, item.get("result_prompt") or "", person)
 
 
-async def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
+async def _extract_server_kicks(queue: asyncio.Queue, *, person: str = "") -> list[dict]:
     """Drain a dying connection's notify queue, keeping only `_server_kick`
     items (the close-rescue path). A kick is a freshly-spawned chat's durable FIRST TURN:
     it waits in the per-connection queue while the viewed chat's turn occupies
@@ -348,7 +354,8 @@ async def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
 
     An undrained `task_result_prompt` is NOT re-derivable state — it is the
     one-shot carrier of a delegate result routed via this socket. Park it as a
-    durable wake on its chat so the next warmup/turn replays it. Everything
+    durable wake on its chat, for ``person`` (the socket's, whose turn it
+    would have run), so the next warmup/turn replays it. Everything
     else in the queue is live-push-only state that a reconnect re-derives; it
     is dropped exactly as a dead queue always did.
 
@@ -373,7 +380,7 @@ async def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
     for item in to_park:
         _cid = item.get("chat_id") or ""
         try:
-            stored = await run_db(_park_delegate_result, item)
+            stored = await run_db(_park_delegate_result, item, person)
             logger.info(
                 f"WS dashboard close-rescue: delegate result for "
                 f"chat={_cid[:8]} {'parked as wake' if stored else 'NOT parked'}"
@@ -698,7 +705,7 @@ async def ws_dashboard_handler(websocket: WebSocket):
     if not user:
         await websocket.close(code=WS_CLOSE_SESSION, reason="User not found")
         return
-    if not session_iat_after_password_change(user, payload):
+    if not session_cookie_current(user, payload):
         await websocket.close(code=WS_CLOSE_SESSION, reason="Invalid or expired session")
         return
     if gate:
@@ -715,7 +722,7 @@ async def ws_dashboard_handler(websocket: WebSocket):
 from ws.dashboard_warmup import WarmupController  # noqa: E402
 from ws.dashboard_chat import ChatController  # noqa: E402
 from ws.dashboard_pty import PtyViewerController  # noqa: E402
-from ws.dashboard_server_events import ServerNotificationController  # noqa: E402
+from ws.dashboard_server_events import ServerNotificationController, result_event_from_notify  # noqa: E402
 from ws.dashboard_dispatch import ClientMessageDispatcher  # noqa: E402
 
 
@@ -754,6 +761,12 @@ class DashboardConnection(
         # Client messages a loop received but left unprocessed (it ended with
         # them in hand); read before the socket (_receive_client_text).
         self._client_pushback: collections.deque[str] = collections.deque()
+        # Set once the revalidation closed the socket: every read of the
+        # socket, in either loop, ends as a disconnect from then on.
+        self._ended = asyncio.Event()
+        # Wakes the ticker early (revalidate_user).
+        self._recheck_wake = asyncio.Event()
+        self._ticker: asyncio.Task | None = None
 
     async def run(self) -> None:
         from storage.pg import run_db
@@ -769,11 +782,18 @@ class DashboardConnection(
         self.session_id: str | None = None
         self.chat_id: str | None = None
         self.agent_name: str = ""
-        self.message_queue: list[TurnInput] = []  # queued user messages during streaming
+        # The plan's implement message a closed pump queue or a dead session
+        # left for this connection's next turn on its chat (a typed message
+        # waits in the chat's own queue, core/events/input_queue.py).
+        self.implement_queue: list[TurnInput] = []
         self.artifact_queue: list[dict] = []  # queued display_ui backchannel interactions
         self.streaming = False
         self.deferred_model: str = ""  # model change before session exists
         self.deferred_mode: str = ""   # mode change before session exists
+        # The chat a deferred pick was made for: the chat the frame named,
+        # or "" on the new-chat page (the chat the warmup mints). A pick
+        # applies only to its own chat's session.
+        self.deferred_for: str = ""
         self.pre_plan_mode_holder = ["default"]  # mutable container to track mode before plan mode
         self.implementing_plan: str = ""  # filename of plan being implemented (set on accept, cleared on done)
         self.chat_plan_filename: str = ""  # reused across pumps so edits update same plan
@@ -837,6 +857,12 @@ class DashboardConnection(
         # session (reconnect replays the scrollback ring).
         self._pty_viewer_sid: str | None = None
         self._pty_listener = None  # the bound bytes->WS listener registered on the session
+        self._pty_outbox = None    # the viewer's bounded output outbox (dashboard_pty)
+        # The task chat's deltas (dashboard_chat_resume): whether this client
+        # declared `history_deltas`, and the floors of the last history it got
+        # for the viewed chat, (chat id, {chat id: highest row id carried}).
+        self._history_deltas = False
+        self._history_floors: tuple[str, dict[str, int]] | None = None
 
         # Pending control requests to send after streaming turn completes
         self.pending_control_requests: list[tuple[str, dict]] = []  # [(subtype, kwargs), ...]
@@ -845,7 +871,7 @@ class DashboardConnection(
         # so notifications can be delivered even before warmup/chat selection.
         # Each WS connection gets its own UUID so the multi-connection routing in
         # notification_manager can track per-tab/device visibility + platform.
-        self.notify_queue: asyncio.Queue = asyncio.Queue()
+        self.notify_queue = notification_manager.NotifyQueue()
         # Live-app frames (push, state, open) have their own queue: it is
         # drained inside a streaming turn too, where the notify queue waits.
         self.live_queue = notification_manager.LiveQueue()
@@ -922,38 +948,7 @@ class DashboardConnection(
         # ones). Pump turns + interactive PTY turns, filtered to what this
         # viewer may see (own chats + shared-only chats of accessible agents).
         try:
-            from core.session.session_state import streaming_chat_ids as _pump_streaming
-            from core.session import interactive_session as _isess
-            from core.session.visibility import is_shared_chat_owner as _is_shared_owner
-            _live_ids: list[str] = []
-            _seen: set[str] = set()
-            _cids: list[str] = []
-            for _cid in list(_pump_streaming()) + list(_isess.streaming_chat_ids()):
-                if not _cid or _cid in _seen:
-                    continue
-                _seen.add(_cid)
-                _cids.append(_cid)
-
-            def _rows_for(ids: list[str]) -> dict[str, dict]:
-                return {c: (task_store.get_chat(c) or {}) for c in ids}
-
-            # ONE executor job for all rows (connect storm: N sockets × M
-            # streaming chats must not become N×M loop-side reads).
-            _rows = await run_db(_rows_for, _cids) if _cids else {}
-            for _cid in _cids:
-                _row = _rows.get(_cid) or {}
-                _owner = _row.get("user_sub") or ""
-                # task:: owners mirror chat_status_targets: scheduled
-                # agent-scope runs are visible to every user of the agent
-                # (the Task history view is the reader).
-                if _owner == self.user_sub or (
-                    (_is_shared_owner(_owner) or _vis.is_task_chat_owner(_owner))
-                    and self._can_access_agent(_row.get("agent") or "")
-                ):
-                    _live_ids.append(_cid)
-            await self.websocket.send_json({
-                "type": wire.CHAT_STATUS_SNAPSHOT, "chat_ids": _live_ids,
-            })
+            await self.websocket.send_json(await self._chat_status_snapshot_frame())
         except Exception:
             logger.exception("chat-status snapshot on connect failed")
 
@@ -963,6 +958,12 @@ class DashboardConnection(
         # earlier in this unguarded region would leak the notify-queue
         # registration until the cleanup below runs). Every deploy restarts
         # the proxy, so every client reconnects and sees this.
+        # Registered for a re-check on demand and ticking only from here: the
+        # ``finally`` below is what unregisters and cancels them, so a connect
+        # phase that raises above leaves neither behind (the send below
+        # cannot raise).
+        _connections_by_user.setdefault(self.user_sub, set()).add(self)
+        self._ticker = asyncio.create_task(self._revalidation_ticker())
         try:
             await self.websocket.send_json(self._server_info_frame())
         except Exception:
@@ -1037,7 +1038,10 @@ class DashboardConnection(
                             ws_closing = True
                     elif t is notify_task:
                         notification = t.result()
-                        await self._handle_server_notification(notification)
+                        if self.notify_queue.stale:
+                            notification = await self._resync_chat_status(notification)
+                        if notification is not None:
+                            await self._handle_server_notification(notification)
                     elif t is live_task:
                         await self._send(t.result())
                         await self._drain_live_queue()
@@ -1070,6 +1074,14 @@ class DashboardConnection(
         except Exception as e:
             logger.error(f"WebSocket dashboard error: {e}", exc_info=True)
         finally:
+            self._ended.set()
+            if self._ticker is not None:
+                self._ticker.cancel()
+            conns = _connections_by_user.get(self.user_sub)
+            if conns is not None:
+                conns.discard(self)
+                if not conns:
+                    _connections_by_user.pop(self.user_sub, None)
             # Mark the connection gone so a still-running
             # backgrounded warmup spawn (_warmup_task) drives its first turn HEADLESS
             # instead of enqueuing a _server_kick to this (now-dead) notify queue —
@@ -1077,37 +1089,13 @@ class DashboardConnection(
             # the spawn window. We deliberately do NOT cancel _warmup_task here
             # (unlike _pre_warmup_task): it owns a real chat's first turn.
             self._ws_gone = True
-            # Close-rescue: rescue kicks that were ALREADY enqueued — they waited behind the
-            # viewed chat's turn (the main loop drains only between turns) and
-            # would die with this per-connection queue. Flag-set + drain happen in
-            # one synchronous step, and _spawn_tail's check+enqueue is likewise
-            # atomic on the loop, so a kick either lands here or sees _ws_gone and
-            # goes headless in _spawn_tail — no gap. Honors the same
-            # abort-during-spawn guard as the main-loop drain; turns run as
-            # fire-and-forget tasks so connection cleanup isn't delayed.
-            for _kick in await _extract_server_kicks(self.notify_queue):
-                _kcid = _kick.get("chat_id", "")
-                _ksid = _kick.get("session_id")
-                if self._warmup_abort_chat == _kcid:
-                    self._warmup_abort_chat = None
-                    _k_layer = await self._resolve_layer_for_chat_async(_kcid)
-                    if _k_layer and _ksid:
-                        try:
-                            await _k_layer.abort(_ksid)
-                        except Exception:
-                            logger.warning(
-                                f"close-rescue: abort teardown failed for chat={_kcid[:8]}"
-                            )
-                    continue
-                logger.info(
-                    f"close-rescue: WS died with a queued server kick — running "
-                    f"first turn headless for chat={_kcid[:8]}"
-                )
-                asyncio.create_task(self._run_kick_headless(
-                    _kcid, _ksid, _kick.get("text", ""),
-                    _kick.get("images", []), _kick.get("files", []),
-                    force_headless=True,
-                ))
+            await self._rescue_queued_kicks()
+            # A typed message this connection queued stays in its chat's
+            # queue, delivered as its author at that chat's next turn; the
+            # interactions go (an app's interaction replayed later could act
+            # on state that moved on).
+            self.artifact_queue.clear()
+            self.implement_queue.clear()
             # Cancel any background pre_warmup task so it doesn't keep mutating
             # this WS handler's closure (and writing to _pre_warmed_* slots) after
             # the connection is gone. We await briefly so an in-progress
@@ -1166,12 +1154,97 @@ class DashboardConnection(
         except Exception:
             pass
 
+    async def _send_text(self, text: str) -> bool:
+        """A frame already encoded (a history, encoded off the loop), under
+        the same lock as ``_send``. True when it went out."""
+        try:
+            async with self._send_lock:
+                await self.websocket.send_text(text)
+            return True
+        except Exception:
+            return False
+
+    async def _rescue_queued_kicks(self) -> None:
+        """Close-rescue: rescue kicks that were ALREADY enqueued — they waited
+        behind the viewed chat's turn (the main loop drains only between
+        turns) and would die with this per-connection queue. The caller sets
+        ``_ws_gone`` right before, and _spawn_tail's check+enqueue is likewise
+        atomic on the loop, so a kick either lands here or sees _ws_gone and
+        goes headless in _spawn_tail — no gap. Honors the same
+        abort-during-spawn guard as the main-loop drain, and a socket the
+        revalidation closed runs none of them (its person no longer holds the
+        sign-in or the chat); turns run as fire-and-forget tasks so
+        connection cleanup isn't delayed."""
+        for _kick in await _extract_server_kicks(self.notify_queue, person=self.user_sub or ""):
+            _kcid = _kick.get("chat_id", "")
+            _ksid = _kick.get("session_id")
+            if self._warmup_abort_chat == _kcid or self._closed_by_revalidation:
+                if self._warmup_abort_chat == _kcid:
+                    self._warmup_abort_chat = None
+                _k_layer = await self._resolve_layer_for_chat_async(_kcid)
+                if _k_layer and _ksid:
+                    try:
+                        await _k_layer.abort(_ksid)
+                    except Exception:
+                        logger.warning(
+                            f"close-rescue: abort teardown failed for chat={_kcid[:8]}"
+                        )
+                continue
+            logger.info(
+                f"close-rescue: WS died with a queued server kick — running "
+                f"first turn headless for chat={_kcid[:8]}"
+            )
+            asyncio.create_task(self._run_kick_headless(
+                _kcid, _ksid, _kick.get("text", ""),
+                _kick.get("images", []), _kick.get("files", []),
+                force_headless=True,
+            ))
+
     async def _receive_client_text(self) -> str:
         """The next client message: one a loop handed back first, else the
-        socket's next."""
+        socket's next. Once the revalidation ended the connection the read
+        raises a disconnect instead, a message already in hand included, so
+        either loop unwinds through its own cleanup."""
+        if self._ended.is_set():
+            raise WebSocketDisconnect(code=1000)
         if self._client_pushback:
             return self._client_pushback.popleft()
-        return await self.websocket.receive_text()
+        recv = asyncio.create_task(self.websocket.receive_text())
+        ended = asyncio.create_task(self._ended.wait())
+        try:
+            done, _ = await asyncio.wait({recv, ended}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # The loops cancel a pending read: a message the read already
+            # took is handed to the next read, never lost.
+            ended.cancel()
+            if recv.done() and not recv.cancelled() and recv.exception() is None:
+                self._client_pushback.appendleft(recv.result())
+            else:
+                recv.cancel()
+            raise
+        ended.cancel()
+        if recv in done and not self._ended.is_set():
+            return recv.result()
+        recv.cancel()
+        await asyncio.gather(recv, return_exceptions=True)
+        raise WebSocketDisconnect(code=1000)
+
+    async def _revalidation_ticker(self) -> None:
+        """The connection's own clock for the throttled revalidation: it runs
+        when a minute has passed since the last check whether or not a
+        client message arrives, and at once when woken."""
+        while not self._ended.is_set():
+            wait = max(1.0, self._last_authz_check + _AUTHZ_REVALIDATE_S - time.time())
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._recheck_wake.wait(), timeout=wait)
+            self._recheck_wake.clear()
+            if self._ended.is_set():
+                return
+            try:
+                await self._session_still_holds()
+            except Exception:
+                logger.exception("WS dashboard: the revalidation tick failed for user=%s",
+                                 self.user_sub)
 
     @staticmethod
     async def _collect_late_results(done: set, pending: set) -> set:
@@ -1229,9 +1302,12 @@ class DashboardConnection(
         ``_AUTHZ_REVALIDATE_S`` has passed since the last check, the cookie,
         the user row and the gate are read again. False when the socket was
         closed for it: 4001 when the session no longer holds (expired,
-        revoked by a password change or logout-all, the user deleted), 4403
-        with the gate's name when the forced password change or 2FA
-        enrolment now holds the person."""
+        revoked by a logout, a password change or a sign out everywhere, the
+        user deleted), 4403 with the gate's name when the forced password
+        change or 2FA enrolment now holds the person; False from then on
+        whatever the throttle says."""
+        if self._closed_by_revalidation:
+            return False
         now = time.time()
         if now - self._last_authz_check < _AUTHZ_REVALIDATE_S:
             return True
@@ -1248,22 +1324,53 @@ class DashboardConnection(
             with contextlib.suppress(Exception):
                 await self.websocket.close(code=WS_CLOSE_GATE, reason=self._held_gate)
             return False
+        if self.chat_id and not await self._viewed_chat_still_open():
+            self._refuse_further_work(chat_lost=self.chat_id)
+            await self._send_error("You no longer have access to this chat")
+            with contextlib.suppress(Exception):
+                await self.websocket.close(code=1000, reason="access changed")
+            return False
         return True
 
-    def _refuse_further_work(self) -> None:
-        """The socket is closing for its session: the turns this connection
-        queued are dropped, so no path that drains them after the viewer
-        loop ends starts a turn for it."""
+    async def _viewed_chat_still_open(self) -> bool:
+        """The chat this socket views is still one this person may open
+        (the resume's own rule, on the roles just re-read). A chat row that
+        is gone is left to the paths that delete it."""
+        from storage.pg import run_db
+        chat = await run_db(task_store.get_chat, self.chat_id)
+        if not chat:
+            return True
+        from api.agents.chats import can_access_chat
+        return bool(await run_db(can_access_chat, self._viewer_context(), chat))
+
+    def _refuse_further_work(self, *, chat_lost: str = "") -> None:
+        """The socket is closing for its session: the messages this
+        connection queued are dropped (in every chat: the chips clear), and
+        for a chat the person lost, every message they queued there, so no
+        path that drains them later starts a turn for it, and every later
+        read of the socket ends as a disconnect. The person's other
+        messages wait: their delivery re-reads the sign-in it runs on."""
         self._closed_by_revalidation = True
-        self.message_queue.clear()
+        self._ended.set()
+        self.implement_queue.clear()
         self.artifact_queue.clear()
+        from core.events import input_queue
+        task = asyncio.create_task(input_queue.drop_where(conn_id=self.notify_connection_id))
+        _refusal_tasks.add(task)
+        task.add_done_callback(_refusal_tasks.discard)
+        if chat_lost:
+            task = asyncio.create_task(input_queue.drop_where(author_sub=self.user_sub or "",
+                                                              chat_id=chat_lost))
+            _refusal_tasks.add(task)
+            task.add_done_callback(_refusal_tasks.discard)
 
     def _revalidate_session(self) -> bool:
         """Re-check the session cookie and refresh cached role/agents.
 
         Returns False (→ close the socket) when the session is no longer
-        valid: cookie expired/invalid, user deleted, or the cookie predates a
-        password change (logout-all / reset). ``_held_gate`` names the forced
+        valid: cookie expired, invalid or revoked by a logout, user deleted,
+        or the cookie predates a password change or the person's token epoch
+        (a sign out everywhere). ``_held_gate`` names the forced
         password change or 2FA enrolment when one now holds the person (the
         caller closes 4403). Otherwise refreshes
         ``user_role``/``agent_roles``/``user_agents`` from the DB so a mid-
@@ -1275,7 +1382,7 @@ class DashboardConnection(
         if not payload or payload.get("sub") != self.user_sub:
             return False
         user = task_store.get_user(self.user_sub)
-        if not user or not session_iat_after_password_change(user, payload):
+        if not user or not session_cookie_current(user, payload):
             return False
         self.user = user
         self.user_role = user["role"]
@@ -1347,6 +1454,47 @@ class DashboardConnection(
         from storage.pg import run_db
         return await run_db(self._resolve_layer_for_chat, cid)
 
+    async def _chat_status_snapshot_frame(self) -> dict:
+        """The ``chat_status_snapshot`` frame: every streaming chat (pump
+        turns and interactive turns) this viewer may see, their rows read in
+        ONE batched job (a connect storm of N sockets at M streaming chats
+        must cost N reads, not N x M)."""
+        from core.session.session_state import streaming_chat_ids as _pump_streaming
+        from core.session import interactive_session as _isess
+        from core.session.visibility import is_shared_chat_owner as _is_shared_owner
+        from storage.pg import run_db
+        cids = list(dict.fromkeys(
+            c for c in [*_pump_streaming(), *_isess.streaming_chat_ids()] if c))
+        rows = await run_db(task_store.get_chats_by_ids, cids) if cids else {}
+        live_ids: list[str] = []
+        for cid in cids:
+            row = rows.get(cid) or {}
+            owner = row.get("user_sub") or ""
+            # task:: owners mirror chat_status_targets: scheduled
+            # agent-scope runs are visible to every user of the agent
+            # (the Task history view is the reader).
+            if owner == self.user_sub or (
+                (_is_shared_owner(owner) or _vis.is_task_chat_owner(owner))
+                and self._can_access_agent(row.get("agent") or "")
+            ):
+                live_ids.append(cid)
+        return {"type": wire.CHAT_STATUS_SNAPSHOT, "chat_ids": live_ids}
+
+    async def _resync_chat_status(self, notification: dict | None) -> dict | None:
+        """The notify queue dropped a status frame: the queued ones are
+        purged (the dequeued one too, when it is one) and a fresh snapshot
+        replaces them. Returns the dequeued item when it still needs its
+        handler."""
+        self.notify_queue.purge_status()
+        try:
+            await self._send(await self._chat_status_snapshot_frame())
+        except Exception:
+            logger.exception("chat-status resync failed")
+        if notification is not None and notification.get("type") in (
+                wire.CHAT_STATUS, wire.CHAT_READ):
+            return None
+        return notification
+
     async def _task_pump_poll(self) -> bool:
         """Check if a new pump appeared (meeting pump or task turn).
 
@@ -1358,8 +1506,9 @@ class DashboardConnection(
             return False
         pump = _active_pumps.get(self.chat_id)
         if pump and not pump.is_done:
-            # Chat has active pump (meeting or task turn) — re-send history + attach
-            await self._handle_resume_chat({"chat_id": self.chat_id})
+            # Chat has active pump (meeting or task turn) — re-send history
+            # (a delta when the client takes one) + attach
+            await self._handle_resume_chat({"chat_id": self.chat_id, "_delta": True})
             await self._enter_pump_loop()
             return True
         if not session_kind.is_task_chat_id(self.chat_id):
@@ -1368,7 +1517,7 @@ class DashboardConnection(
         pump = await run_db(self._find_task_pump)
         if pump and not pump.is_done:
             # Related turn has active pump — re-send history + attach
-            await self._handle_resume_chat({"chat_id": self.chat_id})
+            await self._handle_resume_chat({"chat_id": self.chat_id, "_delta": True})
             await self._enter_pump_loop()
             return True
         return False

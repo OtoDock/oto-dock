@@ -41,7 +41,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 marshmallow==3.26.2
 mcp==1.28.1
-multidict==6.7.1
+multidict==6.9.1
 mypy-extensions==1.1.0
 numpy==2.5.0
 openai==2.31.0
@@ -58,7 +58,7 @@ pycparser==3.0
 pydantic==2.11.3
 pydantic-core==2.33.1
 pydantic-settings==2.14.2
-pyjwt==2.13.0
+pyjwt==2.15.1
 pyopenssl==26.4.0
 pyotp==2.9.0
 python-dotenv==1.2.2
@@ -77,7 +77,7 @@ typing-extensions==4.15.0
 typing-inspect==0.9.0
 typing-inspection==0.4.2
 tzlocal==5.3.1
-urllib3==2.7.0
+urllib3==2.8.0
 uvicorn==0.49.0
 uvloop==0.22.1
 watchfiles==1.1.1
@@ -85,6 +85,3 @@ webauthn==2.8.0
 websockets==16.0
 yarl==1.23.0
 zxcvbn-python==4.4.24
-
-# The following packages were excluded from the output:
-# oto-audio

@@ -203,11 +203,12 @@ class TestLocalReaper:
 class TestCodexReaper:
     def test_candidates_spare_a_running_terminal(self, registries, monkeypatch):
         monkeypatch.setattr(config, "BACKGROUND_WORK_CEILING_S", 1000)
-        monkeypatch.setattr(codex_session, "has_pending_question", lambda sid: False)
+        monkeypatch.setattr(codex_session, "has_pending_prompt", lambda sid: False)
 
         class _S:
             is_alive = True
             last_activity = time.monotonic() - 100
+            _current_turn_id = None
 
         monkeypatch.setattr(codex_session, "_codex_sessions", {"c1": _S(), "c2": _S()})
         _running_command("c1")
@@ -293,7 +294,7 @@ class TestEvictor:
         assert scan.victim is not None and scan.victim[0] == "dx" and scan.spared_live == 3
         # A Codex session with no turn but a question parked on a person is live.
         codex._current_turn_id = None
-        monkeypatch.setattr("core.session.session_state.has_pending_question",
+        monkeypatch.setattr("core.session.session_state.has_pending_prompt",
                             lambda sid: sid == "cx")
         streaming2 = asyncio.get_running_loop().create_future()
         monkeypatch.setitem(DirectLLMExecutionLayer._active_streams, "dx", streaming2)
@@ -415,3 +416,36 @@ class TestEvictor:
         assert not adm and adm.reason == "user_cap"
         assert "You already have 2 sessions running" in adm.user_message
         assert ledger["closed"] == [own_old.session_id]
+
+    @pytest.mark.asyncio
+    async def test_per_user_cap_gives_up_only_sessions_it_counts(
+            self, pool, registries, ledger, monkeypatch):
+        # The cap counts the ledger's owner; a session with no recorded owner
+        # (a view-only re-attach, a wake) counts against nobody, so it is not
+        # the person's to give up even when it carries her user_sub: closing
+        # it frees no counted seat.
+        from core import concurrency as C
+        monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 2)
+        ledger["budget"](10)
+        unowned = _mk_session(idle_s=900)
+        unowned.user_sub = "alice"
+        own_old, own_new = _mk_session(idle_s=500), _mk_session(idle_s=400)
+        await ledger["hold"](unowned)
+        await ledger["hold"](own_old, "alice")
+        await ledger["hold"](own_new, "alice")
+        assert C._owned("alice") == 2
+        scan = await _oldest_evictable_local(60, only_user="alice")
+        assert scan.victim is not None and scan.victim[0] == own_old.session_id
+        assert await C.acquire("alice-3", "chat", user_sub="alice")
+        assert ledger["closed"] == [own_old.session_id]
+        assert unowned.session_id in C._sessions
+        # Her counted sessions all fresh: the cap sentence, and the uncounted
+        # one is left alone.
+        pool.pop(own_new.session_id)
+        C.release(own_new.session_id)
+        fresh = _mk_session(idle_s=1)
+        await ledger["hold"](fresh, "alice")
+        adm = await C.acquire("alice-4", "chat", user_sub="alice")
+        assert not adm and adm.reason == "user_cap"
+        assert ledger["closed"] == [own_old.session_id]
+        assert unowned.session_id in C._sessions

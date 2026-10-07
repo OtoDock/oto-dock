@@ -296,24 +296,6 @@ class MCPServerConnection:
         self.session = await session_cm.__aenter__()
         self._cm_stack.append(session_cm)
 
-    def _swap_brokered_bearer(self, auth_value: str) -> str | None:
-        """``Bearer <the broker placeholder>`` → ``Bearer <the real token>`` from
-        this session's bundle for this server; ``None`` for any other header
-        (a vendor bearer, a session JWT, nothing) or on a store miss."""
-        from core.credentials import mcp_broker
-        if auth_value != f"Bearer {mcp_broker.BROKER_BEARER_PLACEHOLDER}":
-            return None
-        bundle = mcp_broker.get(self.session_id, self.name)
-        bearer = getattr(bundle, "http_bearer", None) if bundle else None
-        if not bearer:
-            logger.warning(
-                "MCP server '%s': brokered bearer missing for session %s — the "
-                "sidecar will refuse the call (no bundle provisioned?)",
-                self.name, self.session_id or "(none)",
-            )
-            return None
-        return f"Bearer {bearer}"
-
     async def _start_remote(self) -> None:
         """Connect to a remote MCP server (SSE or streamable HTTP)."""
         url = self.config.get("url", "")
@@ -324,6 +306,12 @@ class MCPServerConnection:
         if self.session_id and "session_id=" not in url:
             sep = "&" if "?" in url else "?"
             url = f"{url}{sep}session_id={self.session_id}"
+        # A credential-gateway entry is dialled on the internal listener
+        # (the only listener the route answers on), as the sandbox splice
+        # lands sessions there; this layer runs in the proxy process and
+        # has no splice.
+        from core.credentials import mcp_gateway
+        url = mcp_gateway.internal_entry_url(url)
 
         # Forward the entry's Authorization header to the remote MCP. CLI/Codex
         # already do this via their config files; the direct layer historically
@@ -337,19 +325,6 @@ class MCPServerConnection:
         _swapped = swap_session_jwt_bearer(
             headers.get("Authorization", ""), self.session_id, self.agent_name,
         )
-        if _swapped is not None:
-            headers["Authorization"] = _swapped
-        # A proxy-terminable HTTP MCP (github/m365) ships the brokered-bearer
-        # placeholder in its entry and the real token in the session's broker
-        # bundle (mcp_registry: the HTTP bearer-swap). The CLI's per-session
-        # config copy and the satellite tunnel swap it at their boundary; this
-        # layer is its own boundary — it forwards straight to the sidecar — so
-        # it swaps here too. Without this a headless app action (an app's
-        # scheduled handler pressing its GitHub buttons) reached GitHub with
-        # the literal placeholder: "401 Bad credentials" on every call while
-        # the same account worked in every chat (found live, 2026-09-14). A
-        # store miss keeps the placeholder → the sidecar 401s, fail-closed.
-        _swapped = self._swap_brokered_bearer(headers.get("Authorization", ""))
         if _swapped is not None:
             headers["Authorization"] = _swapped
         headers = headers or None
@@ -504,6 +479,7 @@ class AgentMCPManager:
                 phone_mode=self.phone_mode,
                 placement=placement.LOCAL_PLACEMENT,
                 external=self.external,
+                session_id=self.session_id,
             )
         # Credential broker: provision THIS session's per-MCP secret
         # bundles so _start_stdio can merge each server's secrets in-process.

@@ -15,6 +15,7 @@ from api.auth import identity as _identity
 from api.auth import admin_users as _admin_users
 from api.auth import platform as _platform
 from api.auth import webauthn as _webauthn
+from api.auth import csp as _csp
 
 # The shared router app.py mounts as ``auth.router`` (all section routes attached).
 router = _router.router
@@ -22,4 +23,4 @@ router = _router.router
 _enforce_user_paired_disabled = _platform._enforce_user_paired_disabled
 # Importing the section modules above is what registers their routes; the tuple
 # keeps linters from flagging the imports as unused.
-_SECTION_MODULES = (_identity, _admin_users, _platform, _webauthn)
+_SECTION_MODULES = (_identity, _admin_users, _platform, _webauthn, _csp)

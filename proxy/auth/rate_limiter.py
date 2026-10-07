@@ -21,20 +21,70 @@ Two entry points:
   the cap while the password hashes run.
 """
 
+import hashlib
+import logging
 import secrets
 import time
+from collections import Counter
 from datetime import datetime
 
 import jwt
 
 import config
 from storage import database as db
-from storage.pg import get_conn, run_db
+from storage.pg import run_db
 
-# (bucket, key) → {count, first_at, blocked_until, block_count}
-_attempts: dict[tuple[str, str], dict] = {}
+logger = logging.getLogger("claude-proxy")
+
+
+class _Attempts(dict):
+    """``(bucket, key) → {count, first_at, blocked_until, block_count}``,
+    counting the keys of each bucket as entries come and go."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.per_bucket: Counter = Counter()
+        # A bucket found full of blocked keys is not scanned again before
+        # this time: a flood of fresh keys must not rescan it per request.
+        self.full_until: dict[str, float] = {}
+
+    def __setitem__(self, k, v) -> None:
+        if k not in self:
+            self.per_bucket[k[0]] += 1
+        super().__setitem__(k, v)
+
+    def __delitem__(self, k) -> None:
+        super().__delitem__(k)
+        self._dec(k[0])
+
+    def pop(self, k, *default):
+        if k in self:
+            self._dec(k[0])
+        return super().pop(k, *default)
+
+    def clear(self) -> None:
+        super().clear()
+        self.per_bucket.clear()
+        self.full_until.clear()
+
+    def _dec(self, bucket: str) -> None:
+        self.per_bucket[bucket] -= 1
+        if self.per_bucket[bucket] <= 0:
+            del self.per_bucket[bucket]
+
+
+_attempts = _Attempts()
 _last_cleanup = 0.0
 _CLEANUP_EVERY = 300  # sweep stale entries at most every 5 min
+# A bucket keeps at most this many keys: a flood of fresh keys (rotating
+# addresses, invented emails) cannot grow it without bound. At the bound the
+# bucket's expired entries go, then the oldest that were never blocked (a
+# blocked key and its escalation stay); with nothing left to free, a new
+# key goes untracked rather than refused (the account tarpit and the other
+# buckets still apply).
+_EVICT_FRACTION = 10
+_FULL_RESCAN_S = 60.0
+_full_logged: dict[str, float] = {}
 
 
 def _rule(bucket: str) -> dict:
@@ -94,10 +144,38 @@ def check_rate_limit(bucket: str, key: str) -> tuple[bool, int]:
     return False, block_duration
 
 
+def _make_room(bucket: str, now: float) -> bool:
+    """Free keys in a full bucket; False when nothing may go."""
+    rule = _rule(bucket)
+    mine = [(k, d) for k, d in _attempts.items() if k[0] == bucket]
+    stale = [k for k, d in mine
+             if now - d["first_at"] > rule["max_block"] and d.get("blocked_until", 0) < now]
+    for k in stale:
+        del _attempts[k]
+    cap = config.RATE_LIMIT_MAX_KEYS
+    if _attempts.per_bucket[bucket] < cap:
+        return True
+    quiet = sorted((d["first_at"], k) for k, d in mine
+                   if k in _attempts and not d.get("block_count") and d.get("blocked_until", 0) < now)
+    for _, k in quiet[:max(1, cap // _EVICT_FRACTION)]:
+        del _attempts[k]
+    if _attempts.per_bucket[bucket] < cap:
+        return True
+    _attempts.full_until[bucket] = now + _FULL_RESCAN_S
+    if now - _full_logged.get(bucket, 0.0) > 3600:
+        _full_logged[bucket] = now
+        logger.warning("Rate limit bucket %s is full (%d keys, all blocked): new keys go untracked",
+                       bucket, cap)
+    return False
+
+
 def record_attempt(bucket: str, key: str) -> None:
     """Count one attempt against ``(bucket, key)`` (starts/rolls the window)."""
     now = time.time()
     entry = _attempts.get((bucket, key))
+    if entry is None and _attempts.per_bucket[bucket] >= config.RATE_LIMIT_MAX_KEYS:
+        if now < _attempts.full_until.get(bucket, 0.0) or not _make_room(bucket, now):
+            return
     rule = _rule(bucket)
     # Never roll the window (which would zero blocked_until) while a block is
     # still being served — a single probe during the block would otherwise
@@ -132,25 +210,30 @@ def release_attempt(bucket: str, key: str) -> None:
 
 
 def clear_rate_limit(bucket: str, key: str) -> None:
-    """Drop tracking for ``(bucket, key)`` (e.g. on a successful login)."""
+    """Drop tracking for ``(bucket, key)`` (e.g. a link unlocked by its
+    password)."""
     _attempts.pop((bucket, key), None)
 
 
-# --- Login IP limiter: thin wrappers over the "login" bucket --------------
-# Every attempt is counted before the login's first await (``hit``); one that
-# tested no password (the tarpit refused it) or had the right one is given
-# back, so a correct password never blocks the legitimate user.
-
-def hit_ip_login(ip: str) -> tuple[bool, int]:
-    return hit("login", ip)
+def forgot_email_key(email: str) -> str:
+    """The forgot-password bucket's per-address key: a hash, so a stored key
+    is a fixed size whatever the request carried."""
+    digest = hashlib.sha256(email.strip().lower().encode()).hexdigest()[:32]
+    return f"email:{digest}"
 
 
-def release_ip_attempt(ip: str) -> None:
-    release_attempt("login", ip)
+# --- Login address limiter: thin wrappers over the "login" bucket ---------
+# Keyed by ``lan_check.auth_bucket_key``. Every attempt is counted before the
+# login's first await (``hit``); one that tested no password (the tarpit
+# refused it) or had the right one is given back, so a correct password never
+# blocks the legitimate user.
+
+def hit_login(key: str) -> tuple[bool, int]:
+    return hit("login", key)
 
 
-def clear_ip_attempts(ip: str) -> None:
-    clear_rate_limit("login", ip)
+def release_login_attempt(key: str) -> None:
+    release_attempt("login", key)
 
 
 # --- Account Tarpit (DB-backed) ---
@@ -197,25 +280,11 @@ def _clear_account_failures(sub: str) -> None:
     db.reset_login_attempts(sub)
 
 
-def undo_failed_login(sub: str) -> None:
-    """Give back one failure the login counted before a password check that
-    never ran (the hash gate was full): one less, and no last failure when
-    it was the only one. One statement, so a failure another attempt
-    counts meanwhile is kept. Synchronous: call it on the DB executor."""
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE users SET failed_login_attempts = GREATEST(failed_login_attempts - 1, 0), "
-            "last_failed_login = CASE WHEN failed_login_attempts <= 1 THEN NULL "
-            "ELSE last_failed_login END WHERE sub=%s",
-            (sub,),
-        )
-        conn.commit()
-
-
-async def record_successful_login(ip: str, sub: str) -> None:
-    """Clear the limits after a full login: the address's bucket in memory,
-    the account's counters through the DB executor."""
-    clear_ip_attempts(ip)
+async def record_successful_login(sub: str) -> None:
+    """Clear the account's counters after a full login, through the DB
+    executor. No address bucket is cleared: the route gave back the attempt
+    that was right, and the address's other failures stay counted until
+    their window lapses."""
     await run_db(_clear_account_failures, sub)
 
 

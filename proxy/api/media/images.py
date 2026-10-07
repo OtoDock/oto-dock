@@ -9,7 +9,7 @@ Flow:
 
 Security:
     * The POST creator is authenticated via the same Bearer +
-      verify_session_match pattern as every other /v1/hooks/* endpoint, AND
+      verify_session_match_async pattern as every other /v1/hooks/* endpoint, AND
       the requested abs_path is validated to live inside the session's
       agent_dir.
     * Only raster images are minted (png, jpeg, gif, webp, bmp, tiff): the

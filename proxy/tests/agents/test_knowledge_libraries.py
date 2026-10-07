@@ -499,6 +499,29 @@ class TestProjector:
         mode = (_mirror(CON_B) / "index.md").stat().st_mode & 0o777
         assert mode == (0o666 & ~umask)
 
+    def test_a_changed_umask_is_followed_at_the_next_copy(self, kl_env, quiet_fanout):
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        (config.get_agent_dir(SRC) / "knowledge" / "docs" / "late.md").write_text("late")
+        old = os.umask(0o077)
+        try:
+            _run(library_projector.reconcile_source(SRC))
+        finally:
+            os.umask(old)
+        assert (_mirror(CON_B) / "docs" / "late.md").stat().st_mode & 0o777 == 0o600
+
+    def test_importing_the_projector_never_sets_the_umask(self, monkeypatch):
+        """``os.umask`` is process-wide: setting it, even for a moment, can
+        hand a file another thread creates meanwhile the wrong bits."""
+        import importlib.util
+        from services.knowledge import library_projector
+        calls = []
+        monkeypatch.setattr(os, "umask", lambda *a: calls.append(a) or 0o022)
+        spec = importlib.util.spec_from_file_location("_projector_import_probe",
+                                                      library_projector.__file__)
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
+        assert calls == []
+
     def test_detach_and_teardown(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
         _run(library_projector.reconcile_source(SRC))

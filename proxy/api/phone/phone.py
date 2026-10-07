@@ -21,7 +21,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user, mask_email, require_admin
+from adapters.phone import DIRECTIONS, INBOUND, is_outbound
+from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_user
 from services.phone import phone_adapters
 from storage.agents import agent_store
 from storage.identity import credential_store
@@ -35,7 +36,8 @@ from auth import roles
 from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE
 
 logger = logging.getLogger("claude-proxy")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # Call-only platform settings (``phone_`` prefix stripped on the wire).
 _PHONE_SETTING_PREFIX = "phone_"
@@ -53,7 +55,7 @@ _twilio_cred_name = phone_server_store.twilio_cred_name
 # ---------------------------------------------------------------------------
 
 class PhoneRouteCreate(BaseModel):
-    direction: str  # "inbound" | "outbound"
+    direction: str  # one of adapters.phone.DIRECTIONS
     name: str = ""
     agent: str = "personal-assistant"
     language: str = "en"
@@ -209,13 +211,13 @@ async def _assert_did_available(
 ) -> None:
     """409 if an inbound DID is already routed on this server (the DB has a
     unique index on it — pre-checking gives a clean message instead of a 500)."""
-    if direction != "inbound" or not did:
+    if direction != INBOUND or not did:
         return
     routes = await asyncio.to_thread(phone_route_store.get_all_routes)
     for r in routes:
         if (
             r.get("phone_server_id") == server_id
-            and r.get("direction") == "inbound"
+            and r.get("direction") == INBOUND
             and r.get("did") == did
             and r.get("id") != exclude_route_id
         ):
@@ -236,7 +238,7 @@ def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
     out = []
     for r in routes:
         pin_configured = (
-            r["direction"] == "inbound"
+            r["direction"] == INBOUND
             and bool(phone_route_store.get_route_pin(r["id"]))
         )
         out.append({
@@ -257,9 +259,6 @@ def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
 # A stored legacy value resolves as ``caller`` and is upgraded on the next save.
 _IDENTITY_MODES = ("caller", "user")
 _LEGACY_IDENTITY_MODE = "shared"
-# The adapters provision anything that is not ``outbound`` as inbound, so the
-# spelling is an enum on every save (the no-PIN rule keys on it).
-_DIRECTIONS = ("inbound", "outbound")
 # The body keys whose presence on a PUT re-runs the identity rules on the
 # post-edit row (the route form sends every field; the table's enable toggle
 # sends ``enabled`` alone).
@@ -267,21 +266,25 @@ _IDENTITY_KEYS = ("identity_mode", "identity_user_sub", "agent", "direction")
 # The only role an external caller runs with; the route column is written
 # as this on every save (services/phone/phone_identity.py ignores it anyway).
 _ROUTE_ROLE = EXTERNAL_ROUTE_ROLE
-_PIN_RE = re.compile(r"^\d{4,6}$")
+# A PIN being set is 6 digits; one stored earlier with 4 or 5 keeps working
+# (the daemon compares whatever is stored) until it is changed.
+_PIN_RE = re.compile(r"^\d{6}$")
 
 
 def _validate_direction(value: str) -> None:
-    if value not in _DIRECTIONS:
+    """The adapters provision anything that is not outbound as inbound, so the
+    spelling is an enum on every save (the no-PIN rule keys on it)."""
+    if value not in DIRECTIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown direction {value!r}: expected one of {list(_DIRECTIONS)}",
+            detail=f"Unknown direction {value!r}: expected one of {list(DIRECTIONS)}",
         )
 
 
 def _validate_pin_value(value: str) -> None:
-    """4-6 digits; the error never echoes the value."""
+    """6 digits; the error never echoes the value."""
     if not _PIN_RE.fullmatch(value or ""):
-        raise HTTPException(status_code=400, detail="The PIN must be 4 to 6 digits")
+        raise HTTPException(status_code=400, detail="The PIN must be 6 digits")
 
 
 def _tied_user_label(sub: str, user: dict | None = None) -> str:
@@ -300,7 +303,7 @@ def _require_no_pin_acknowledged(route: dict, *, has_pin: bool, acknowledged: bo
     by the same request."""
     if (route.get("identity_mode") or "caller") != "user":
         return
-    if route.get("direction", "inbound") != "inbound" or has_pin or acknowledged:
+    if route.get("direction", INBOUND) != INBOUND or has_pin or acknowledged:
         return
     who = _tied_user_label(route.get("identity_user_sub") or "")
     raise HTTPException(
@@ -386,7 +389,7 @@ def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[
             return warnings
         user = task_store.get_user(sub) or {}
         who = _tied_user_label(sub, user)
-        if route.get("direction") == "outbound":
+        if is_outbound(route.get("direction")):
             warnings.append(
                 f"Outbound calls on this route run as {who}: whoever answers "
                 "acts as that user."
@@ -468,10 +471,10 @@ async def create_phone_route(
     u = require_admin(user)
     data = req.model_dump(exclude=_REQUEST_ONLY)
     data["role"] = _ROUTE_ROLE
-    _validate_direction(data.get("direction", "inbound"))
+    _validate_direction(data.get("direction", INBOUND))
     if req.pin is not None:
         _validate_pin_value(req.pin)
-        if data["direction"] != "inbound":
+        if data["direction"] != INBOUND:
             raise HTTPException(
                 status_code=400, detail="PIN protection is for inbound routes only")
     _validate_background_sound(data.get("background_sound", "off"))
@@ -490,7 +493,7 @@ async def create_phone_route(
     await _assert_did_available(server["id"], data.get("did") or "", data["direction"])
     # Inbound routes need a stable AudioSocket UUID — it's baked into the PBX
     # DID→UUID mapping. Allocate one when the caller didn't supply it.
-    if data["direction"] == "inbound" and not data.get("audiosocket_uuid"):
+    if data["direction"] == INBOUND and not data.get("audiosocket_uuid"):
         data["audiosocket_uuid"] = str(uuid.uuid4())
 
     route = await asyncio.to_thread(phone_route_store.create_route, data)
@@ -575,12 +578,12 @@ async def update_phone_route(
     post_direction = data.get("direction") or existing["direction"]
     if req.pin is not None:
         _validate_pin_value(req.pin)
-        if post_direction != "inbound":
+        if post_direction != INBOUND:
             raise HTTPException(
                 status_code=400, detail="PIN protection is for inbound routes only")
     stored_pin = await asyncio.to_thread(phone_route_store.get_route_pin, route_id)
-    if (data.get("direction") == "outbound"
-            and existing["direction"] == "inbound"
+    if (is_outbound(data.get("direction"))
+            and existing["direction"] == INBOUND
             and stored_pin):
         # A silent flip would strand the encrypted credential AND disarm the
         # PIN without anyone noticing — make the admin remove it first.
@@ -636,9 +639,9 @@ async def update_phone_route(
             data["phone_server_id"] = server["id"]
             await _assert_did_available(
                 server["id"], merged.get("did") or "",
-                merged.get("direction", "inbound"), exclude_route_id=route_id,
+                merged.get("direction", INBOUND), exclude_route_id=route_id,
             )
-            if merged.get("direction", "inbound") == "inbound" and not merged.get("audiosocket_uuid"):
+            if merged.get("direction", INBOUND) == INBOUND and not merged.get("audiosocket_uuid"):
                 merged["audiosocket_uuid"] = str(uuid.uuid4())
             # Provision on the target server FIRST: the DB stays untouched on failure.
             new_adapter = await _load_adapter(server)
@@ -746,13 +749,13 @@ async def set_phone_route_pin(
     req: SecretSet,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Set the route's inbound PIN (4-6 digits). The value is never echoed
+    """Set the route's inbound PIN (6 digits). The value is never echoed
     back, never logged, and never appears in route responses."""
     u = require_admin(user)
     route = await asyncio.to_thread(phone_route_store.get_route, route_id)
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
-    if route["direction"] != "inbound":
+    if route["direction"] != INBOUND:
         raise HTTPException(
             status_code=400, detail="PIN protection is for inbound routes only")
     _validate_pin_value(req.value)

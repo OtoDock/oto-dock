@@ -24,7 +24,7 @@ import config
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from core.session import session_state
 from storage import database as task_store
 from pathlib import Path
@@ -35,7 +35,7 @@ SID = "sess-ui-1"
 AGENT = "ui-agent"
 # A session token, as the MCP sidecars send: a body past 64 KB with a bearer
 # that does not verify is refused before the route runs.
-_BEARER = {"Authorization": f"Bearer {create_session_token(SID, AGENT, '')}"}
+_BEARER = {"Authorization": f"Bearer {live_session_token(SID, AGENT, '')}"}
 
 
 def _user(sub: str = "user-viewer", role: str = "member",
@@ -55,6 +55,18 @@ def authed():
 
 def _as(user: UserContext | None) -> None:
     app.dependency_overrides[get_current_user] = lambda: user
+
+
+def _off_loop(fn):
+    """``fn`` that raises when called on the event loop (a worker thread
+    has no running loop)."""
+    def guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*a, **kw)
+        raise AssertionError(f"{fn.__name__} ran on the event loop")
+    return guarded
 
 
 @pytest.fixture
@@ -223,6 +235,15 @@ def test_hook_ui_broadcasts_file_updated_for_update_in_place(agent_tree, monkeyp
     assert (agent_tree / "workspace" / "trip.html").read_text() == "<p>flight booked</p>"
 
 
+def test_hook_ui_mints_its_token_off_the_loop(agent_tree, monkeypatch):
+    monkeypatch.setattr(task_store, "create_media_token",
+                        _off_loop(task_store.create_media_token))
+    r = _post_ui({"html": "<p>lane</p>"})
+    assert r.status_code == 200
+    token = _queue_items()[-1]["token"]
+    assert task_store.get_media_token(token)["media_kind"] == "ui"
+
+
 # ───────────────────────── GET /v1/ui/{token} ───────────────────────────────
 
 
@@ -286,10 +307,19 @@ def test_csp_origin_prefers_public_url_on_matching_host(agent_tree, tmp_path, mo
     resp = client.get(f"/v1/ui/{token}", headers={"host": "192.168.1.10:8400"})
     assert "script-src http://192.168.1.10:8400 'unsafe-inline'" in \
         resp.headers["Content-Security-Policy"]
-    # X-Forwarded-Proto still honoured on non-matching hosts.
-    resp = client.get(f"/v1/ui/{token}", headers={
+    # X-Forwarded-Proto still honoured on non-matching hosts, from a trusted
+    # hop (loopback on bare metal).
+    monkeypatch.setattr(config, "RUNNING_IN_DOCKER", False)
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
+    hop_client = TestClient(app, client=("127.0.0.1", 50000))
+    resp = hop_client.get(f"/v1/ui/{token}", headers={
         "host": "alt.example.com", "x-forwarded-proto": "https"})
     assert "script-src https://alt.example.com 'unsafe-inline'" in \
+        resp.headers["Content-Security-Policy"]
+    # From a peer that is not a hop the header names nothing.
+    resp = client.get(f"/v1/ui/{token}", headers={
+        "host": "alt.example.com", "x-forwarded-proto": "https"})
+    assert "script-src http://alt.example.com 'unsafe-inline'" in \
         resp.headers["Content-Security-Policy"]
 
 
@@ -485,6 +515,22 @@ def test_chat_bound_token_uses_chat_access_rule(agent_tree, tmp_path):
     assert client.get(f"/v1/ui/{token}").status_code == 200  # admin
 
 
+def test_serve_media_reads_the_token_and_its_chat_off_the_loop(agent_tree, monkeypatch):
+    task_store.create_chat("chat-media-lane", "user-viewer", AGENT)
+    doc = agent_tree / "workspace" / "lane.txt"
+    doc.write_text("x")
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(32)
+    task_store.create_media_token(
+        token, str(doc), media_kind="file",
+        chat_id="chat-media-lane", session_id=SID, agent=AGENT,
+    )
+    monkeypatch.setattr(task_store, "get_media_token", _off_loop(task_store.get_media_token))
+    monkeypatch.setattr(task_store, "get_chat", _off_loop(task_store.get_chat))
+    resp = client.get(f"/v1/media/{token}?download=1&fn=lane.txt")
+    assert resp.status_code == 200 and resp.content == b"x"
+
+
 def test_shared_only_chat_token_serves_any_assigned_user(agent_tree, tmp_path):
     from core.session.visibility import SHARED_CHAT_OWNER_PREFIX
     task_store.create_chat("chat-ui-shared", f"{SHARED_CHAT_OWNER_PREFIX}{AGENT}", AGENT)
@@ -600,13 +646,12 @@ def test_pump_artifact_queue_cap_and_abort_clear():
         producer = loop.create_task(_asyncio.sleep(3600))
         p = ChatStreamPump(chat_id="c1", session_id="s1", producer=producer,
                            event_queue=_asyncio.Queue(), perm_queue=None)
+        p.queue_closed = False  # as the producer that drains it opens it
         for i in range(QUEUE_CAP):
             assert p.queue_artifact({"token": f"t{i}"}) is True
         assert p.queue_artifact({"token": "overflow"}) is False
-        from core.events.common_events import TurnInput
-        p.queue_message(TurnInput("user words"))
-        p.cancel_all_queued()
-        assert p.artifact_queue == [] and p.message_queue == []
+        p.cancel_all_artifacts()
+        assert p.artifact_queue == [] and p.artifact_leftover == []
         producer.cancel()
     finally:
         loop.close()

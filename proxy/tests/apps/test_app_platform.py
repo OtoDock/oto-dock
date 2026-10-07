@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 import config
 from app import app
 from auth.providers import UserContext, get_current_user
-from auth.session_token import create_session_token
+from tests.conftest import live_session_token
 from api.apps import app_proxy, catalog
 from services.apps import app_supervisor, app_tokens
 from storage import database as task_store
@@ -283,14 +283,14 @@ def test_methods_run_as_the_forwarded_viewer_else_as_the_app(agent_tree):
     other = _row("other", ME)
     assert _call(row["id"], "viewer.me", inst.token, viewer=_viewer_token(other["id"])).status_code == 400
     assert _call(row["id"], "viewer.me", alice).json()["result"]["sub"] == "alice-sub"
-    sess = create_session_token("s-1", AGENT, "alice-sub")
+    sess = live_session_token("s-1", AGENT, "alice-sub")
     assert _call(row["id"], "viewer.me", sess).json()["result"]["sub"] == "alice-sub"
     # The claim an agent's call brought to the server, forwarded on: that
     # session's user, as the agent's own call; a no-user session's claim
     # runs as the app.
     import asyncio as _aio
     for token, want in ((sess, "alice-sub"),
-                        (create_session_token("s-2", AGENT, ""), f"session:app:{row['id']}")):
+                        (live_session_token("s-2", AGENT, ""), f"session:app:{row['id']}")):
         relayed = _aio.run(app_proxy._agent_caller(
             app_proxy.validate_session_token(token), row)).claim
         r = _call(row["id"], "viewer.me", inst.token, viewer=relayed)
@@ -530,6 +530,23 @@ def test_a_preview_or_a_reconnect_never_takes_the_live_servers_feeds(agent_tree)
         assert new.receive_json()["delta"]["id"] == "after-reconnect"
 
 
+def test_a_preview_burst_never_spends_the_live_servers_platform_bucket(agent_tree, monkeypatch):
+    # The preview copy runs code nobody approved: its calls count in a
+    # bucket of their own, so the live server keeps its four a second.
+    row = _row("board", ME)
+    live = _install(row)
+    preview = app_supervisor.Instance(row_id=row["id"], name="preview", row=row,
+                                      release_dir=config.get_agent_dir(AGENT),
+                                      data_dir=config.get_agent_dir(AGENT), host_port=2, state="up")
+    preview.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
+                                    {"sub": f"app:{row['id']}", "instance": "preview"}, 3600)
+    app_supervisor._instances[(row["id"], "preview")] = preview
+    monkeypatch.setattr(app_proxy, "PLATFORM_RATE", 2.0)
+    codes = [_call(row["id"], "viewer.me", preview.token).status_code for _ in range(4)]
+    assert codes[:2] == [200, 200] and codes[-1] == 429, codes
+    assert _call(row["id"], "viewer.me", live.token).status_code == 200
+
+
 def test_the_agent_slice_of_a_snapshot(agent_tree):
     import uuid
     from core.session.visibility import SHARED_CHAT_OWNER_PREFIX
@@ -558,7 +575,7 @@ def test_an_agent_session_is_judged_at_its_row_not_its_platform_standing(agent_t
     row = _row("floored", floored)
     inst = _install(row)
     task_store.upsert_user("root-sub", "root@test.com", "Root", "admin")  # admin, no row
-    sess = create_session_token("s-root", AGENT, "root-sub")
+    sess = live_session_token("s-root", AGENT, "root-sub")
     assert _call(row["id"], "viewer.me", sess).status_code == 403
     relayed = _aio.run(app_proxy._agent_caller(app_proxy.validate_session_token(sess), row)).claim
     assert _call(row["id"], "viewer.me", inst.token, viewer=relayed).status_code == 403
@@ -568,7 +585,7 @@ def test_an_agent_session_is_judged_at_its_row_not_its_platform_standing(agent_t
                        headers={"Authorization": f"Bearer {sess}"}).status_code == 403
     _as(ALICE)
     # A manager session passes the manager floor at its row and runs as its user.
-    alice_sess = create_session_token("s-alice", AGENT, "alice-sub")
+    alice_sess = live_session_token("s-alice", AGENT, "alice-sub")
     r = _call(row["id"], "viewer.me", alice_sess)
     assert r.status_code == 200 and r.json()["result"]["sub"] == "alice-sub", r.text
     # A person's own claim, forwarded by the server: their full standing.
@@ -579,7 +596,7 @@ def test_an_agent_session_is_judged_at_its_row_not_its_platform_standing(agent_t
     writer = _row("writer", [{"id": "w", "label": "W", "type": "platform", "method": "files.write"}],
                   files={"write": ["workspace/out"]})
     (agent_tree / "workspace" / "out").mkdir()
-    r = _call(writer["id"], "files.write", create_session_token("s-pm", AGENT, "pm-sub"),
+    r = _call(writer["id"], "files.write", live_session_token("s-pm", AGENT, "pm-sub"),
               {"path": "workspace/out/a.txt", "content": "hi"})
     assert r.status_code == 200 and r.json()["ok"], r.text
     assert (agent_tree / "workspace" / "out" / "a.txt").read_text() == "hi"
@@ -622,3 +639,279 @@ def test_the_files_methods_never_follow_a_link_swapped_in_after_the_check(agent_
               viewer=alice)
     assert r.status_code == 200 and not r.json()["ok"], r.text
     assert sorted(p.name for p in outside.iterdir()) == ["secret.md"]
+
+
+def test_a_placed_agents_session_never_reaches_the_platform_route(agent_tree):
+    """A session of an agent the app is placed in reaches the app's exports
+    alone (APPS.md "Agents call apps"): the platform route refuses it,
+    directly and relayed by the app's own server, so the home agent's
+    declared files never answer another agent's session."""
+    from storage.sharing import share_store
+    other = "platform-other"
+    row = _row("notes", ME + [{"id": "r", "label": "Read", "type": "platform", "method": "files.read"}],
+               files={"read": ["workspace/notes"]})
+    inst = _install(row)
+    (agent_tree / "workspace" / "notes").mkdir()
+    (agent_tree / "workspace" / "notes" / "a.md").write_text("member-only text")
+    share_store.create_internal_share(target_kind="app", target_id=row["id"], created_by="alice-sub",
+                                      grantee_kind=share_store.AGENT, grantee_agent=other,
+                                      role_cap="editor", decision=share_store.ACCEPTED,
+                                      decided_by="alice-sub")
+    read = {"path": "workspace/notes/a.md"}
+    for sess in (live_session_token("s-x", other, ""), live_session_token("s-bob", other, "bob-sub")):
+        assert _call(row["id"], "viewer.me", sess).status_code == 403
+        r = _call(row["id"], "files.read", sess, read)
+        assert r.status_code == 403 and "member-only" not in r.text
+    # The server relaying such a claim is refused too: the real claim, and
+    # one spelled with the word the app's own sessions carry (the placement
+    # marker says what it is, whatever the principal word).
+    import asyncio as _aio
+    real = _aio.run(app_proxy._agent_caller(
+        app_proxy.validate_session_token(live_session_token("s-bob2", other, "bob-sub")), row)).claim
+    spelled = app_tokens.mint(row["id"], app_tokens.PURPOSE_CALLER, {
+        "principal": "agent", "sub": "session:s-x", "username": "", "role": "editor",
+        "agent": other, "session": "s-x", "external": False,
+        "placement": {"kind": "agent", "share_id": "sh", "from_agent": AGENT, "agent": other,
+                      "role_cap": "editor"}}, 60)
+    for placed in (real, spelled):
+        assert _call(row["id"], "viewer.me", inst.token, viewer=placed).status_code == 403
+        r = _call(row["id"], "files.read", inst.token, read, viewer=placed)
+        assert r.status_code == 403 and "member-only" not in r.text
+    # The home agent's own no-user session still runs as the app identity.
+    assert _call(row["id"], "files.read", live_session_token("s-own", AGENT, ""), read).json()["ok"]
+
+
+# ── the audience and the per-viewer slice (APPS.md "Platform catalog") ──────
+
+AUDIENCE = [{"id": "aud", "label": "Who", "type": "platform", "method": "app.audience"}]
+SLICE = [{"id": "r", "label": "Read", "type": "platform", "method": "viewer.data.read"},
+         {"id": "w", "label": "Write", "type": "platform", "method": "viewer.data.write"}]
+
+
+def _file_row(slug: str, actions: list[dict]) -> dict:
+    from api.apps import manifest as _mf
+    actions_json, err = _mf.validate_actions(actions, AGENT, shared=True)
+    assert actions_json is not None, err
+    row = task_store.upsert_app(AGENT, "", None, slug, title=slug.title(),
+                                rel_path=f"workspace/apps/{slug}.html", actions_json=actions_json)
+    task_store.approve_app_actions(row["id"], task_store.manifest_sig(row), "alice-sub")
+    return task_store.get_app(row["id"])
+
+
+def _catalog(app_id: str, method: str, args=None):
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+    return client.post(f"/v1/apps/{app_id}/catalog/{method}", json={"args": args})
+
+
+def test_the_audience_method_names_who_uses_the_app(agent_tree):
+    """``app.audience`` (APPS.md "Platform catalog"): the home agent's
+    members, the agents a share placed the app in with their members at the
+    capped role, and the people it is shared with; read unattended by the
+    app itself (the live instance alone), floored at editor for a person."""
+    from storage.agents import agent_store
+    from storage.sharing import share_store
+    other = "platform-other"
+    agent_store.create_agent(other, "Other Desk", created_by="alice-sub")
+    row = _row("register", AUDIENCE)
+    inst = _install(row)
+    # The floor is clamped to editor at validation whatever the author wrote.
+    assert [a.get("min_role") for a in json.loads(row["actions"])] == ["editor"]
+    task_store.upsert_user("carol-sub", "carol-sub@test.com", "Carol", "member")
+    task_store.upsert_user("dan-sub", "dan-sub@test.com", "Dan", "member")
+    task_store.add_user_agent("dan-sub", other, "editor", "test")
+    task_store.add_user_agent("bob-sub", other, "manager", "test")
+    share_store.create_internal_share(target_kind="app", target_id=row["id"], created_by="alice-sub",
+                                      grantee_sub="carol-sub", role_cap="viewer")
+    theirs = share_store.create_internal_share(target_kind="app", target_id=row["id"],
+                                               created_by="alice-sub", grantee_sub="dan-sub",
+                                               role_cap="editor")
+    share_store.set_decision(theirs["id"], share_store.ACCEPTED, "dan-sub", placed_agent=other)
+    team = share_store.create_internal_share(target_kind="app", target_id=row["id"],
+                                             created_by="alice-sub", grantee_kind=share_store.AGENT,
+                                             grantee_agent=other, role_cap="editor",
+                                             decision=share_store.ACCEPTED, decided_by="alice-sub")
+    r = _call(row["id"], "app.audience", inst.token)
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    aud = r.json()["result"]
+    assert {(m["sub"], m["role"], m["via"]) for m in aud["members"]} == {
+        ("alice-sub", "manager", "membership"), ("bob-sub", "viewer", "membership")}
+    assert {m["username"] for m in aud["members"]} == {"alice", "bob"}
+    assert [(p["agent"], p["agent_name"], p["kind"], p["share_id"], p["role_cap"], p["via"], p["department"])
+            for p in aud["placements"]] == [(other, "Other Desk", "agent", team["id"], "editor", "placement", None)]
+    assert {(m["sub"], m["role"]) for m in aud["placements"][0]["members"]} == {
+        ("dan-sub", "editor"), ("bob-sub", "editor")}
+    assert {(g["sub"], g["role"], g["decision"], g["placed_agent"], g["via"]) for g in aud["grantees"]} == {
+        ("carol-sub", "viewer", "pending", "", "share"), ("dan-sub", "editor", "accepted", other, "share")}
+    assert aud["truncated"] is False and "email" not in r.text
+    # The preview copy's launch token never reads it; a bearer on the page
+    # route is a viewer and the editor floor refuses it; a viewer member's
+    # forwarded claim is refused at the floor too.
+    preview = app_supervisor.Instance(row_id=row["id"], name="preview", row=row,
+                                      release_dir=config.get_agent_dir(AGENT),
+                                      data_dir=config.get_agent_dir(AGENT), host_port=1, state="up")
+    preview.token = app_tokens.mint(row["id"], app_tokens.PURPOSE_LAUNCH,
+                                    {"sub": f"app:{row['id']}", "instance": "preview"}, 3600)
+    app_supervisor._instances[(row["id"], "preview")] = preview
+    assert _call(row["id"], "app.audience", preview.token).status_code == 403
+    _as(BOB)
+    assert _catalog(row["id"], "app.audience").status_code == 403
+    _as(ALICE)
+    assert _call(row["id"], "app.audience", inst.token, viewer=_bob_claim(row["id"])).status_code == 403
+    app.dependency_overrides.pop(get_current_user, None)
+    sess = live_session_token("s-bearer", AGENT, "alice-sub")
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+    assert client.post(f"/v1/apps/{row['id']}/catalog/app.audience", json={"args": None},
+                       headers={"Authorization": f"Bearer {sess}"}).status_code == 403
+    _as(ALICE)
+    # A person reads it page-side as an editor or manager of the app's OWN
+    # agent (or an admin); a placed editor passes the floor and is refused
+    # by the rule, and reads it through the app's server instead.
+    assert _catalog(row["id"], "app.audience").json()["ok"] is True
+    assert _call(row["id"], "app.audience", inst.token, viewer=_viewer_token(row["id"])).json()["ok"] is True
+    _as(UserContext(sub="dan-sub", email="dan-sub@test.com", name="dan", role="member",
+                    agents=[other], agent_roles={other: "editor"}))
+    r = _catalog(row["id"], "app.audience")
+    assert r.status_code == 200 and r.json()["ok"] is False and "own editors" in r.json()["reason"]
+    _as(UserContext(sub="root-sub", email="root@test.com", name="root", role="admin", agents=[]))
+    assert _catalog(row["id"], "app.audience").json()["ok"] is True
+    _as(ALICE)
+    # A session of the home agent with no person reads it as the app does;
+    # one carrying a viewer is judged at that row.
+    assert _call(row["id"], "app.audience", live_session_token("s-own", AGENT, "")).json()["ok"] is True
+    assert _call(row["id"], "app.audience", live_session_token("s-bob", AGENT, "bob-sub")).status_code == 403
+    assert _call(row["id"], "app.audience", live_session_token("s-alice", AGENT, "alice-sub")).json()["ok"] is True
+    # While the directory is closed to members, every reader but an admin
+    # gets subs and roles with the names blank; the app itself too.
+    task_store.set_platform_setting("user_directory_visible_to_members", "0")
+    try:
+        for aud in (_catalog(row["id"], "app.audience").json()["result"],
+                    _call(row["id"], "app.audience", inst.token).json()["result"]):
+            assert {m["sub"] for m in aud["members"]} == {"alice-sub", "bob-sub"}
+            assert all(m["username"] == "" and m["display_name"] == "" for m in aud["members"])
+            assert all(g["username"] == "" for g in aud["grantees"])
+        _as(UserContext(sub="root-sub", email="root@test.com", name="root", role="admin", agents=[]))
+        assert {m["username"] for m in _catalog(row["id"], "app.audience").json()["result"]["members"]} == {"alice", "bob"}
+    finally:
+        task_store.set_platform_setting("user_directory_visible_to_members", "1")
+    _as(ALICE)
+    # A revoked share leaves the list at once (no cache).
+    share_store.revoke_share(team["id"])
+    assert _call(row["id"], "app.audience", inst.token).json()["result"]["placements"] == []
+
+
+def _bob_claim(app_id: str) -> str:
+    _as(BOB)
+    try:
+        return _viewer_token(app_id)
+    finally:
+        _as(ALICE)
+
+
+def test_the_per_viewer_slice_is_each_viewers_own(agent_tree, monkeypatch):
+    """``viewer.data.read`` / ``viewer.data.write`` (APPS.md "Platform
+    catalog"): a single-file app's page keeps one small document per
+    viewer, written by that viewer alone and read by nobody else; a
+    bearer and a folder app are refused, and the files live beside the
+    app's data directory, never inside a server's mount."""
+    import re
+    from services.apps import app_deploy, releases
+    from storage.sharing import share_store
+    row = _file_row("notes", SLICE)
+    url = f"/v1/apps/{row['id']}"
+    assert _catalog(row["id"], "viewer.data.read").json() == {"ok": True, "result": {"doc": {}, "rev": 0}}
+    r = _catalog(row["id"], "viewer.data.write", {"doc": {"theme": "dark", "font": "small"}})
+    assert r.json() == {"ok": True, "result": {"doc": {"theme": "dark", "font": "small"}, "rev": 1}}, r.text
+    r = _catalog(row["id"], "viewer.data.write", {"patch": {"font": None, "lang": "el"}})
+    assert r.json()["result"] == {"doc": {"theme": "dark", "lang": "el"}, "rev": 2}
+    assert _catalog(row["id"], "viewer.data.read").json()["result"]["rev"] == 2
+    # bob's own slice is empty until he writes; alice's stays hers.
+    _as(BOB)
+    assert _catalog(row["id"], "viewer.data.read").json()["result"] == {"doc": {}, "rev": 0}
+    assert _catalog(row["id"], "viewer.data.write", {"doc": {"mine": 1}}).json()["result"]["rev"] == 1
+    _as(ALICE)
+    assert _catalog(row["id"], "viewer.data.read").json()["result"]["doc"] == {"theme": "dark", "lang": "el"}
+    # A person a share admits, with no row on the agent, keeps their own too.
+    task_store.upsert_user("carol-sub", "carol-sub@test.com", "Carol", "member")
+    share_store.create_internal_share(target_kind="app", target_id=row["id"], created_by="alice-sub",
+                                      grantee_sub="carol-sub")
+    _as(UserContext(sub="carol-sub", email="carol-sub@test.com", name="carol", role="member",
+                    agents=[], agent_roles={}))
+    assert _catalog(row["id"], "viewer.data.write", {"doc": {"c": 1}}).json()["result"]["rev"] == 1
+    assert _catalog(row["id"], "viewer.data.read").json()["result"]["doc"] == {"c": 1}
+    _as(ALICE)
+    # The files sit beside the app's data directory (a server's mount never
+    # holds them), named by a hash, never a sub.
+    folder = releases.app_data_dir(row).parent / "notes.viewers"
+    assert not (releases.app_data_dir(row) / "viewers").exists()
+    names = sorted(p.name for p in folder.iterdir())
+    assert len(names) == 3 and all(re.fullmatch(r"[0-9a-f]{32}\.json", n) for n in names)
+    assert "alice" not in "".join(names) and "sub" not in "".join(names)
+    # A later app pinned under the slug finds the documents (the names are
+    # keyed by the slug and the viewer, as a folder app's database is by the
+    # slug), so a hard unpin loses nothing.
+    task_store.delete_app(row["id"])
+    again = _file_row("notes", SLICE)
+    assert again["id"] != row["id"]
+    assert _catalog(again["id"], "viewer.data.read").json()["result"] == {
+        "doc": {"theme": "dark", "lang": "el"}, "rev": 2}
+    row = again
+    url = f"/v1/apps/{row['id']}"
+    # The cap on the files an app keeps (placed viewers spend the home
+    # agent's quota): a fourth viewer's first write is refused at 3.
+    from services.apps import viewer_data
+    monkeypatch.setattr(viewer_data, "VIEWER_FILES_MAX", 3)
+    task_store.upsert_user("dan-sub", "dan-sub@test.com", "Dan", "member")
+    task_store.add_user_agent("dan-sub", AGENT, "viewer", "test")
+    _as(UserContext(sub="dan-sub", email="dan-sub@test.com", name="dan", role="member",
+                    agents=[AGENT], agent_roles={AGENT: "viewer"}))
+    r = _catalog(row["id"], "viewer.data.write", {"doc": {"d": 1}})
+    assert r.json()["ok"] is False and "3 viewers" in r.json()["reason"]
+    _as(ALICE)
+    assert _catalog(row["id"], "viewer.data.write", {"patch": {"again": True}}).json()["result"]["rev"] == 3
+    monkeypatch.setattr(viewer_data, "VIEWER_FILES_MAX", 1000)
+    # A damaged file refuses a patch and takes a whole document; a number
+    # JSON cannot carry is refused before anything is written.
+    viewer_data.file_for(row, "alice-sub").write_text("{not json")
+    assert _catalog(row["id"], "viewer.data.read").json()["ok"] is False
+    assert _catalog(row["id"], "viewer.data.write", {"patch": {"x": 1}}).json()["ok"] is False
+    assert _catalog(row["id"], "viewer.data.write", {"doc": {"fresh": 1}}).json()["result"] == {
+        "doc": {"fresh": 1}, "rev": 1}
+    with pytest.raises(ValueError, match="JSON"):
+        viewer_data.write(row, "alice-sub", doc={"n": float("nan")})
+    # The limits: neither doc nor patch, the state document's size, a bearer
+    # (a session token) and a folder app.
+    assert _catalog(row["id"], "viewer.data.write", {}).json()["ok"] is False
+    from services.apps import viewer_data
+    with pytest.raises(ValueError, match="64 KB"):
+        viewer_data.write(row, "alice-sub", doc={"k": "x" * (64 * 1024)})
+    deep: dict = {}
+    for _ in range(17):
+        deep = {"d": deep}
+    r = _catalog(row["id"], "viewer.data.write", {"doc": deep})
+    assert r.json()["ok"] is False and "deeper" in r.json()["reason"]
+    # The page shows the reason to the viewer about their own document.
+    assert "your saved data" in r.json()["reason"] and "state document" not in r.json()["reason"]
+    assert _catalog(row["id"], "viewer.data.read").json()["result"] == {"doc": {"fresh": 1}, "rev": 1}
+    app.dependency_overrides.pop(get_current_user, None)
+    sess = live_session_token("s-bearer", AGENT, "alice-sub")
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+    r = client.post(f"{url}/catalog/viewer.data.read", json={"args": None},
+                    headers={"Authorization": f"Bearer {sess}"})
+    assert r.status_code == 200 and r.json()["ok"] is False and "page" in r.json()["reason"]
+    _as(ALICE)
+    folder_app = _row("board", SLICE)
+    r = _catalog(folder_app["id"], "viewer.data.read")
+    assert r.json()["ok"] is False and "database" in r.json()["reason"]
+    with pytest.raises(app_deploy.DeployError, match="single-file"):
+        app_deploy.validate_app_json({"actions": SLICE}, AGENT, True)
+    # On the platform route a person's own page is required: the launch token
+    # alone and an agent session carrying a person are refused; a page's
+    # forwarded claim reaches that person's slice.
+    inst = _install(folder_app)
+    assert _call(folder_app["id"], "viewer.data.read", inst.token).status_code == 403
+    assert _call(folder_app["id"], "viewer.data.read", live_session_token("s-a", AGENT, "alice-sub")).status_code == 403
+    r = _call(folder_app["id"], "viewer.data.read", inst.token, viewer=_viewer_token(folder_app["id"]))
+    assert r.status_code == 200 and r.json()["ok"] is False and "database" in r.json()["reason"]

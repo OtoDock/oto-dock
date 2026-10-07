@@ -348,3 +348,64 @@ export const useRestoreBearerAllowlist = () => {
       qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
   })
 }
+
+// ───────────────────────────────────────────────────────────────────
+// The OAuth clients the install registered at vendors (admin)
+// ───────────────────────────────────────────────────────────────────
+
+// One registration of this install at an authorization server, for one
+// callback URL; a revoked row stays listed (token files point at it).
+export interface ClientRegistration {
+  id: number
+  issuer: string
+  redirect_uri: string
+  registration_endpoint: string
+  client_id: string
+  client_secret_expires_at: string
+  token_endpoint_auth_method: string
+  registration_client_uri: string
+  client_name: string
+  scope: string
+  created_at: string
+  last_used_at: string
+  revoked_at: string
+  revoked_reason: string
+  // The token endpoint auth method the install asked for, and the
+  // space-separated MCP server URLs that signed in through this row.
+  requested_auth_method: string
+  resources: string
+  has_secret: boolean
+  mcps: string[]
+}
+
+export const useClientRegistrations = (enabled = true) =>
+  useQuery({
+    queryKey: ['oauth-client-registrations'],
+    enabled,
+    queryFn: async (): Promise<ClientRegistration[]> => {
+      const res = await apiFetch('/v1/admin/oauth-client-registrations')
+      if (!res.ok) throw new Error('Failed to load registrations')
+      const data = await res.json()
+      return data.registrations || []
+    },
+  })
+
+export const useForgetClientRegistration = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (rowId: number) => {
+      const res = await apiFetch(
+        `/v1/admin/oauth-client-registrations/${rowId}/forget`,
+        { method: 'POST' },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to forget the registration')
+      }
+      return res.json()
+    },
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ['oauth-client-registrations'] }),
+  })
+}
+

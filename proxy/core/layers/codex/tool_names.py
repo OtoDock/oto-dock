@@ -26,6 +26,7 @@ NATIVE_TO_CANONICAL: dict[str, str] = {
     "update_plan": "TodoWrite",           # rollout function call (the checklist snapshot)
     "request_user_input": "request_user_input",
     "CodexEscalation": "CodexEscalation", # the approval bridge's synthetic tool
+    "CodexTerminalInput": "CodexTerminalInput",  # the bridge's terminal-input approval (0.158+)
 }
 
 #: The app-server item types that are tool calls (the translator emits

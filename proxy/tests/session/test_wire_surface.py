@@ -133,7 +133,7 @@ def test_no_sender_spells_a_frame_name_by_literal():
 
 BESIDE_THE_WIRE = frozenset({
     wire.PUMP_WS_EVENT, wire.PUMP_PERMISSION_PROMPT, wire.PUMP_PLAN_REVIEW,
-    wire.PUMP_QUESTION_PROMPT, wire.PUMP_MODE_RESTORED, wire.PUMP_QUEUE_TURN,
+    wire.PUMP_QUESTION_PROMPT, wire.PUMP_MODE_RESTORED,
     wire.PUMP_IS_DONE, wire.PUMP_ALL_DONE, wire.PUMP_ENDED, wire.PUMP_DETACHED,
     wire.ITEM_QUESTION_PROMPT, wire.ITEM_MODE_RESTORED,
     wire.NOTIFY_SERVER_KICK, wire.NOTIFY_BG_NUDGE, wire.NOTIFY_BG_COMMAND_NUDGE,
@@ -218,8 +218,8 @@ DASH_WORDS = (FRAME_NAMES - ARTIFACT_KINDS) | {
 KNOWN_TS_SITES: dict[str, dict[str, int]] = {
     # The render block kinds (``components/chat/types.ts``) share these words
     # with the wire; each file compares a MessageBlock's kind.
-    "dashboard/src/hooks/useChatStream.ts": {"text": 4, "thinking": 3, "system": 2, "question": 2,
-                                             "plan_review": 3, "tool": 2},
+    "dashboard/src/hooks/useChatStream.ts": {"text": 3, "thinking": 3, "system": 2, "question": 4,
+                                             "plan_review": 6, "tool": 2},
     "dashboard/src/components/chat/ChatBlockRenderer.tsx": {"text": 1, "thinking": 1, "tool": 1, "question": 1,
                                                             "plan_review": 1, "system": 1,
                                                             "artifact_interaction": 1, "app_action": 1,
@@ -229,7 +229,7 @@ KNOWN_TS_SITES: dict[str, dict[str, int]] = {
     "dashboard/src/lib/activityGroups.ts": {"tool": 1, "thinking": 1},
     "dashboard/src/hooks/useChatMessages.ts": {"text": 1, "tool": 3},
     "dashboard/src/components/workspace/FilePreviewBody.tsx": {"text": 1},
-    "dashboard/src/lib/messageBlocks.ts": {"question": 1, "tool": 2},
+    "dashboard/src/lib/messageBlocks.ts": {"text": 1, "question": 1, "tool": 2},
     # The duplex voice STATE (listening | thinking | speaking) and the duplex
     # browser socket's own ``error``.
     "dashboard/src/components/chat/PresenceHalo.tsx": {"thinking": 4, "error": 1},

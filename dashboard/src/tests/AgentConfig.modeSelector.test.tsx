@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
@@ -22,16 +22,31 @@ const h = vi.hoisted(() => ({
   // Execution-layers payload for the effort-gating tests. undefined = not
   // loaded, which is what the mode-selector tests run with.
   layers: undefined as Record<string, import('@/api/agents').LayerCapabilities> | undefined,
+  // GET /v1/agents/{name}/users while the Shared-only dialog is open.
+  agentUsers: [] as { sub: string; name: string; email: string; role: string; platform_role?: string }[],
+  // The users read while the Shared-only dialog is open: loading, and the
+  // `enabled` each call was made with.
+  usersLoading: false,
+  usersEnabled: [] as boolean[],
+  dfnuMock: vi.fn(),
 }))
 
-vi.mock('@/api/agents', () => ({
+vi.mock('@/api/agents', async (importOriginal) => ({
+  AgentUpdateError: (await importOriginal<typeof import('@/api/agents')>()).AgentUpdateError,
   useAgentInfo: () => ({ data: h.agentInfo, isLoading: false }),
   useUpdateAgent: () => ({ mutate: h.updateMock, isPending: false }),
   useDeleteAgent: () => ({ mutate: vi.fn(), isPending: false }),
   useDelegationTargets: () => ({ data: undefined }),
   useSetDelegationTargets: () => ({ mutate: vi.fn(), isPending: false }),
   useExecutionLayers: () => ({ data: h.layers }),
-  useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
+  useSetDefaultForNewUsers: () => ({ mutate: h.dfnuMock }),
+  useAgentUsers: (_name: string, opts?: { enabled?: boolean }) => {
+    const enabled = opts?.enabled !== false
+    h.usersEnabled.push(enabled)
+    return enabled
+      ? { data: h.usersLoading ? undefined : h.agentUsers, isLoading: h.usersLoading, isError: false }
+      : { data: undefined, isLoading: false, isError: false }
+  },
   useKnowledgeAttachments: () => ({ data: undefined }),
   useKnowledgeLibraries: () => ({ data: undefined }),
   useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
@@ -80,8 +95,31 @@ const radio = (label: RegExp) => screen.getByRole('radio', { name: label })
 describe('AgentConfig — visibility mode selector', () => {
   beforeEach(() => {
     h.updateMock.mockClear()
+    h.dfnuMock.mockClear()
     h.agentInfo.collaborative = true
     h.agentInfo.default_scope = 'user'
+    h.agentUsers = []
+    h.usersLoading = false
+    h.usersEnabled = []
+  })
+
+  it('reads the users only while the Shared-only dialog is open, and waits for them', () => {
+    h.usersLoading = true
+    renderConfig()
+    expect(h.usersEnabled.every((e) => e === false)).toBe(true)
+    fireEvent.click(radio(/Shared only/))
+    expect(h.usersEnabled[h.usersEnabled.length - 1]).toBe(true)
+    expect(screen.getByText(/Loading who loses access/)).toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('CONFIRM'), { target: { value: 'CONFIRM' } })
+    expect(screen.getByRole('button', { name: /Switch mode/i })).toBeDisabled()
+  })
+
+  it('offers editor and manager only as the Shared-only default for new users', () => {
+    h.agentInfo.collaborative = false
+    h.agentInfo.default_scope = 'agent'
+    renderConfig()
+    const select = screen.getByDisplayValue(/^Editor/) as HTMLSelectElement
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(['editor', 'manager'])
   })
 
   it('renders all four modes with the current one selected', () => {
@@ -119,6 +157,51 @@ describe('AgentConfig — visibility mode selector', () => {
       collaborative: false,
       default_scope: 'agent',
     })
+  })
+
+  it('the Shared-only dialog names the viewers and contributors and confirms exactly them', async () => {
+    h.agentUsers = [
+      { sub: 'u-pm', name: 'Site PM', email: 'pm@x', role: 'contributor' },
+      { sub: 'u-ed', name: 'Ed', email: 'ed@x', role: 'editor' },
+      { sub: 'u-ro', name: 'Reader', email: 'ro@x', role: 'viewer' },
+      { sub: 'u-boss', name: 'Boss', email: 'b@x', role: 'viewer', platform_role: 'admin' },
+    ]
+    renderConfig()
+    fireEvent.click(radio(/Shared only/))
+    expect(screen.getByText('Site PM')).toBeInTheDocument()
+    expect(screen.getByText('Reader')).toBeInTheDocument()
+    expect(screen.queryByText('Ed')).not.toBeInTheDocument()
+    expect(screen.queryByText('Boss')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByPlaceholderText('CONFIRM'), { target: { value: 'CONFIRM' } })
+    fireEvent.click(screen.getByRole('button', { name: /Switch mode/i }))
+    expect(h.updateMock.mock.calls[0][0]).toMatchObject({
+      collaborative: false, default_scope: 'agent', confirm_removals: ['u-pm', 'u-ro'],
+    })
+    // Not saved until the server agrees: the radio stays, the dialog stays.
+    expect(radio(/Personal \+ shared/)).toBeChecked()
+    expect(screen.getByText(/Switch to Shared only\?/i)).toBeInTheDocument()
+  })
+
+  it('a changed list comes back from the server and is confirmed again', async () => {
+    const { AgentUpdateError } = await import('@/api/agents')
+    h.agentUsers = [{ sub: 'u-pm', name: 'Site PM', email: 'pm@x', role: 'contributor' }]
+    renderConfig()
+    fireEvent.click(radio(/Shared only/))
+    fireEvent.change(screen.getByPlaceholderText('CONFIRM'), { target: { value: 'CONFIRM' } })
+    fireEvent.click(screen.getByRole('button', { name: /Switch mode/i }))
+    const [, opts] = h.updateMock.mock.calls[0]
+    const fresh = [
+      { sub: 'u-pm', name: 'Site PM', email: 'pm@x', role: 'contributor' },
+      { sub: 'u-new', name: 'Newcomer', email: 'n@x', role: 'viewer' },
+    ]
+    act(() => { opts.onError(new AgentUpdateError(409, { code: 'shared_only_removals', message: 'm', people: fresh })) })
+    expect(screen.getByText('Newcomer')).toBeInTheDocument()
+    expect(screen.getByText(/confirm again/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Switch mode/i }))
+    expect(h.updateMock.mock.calls[1][0].confirm_removals).toEqual(['u-pm', 'u-new'])
+    act(() => { h.updateMock.mock.calls[1][1].onSuccess({ shared_only_switch: { removed: ['u-pm', 'u-new'], not_removed: [], default_cleared: false } }) })
+    expect(radio(/Shared only/)).toBeChecked()
+    expect(screen.queryByText(/Switch to Shared only\?/i)).not.toBeInTheDocument()
   })
 
   it('cancelling the confirm leaves the mode unchanged', () => {

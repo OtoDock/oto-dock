@@ -40,6 +40,25 @@ _HOP_BY_HOP = {
 # upstream's compressed-byte count.
 _STRIP_RESPONSE_HEADERS = _HOP_BY_HOP | {"content-encoding", "content-length"}
 
+# The platform's own cookies stop at the relay: Collabora needs none of them
+# (the gate above has judged the request) and its start-up trace logs request
+# headers whole. A cookie of something in front of the install passes.
+_PLATFORM_COOKIES = frozenset({"session", "otodock_render", "pk_handoff", "__Host-pk_handoff"})
+_PLATFORM_COOKIE_PREFIXES = ("share_session_",)
+
+
+def _upstream_cookie(raw: str | None) -> str | None:
+    """The ``Cookie`` header to forward: ``raw`` without the platform's
+    cookies, None when nothing is left."""
+    kept = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        name = part.split("=", 1)[0].strip()
+        if not part or name in _PLATFORM_COOKIES or name.startswith(_PLATFORM_COOKIE_PREFIXES):
+            continue
+        kept.append(part)
+    return "; ".join(kept) or None
+
 
 def _is_subpath_mode() -> bool:
     """True iff COLLABORA_URL is on the same host as DASHBOARD_PUBLIC_URL.
@@ -187,8 +206,10 @@ async def proxy_collabora_http(path: str, request: Request):
 
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
+        if k.lower() not in _HOP_BY_HOP and k.lower() not in ("host", "cookie")
     }
+    if cookie := _upstream_cookie(request.headers.get("cookie")):
+        headers["cookie"] = cookie
     headers.update(_forwarded_headers())
 
     raw_query = request.scope.get("query_string", b"")
@@ -221,6 +242,36 @@ async def proxy_collabora_http(path: str, request: Request):
         headers=response_headers,
         media_type=upstream.headers.get("content-type"),
     )
+
+
+# Collabora's Viewing mode (the tick that ends editing on a phone, the
+# Editing/Viewing switch on a desktop) tells the document process to refuse
+# edits from that view, and the process then refuses the view's saves too:
+# every save of the unsaved edits, the idle save included, waits for an
+# answer that never comes, five times, and Collabora stops storing the file.
+# The relay asks for the save on the same socket right before the switch, so
+# the document process saves while the view still may (its frames are
+# handled in order), and the switch finds nothing unsaved.
+_VIEW_EDITING = "setviewreadonly value=false"
+_VIEW_VIEWING = "setviewreadonly value=true"
+_SAVE_BEFORE_VIEWING = "save dontTerminateEdit=1 dontSaveIfUnmodified=1"
+
+
+class _EditingWatch:
+    """The frames one client frame becomes upstream: itself, after a save
+    when the view leaves Editing. A view starts in Viewing on a phone, so
+    only a switch after an Editing frame can have edits to save."""
+
+    def __init__(self) -> None:
+        self.editing = False
+
+    def upstream_frames(self, text: str) -> list[str]:
+        if text == _VIEW_EDITING:
+            self.editing = True
+        elif text == _VIEW_VIEWING and self.editing:
+            self.editing = False
+            return [_SAVE_BEFORE_VIEWING, text]
+        return [text]
 
 
 def _upstream_connect_kwargs(
@@ -279,11 +330,12 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
         await websocket.accept()
 
     # Forward request headers Collabora requires/uses for origin validation,
-    # cookies (Authentik passthrough), and any future custom headers. The WS
-    # library sets Host / Sec-WebSocket-* itself; we must not override those.
+    # cookies (a gateway's passthrough, never the platform's own), and any
+    # future custom headers. The WS library sets Host / Sec-WebSocket-* itself;
+    # we must not override those.
     req_headers = {k.lower(): v for k, v in websocket.headers.items()}
     forwarded_origin = req_headers.get("origin")
-    forwarded_cookie = req_headers.get("cookie")
+    forwarded_cookie = _upstream_cookie(req_headers.get("cookie"))
     additional_headers: list[tuple[str, str]] = []
     if forwarded_cookie:
         additional_headers.append(("Cookie", forwarded_cookie))
@@ -298,6 +350,7 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
         )
         async with websockets.connect(upstream_url, **connect_kwargs) as upstream:
             async def client_to_upstream():
+                watch = _EditingWatch()
                 try:
                     while True:
                         msg = await websocket.receive()
@@ -305,7 +358,8 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
                             await upstream.close()
                             return
                         if msg.get("text") is not None:
-                            await upstream.send(msg["text"])
+                            for frame in watch.upstream_frames(msg["text"]):
+                                await upstream.send(frame)
                         elif msg.get("bytes") is not None:
                             await upstream.send(msg["bytes"])
                 except WebSocketDisconnect:

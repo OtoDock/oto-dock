@@ -41,7 +41,7 @@ from webauthn.helpers.structs import (
 )
 
 import config
-from auth.lan_check import check_local_auth_allowed, get_client_ip
+from auth.lan_check import auth_bucket_key, check_local_auth_allowed
 from auth.providers import UserContext, get_current_user, mask_email, require_auth
 from auth.rate_limiter import hit as rate_limit_hit
 from auth.totp import consume_2fa_session_token, validate_2fa_session_token
@@ -240,7 +240,7 @@ async def passkey_confirm_options(request: Request,
     challenge is bound to the caller, so only their own passkeys answer."""
     from auth.providers import require_human
     u = require_human(user)
-    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("passkey", auth_bucket_key(request))
     if not ok:
         raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
                             headers={"Retry-After": str(retry_after)})
@@ -266,7 +266,7 @@ async def passkey_confirm_verify(req: PasskeyConfirmVerifyRequest, request: Requ
     from auth import confirm
     from auth.providers import require_human
     u = require_human(user)
-    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("passkey", auth_bucket_key(request))
     if not ok:
         raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
                             headers={"Retry-After": str(retry_after)})
@@ -448,7 +448,7 @@ async def passkey_login_options(request: Request,
     step (any mode) the password-verified step token scopes allowCredentials to
     that user; in ``second_factor`` mode the token is REQUIRED (no passwordless
     entry)."""
-    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("passkey", auth_bucket_key(request))
     if not ok:
         raise HTTPException(
             status_code=429,
@@ -483,7 +483,7 @@ async def passkey_login_options(request: Request,
 @router.post("/auth/passkey/verify")
 async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request):
     """Finish a passkey login: verify the assertion, issue the session cookie."""
-    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("passkey", auth_bucket_key(request))
     if not ok:
         raise HTTPException(
             status_code=429,
@@ -526,8 +526,6 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
     user_row = await asyncio.to_thread(task_store.get_user, cred["user_sub"])
     if not user_row:
         raise HTTPException(401, "Unknown passkey")
-    if not check_local_auth_allowed(request, user_row):
-        raise HTTPException(403, "This account can only be accessed from the local network")
 
     try:
         verification = verify_authentication_response(
@@ -544,6 +542,11 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
     except WebAuthnException as e:
         logger.info(f"Passkey login rejected for credential {credential_id[:12]}…: {e}")
         raise HTTPException(401, "Passkey could not be verified")
+    # The LAN restriction is judged only after the assertion verifies, as the
+    # password login judges it after the password: before, a caller holding
+    # a credential id alone would learn which accounts are local_only.
+    if not check_local_auth_allowed(request, user_row):
+        raise HTTPException(403, "This account can only be accessed from the local network")
 
     await asyncio.to_thread(
         webauthn_store.record_use, credential_id, verification.new_sign_count,
@@ -584,7 +587,7 @@ async def passkey_native_start(request: Request):
 @router.post("/auth/passkey/native/exchange")
 async def passkey_native_exchange(req: PasskeyNativeExchangeRequest, request: Request):
     """Trade a one-time native-handoff token for a session cookie (app webview)."""
-    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("passkey", auth_bucket_key(request))
     if not ok:
         raise HTTPException(
             status_code=429,

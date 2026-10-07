@@ -5,6 +5,7 @@ import { formatNextRun, describeSchedule, browserTimeZone } from '../../lib/form
 import { useAuth } from '../../contexts/AuthContext'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
 import { TaskModelChip } from '../../components/common/TaskModelChip'
+import TransferredFrom from '../../components/TransferredFrom'
 
 export default function AgentSchedules() {
   const { name } = useParams<{ name: string }>()
@@ -103,6 +104,7 @@ export default function AgentSchedules() {
                 <tr key={task.id} className="border-b border-p-border-light hover:bg-p-surface-hover">
                   <td className="px-4 py-3">
                     <div className="font-medium text-p-text">{task.name}</div>
+                    <TransferredFrom row={task} className="block" />
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span className="text-xs text-p-text-light font-mono">{task.id}</span>
                       <TaskModelChip task={task} />
@@ -193,6 +195,7 @@ export default function AgentSchedules() {
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0 flex-1" data-testid="task-card-main">
                 <p className="text-sm font-medium text-p-text">{task.name}</p>
+                <TransferredFrom row={task} className="block" />
                 <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
                   <span className="text-xs text-p-text-light font-mono break-all">{task.id}</span>
                   <TaskModelChip task={task} />

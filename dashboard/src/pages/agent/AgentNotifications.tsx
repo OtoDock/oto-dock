@@ -10,6 +10,7 @@ import {
 import type { NotificationDefinition } from '../../api/notifications'
 import { formatIntervalDescription } from '../../lib/format'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
+import TransferredFrom from '../../components/TransferredFrom'
 
 const SEVERITY_BADGE: Record<string, string> = {
   info: 'bg-brand/10 text-brand',
@@ -143,6 +144,7 @@ export default function AgentNotifications() {
                     <tr key={n.id} className="border-t border-p-border-light hover:bg-p-surface-hover transition-colors">
                       <td className="px-4 py-3">
                         <div className="font-medium text-p-text">{n.title}</div>
+                        <TransferredFrom row={n} className="block" />
                         <div className="text-xs text-p-text-light mt-0.5 line-clamp-1">{n.body}</div>
                       </td>
                       <td className="px-4 py-3">
@@ -227,6 +229,7 @@ export default function AgentNotifications() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <h3 className="text-sm font-medium text-p-text truncate">{n.title}</h3>
+                    <TransferredFrom row={n} className="block" />
                     <p className="text-xs text-p-text-light mt-0.5 line-clamp-2">{n.body}</p>
                   </div>
                   <span className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${SEVERITY_BADGE[n.severity] || SEVERITY_BADGE.info}`}>

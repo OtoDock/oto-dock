@@ -43,7 +43,7 @@ export default function FindBar({ value, onChange, onClose }: Props) {
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="Find in chat..."
-        className="w-44 min-w-0 shrink text-xs px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface
+        className="w-44 min-w-0 shrink text-xs pointer-coarse:text-base px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface
                    text-p-text placeholder:text-p-text-light
                    focus:outline-hidden focus:ring-1 focus:ring-brand/40 focus:border-brand/40"
       />

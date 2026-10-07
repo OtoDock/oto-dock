@@ -2,6 +2,8 @@
 sync stamps builtins, an admin tags custom rows, and every read surface
 gets the same answer for a model id."""
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -21,8 +23,8 @@ class TestRegistry:
 
     def test_the_ranking_the_registry_comments_describe(self):
         tier = {m: e["tier"] for m, e in app_config.MODEL_REGISTRY.items()}
-        assert tier["claude-fable-5-1"] < tier["claude-opus-5-5"] < tier["claude-sonnet-5"]
-        assert tier["gpt-6-astra"] < tier["gpt-6-sol"] < tier["gpt-5.6-terra"] < tier["gpt-6-luna"]
+        assert tier["claude-fable-5-1"] < tier["claude-opus-5-5"] < tier["claude-sonnet-5-5"]
+        assert tier["gpt-6-astra"] < tier["gpt-6.1-sol"] < tier["gpt-5.6-terra"] < tier["gpt-6-luna"]
         assert tier["claude-fable-5-1"] == tier["gpt-6-astra"] == 1
 
     def test_get_model_tier_reads_the_registry_first(self):
@@ -40,14 +42,14 @@ class TestRegistry:
     def test_sort_key_orders_tier_then_builtin_then_registry_order(self):
         rows = [
             {"model_id": "custom-untiered", "is_builtin": False, "created_at": "2"},
-            {"model_id": "claude-sonnet-5", "is_builtin": True, "tier": 3},
+            {"model_id": "claude-sonnet-5-5", "is_builtin": True, "tier": 3},
             {"model_id": "custom-fast", "is_builtin": False, "tier": 4, "created_at": "1"},
             {"model_id": "claude-fable-5-1", "is_builtin": True, "tier": 1},
             {"model_id": "gpt-6-astra", "is_builtin": True, "tier": 1},
         ]
         rows.sort(key=app_config.model_catalog_sort_key)
         assert [r["model_id"] for r in rows] == [
-            "claude-fable-5-1", "gpt-6-astra", "claude-sonnet-5", "custom-fast", "custom-untiered",
+            "claude-fable-5-1", "gpt-6-astra", "claude-sonnet-5-5", "custom-fast", "custom-untiered",
         ]
 
 
@@ -82,6 +84,16 @@ class TestStore:
         # A re-add never changes a tier (ON CONFLICT DO NOTHING).
         subscription_store.add_model("codex-cli", "local-y", "Local Y", tier=1)
         assert subscription_store.get_model(a["id"])["tier"] is None
+
+
+def _off_loop(fn):
+    def guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*a, **kw)
+        raise AssertionError(f"{fn.__name__} ran on the event loop")
+    return guarded
 
 
 @pytest.fixture
@@ -129,3 +141,12 @@ class TestAdminRoutes:
         r = admin_client.put(f"/v1/admin/execution-layers/claude-code-cli/models/{row['id']}",
                              json={"enabled": False})
         assert r.status_code == 200 and r.json()["enabled"] is False
+
+    def test_model_listing_runs_off_the_loop(self, admin_client, monkeypatch):
+        monkeypatch.setattr(subscription_store, "sync_builtin_models",
+                            _off_loop(subscription_store.sync_builtin_models))
+        monkeypatch.setattr(subscription_store, "list_models",
+                            _off_loop(subscription_store.list_models))
+        r = admin_client.get("/v1/admin/execution-layers/claude-code-cli/models")
+        assert r.status_code == 200
+        assert any(m["model_id"] == "claude-opus-5-5" for m in r.json()["models"])

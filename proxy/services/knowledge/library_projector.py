@@ -79,6 +79,7 @@ folder must never fan its object store out to consumers); plus
 """
 
 import asyncio
+import contextlib
 import errno
 import hashlib
 import logging
@@ -110,12 +111,8 @@ RECONCILE_KICK_DEBOUNCE_S = 10.0
 # library; more than that is treated as a wiped mirror and healed instead.
 MASS_DELETE_MIN = 25
 MASS_DELETE_FRACTION = 0.5
-# A projected file gets the bits a plain ``open(..., "wb")`` gives (the
-# umask's), never the source's: a read-only source must not make a writable
-# mirror that its consumer cannot edit in place.
-_UMASK = os.umask(0)
-os.umask(_UMASK)
-_MIRROR_MODE = 0o666 & ~_UMASK
+# The umask assumed when the kernel does not report it.
+_DEFAULT_UMASK = 0o022
 
 # Serializes work per source agent — overlapping reconciles would race
 # their .partial files and double-fan-out.
@@ -219,6 +216,22 @@ def _walk_rel(root: Path, *, prune_top: bool = True) -> dict[str, os.stat_result
     return out
 
 
+def _mirror_mode() -> int:
+    """The bits a plain ``open(..., "wb")`` gives (the umask's), never the
+    source's: a read-only source must not make a writable mirror that its
+    consumer cannot edit in place. The umask is read from the kernel, never
+    set: ``os.umask`` is process-wide, so setting it even for a moment can
+    hand a file another thread creates meanwhile the wrong bits."""
+    umask = _DEFAULT_UMASK
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open("/proc/self/status", "rb") as fh:
+            for line in fh:
+                if line.startswith(b"Umask:"):
+                    umask = int(line.split()[1], 8)
+                    break
+    return 0o666 & ~umask
+
+
 def _copy_file(src: Path, dest: Path) -> str:
     """`.partial` + fsync + atomic replace, both sides beneath ``AGENTS_DIR``
     with no symlink followed: the source must be a regular file (a link,
@@ -231,7 +244,7 @@ def _copy_file(src: Path, dest: Path) -> str:
     h = hashlib.sha256()
     safe_fs.copy_file_beneath(
         config.AGENTS_DIR, _agent_rel(src), config.AGENTS_DIR, _agent_rel(dest),
-        mode=_MIRROR_MODE, mkdirs=True, fsync=True, on_chunk=h.update,
+        mode=_mirror_mode(), mkdirs=True, fsync=True, on_chunk=h.update,
     )
     return h.hexdigest()
 

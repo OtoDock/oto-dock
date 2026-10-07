@@ -552,3 +552,68 @@ def test_open_hook_follows_the_turn_sender_and_reports_why_not(people):
         assert _hook("open", {"slug": "team"}).json()["status"] == "no_screen"
     with patch("api.hooks.routing.resolve_hook_chat_id", return_value=""):
         assert _hook("open", {"slug": "team"}).json()["status"] == "no_screen"
+
+
+def test_open_hook_opens_a_placed_app_and_reads_the_hide_here(people):
+    """``open_app`` finds an app a share placed in the session's agent (by
+    slug, or by its home agent when a native app shares the slug), reads
+    the hide in THIS agent (never the home agent's strip hides), and frames
+    it with its own agent."""
+    from auth import rate_limiter
+    from storage.agents import agent_store
+    from storage.sharing import share_store
+    source = "live-source"
+    for slug in (AGENT, source):
+        agent_store.create_agent(slug, slug.title(), created_by="alice-sub")
+    src = task_store.upsert_app(source, "", None, "register", title="Register",
+                                rel_path="workspace/apps/register.html")
+    task_store.create_chat("chat-live", "alice-sub", AGENT)
+    with patch("api.hooks.routing.resolve_hook_chat_id", return_value="chat-live"):
+        screen = _connect("alice-sub")
+        assert _hook("open", {"slug": "register"}).status_code == 404
+        share_store.create_internal_share(
+            target_kind="app", target_id=src["id"], created_by="alice-sub",
+            grantee_kind=share_store.AGENT, grantee_agent=AGENT, role_cap="viewer",
+            decision=share_store.ACCEPTED, decided_by="alice-sub")
+        r = _hook("open", {"slug": "register"})
+        assert r.json() == {"status": "opened", "app_id": src["id"], "screens": 1}, r.text
+        assert _frames("alice-sub", screen) == [{
+            "type": "open_app", "app_id": src["id"], "title": "Register", "agent": source,
+            "scope_chat_id": "", "scope_project_id": "", "opened_by": AGENT}]
+        # Hidden in this agent: nothing opens; a hide on the home agent's
+        # own strip is not this agent's.
+        share_store.set_placement_hidden(src["id"], AGENT, "alice-sub", True)
+        assert _hook("open", {"slug": "register"}).json()["status"] == "hidden"
+        share_store.set_placement_hidden(src["id"], AGENT, "alice-sub", False)
+        task_store.hide_app_for_user(src["id"], "alice-sub")
+        rate_limiter._attempts.clear()
+        assert _hook("open", {"slug": "register"}).json()["status"] == "opened"
+        # A native app of the same slug: 400 without the home agent; the
+        # home agent names the placed one, this agent the native one.
+        own = _row("register")
+        assert _hook("open", {"slug": "register"}).status_code == 400
+        rate_limiter._attempts.clear()
+        assert _hook("open", {"slug": "register", "agent": source}).json()["app_id"] == src["id"]
+        rate_limiter._attempts.clear()
+        assert _hook("open", {"slug": "register", "agent": AGENT}).json()["app_id"] == own["id"]
+        assert _hook("open", {"slug": "nothing", "agent": source}).status_code == 404
+        # The slug placed from two home agents: 400 naming both until the
+        # home agent picks one.
+        twin = task_store.upsert_app("live-twin", "", None, "board", title="Board",
+                                     rel_path="workspace/apps/board.html")
+        other_board = task_store.upsert_app(source, "", None, "board", title="Board",
+                                            rel_path="workspace/apps/board.html")
+        for app_id in (twin["id"], other_board["id"]):
+            share_store.create_internal_share(
+                target_kind="app", target_id=app_id, created_by="alice-sub",
+                grantee_kind=share_store.AGENT, grantee_agent=AGENT, role_cap="viewer",
+                decision=share_store.ACCEPTED, decided_by="alice-sub")
+        r = _hook("open", {"slug": "board"})
+        assert r.status_code == 400 and "live-source and live-twin" in r.text
+        rate_limiter._attempts.clear()
+        assert _hook("open", {"slug": "board", "agent": "live-twin"}).json()["app_id"] == twin["id"]
+    # A placed-only slug on a task chat answers no_screen, as any app does;
+    # an unknown slug stays 404.
+    with patch("api.hooks.routing.resolve_hook_chat_id", return_value="task-123"):
+        assert _hook("open", {"slug": "board", "agent": "live-twin"}).json()["status"] == "no_screen"
+        assert _hook("open", {"slug": "nothing"}).status_code == 404

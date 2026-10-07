@@ -31,7 +31,8 @@ def _constants(module, prefix: str = "") -> dict[str, str]:
 # The constants that alias a frame name for another vocabulary (the pump
 # item, hook item, notify, phone, inbound and live-block spellings).
 _ALIAS_PREFIXES = ("PUMP_", "ITEM_", "NOTIFY_", "PHONE_", "IN_", "PERSISTED_", "SUBTYPE_")
-_ALIASES = {"LIVE_TEXT", "LIVE_THINKING", "LIVE_TOOL"}
+# UNDELIVERED_QUEUED: a card's ``reason`` value that shares the word "queued".
+_ALIASES = {"LIVE_TEXT", "LIVE_THINKING", "LIVE_TOOL", "UNDELIVERED_QUEUED"}
 
 
 def _frame_constants() -> dict[str, str]:
@@ -44,7 +45,7 @@ def test_every_frame_is_a_constant_and_every_constant_a_frame():
     # Every FRAMES key is the value of an upper-case module constant.
     values = set(_constants(wire).values())
     assert names <= values, sorted(names - values)
-    assert len(names) == 112
+    assert len(names) == 115
     # No frame name is spelled twice.
     assert len(_frame_constants()) == len(names)
 
@@ -56,7 +57,16 @@ def test_per_chat_is_derived_from_the_table():
     # The receiver's hand list had 61 names; thinking_changed (a dead
     # listener) is gone and turn_complete stays origin-routed, never gated.
     assert wire.TURN_COMPLETE not in wire.PER_CHAT_FRAMES
-    assert len(wire.PER_CHAT_FRAMES) == 60
+    # The chat's queue frames are chat-routed: they name the chat whose
+    # queue they describe, which the view may not be showing. A steer stays
+    # in its stream.
+    for frame in (wire.QUEUED, wire.QUEUE_REMOVED, wire.QUEUE_SENT, wire.QUEUE_CLEARED,
+                  wire.QUEUE_SNAPSHOT):
+        assert frame not in wire.PER_CHAT_FRAMES
+    assert wire.STEERED in wire.PER_CHAT_FRAMES
+    # A retired prompt's card belongs to the viewed chat's stream.
+    assert wire.FRAMES[wire.PROMPT_RETIRED] == wire.Frame(True, None)
+    assert len(wire.PER_CHAT_FRAMES) == 57
 
 
 def test_the_persisted_spellings():
@@ -110,13 +120,14 @@ def test_the_other_vocabularies_beside_the_wire():
     assert wire.PHONE_FRAMES == {"warmup_ready", "session", "text", "tool_start", "tool_end", "done", "error"}
     assert wire.SYSTEM_SUBTYPES >= {"session_reseeded", "meeting_started", "bg_wake", "context_compressed"}
     assert wire.REASON_POOL_CAP in wire.WARMUP_FAILED_REASONS
+    assert wire.REASON_BELOW_EDITOR in wire.WARMUP_FAILED_REASONS
     assert wire.SEED_REASONS == {"machine_removed", "moved", "engine_switch", "resume_failed",
                                  "retention"}
 
 
 def test_the_three_error_shapes_share_one_string():
     assert wire.ERROR == wire.PHONE_ERROR == "error"
-    assert set(wire.ErrorFrame.__annotations__) == {"chat_id", "message"}
+    assert set(wire.ErrorFrame.__annotations__) == {"chat_id", "message", "reason", "resets_at"}
     assert set(wire.PhoneErrorFrame.__annotations__) == {"turn", "data"}
     assert set(wire.DuplexErrorFrame.__annotations__) == {"reason"}
 
@@ -188,6 +199,17 @@ def _ts_frames(text: str) -> dict[str, tuple[bool, str | None]]:
     return out
 
 
+def test_the_history_delta_declares_what_it_always_carries():
+    # The sender always sets these three and the dashboard's
+    # ChatHistoryDeltaFrame requires them; the rest stay optional.
+    assert {"chat_id", "messages", "since_id"} <= wire.ChatHistoryDeltaFrame.__required_keys__
+    assert "has_more" in wire.ChatHistoryDeltaFrame.__optional_keys__
+    text = MIRROR.read_text(encoding="utf-8")
+    body = re.search(r"export interface ChatHistoryDeltaFrame[^{]*\{(.*?)\n\}", text, re.S).group(1)
+    for key in ("chat_id", "since_id"):
+        assert re.search(rf"^\s*{key}: ", body, re.M), key
+
+
 def test_the_dashboard_mirror_equals_the_authority():
     text = MIRROR.read_text(encoding="utf-8")
     ts_wire = _ts_const_object(text, "WIRE")
@@ -207,9 +229,14 @@ def test_the_dashboard_mirror_equals_the_authority():
     assert set(ts_sub.values()) >= wire.SYSTEM_SUBTYPES
     synthesised = set(ts_sub.values()) - wire.SYSTEM_SUBTYPES
     assert synthesised == {"no_subscription", "pool_cap", "target_unavailable", "session_error",
-                           "bg_agents_completed", "bg_commands_completed"}
+                           "below_editor", "bg_agents_completed", "bg_commands_completed"}
     ts_reasons = _ts_const_object(text, "WARMUP_FAILED_REASON")
     assert set(ts_reasons.values()) == wire.WARMUP_FAILED_REASONS
+    assert _ts_const_object(text, "UNDELIVERED_REASON") == {
+        "QUEUED": wire.UNDELIVERED_QUEUED, "TURN_FAILED": wire.UNDELIVERED_TURN_FAILED,
+        "STOPPED": wire.UNDELIVERED_STOPPED}
+    from core.events import input_queue
+    assert _ts_const_object(text, "QUEUE_WAITING") == {"RECONNECT": input_queue.WAITING_RECONNECT}
     # The artifact kinds' replayable set derives from the facts table in
     # lib/kinds/artifact.ts — bound by tests/core/test_kinds.py (phase 9).
     # Every frame has a payload interface in the union.
@@ -218,6 +245,65 @@ def test_the_dashboard_mirror_equals_the_authority():
     declared = set(re.findall(r"export interface ([A-Z][A-Za-z]+Frame)\b", text))
     assert members <= declared, sorted(members - declared)
     assert len(re.findall(r"type: typeof WIRE\.[A-Z_]+", text)) == len(wire.FRAMES)
+
+
+def _ts_interfaces(text: str) -> dict[str, tuple[set[str], list[str]]]:
+    """Each TS interface's own keys and the interfaces it extends (an
+    ``Omit<X, …>`` parent counts as ``X``)."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    out: dict[str, tuple[set[str], list[str]]] = {}
+    for m in re.finditer(r"(?:export\s+)?interface\s+(\w+)\s*(?:extends\s+([^{]+?))?\s*\{", text):
+        depth, j = 1, m.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            j += 1
+        keys: set[str] = set()
+        seg, level = "", 0
+        for c in text[m.end():j - 1] + ";":
+            level += {"{": 1, "[": 1, "(": 1, "}": -1, "]": -1, ")": -1}.get(c, 0)
+            if level == 0 and c in ";\n":
+                k = re.match(r"\s*(\w+)\??\s*:", seg)
+                if k:
+                    keys.add(k.group(1))
+                seg = ""
+            else:
+                seg += c
+        parents = [a or b for a, b in re.findall(r"Omit<\s*(\w+)|(\w+)", m.group(2) or "")]
+        out[m.group(1)] = (keys, [p for p in parents if p != "Omit"])
+    return out
+
+
+def _ts_keys(name: str, table: dict[str, tuple[set[str], list[str]]]) -> set[str]:
+    keys, parents = table[name]
+    found = set(keys)
+    for parent in parents:
+        if parent in table:
+            found |= _ts_keys(parent, table)
+    return found - {"type"}
+
+
+# The frames whose keys the 2026-10 release wave changed. A comparison over
+# every frame finds older drifts (AbortedFrame.session_id,
+# OpenAppFrame.handled, a page-only flag) that predate it; a frame joins this
+# set when its keys are reconciled. The queue and prompt frames joined with
+# the queue frames' attachments and the steer's event_data declared.
+_KEY_BOUND_FRAMES = ("DocumentPreviewFrame", "PromptRetiredFrame", "QueueClearedFrame",
+                     "SystemFrame", "QueuedFrame", "QueueRemovedFrame", "QueueSentFrame",
+                     "SteeredFrame", "QueueSnapshotFrame", "LiveStateFrame", "ErrorFrame",
+                     "PermissionPromptFrame", "PlanReviewFrame", "QuestionFrame",
+                     "DelegateResultFrame", "ShareInboxFrame")
+
+
+def test_the_mirror_declares_the_same_keys_per_frame():
+    table = _ts_interfaces(MIRROR.read_text(encoding="utf-8"))
+    for name in _KEY_BOUND_FRAMES:
+        cls = getattr(wire, name)
+        py_keys = set(cls.__required_keys__) | set(cls.__optional_keys__)
+        assert py_keys == _ts_keys(name, table), name
+    # The parser reads what the frames carry (a guard against a vacuous pass).
+    assert {"access_token", "access_token_ttl", "wopi_url", "chat_id"} <= _ts_keys(
+        "DocumentPreviewFrame", table)
 
 
 # ---------------------------------------------------------------------------

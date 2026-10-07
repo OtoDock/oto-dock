@@ -445,6 +445,21 @@ def augment_entry(
         installed_hash = installed_manifest_hashes.get(name)
         if catalog_hash and installed_hash and catalog_hash != installed_hash:
             update_available = True
+    # An entry whose source moved is not an update the Browse button can
+    # apply (the install gate refuses it): the MCP Servers page carries the
+    # switch. Judged only when the registry names the entry's identity.
+    source_changed = False
+    if installed and update_available:
+        from services.community import mcp_source_swap
+        from services.mcp import mcp_registry
+        to_identity = mcp_source_swap.entry_identity(entry)
+        local = mcp_registry.get_manifest(name)
+        raw = mcp_source_swap._read_manifest(local.mcp_dir) if local is not None else None
+        if to_identity is not None and raw is not None:
+            from_identity = mcp_source_swap.manifest_identity(raw)
+            if mcp_source_swap.judged(from_identity) and from_identity != to_identity:
+                update_available = False
+                source_changed = True
     pending_request: int | None = None
     pending_request_count = 0
     if pending_requests is not None:
@@ -458,6 +473,7 @@ def augment_entry(
         "installed": installed,
         "installed_version": local_version,
         "update_available": update_available,
+        "source_changed": source_changed,
         "enabled_for_agents": sorted(enabled_for_agents.get(name, [])),
         "pending_request": pending_request,
         "pending_request_count": pending_request_count,

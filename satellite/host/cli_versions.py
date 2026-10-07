@@ -368,9 +368,15 @@ def _npm_install(pkg: str, version: str) -> bool:
     if not npm:
         logger.warning("CLI reconcile: npm not found; cannot pin %s@%s", pkg, version)
         return False
+    # npm 12 blocks a package's install scripts unless they are allowed, and
+    # Claude Code's postinstall is what puts its native binary in place:
+    # without the allowance the install succeeds and leaves a stub `claude`
+    # that exits 1. Older npm (11.16 and later know the option, 10 ignores it)
+    # runs the scripts either way.
+    allow = f"--allow-scripts={pkg}"
     attempts = (
-        [npm, "install", "-g", f"{pkg}@{version}"],
-        [npm, "install", "-g", "--prefix", str(_USER_NPM_PREFIX),
+        [npm, "install", "-g", allow, f"{pkg}@{version}"],
+        [npm, "install", "-g", "--prefix", str(_USER_NPM_PREFIX), allow,
          f"{pkg}@{version}"],
     )
     for i, cmd in enumerate(attempts):

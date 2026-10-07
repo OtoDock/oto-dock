@@ -71,6 +71,8 @@ def conn(monkeypatch):
         agent_name = "alpha"
         session_id = "sess-1"
         layer = _Layer()
+        deferred_mode = None
+        deferred_model = None
 
         async def _send(self, frame):
             sent.append(frame)

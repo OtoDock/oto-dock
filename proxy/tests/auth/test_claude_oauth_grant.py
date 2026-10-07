@@ -10,7 +10,7 @@ before any store write, with a reason the connect forms display.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -142,3 +142,62 @@ class TestExchangeRefusesConsoleGrant:
         store, pool = _exchange(token)
         store.add_subscription.assert_called_once()
         pool.schedule_rebind.assert_called_once()
+
+
+def _refused_on_loop(*_a, **_kw):
+    """A store mock's side effect: refuse a call made on a thread with a
+    running event loop (a worker thread has none)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return DEFAULT
+    raise AssertionError("a store call ran on the event loop")
+
+
+class TestExchangeStoreOffLoop:
+    def test_every_store_call_runs_off_the_loop(self):
+        token = {**_console_token(), "scope": " ".join(_SUBSCRIPTION_SCOPES),
+                 "subscriptionType": "max"}
+        user = SimpleNamespace(sub="user-1", role="admin")
+        meta = {"user_sub": "user-1", "owner_type": "user", "code_verifier": "ver"}
+        # A pre-identity row holding the account's uuid in its blob: the
+        # match reads the blob, then the reconnect re-reads the row.
+        held = {"id": "held-row", "auth_type": "oauth", "provider": "anthropic",
+                "oauth_email": "", "status": "active"}
+
+        def _run(rows, add_raises=False):
+            store = MagicMock()
+            store.SubscriptionExists = type("SubscriptionExists", (Exception,), {})
+            for name in ("list_subscriptions", "add_subscription", "get_subscription",
+                         "get_credential_data", "update_credential_data",
+                         "update_subscription"):
+                getattr(store, name).side_effect = _refused_on_loop
+            store.list_subscriptions.return_value = rows
+            store.get_credential_data.return_value = {"oauth_token": {"accountUuid": "u-1"}}
+            store.add_subscription.return_value = {"id": "new-sub"}
+            store.get_subscription.return_value = {"id": "held-row"}
+            if add_raises:
+                def _lost_race(*a, **kw):
+                    _refused_on_loop()
+                    raise store.SubscriptionExists()
+                store.add_subscription.side_effect = _lost_race
+            req = OAuthExchangeRequest(code="auth-code", state="st-1")
+            with patch.object(claude_api, "subscription_store", store), \
+                 patch.object(claude_api, "subscription_pool", MagicMock()), \
+                 patch.object(claude_api, "_consume_state", return_value=meta), \
+                 patch.object(claude_api, "require_human", lambda u: u), \
+                 patch.object(claude_api.claude_oauth, "exchange_code",
+                              return_value=token):
+                return store, asyncio.run(claude_api.oauth_exchange(req, user=user))
+
+        store, out = _run([held])
+        assert out["created"] is False and out["subscription"] == {"id": "held-row"}
+        store.get_credential_data.assert_called_once_with("held-row")
+        store.get_subscription.assert_called_once_with("held-row")
+
+        store, out = _run([])
+        assert out["created"] is True and out["subscription"] == {"id": "new-sub"}
+
+        with pytest.raises(HTTPException) as exc:
+            _run([], add_raises=True)
+        assert exc.value.status_code == 409

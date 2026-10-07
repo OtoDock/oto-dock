@@ -21,7 +21,7 @@
 # file stays pull-only and works standalone when downloaded on its own.)
 #
 # This is the ONE-COMMAND self-host: the proxy itself runs as a container and
-# drives sibling MCP containers through a read-restricted docker-socket-proxy.
+# drives sibling MCP containers through an allowlisting docker-socket-proxy.
 # It is SEPARATE from (and does not touch) the bare-metal `docker-compose.t1.yml`
 # (which brings up only Postgres for a host-process proxy — topology T1, the
 # bare-metal dev install). Pick ONE: the T1 file for a host proxy, this
@@ -49,7 +49,7 @@ x-logging: &default-logging
 services:
   # --- PostgreSQL ---
   otodock-postgres:
-    image: ${POSTGRES_IMAGE:-postgres:16.14-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -95,16 +95,23 @@ services:
       start_period: 300s
 
   # --- Docker socket proxy (Tecnativa) ---
-  # The proxy reaches the host Docker daemon ONLY through this read-restricted
-  # tcp shim. Whitelist: CONTAINERS/IMAGES/NETWORKS/VOLUMES + POST
-  # (create/start/stop). VOLUMES is needed because a pulled community Docker MCP
-  # uses NAMED volumes (the install rewrite converts any host bind-mount to one —
-  # a host path is meaningless to a containerised proxy); `compose up` then has
-  # to create/inspect them. `build` is intentionally NOT whitelisted → community
-  # Docker MCPs must be PULLED (pre-built images), never built, in T2/cloud
-  # (verified). The host socket is mounted read-only; the shim is the only writer.
+  # The proxy reaches the host Docker daemon ONLY through this allowlisting tcp
+  # shim. Allowed paths: CONTAINERS/IMAGES/NETWORKS/VOLUMES (set below) plus
+  # the image's default-on PING/VERSION/EVENTS; every other path is denied
+  # (exec start, build, auth, info, system, swarm, secrets, ...). POST=1 lets
+  # EVERY write method through on the allowed paths, not only POST: PUT and
+  # DELETE too, so container create/start/stop/kill/remove, exec create,
+  # archive upload, image pull/delete and network/volume create/remove all
+  # pass; without it only GET/HEAD would. VOLUMES is needed because a pulled
+  # community Docker MCP uses NAMED volumes (the install rewrite converts any
+  # host bind-mount to one — a host path is meaningless to a containerised
+  # proxy); `compose up` then has to create/inspect them. `build` is
+  # intentionally NOT allowed → community Docker MCPs must be PULLED (pre-built
+  # images), never built, in T2/cloud (verified). The host socket is mounted
+  # read-only, a mount flag that stops nothing sent THROUGH the socket (the
+  # allowlist above does); the shim is the only client that reaches it.
   docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:v0.4.2
+    image: tecnativa/docker-socket-proxy:v0.5.0
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -121,7 +128,7 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.1}
     restart: unless-stopped
     logging: *default-logging
     # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
@@ -291,7 +298,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.1}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -323,7 +330,7 @@ services:
   # on the next start. Idempotent, injection-safe. Postgres image (ships psql):
   # no Dockerfile change. Runs before the proxy connects.
   otodock-db-init:
-    image: ${POSTGRES_IMAGE:-postgres:16.14-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
     restart: "no"
     logging: *default-logging
     # Data-plane only: the TCP gate and the app-role proof reach
@@ -504,7 +511,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.7.0}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.7.1}
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document parse OOM-restarts this container instead of
@@ -538,7 +545,7 @@ services:
   # Reached internally by the proxy at http://collabora:9980; its WOPI callbacks
   # reach the proxy at http://otodock-proxy:8400 (WOPI_BASE_URL on file-tools).
   collabora:
-    image: collabora/code:25.04.9.4.1
+    image: collabora/code:25.04.10.3.1
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document degrades (Collabora sheds its LRU doc)
@@ -555,6 +562,10 @@ services:
       # (in config.env) and preview works — no Collabora-specific knobs.
       # NOTE: this is sub-path mode (the proxy forwards /collabora/* to here). For a
       # separate Collabora FQDN, run your own reverse proxy and set COLLABORA_URL.
+      # Background save is off: a save runs in the document's own process, as
+      # a forked save on 25.04.10.3.1 hung past its timeout and lost the edit.
+      # An edit is saved 10 s after the last keystroke (the stock 30), beside
+      # the saves the dashboard asks for: the agent reads the stored file.
       - DASHBOARD_PUBLIC_URL=${DASHBOARD_PUBLIC_URL:-http://localhost:${PROXY_PORT:-8400}}
       - aliasgroup1=http://otodock-proxy:8400
     entrypoint:
@@ -563,7 +574,7 @@ services:
       - |
         host="$${DASHBOARD_PUBLIC_URL#*://}"; host="$${host%%/*}";
         case "$$DASHBOARD_PUBLIC_URL" in https://*) t=true ;; *) t=false ;; esac;
-        export extra_params="--o:ssl.enable=false --o:ssl.termination=$$t --o:net.frame_ancestors=$$host --o:server_name=$$host --o:net.service_root=/collabora --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200";
+        export extra_params="--o:ssl.enable=false --o:ssl.termination=$$t --o:net.frame_ancestors=$$host --o:server_name=$$host --o:net.service_root=/collabora --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200 --o:per_document.background_autosave=false --o:per_document.background_manualsave=false --o:per_document.idlesave_duration_secs=10 --o:logging.level_startup=warning";
         exec /start-collabora-online.sh
     cap_add:
       - MKNOD

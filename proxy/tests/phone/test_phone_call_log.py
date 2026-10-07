@@ -82,6 +82,45 @@ def _report(client, **over):
     return client.post("/v1/phone/calls/report", headers=_auth(), json=payload)
 
 
+class TestPinFailures:
+    """The daemon rebuilds its PIN lockout windows from the call log after a
+    restart: the inbound calls of the window that entered the gate."""
+
+    def test_master_key_only_and_allowlisted(self, client):
+        from auth.service_endpoints import is_service_endpoint_allowed
+        assert client.get("/v1/phone/pin-failures").status_code == 401
+        assert is_service_endpoint_allowed("GET", "/v1/phone/pin-failures")
+        assert not is_service_endpoint_allowed("POST", "/v1/phone/pin-failures")
+
+    def test_the_window_holds_gate_calls_only_oldest_first(self, client):
+        route = _make_route("inbound")
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(minutes=40)).isoformat()
+        recent = (now - timedelta(minutes=5)).isoformat()
+        latest = (now - timedelta(minutes=1)).isoformat()
+        _report(client, route_id=route["id"], outcome="pin_failed", pin_attempts=3,
+                started_at=old, ended_at=old)
+        _report(client, route_id=route["id"], outcome="pin_timeout", pin_attempts=1,
+                started_at=latest, ended_at=latest)
+        _report(client, route_id=route["id"], outcome="pin_failed", pin_attempts=3,
+                started_at=recent, ended_at=recent, from_number="+15550002222")
+        _report(client, route_id=route["id"], outcome="completed", pin_attempts=0,
+                started_at=recent, ended_at=recent)
+        _report(client, direction="outbound", outcome="completed", pin_attempts=2,
+                started_at=recent, ended_at=recent)
+        calls = client.get("/v1/phone/pin-failures", headers=_auth(),
+                           params={"window_s": 900}).json()["calls"]
+        assert [(c["outcome"], c["pin_attempts"]) for c in calls] == [
+            ("pin_failed", 3), ("pin_timeout", 1)]
+        assert calls[0]["from_number"] == "+15550002222" and calls[0]["route_id"] == route["id"]
+        assert set(calls[0]) == {"from_number", "route_id", "outcome", "pin_attempts",
+                                 "started_at", "ended_at"}
+        # The window is cut to an hour: the 40-minute-old call is in at most that.
+        wide = client.get("/v1/phone/pin-failures", headers=_auth(),
+                          params={"window_s": 10 ** 9}).json()["calls"]
+        assert len(wide) == 3
+
+
 class TestIngest:
     def test_requires_master_key(self, client):
         r = client.post("/v1/phone/calls/report", json={"outcome": "completed"})

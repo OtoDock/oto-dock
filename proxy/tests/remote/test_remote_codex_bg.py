@@ -259,6 +259,8 @@ def test_remote_plan_mode_synthesizes_implement_card():
     events = _drain_codex_turn(info, layer, [
         _ev("item/completed", MAIN, type="agentMessage",
             text="- Add --version\n- Add a CLI test"),
+        {"method": "turn/completed",
+         "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
         {"type": "_turn_ended", "command_id": ""},
     ])
     plan = [e for e in events if e.type == PLAN_MODE]
@@ -281,6 +283,77 @@ def test_remote_default_mode_emits_no_plan_card():
         {"type": "_turn_ended", "command_id": ""},
     ])
     assert not [e for e in events if e.type == PLAN_MODE]
+
+
+def test_a_turn_the_satellite_closed_before_completion_is_lost_and_resumes():
+    """The satellite closed the turn before ``turn/completed`` (its daemon
+    went): the ``lost`` ending, and the session reads dead so the next send
+    re-warms it instead of meeting the gone process first."""
+    from core.events import turn_ending
+    from core.events.common_events import ERROR
+    layer, info = _make_layer_info()
+    events = _drain_codex_turn(info, layer, [
+        _ev("item/completed", MAIN, type="agentMessage", text="half an answer"),
+        {"type": "_turn_ended", "command_id": ""},
+    ])
+    err = next(e for e in events if e.type == ERROR)
+    assert turn_ending.from_dict(err.data["ending"]).reason == turn_ending.LOST
+    assert info.cli_dead
+
+
+def test_a_silent_remote_codex_turn_ends_typed_and_a_tool_item_keeps_it(monkeypatch):
+    """No notification past the silence ceiling with nothing running: the
+    satellite's codex turn is aborted and the turn ends ``silent`` (not
+    graceful: the next turn gets the cancelled context). An open tool item
+    keeps the turn past the ceiling, and a steer past it is refused."""
+    import time
+    import config
+    from core.events import turn_ending
+    from core.events.common_events import ERROR
+    from core.layers.codex import remote as codex_remote
+    monkeypatch.setattr(config, "TURN_SILENCE_S", 0.2)
+    monkeypatch.setattr(codex_remote, "_SILENCE_SLICE_S", 0.1)
+    layer, info = _make_layer_info()
+    monkeypatch.setattr(layer._cm, "is_session_in_grace", lambda mid, sid: False)
+    sent: list[dict] = []
+
+    async def _send(mid, msg):
+        sent.append(msg)
+    monkeypatch.setattr(layer._cm, "send_fire_and_forget", _send)
+    info.last_event_at = time.monotonic() - 1.0
+    events = _drain_codex_turn(info, layer, [])
+    assert [e.type for e in events][-2:] == [ERROR, DONE]
+    ending = turn_ending.from_dict(events[-2].data["ending"])
+    assert (ending.reason, ending.graceful) == (turn_ending.SILENT, False)
+    assert sent == [{"type": "abort", "session_id": "s1"}]
+
+    async def with_open_tool():
+        info.engine_state.default_consumer = asyncio.Queue()
+        info.engine_state.default_consumer.put_nowait(
+            _ev("item/started", MAIN, id="call-1", type="mcpToolCall"))
+        stream = _adapter().stream_turn(info, layer._cm)
+        seen = [await stream.__anext__()]
+        collect = asyncio.create_task(_collect(stream, seen))
+        await asyncio.sleep(0.5)             # past the ceiling, the tool open
+        assert not collect.done() and not [e for e in seen if e.type == ERROR]
+        info.engine_state.default_consumer.put_nowait(
+            {"method": "turn/completed",
+             "params": {"threadId": MAIN, "turn": {"status": "completed"}}})
+        info.engine_state.default_consumer.put_nowait({"type": "_turn_ended", "command_id": ""})
+        await asyncio.wait_for(collect, 5.0)
+        assert not [e for e in seen if e.type == ERROR] and seen[-1].type == DONE
+        # A steer past the ceiling with nothing running is refused: the
+        # caller queues the message for the turn that is about to end.
+        info.turn_active = True
+        info.engine_state.open_items.clear()
+        info.last_event_at = time.monotonic() - 1.0
+        assert await _adapter().steer(info, layer._cm, "x") is False
+    asyncio.run(with_open_tool())
+
+
+async def _collect(stream, into: list) -> None:
+    async for ev in stream:
+        into.append(ev)
 
 
 def test_remote_interrupted_plan_turn_emits_no_card():
@@ -629,3 +702,130 @@ def test_supports_codex_bg_terminals_version_gate():
     assert cm.supports_codex_bg_terminals("old") is False
     assert cm.supports_codex_bg_terminals("blank") is False
     assert cm.supports_codex_bg_terminals("absent") is False
+
+
+# ---------------------------------------------------------------------------
+# An idle Codex session a satellite kept across a proxy restart is taken back
+# ---------------------------------------------------------------------------
+
+def _adopting_layer(monkeypatch):
+    """A remote layer on a connected machine, the credential and gateway
+    restores stubbed, every control frame recorded."""
+    cm = SatelliteConnectionManager()
+    cm._connections["m1"] = SatelliteConnection(machine_id="m1", ws=None,
+                                                satellite_version="0.5.138")
+    layer = RemoteExecutionLayer(cm)
+    monkeypatch.setattr(RemoteExecutionLayer, "_restore_adopted_credentials",
+                        staticmethod(lambda *a: None))
+
+    async def _no_gateway(*a):
+        return None
+    monkeypatch.setattr(RemoteExecutionLayer, "_reprovision_gateway", staticmethod(_no_gateway))
+    controls: list[tuple] = []
+
+    async def _control(self, info, cm_, subtype, **kw):
+        controls.append((info.session_id, subtype, kw))
+        return True
+    monkeypatch.setattr(type(_adapter()), "control_request", _control)
+    return layer, controls
+
+
+def test_an_idle_codex_session_is_adopted_on_its_thread(monkeypatch):
+    from core.session import session_state
+
+    async def run():
+        layer, controls = _adopting_layer(monkeypatch)
+        await layer.adopt_idle_session(
+            machine_id="m1", session_id="s-ad1", agent_name="a",
+            execution_path="codex-cli", mode="default", token_floor=0,
+            resume_handle=MAIN, model="gpt-6.1-sol", used_mcps={"file-tools"},
+            allow_full_fs=True,
+        )
+        info = layer._sessions["s-ad1"]
+        try:
+            assert info.resume_handle == MAIN and info.model == "gpt-6.1-sol"
+            assert info.used_mcps == {"file-tools"} and info.allow_full_fs is True
+            state = info.engine_state
+            assert isinstance(state, CodexRemoteState) and state.router_task is not None
+            # The sandbox follows the session's mode again, now (fire-and-forget).
+            for _ in range(50):
+                if controls:
+                    break
+                await asyncio.sleep(0.01)
+            assert ("s-ad1", "set_permission_mode", {"mode": "default"}) in controls
+            # A background sub-agent's events never reach a new turn's main consumer.
+            state.default_consumer = asyncio.Queue()
+            info.event_queue.put_nowait(_ev("item/started", SUB, type="agentMessage"))
+            info.event_queue.put_nowait(_ev("item/started", MAIN, type="agentMessage"))
+            for _ in range(50):
+                if not state.default_consumer.empty():
+                    break
+                await asyncio.sleep(0.01)
+            assert state.default_consumer.get_nowait()["params"]["threadId"] == MAIN
+            assert state.thread_consumers[SUB].qsize() == 1
+        finally:
+            await layer.close_session("s-ad1")
+
+    try:
+        asyncio.run(run())
+    finally:
+        session_state._sessions.pop("s-ad1", None)
+
+
+def test_adoption_leaves_a_held_or_spawning_id_and_an_engine_that_cannot(monkeypatch):
+    async def run():
+        layer, _ = _adopting_layer(monkeypatch)
+        held = object()
+        layer._sessions["s-held"] = held
+        layer._spawning.add("s-spawn")
+        for sid, path in (("s-held", "codex-cli"), ("s-spawn", "codex-cli"),
+                          ("s-direct", "direct-llm")):
+            await layer.adopt_idle_session(
+                machine_id="m1", session_id=sid, agent_name="a",
+                execution_path=path, resume_handle=MAIN)
+        assert layer._sessions == {"s-held": held}
+
+    asyncio.run(run())
+
+
+def test_a_new_thread_handle_is_written_on_the_next_turn():
+    async def run():
+        layer, info = _make_layer_info()
+        translator = info.engine_state.translator
+        translator._emitted_thread_id = True
+        router = asyncio.create_task(_adapter()._route_notifications(info))
+        try:
+            info.event_queue.put_nowait({"type": "_resume_handle", "handle": MAIN})
+            await asyncio.sleep(0.02)
+            assert translator._emitted_thread_id is True     # the same thread
+            info.event_queue.put_nowait({"type": "_resume_handle", "handle": "thread-NEW"})
+            for _ in range(50):
+                if info.resume_handle == "thread-NEW":
+                    break
+                await asyncio.sleep(0.01)
+            assert info.resume_handle == "thread-NEW"
+            assert translator._emitted_thread_id is False
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await router
+
+    asyncio.run(run())
+
+
+def test_a_spawn_over_an_adopted_record_ends_the_records_router(monkeypatch):
+    async def run():
+        layer, _ = _adopting_layer(monkeypatch)
+        await layer.adopt_idle_session(
+            machine_id="m1", session_id="s-ins", agent_name="a",
+            execution_path="codex-cli", resume_handle=MAIN)
+        old = layer._sessions["s-ins"]
+        old_router = old.engine_state.router_task
+        fresh = RemoteSessionInfo(session_id="s-ins", machine_id="m1", agent_name="a",
+                                  execution_path="codex-cli", event_queue=asyncio.Queue())
+        await layer._insert_session(fresh)
+        assert layer._sessions["s-ins"] is fresh
+        await asyncio.sleep(0)
+        assert old_router.done()
+
+    asyncio.run(run())

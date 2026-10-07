@@ -166,3 +166,17 @@ def test_the_save_drops_the_transcode_skeleton_and_keeps_the_generation_one():
     assert wire.PERSISTED_TOOL in kinds
     assert not artifact_events.kind_of("media_processing").saved
     assert artifact_events.kind_of("image_generating").saved
+
+
+def test_the_save_drops_the_live_wopi_token():
+    """F57: the document preview's WOPI token rides the live frame only; the
+    stored row (what history and a reconnect read) never carries it."""
+    import json
+    rows = stream_pump._serialize_turn_rows([
+        {"type": "document_preview", "wopi_url": "https://c/cool.html?WOPISrc=x",
+         "access_token": "secret-token", "access_token_ttl": 1, "filename": "a.docx",
+         "file_id": "f", "download_url": "/d"},
+    ])
+    stored = json.loads(rows[0][3])
+    assert "access_token" not in stored and "access_token_ttl" not in stored
+    assert stored["wopi_url"] == "https://c/cool.html?WOPISrc=x"

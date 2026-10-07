@@ -2,11 +2,13 @@
 #
 # Parallel to scripts/install-baseline-tools.sh. Single source of truth
 # for what a Windows satellite host needs:
-#   Tier 1 (always): git, gh, python3 + pipx, node + npm + pnpm, uv,
+#   Tier 1 (always): git, gh, python3 + pipx + sympy, node + npm + pnpm, uv,
 #                    jq, ripgrep, curl (built-in on Win10+)
 #   CLIs:    claude (npm), codex (npm)
 #
-# Idempotent -- re-running is a no-op for already-installed tools. Each
+# Idempotent -- re-running installs what is missing, upgrades an older uv or
+# pnpm, moves the two CLIs to their pins, re-pins sympy and takes pip's latest
+# pipx; the winget tools are left once present. Each
 # install wrapped in try/catch so a single failure doesn't abort the
 # whole run; final report lists any skipped tools.
 #
@@ -41,6 +43,45 @@ function Refresh-Path {
     $machine = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user = [System.Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = "$machine;$user"
+}
+
+function Get-ToolVersion {
+    # The first x.y.z of `<tool> --version`, $null when the tool is absent,
+    # and '0.0' (older than any pin) when it is present but unreadable.
+    param([string]$Name)
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { return $null }
+    $out = (& $Name --version 2>$null | Out-String)
+    if ($out -match '(\d+\.\d+\.\d+)') { return $Matches[1] }
+    return '0.0'
+}
+
+function Test-ResolvedCli {
+    # After an install/upgrade, verify what the shell NOW resolves for the
+    # bare name. The install placed the pinned copy in its own location, but
+    # PATH may still resolve another install (e.g. a vendor's standalone
+    # installer) — the upgrade then silently changes nothing for anything
+    # that spawns the bare name. Warn with every resolvable copy.
+    param([string]$Label, [string]$Bin, [string]$Want)
+    $now = $null
+    $winner = Get-Command $Bin -ErrorAction SilentlyContinue
+    if ($winner) {
+        $verOut = (& $winner.Source --version 2>$null | Out-String)
+        if ($verOut -match '(\d+\.\d+\.\d+)') { $now = $Matches[1] }
+    }
+    if ($now -eq $Want) {
+        Write-Host "[baseline]   $Label resolves at pinned $Want" -ForegroundColor Green
+        return
+    }
+    $nowText = if ($now) { $now } else { 'nothing' }
+    Write-Warning "$Label`: '$Bin' still resolves $nowText - want $Want. Another install shadows the pinned copy on PATH:"
+    foreach ($c in @(Get-Command $Bin -All -ErrorAction SilentlyContinue)) {
+        $v = $null
+        $o = (& $c.Source --version 2>$null | Out-String)
+        if ($o -match '(\d+\.\d+\.\d+)') { $v = $Matches[1] }
+        $vText = if ($v) { $v } else { 'unknown' }
+        Write-Warning "  $($c.Source) ($vText)"
+    }
+    Write-Warning "Remove or upgrade the shadowing copy so '$Bin' resolves $Want."
 }
 
 function Invoke-Native {
@@ -129,8 +170,8 @@ function Install-WingetPackage {
     # Python, whose WindowsApps "App execution alias" stub would fool a bare
     # Get-Command into reporting a usable interpreter that isn't there) takes
     # precedence over the name-on-PATH -CheckCmd test. Pairing-time baseline
-    # only needs the tool PRESENT; upgrading already-installed tools is the
-    # user's call. Mirrors the `command -v` guards in install-baseline-tools.sh.
+    # only needs these tools PRESENT; upgrading them is the user's call (uv,
+    # pnpm and the CLIs have their own pinned steps below).
     $present = $false
     if ($Probe) {
         $present = [bool](& $Probe)
@@ -224,12 +265,15 @@ Write-Host ""
 Write-Host "=== uv (Python version manager) ===" -ForegroundColor Yellow
 # PINNED to an exact version (uv is 0.x + fast-moving). Keep in sync with
 # VERSIONS.md (UV_VERSION). The Astral installer takes the version in the URL path.
-$UvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { '0.11.24' }
-if (Get-Command uv -ErrorAction SilentlyContinue) {
-    Write-Host "[baseline] uv already present" -ForegroundColor Green
+# An installed uv older than the pin is upgraded; a newer one is left alone.
+$UvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { '0.12.23' }
+$uvHave = Get-ToolVersion 'uv'
+if ($uvHave -and ([version]$uvHave -ge [version]$UvVersion)) {
+    Write-Host "[baseline] uv $uvHave present (pin $UvVersion)" -ForegroundColor Green
 } else {
     try {
-        Write-Host "[baseline] installing uv $UvVersion via Astral PowerShell installer..."
+        $over = if ($uvHave) { " over $uvHave" } else { '' }
+        Write-Host "[baseline] installing uv $UvVersion$over via Astral PowerShell installer..."
         # Use Invoke-RestMethod (irm) so the response body comes back as
         # a string ready for Invoke-Expression. Invoke-WebRequest's
         # .Content can be a byte[] (especially with -UseBasicParsing)
@@ -241,9 +285,14 @@ if (Get-Command uv -ErrorAction SilentlyContinue) {
         $uvPath = Join-Path $env:USERPROFILE ".local\bin"
         if (Test-Path $uvPath) { $env:Path = "$uvPath;$env:Path" }
         Write-Host "[baseline]   uv OK" -ForegroundColor Green
+        Test-ResolvedCli -Label 'uv' -Bin 'uv' -Want $UvVersion
     } catch {
-        Write-Warning "[baseline]   uv install failed: $_"
-        $skipped += 'uv'
+        if ($uvHave) {
+            Write-Warning "[baseline]   uv $UvVersion did not install -- $uvHave stays: $_"
+        } else {
+            Write-Warning "[baseline]   uv install failed: $_"
+            $skipped += 'uv'
+        }
     }
 }
 
@@ -300,20 +349,21 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     Write-Host ""
     Write-Host "=== npm-installed tools ===" -ForegroundColor Yellow
 
-    # Skip the npm reinstall when pnpm is already on PATH. `npm install -g`
-    # always hits the registry to resolve + re-verify the global tree (several
-    # slow seconds) even when nothing changes — that was the long pause on the
-    # "=== npm-installed tools ===" line. Mirrors the claude/codex guards below
-    # and the `command -v pnpm` guard in install-baseline-tools.sh. Pairing
-    # only needs pnpm PRESENT; upgrading is the user's call.
+    # pnpm: absent or older than the pin is installed through npm, a newer
+    # one is left alone. The version check is a local --version, so the slow
+    # `npm install -g` registry round trip runs only when something moves.
     # PINNED — keep PnpmVersion in sync with VERSIONS.md (PNPM_VERSION).
-    $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '11.9.0' }
-    if (Get-Command pnpm -ErrorAction SilentlyContinue) {
-        Write-Host "[baseline]   pnpm already present -- skipping" -ForegroundColor Green
+    $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '11.28.2' }
+    $pnpmHave = Get-ToolVersion 'pnpm'
+    if ($pnpmHave -and ([version]$pnpmHave -ge [version]$PnpmVersion)) {
+        Write-Host "[baseline]   pnpm $pnpmHave present (pin $PnpmVersion)" -ForegroundColor Green
     } else {
         Write-Host "[baseline] pnpm $PnpmVersion..."
         if (Invoke-Native -Name 'pnpm' -Cmd { npm install -g "pnpm@$PnpmVersion" }) {
             Write-Host "[baseline]   pnpm OK" -ForegroundColor Green
+            Test-ResolvedCli -Label 'pnpm' -Bin 'pnpm' -Want $PnpmVersion
+        } elseif ($pnpmHave) {
+            Write-Warning "[baseline]   pnpm $PnpmVersion did not install -- $pnpmHave stays"
         } else {
             $skipped += 'pnpm'
         }
@@ -323,37 +373,8 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # CODEX_VERSION). Mirrors install-baseline-tools.sh: the platform runs a
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
-    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.281' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.156.1' }
-
-    function Test-ResolvedCli {
-        # After an install/upgrade, verify what the shell NOW resolves for the
-        # bare name. npm placed the pinned copy in its prefix, but PATH may
-        # still resolve another install (e.g. the vendor's standalone
-        # installer) — the upgrade then silently changes nothing for anything
-        # that spawns the bare name. Warn with every resolvable copy.
-        param([string]$Label, [string]$Bin, [string]$Want)
-        $now = $null
-        $winner = Get-Command $Bin -ErrorAction SilentlyContinue
-        if ($winner) {
-            $verOut = (& $winner.Source --version 2>$null | Out-String)
-            if ($verOut -match '(\d+\.\d+\.\d+)') { $now = $Matches[1] }
-        }
-        if ($now -eq $Want) {
-            Write-Host "[baseline]   $Label resolves at pinned $Want" -ForegroundColor Green
-            return
-        }
-        $nowText = if ($now) { $now } else { 'nothing' }
-        Write-Warning "$Label`: '$Bin' still resolves $nowText - want $Want. Another install shadows the pinned copy on PATH:"
-        foreach ($c in @(Get-Command $Bin -All -ErrorAction SilentlyContinue)) {
-            $v = $null
-            $o = (& $c.Source --version 2>$null | Out-String)
-            if ($o -match '(\d+\.\d+\.\d+)') { $v = $Matches[1] }
-            $vText = if ($v) { $v } else { 'unknown' }
-            Write-Warning "  $($c.Source) ($vText)"
-        }
-        Write-Warning "Remove or upgrade the shadowing copy so '$Bin' resolves $Want."
-    }
+    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.289' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.160.0' }
 
     function Install-PinnedCli {
         # Install OR upgrade an npm-global CLI to the EXACT pinned version.
@@ -370,8 +391,12 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
         } else {
             Write-Host "[baseline] Installing $Label $Want..."
         }
+        # --allow-scripts lets the CLI's own install step run under npm 12,
+        # which blocks it by default (Claude Code's puts its native binary in
+        # place; without it `claude` is a stub that exits 1).
         $spec = "$Pkg@$Want"
-        $installed = (Invoke-Native -Name "$Label (npm)" -Cmd ({ npm install -g $spec }.GetNewClosure()))
+        $allow = "--allow-scripts=$Pkg"
+        $installed = (Invoke-Native -Name "$Label (npm)" -Cmd ({ npm install -g $allow $spec }.GetNewClosure()))
         if ($installed) {
             Test-ResolvedCli -Label $Label -Bin ($BinCmd -replace '\.cmd$', '') -Want $Want
         }

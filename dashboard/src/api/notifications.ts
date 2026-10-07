@@ -2,6 +2,11 @@ import { apiFetch } from './auth'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 
 export interface NotificationDefinition {
+  /** Set on a row the offboarding transfer moved: the first creator's sub,
+   *  when, and the name to show (live display name, else retired username). */
+  transferred_from?: string
+  transferred_at?: string
+  transferred_from_name?: string
   id: string
   title: string
   body: string

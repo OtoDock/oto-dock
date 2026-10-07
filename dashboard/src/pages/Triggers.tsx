@@ -9,6 +9,7 @@ import {
 } from '../api/triggers'
 import { useAgents } from '../api/agents'
 import { TaskModelChip, linkedTaskModel } from '../components/common/TaskModelChip'
+import TransferredFrom from '../components/TransferredFrom'
 
 /**
  * Admin Triggers page — platform-wide list of every trigger across all
@@ -147,6 +148,7 @@ function AdminTriggerRow({ trigger }: { trigger: Trigger }) {
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-p-text">{trigger.name}</span>
+            <TransferredFrom row={trigger} />
             <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${scopeBadge.cls}`}>
               {scopeBadge.label}
             </span>

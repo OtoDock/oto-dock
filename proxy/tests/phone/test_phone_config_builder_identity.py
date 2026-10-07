@@ -89,6 +89,8 @@ async def test_caller_mode_builds_the_caller_tree(agent, stubs):
     assert (home / ".claude" / "settings.json").is_file()
     assert cfg.client_type == "phone" and cfg.permission_mode == "auto"
     assert stubs["mcp_kwargs"]["external"] is True and stubs["mcp_kwargs"]["phone_mode"] is True
+    # The caller is a viewer: an MCP or skill above that audience stays out.
+    assert stubs["mcp_kwargs"]["user_role"] == "viewer" == stubs["dynamic_kwargs"]["user_role"]
     # Only attached MCPs describe themselves.
     assert stubs["dynamic_names"] == ["memory-mcp"]
     assert "external caller" in cfg.system_prompt and "/caller/workspace/" in cfg.system_prompt
@@ -97,6 +99,33 @@ async def test_caller_mode_builds_the_caller_tree(agent, stubs):
     assert "## Caller memory (private to this caller)" in cfg.system_prompt
     assert "## User memory" not in cfg.system_prompt
     assert cfg.extra_env.get("_USER_SUB", None) in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_a_skill_above_a_callers_viewer_role_stays_out_of_the_prompt(
+    agent, stubs, monkeypatch,
+):
+    """A caller is a viewer: a skill whose ``audience`` is ``editor`` (on an
+    MCP the caller keeps) stays out of the caller's prompt, and a skill for
+    everyone stays in. The prompt's skill gate reads the role the builder
+    passes; with none it filters nothing."""
+    from services.mcp import mcp_registry
+    seen: dict = {}
+
+    def _skills(model, *, context="", placement=None, skip_http_mcps=False,
+                external=False, user_role=None):
+        seen["user_role"] = user_role
+        out = [("everyone", "EVERYONE-SKILL-BODY", "always")]
+        if mcp_registry.skill_audience_admits(SimpleNamespace(audience="editor"), user_role):
+            out.append(("editors", "EDITOR-ONLY-SKILL-BODY", "always"))
+        return out
+    monkeypatch.setattr(mcp_registry, "get_skills_for_agent", _skills)
+    cfg = await pcb.build_phone_agent_config(
+        agent, route_identity=_identity(agent), session_id=SID,
+    )
+    assert seen["user_role"] == "viewer"
+    assert "EVERYONE-SKILL-BODY" in cfg.system_prompt
+    assert "EDITOR-ONLY-SKILL-BODY" not in cfg.system_prompt
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,24 @@ export interface OAuthMeta {
   // Provider-specific copy for the PAT option in the flow picker;
   // empty → the generic FLOW_DESCRIPTIONS fallback.
   pat_description?: string
+  // The MCP server names its own authorization server: the install
+  // registers itself there as a client and people sign in on the vendor's
+  // consent page (manifest values only; the install's registrations are
+  // an admin route).
+  authorization_server?: AuthorizationServerMeta
+}
+
+export interface AuthorizationServerMeta {
+  registration: 'dynamic'
+  issuer: string
+  resource_host: string
+  confidential: boolean
+  // The server also takes the vendor's app tokens (the relay's or an
+  // admin's app): the registered client is then the fallback sign-in.
+  accepts_app_tokens: boolean
+  // On the integrations list only: whether a connect goes through the
+  // registered client right now.
+  active?: boolean
 }
 
 export interface OverridableConfigField {
@@ -63,6 +81,26 @@ export interface AccountSummary {
   agent_overrides: string[]
   missing_scopes: string[]
   service_bindings?: ServiceBindingSummary[]
+  // The token can no longer serve a session (a grant the vendor ended, an
+  // expired token nobody can refresh, a file the MCP's way of issuing
+  // tokens no longer covers): the card says reconnect, the resolver
+  // leaves the MCP out of new sessions.
+  needs_reconnect?: boolean
+  reconnect_reason?: string
+}
+
+// What the card tells the person for each reconnect reason the server
+// records.
+export const RECONNECT_REASONS: Record<string, string> = {
+  expired: 'its access expired and the vendor issued no refresh token',
+  revoked: 'the vendor ended the grant',
+  mechanism_changed: "this MCP now signs you in through the vendor's own authorization server",
+  registration_unavailable: "the install's client registration at the vendor is gone",
+  issuer_changed: "the vendor's authorization server moved",
+}
+
+export function reconnectReasonText(reason?: string): string {
+  return (reason && RECONNECT_REASONS[reason]) || 'the connection can no longer be refreshed'
 }
 
 export interface Integration {
@@ -80,6 +118,28 @@ export interface Integration {
   accounts: AccountSummary[]
   candidate_agents: string[]
 }
+
+// The credential schema of every installed MCP (the manifest's credential
+// block as the proxy serializes it: ``oauth_meta`` carries the
+// ``authorization_server`` declaration the admin card reads).
+export interface CredentialSchemaEntry {
+  type: string
+  label?: string
+  oauth?: boolean
+  oauth_meta?: OAuthMeta
+  app_credential?: string
+}
+
+export const useCredentialSchema = (enabled = true) =>
+  useQuery({
+    queryKey: ['mcp-credential-schema'],
+    enabled,
+    queryFn: async (): Promise<Record<string, CredentialSchemaEntry>> => {
+      const res = await apiFetch('/v1/mcp-credential-schema')
+      if (!res.ok) throw new Error('Failed to load credential schema')
+      return res.json()
+    },
+  })
 
 // ───────────────────────────────────────────────────────────────────
 // User integrations (multi-account aware)

@@ -1,9 +1,9 @@
 """TOML parsing for the tests on every interpreter the satellite supports.
 
 The satellite runs on the host floor (``PYTHON_MIN_VERSION`` in VERSIONS.md,
-3.10), where the standard library has no ``tomllib``; the runtime guards
-its own use (``sessions/codex_session._validate_config_toml`` skips the
-check there). A test that parses a composed config.toml must not be a bare
+3.10), where the standard library has no ``tomllib``; the runtime parses
+there with the shipped ``tomli`` (``sessions/codex_session._validate_config_toml``).
+A test that parses a composed config.toml must not be a bare
 ``import tomllib``: on the floor's CI leg that is an ImportError, not a
 verdict. ``tomli`` (installed on that leg) is the same parser; without
 either the test skips instead of failing.

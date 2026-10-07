@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 
 import config as app_config
@@ -67,11 +68,14 @@ def _verified_session_dir(agent_name: str, *parts: str) -> Path:
     """Build ``agents/<agent>/parts...`` refusing symlinked components.
 
     Same invariant as ``sandbox._verified_literal_path``: the dir chain lives
-    under agent-writable binds, so verify realpath == literal BEFORE mkdir
-    (a follow-prone ``mkdir -p`` would create dirs at a planted symlink's
-    target) and again after. Raises on tampering — a session must fail
-    loudly rather than write its config through a redirected path.
+    under agent-writable binds, so verify realpath == literal first (an early
+    refusal), then create it with no link followed below the agent's
+    resolved folder (``safe_fs.mkdirs_beneath``): a component swapped for a
+    link after the check is refused, never created through. Raises on
+    tampering — a session must fail loudly rather than write its config
+    through a redirected path.
     """
+    from services.infra import safe_fs
     root_real = Path(os.path.realpath(app_config.get_agent_dir(agent_name)))
     expected = root_real.joinpath(*parts)
     if os.path.realpath(expected) != str(expected):
@@ -79,12 +83,14 @@ def _verified_session_dir(agent_name: str, *parts: str) -> Path:
             f"Refusing session config dir {expected}: a path component is a "
             f"symlink (possible tampering)"
         )
-    expected.mkdir(parents=True, exist_ok=True)
-    if os.path.realpath(expected) != str(expected):
+    root_real.mkdir(parents=True, exist_ok=True)
+    try:
+        safe_fs.mkdirs_beneath(root_real, "/".join(parts))
+    except safe_fs.SafeFsError as exc:
         raise RuntimeError(
             f"Refusing session config dir {expected}: path changed "
             f"underneath the build (possible tampering)"
-        )
+        ) from exc
     return expected
 
 
@@ -154,8 +160,10 @@ HOOK_SCRIPTS: tuple[str, ...] = (
 )
 
 #: The permission gate's and the Stop hook's transport ceiling: a dashboard
-#: prompt and a turn-end verdict are long polls the proxy bounds itself.
-LONG_HOOK_TIMEOUT_S = 604800
+#: prompt and a turn-end verdict are long polls the proxy bounds itself. One
+#: hour past the prompt's own wait (``session_state.PROMPT_WAIT_S``), so the
+#: proxy's answer always comes first.
+LONG_HOOK_TIMEOUT_S = 3 * 24 * 3600 + 3600
 STOP_HOOK_TIMEOUT_S = LONG_HOOK_TIMEOUT_S
 
 
@@ -242,6 +250,7 @@ def prepare_mcp_config_for_sandbox(
     if not src.exists():
         return str(src)
 
+    dst = _session_copy_path(Path(host_config_dir), src, session_id)
     # Read config, rewrite any referenced file paths, copy referenced files
     import json as _json
     try:
@@ -263,7 +272,9 @@ def prepare_mcp_config_for_sandbox(
         # token into each stdio MCP that has a secret bundle, then wrap its
         # command with the stdio interceptor so it fetches its secrets at spawn.
         # The token lands in THIS per-session copy only — never the shared
-        # sessions/ build file (reused across concurrent sessions).
+        # sessions/ build file (reused across concurrent sessions). An HTTP
+        # MCP's entry already names the credential gateway with the session
+        # token sentinel; nothing is added to it here.
         if session_id and secret_bundles:
             from core.credentials import mcp_broker
             from core.sandbox.interceptor_wrap import wrap_servers_json
@@ -275,44 +286,43 @@ def prepare_mcp_config_for_sandbox(
                     env = srv.get("env") or {}
                     env["OTO_MCP_FETCH_TOKEN"] = mcp_broker.mint_token(session_id, name)
                     srv["env"] = env
-                else:
-                    # Proxy-terminable HTTP MCP (github/m365). The shared
-                    # build file ships a sentinel bearer; on the TRUSTED proxy
-                    # host, swap in the REAL token from the bundle. Local has no
-                    # tunnel hop to swap at, so the bearer lives inline in THIS
-                    # per-session sandbox copy. The agent CAN read this file
-                    # (a same-uid native/Codex tool isn't bound by the hook), but
-                    # it is the session principal's OWN token: a user-scope
-                    # session carries the user's own subscription token (already
-                    # theirs); admin/agent-scope tokens never reach a user-paired
-                    # machine, and admin machines are fully trusted. So this is a
-                    # same-trust-domain residual, not a cross-principal leak.
-                    # Never the shared sessions/ file.
-                    # HTTP MCPs with no bundle bearer (vendor, file-tools) are
-                    # left untouched.
-                    bearer = getattr(secret_bundles.get(name), "http_bearer", None)
-                    if bearer:
-                        headers = srv.get("headers") or {}
-                        headers["Authorization"] = f"Bearer {bearer}"
-                        srv["headers"] = headers
             wrap_servers_json(
-                config_data, interpreter="python3",
+                config_data, interpreter="python3", interpreter_args=("-I",),
                 interceptor_path=f"{sandbox_config_dir}/{_INTERCEPTOR_SRC.name}",
             )
 
         # Write rewritten config. No-follow: this per-session copy carries
-        # broker tokens / inline bearers and the destination dir is
-        # agent-writable — a planted symlink must never redirect it.
-        dst = Path(host_config_dir) / src.name
+        # broker tokens and the destination dir is agent-writable — a planted
+        # symlink must never redirect it.
         write_no_follow(dst, _json.dumps(config_data, indent=2).encode())
     except Exception:
         # Fallback: simple copy without rewriting (same no-follow rule —
         # falling back to a follow-prone copy would void the guard above).
-        dst = Path(host_config_dir) / src.name
         write_no_follow(dst, src.read_bytes())
 
     # Return sandbox-internal path
-    return f"{sandbox_config_dir}/{src.name}"
+    return f"{sandbox_config_dir}/{dst.name}"
+
+
+def _session_copy_path(host_config_dir: Path, src: Path, session_id: str) -> Path:
+    """Where a session's MCP config copy lands: named per session, so two
+    concurrent sessions of one person on one agent never read each other's
+    token. The shared-named copy earlier releases wrote (it carried inline
+    vendor bearers) is removed, and per-session copies older than a token's
+    life are swept."""
+    if not session_id:
+        return host_config_dir / src.name
+    legacy = host_config_dir / src.name
+    if legacy.is_file() or legacy.is_symlink():
+        legacy.unlink(missing_ok=True)
+    cutoff = time.time() - 24 * 3600
+    for stale in host_config_dir.glob(f"{src.stem}-*{src.suffix}"):
+        try:
+            if stale.is_file() and stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            pass
+    return host_config_dir / f"{src.stem}-{session_id[:12]}{src.suffix}"
 
 
 class AgentStateRefused(RuntimeError):
@@ -325,21 +335,33 @@ class AgentStateRefused(RuntimeError):
     person's to read."""
 
 
-def refuse_agent_state_below_editor(scope: str, role: str, *, external: bool = False) -> None:
+def refuse_agent_state_below_editor(scope: str, role: str, *, external: bool = False,
+                                    shared_only: bool = True) -> None:
     """Raise :class:`AgentStateRefused` when a session of ``scope`` (its
     MOUNT scope) and ``role`` would run from the agent's own CLI state below
     the editor tier: a Shared-only chat of a viewer or a contributor, or
     their own task or meeting on a Shared-only agent. An external caller is
     not a person on the agent (a no-shell session the gate floors), and a
-    personal session runs from its own tree."""
+    personal session runs from its own tree.
+
+    The sentence names what the session runs as: a Shared-only agent's
+    chats (the default), or, with ``shared_only=False``, an agent-scope chat
+    on an agent with personal chats (a delegate worker's chat)."""
     from auth import roles
     from core.session.visibility import SCOPE_AGENT
     if scope != SCOPE_AGENT or external or roles.can_edit(role):
         return
+    ran_as = role or "no role"
+    if not shared_only:
+        raise AgentStateRefused(
+            "This chat runs as the agent itself (an agent-scope chat), which "
+            f"takes the editor role or above (this one would run as {ran_as}). "
+            "Ask a manager of the agent for the editor role."
+        )
     raise AgentStateRefused(
         "This agent is set to Shared only, so its chats and tasks run as the "
         "agent itself, which takes the editor role or above (this one would "
-        f"run as {role or 'no role'}). Ask a manager of the agent for the "
+        f"run as {ran_as}). Ask a manager of the agent for the "
         "editor role, or to turn on personal chats."
     )
 
@@ -357,9 +379,17 @@ def refuse_session_on_agent_state(ctx) -> None:
         refuse_agent_state_below_editor(SCOPE_AGENT, "")
         return
     scope = SCOPE_USER if getattr(ctx, "mount_username", "") else SCOPE_AGENT
-    refuse_agent_state_below_editor(
-        scope, getattr(ctx, "role", "") or "", external=is_external_ctx(ctx),
-    )
+    role = getattr(ctx, "role", "") or ""
+    external = is_external_ctx(ctx)
+    try:
+        refuse_agent_state_below_editor(scope, role, external=external)
+    except AgentStateRefused:
+        # Refused: word it by what the session runs as (an agent-scope chat
+        # on an agent with personal chats, or a Shared-only agent's).
+        from core.session.visibility import is_shared_only
+        refuse_agent_state_below_editor(
+            scope, role, external=external,
+            shared_only=is_shared_only(getattr(ctx, "agent", "") or ""))
 
 
 def session_takes_ssh_keys(ctx) -> bool:
@@ -421,10 +451,10 @@ def materialize_ssh_keys_for_sandbox(
 ) -> bool:
     """Provision this agent's authorized SSH keys into ``<config_dir>/ssh``.
 
-    ssh-hosts is a context-only MCP — agents run plain ``ssh`` from bash, so
-    the keys must exist inside the sandbox. The master copies live in the
-    MCP's ``keys/`` dir, which is NEVER sandbox-mounted (the sandbox binds
-    only assigned stdio MCP dirs, and ssh-hosts has no server); each session
+    Agents run plain ``ssh`` from bash (ssh-hosts' own tool only lists the
+    hosts), so the keys must exist inside the sandbox. The master copies live
+    in the MCP's ``keys/`` dir, which is NEVER sandbox-mounted (the sandbox
+    binds only the MCP's code dir, never its data dirs); each session
     instead gets ONLY the keys referenced by the agent's authorizing
     instances, copied 0600 into the session config dir (already private to
     this agent+user and bind-mounted). The dir is wiped and rebuilt every

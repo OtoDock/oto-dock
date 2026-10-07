@@ -12,7 +12,7 @@ import {
   type McpInstanceField,
   type McpInstance,
 } from '../../api/mcps'
-import { usePhoneRoutes } from '../../api/phone'
+import { usePhoneRoutes, PHONE_OUTBOUND } from '../../api/phone'
 import { useAudioProviders } from '../../api/audio'
 import { InstanceFieldInput } from './McpInstanceManager.fieldInput'
 import { AgentAssignmentPicker } from './McpInstanceManager.agentPicker'
@@ -412,7 +412,7 @@ function InstanceForm({
   // enabled outbound routes (the only ones phone-mcp can use).
   const { data: phoneRoutes } = usePhoneRoutes()
   const outboundRoutes = (phoneRoutes || []).filter(
-    r => r.direction === 'outbound' && r.enabled,
+    r => r.direction === PHONE_OUTBOUND && r.enabled,
   )
   // Audio-provider dropdown sources for `stt_provider_select` (transcribe-mcp)
   // and `tts_provider_select` (tts-mcp): the platform's providers, so an

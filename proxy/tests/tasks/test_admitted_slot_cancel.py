@@ -25,7 +25,7 @@ pytestmark = pytest.mark.asyncio
 
 
 @contextlib.asynccontextmanager
-async def _parked_slot(session_id, target="", execution_path=None):
+async def _parked_slot(session_id, target="", execution_path=None, ring_key=""):
     await asyncio.sleep(3600)  # never admits — the cancel target
     yield
 
@@ -163,7 +163,7 @@ async def test_a_cancel_between_the_config_build_and_the_session_start_gives_the
             _Layer.closes += 1
 
     @contextlib.asynccontextmanager
-    async def _instant_slot(session_id, target="", execution_path=None):
+    async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
         yield
 
     async def _cfg(agent, task_def, sid, **kw):

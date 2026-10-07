@@ -508,6 +508,17 @@ MAX_REQUEST_BODY_BYTES = int(
 # backstop still applies).
 MAX_AUTH_BODY_BYTES = int(_cfg("MAX_AUTH_BODY_BYTES", str(64 * 1024)))
 MAX_WEBHOOK_BODY_BYTES = int(_cfg("MAX_WEBHOOK_BODY_BYTES", str(2 * 1024 * 1024)))
+# The webhook caps a route lifts to once its sender is checked
+# (api/events/webhook_body.py): a signed delivery of a large-event provider
+# (GitHub, GitLab, Jira) and a trigger fire whose API key verified. Never
+# below MAX_WEBHOOK_BODY_BYTES; 0 is the backstop.
+MAX_WEBHOOK_SIGNED_BODY_BYTES = int(_cfg("MAX_WEBHOOK_SIGNED_BODY_BYTES", str(25 * 1024 * 1024)))
+MAX_WEBHOOK_KEYED_BODY_BYTES = int(_cfg("MAX_WEBHOOK_KEYED_BODY_BYTES", str(25 * 1024 * 1024)))
+# Webhook bodies being read at once, in bytes: in all (half of it for
+# unchecked senders) and per client address. 0 turns a bound off.
+MAX_WEBHOOK_INFLIGHT_BYTES = int(_cfg("MAX_WEBHOOK_INFLIGHT_BYTES", str(128 * 1024 * 1024)))
+MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT = int(
+    _cfg("MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT", str(32 * 1024 * 1024)))
 MAX_UNAUTH_BODY_BYTES = int(_cfg("MAX_UNAUTH_BODY_BYTES", str(64 * 1024)))
 MAX_JSON_BODY_BYTES = int(_cfg("MAX_JSON_BODY_BYTES", str(8 * 1024 * 1024)))
 
@@ -523,6 +534,11 @@ ZIP_MAX_CONCURRENT = max(1, int(_cfg("ZIP_MAX_CONCURRENT", "2")))
 ZIP_MAX_PATHS = int(_cfg("ZIP_MAX_PATHS", "500"))
 ZIP_MAX_ENTRIES = int(_cfg("ZIP_MAX_ENTRIES", "100000"))
 ZIP_MAX_INPUT_MB = int(_cfg("ZIP_MAX_INPUT_MB", "4096"))
+# Workspace copies through the files API: the bytes and the files one
+# request may copy across all its sources (a source past either fails;
+# 0 = no cap).
+COPY_MAX_INPUT_MB = int(_cfg("COPY_MAX_INPUT_MB", "4096"))
+COPY_MAX_ENTRIES = int(_cfg("COPY_MAX_ENTRIES", "100000"))
 # Temporary public image URLs (/v1/images/temp): the mint copies the image,
 # so each copy is capped, and so are the copies one session and all
 # sessions hold at once.
@@ -559,6 +575,9 @@ def _rate_limit_rule(prefix: str, mx: int, window: int, base_block: int, max_blo
 # bucket → {max, window, base_block, max_block} (seconds, except ``max`` = count
 # within the window). Consumed by ``auth/rate_limiter.py``. ``login`` preserves
 # the historical thresholds; the rest gate previously-unlimited surfaces.
+# Keys one rate-limit bucket keeps at most (auth/rate_limiter.py).
+RATE_LIMIT_MAX_KEYS = max(100, int(_cfg("RATE_LIMIT_MAX_KEYS", "50000")))
+
 RATE_LIMIT_RULES = {
     "login":   _rate_limit_rule("LOGIN", 10, 900, 900, 14400),
     # Wrong passwords from a trusted-device browser (the device cookie skips
@@ -573,7 +592,7 @@ RATE_LIMIT_RULES = {
     # Per-trigger SUCCESS throttle — generous (10/s sustained) so a legitimately
     # busy integration isn't dropped; only a runaway/leaked-key flood trips it.
     "webhook": _rate_limit_rule("WEBHOOK", 600, 60, 30, 600),
-    # Per-IP webhook AUTH-FAILURE throttle — strict, to rate-limit key brute force.
+    # Per-address webhook AUTH-FAILURE throttle — strict, to rate-limit key brute force.
     "webhook_auth": _rate_limit_rule("WEBHOOK_AUTH", 20, 300, 300, 3600),
     # Per-USER password-confirm throttle (change-password/change-email/
     # TOTP-disable/passkey management): these re-verify the account password
@@ -586,7 +605,10 @@ RATE_LIMIT_RULES = {
     # Shares created per user: a share is an exfiltration channel, so a
     # burst of them is never legitimate.
     "share_create": _rate_limit_rule("SHARE_CREATE", 10, 3600, 1800, 7200),
-    # Wrong passwords on an external link, per client IP and per link
+    # SSO sign-ins started per address: each one holds a state the callback
+    # needs, so a flood of anonymous starts must not push others out.
+    "sso_start": _rate_limit_rule("SSO_START", 60, 300, 300, 3600),
+    # Wrong passwords on an external link, per client address and per link
     # (failures only, like the login bucket).
     "share_unlock_ip": _rate_limit_rule("SHARE_UNLOCK_IP", 10, 300, 300, 3600),
     "share_unlock_share": _rate_limit_rule("SHARE_UNLOCK_SHARE", 10, 300, 300, 3600),
@@ -598,6 +620,9 @@ RATE_LIMIT_RULES = {
     # trips it).
     "app_inbound_ip": _rate_limit_rule("APP_INBOUND_IP", 120, 60, 60, 600),
     "app_inbound_app": _rate_limit_rule("APP_INBOUND_APP", 600, 60, 30, 600),
+    # Failed inbound-hook signatures, per hook (and per client address for a
+    # distinct client), checked right before the next verification.
+    "app_inbound_fail": _rate_limit_rule("APP_INBOUND_FAIL", 20, 300, 300, 3600),
     # Webhook-fire key failures per key prefix, checked before bcrypt runs.
     "webhook_prefix": _rate_limit_rule("WEBHOOK_PREFIX", 10, 300, 300, 3600),
     # Vendor and relay webhook receivers, per client IP (unauthenticated).
@@ -650,6 +675,11 @@ BUN_BIN = _cfg(
         if (Path.home() / ".bun" / "bin" / "bun").is_file() else "")
 )
 CLAUDE_TIMEOUT = int(_cfg("CLAUDE_TIMEOUT", "7200"))  # 2 hours — headroom for long tasks; per-deployment override via CLAUDE_TIMEOUT, per-install override via the session_timeout platform setting
+# A chat turn with no stream line and nothing keeping it alive (no open tool,
+# no prompt waiting on a person, no background work, no recent hook) for this
+# long is ended with the ``silent`` ending (core/events/turn_life.py). Env or
+# config.env only, like CLAUDE_TIMEOUT, floored so a 0 cannot end every turn.
+TURN_SILENCE_S = max(60, int(_cfg("TURN_SILENCE_S", "600")))
 
 # Audio/video playback transcoding (services/media/media_pipeline.py). ffmpeg/ffprobe
 # are PROXY-SIDE ONLY — never mounted into the agent bwrap sandbox, never on
@@ -1201,8 +1231,15 @@ def build_agent_prompt(model: str, *,
                        execution_path: str = "",
                        skip_http_mcps: bool = False,
                        external: bool = False,
-                       external_home: str = "") -> str | None:
+                       external_home: str = "",
+                       user_role: str | None = None) -> str | None:
     """Build the full system prompt for an agent.
+
+    ``user_role`` is the person's effective role on the agent when the
+    caller knows it: the inline skills and the skill catalog drop a skill
+    whose ``audience`` that role fails (``mcp_registry.skill_audience_admits``),
+    and the MCP catalog an MCP whose ``audience`` it fails (``audience_admits``).
+    ``None`` filters nothing (a task, a phone call, a caller with no person).
 
     ``external`` = an EXTERNAL session (a phone caller who is not a platform
     user): the MCP catalog, the inline skills and the skill catalog drop the
@@ -1328,6 +1365,9 @@ def build_agent_prompt(model: str, *,
             placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
+            # The person's role: an MCP whose audience is above it is not
+            # listed, as the session config leaves it out.
+            user_role=user_role,
         )
         if catalog:
             parts.append("\n\n---\n\n" + catalog)
@@ -1344,6 +1384,7 @@ def build_agent_prompt(model: str, *,
             placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
+            user_role=user_role,
         )
         # Only "always" skills inline; "on_demand" skills reach CLI sessions
         # as materialized skill folders (core/sandbox/skills_materializer)
@@ -1372,6 +1413,7 @@ def build_agent_prompt(model: str, *,
                 placement=placement,
                 skip_http_mcps=skip_http_mcps,
                 external=external,
+                user_role=user_role,
             )
             if catalog:
                 parts.append(
@@ -1510,19 +1552,92 @@ def build_agent_prompt(model: str, *,
                 if v not in (EXTERNAL_DENIED_REASON, EXTERNAL_CONTEXT_REASON)
             }
     if listed_exclusions:
-        parts.append(
-            "\n\n---\n\n"
-            "# Unavailable Tools\n\n"
-            "The following MCP servers are NOT available in this session:\n"
-        )
+        parts.append(_UNAVAILABLE_HEAD)
         for mcp_name, reason in sorted(listed_exclusions.items()):
-            parts.append(f"- **{mcp_name}**: {reason}")
-        parts.append(
-            "\nDo not attempt to use tools from these servers. "
-            "If the user asks about them, explain they need to be configured first."
-        )
+            parts.append(_unavailable_row(mcp_name, reason))
+        parts.append(_UNAVAILABLE_TAIL)
 
     return "\n".join(parts)
+
+
+_UNAVAILABLE_HEADING = "# Unavailable Tools"
+_UNAVAILABLE_HEAD = (
+    "\n\n---\n\n"
+    f"{_UNAVAILABLE_HEADING}\n\n"
+    "The following MCP servers are NOT available in this session:\n"
+)
+_UNAVAILABLE_TAIL = (
+    "\nDo not attempt to use tools from these servers. "
+    "If the user asks about them, explain they need to be configured first."
+)
+_AVAILABLE_HEADING = "# Available Tools (MCPs)"
+_SKILLS_HEADING = "# MCP Tool Skills"
+
+
+def _unavailable_row(mcp_name: str, reason: str) -> str:
+    return f"- **{mcp_name}**: {reason}"
+
+
+def _always_skill_bodies(mcp_name: str) -> list[str]:
+    """The inline ("always") skill bodies an MCP contributes to a prompt, as
+    ``build_agent_prompt`` renders them; empty when the registry has no such
+    manifest."""
+    try:
+        from services.mcp import mcp_manifest_parse, mcp_registry
+        from services.mcp.skill_format import strip_frontmatter
+        manifest = mcp_registry.get_manifest(mcp_name)
+        if manifest is None:
+            return []
+        out = []
+        for skill_def in manifest.skills:
+            if skill_def.loading != "always":
+                continue
+            path = mcp_manifest_parse.resolve_skill_file(manifest.mcp_dir, skill_def.file)
+            if path is not None:
+                out.append(strip_frontmatter(path.read_text()))
+        return out
+    except Exception:
+        return []
+
+
+def fold_unavailable_mcps(prompt: str, unavailable: dict[str, str]) -> str:
+    """A prompt built before a remote session's MCP sync, made true after it.
+
+    The prompt is rendered before the satellite installs the session's MCPs;
+    a server it could not install is stripped from the CLI's config, so the
+    prompt must stop offering it: its "Available Tools (MCPs)" row and its
+    inline skill bodies go, and it is listed with its reason under
+    "Unavailable Tools" (the block is added when the prompt has none)."""
+    if not unavailable or not prompt:
+        return prompt
+    lines = prompt.split("\n")
+    out: list[str] = []
+    in_catalog = False
+    for line in lines:
+        if line == _AVAILABLE_HEADING:
+            in_catalog = True
+        elif line == "---":
+            in_catalog = False
+        if in_catalog and line.startswith("- **") and any(
+                f"(`{name}`)" in line for name in unavailable):
+            continue
+        out.append(line)
+    text = "\n".join(out)
+    skills_at = text.find(_SKILLS_HEADING)
+    if skills_at >= 0:
+        head, tail = text[:skills_at], text[skills_at:]
+        for name in unavailable:
+            for body in _always_skill_bodies(name):
+                tail = tail.replace("\n" + body, "", 1)
+        text = head + tail
+    rows = [_unavailable_row(name, reason) for name, reason in sorted(unavailable.items())]
+    head_at = text.find(_UNAVAILABLE_HEADING)
+    if head_at < 0:
+        return text + "\n" + "\n".join([_UNAVAILABLE_HEAD, *rows, _UNAVAILABLE_TAIL])
+    tail_at = text.find(_UNAVAILABLE_TAIL, head_at)
+    if tail_at < 0:
+        return text + "\n" + "\n".join(rows)
+    return text[:tail_at] + "\n".join(rows) + "\n" + text[tail_at:]
 
 
 # Persistent sessions: idle timeout before reaping (seconds)
@@ -1732,15 +1847,15 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": 2,
         "good_at": "substantial, well-scoped coding and analysis; complex or open-ended work belongs on the frontier",
     },
-    "claude-sonnet-5": {
-        "label": "Sonnet 5",
+    "claude-sonnet-5-5": {
+        "label": "Sonnet 5.5",
         "provider": "anthropic",
         "context_window": 1_000_000,   # native 1M window (no [1m] suffix needed)
-        "pricing": (2.0, 10.0, 2.50, 0.20),  # $2/$10 made the STANDARD price 2026-08 (the launch-promo increase to $3/$15 on Sept 1 was cancelled — platform.claude.com pricing page + CC 2.1.243 changelog)
+        "pricing": (2.0, 10.0, 2.50, 0.20),  # Sonnet 5's tuple exactly: 5.5 replaced Sonnet 5 (MODEL_SUCCESSORS; needs Claude Code >= 2.1.284 and its hosted-relay row, it serves direct-llm too)
         "layers": ["claude-code-cli", "direct-llm"],
         "server_tools": True,
-        "supports_reasoning": True,
-        "supports_xhigh": True,   # first Sonnet with the xhigh effort level
+        "supports_reasoning": True,   # adaptive thinking on by default; temperature/top_p never sent
+        "supports_xhigh": True,   # xhigh and max, as Sonnet 5
         "tier": 3,
         "good_at": "drafting, summaries and bounded analysis",
     },
@@ -1754,9 +1869,8 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": 4,
         "good_at": "high-volume routine work; no programmatic tool calling on Direct LLM",
     },
-    # Admins can add further models (Ollama, LM Studio, more Groq/OpenAI, etc.)
-    # dynamically via the admin discover-models UI; the entries below are the
-    # predefined builtins that ship with the platform.
+    # Admins add further models (Ollama, LM Studio, more Groq/OpenAI, …) through
+    # the admin discover-models UI; the entries below are the shipped builtins.
 
     # --- OpenAI models ---
     # All gpt-5 family entries set supports_xhigh: True. Effort mapping:
@@ -1766,18 +1880,19 @@ MODEL_REGISTRY: dict[str, dict] = {
     # orchestration on top of max reasoning (Astra delegates at xhigh) — see
     # core/layers/codex/helpers.map_effort_to_codex.
     #
-    # GPT-6 Sol and GPT-6 Luna (API ids gpt-6-sol / gpt-6-luna, no alias)
-    # replace the retired GPT-5.6 Sol and GPT-5.6 Luna builtins at
-    # a LOWER price on every element of the tuple with the same effort
-    # ceilings (Sol: max + ultra; Luna: max, no ultra), so both swaps are
-    # lossless MODEL_SUCCESSORS entries; GPT-5.6 Terra stays (no cheaper
-    # same-capability successor — GPT-6 Sol is dearer). Prices per 1M from
-    # developers.openai.com/api/docs/pricing at the swap, stated by OpenAI
-    # as permanent, not promotional. Prompt-caching billing as the
-    # 5.6 family: cache WRITES cost 1.25x the uncached input rate, cache
-    # reads keep the 90% discount — reflected in the tuples. Codex 0.156.1
-    # bundles both (VERSIONS.md); its catalog marks 5.6 Sol/Terra → GPT-6
-    # Sol and 5.6 Luna → GPT-6 Luna.
+    # GPT-6.1 Sol (API id gpt-6.1-sol) replaces GPT-6 Sol, which
+    # had replaced GPT-5.6 Sol on 2026-09-24, and GPT-6 Luna replaces GPT-5.6
+    # Luna (2026-09-24): each at a LOWER or equal price on every element of
+    # the tuple with the same effort ceilings (Sol: max + ultra; Luna: max,
+    # no ultra), so the swaps are lossless MODEL_SUCCESSORS entries and the
+    # chain gpt-5.6-sol → gpt-6-sol → gpt-6.1-sol ends on 6.1. GPT-5.6 Terra
+    # stays (no cheaper same-capability successor on direct-llm). Prices per
+    # 1M from developers.openai.com/api/docs/pricing at each swap, permanent.
+    # Cache WRITES cost 1.25x the uncached input rate, cache reads 95% off on
+    # 6.1 Sol (90% before) — reflected in the tuples. Codex 0.160.0 bundles
+    # all three (VERSIONS.md); gpt-6.1-sol is its own default (priority 1,
+    # default effort low, ultra delegating at xhigh) and is ABSENT from the
+    # 0.156.1 catalog, so a Codex still on that pin refuses the id.
     # Context: 272k is the PRICING-TIER line, not the raw model window —
     # the GPT-6 and 5.6 models are really 1.05M (922k input + 128k output),
     # but input beyond 272k bills the WHOLE request at the long-context tier
@@ -1792,15 +1907,15 @@ MODEL_REGISTRY: dict[str, dict] = {
     # running (the CLI supports it; pricing falls back to the provider
     # default) — sync_builtin_models retires the builtin row so pickers
     # stop offering it.
-    "gpt-6-sol": {
-        "label": "GPT-6 Sol",
+    "gpt-6.1-sol": {
+        "label": "GPT-6.1 Sol",
         "provider": "openai",
         "context_window": 272_000,   # the pricing-tier line — see the window note above
-        "pricing": (2.0, 10.0, 2.50, 0.20),  # per 1M: (input, output, cache_write, cache_read)
-        "layers": ["codex-cli"],
+        "pricing": (2.0, 10.0, 2.50, 0.10),  # per 1M: (input, output, cache_write, cache_read)
+        "layers": ["codex-cli"],   # codex-cli only until the hosted relay prices it
         "supports_reasoning": True,
         "supports_xhigh": True,
-        "supports_ultra": True,   # Codex "ultra": max reasoning + proactive multi-agent
+        "supports_ultra": True,   # Codex "ultra": proactive multi-agent on top of xhigh reasoning
         "tier": 2,
         "good_at": "substantial, well-scoped coding and analysis; complex or open-ended work belongs on the frontier",
     },
@@ -1808,8 +1923,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     # NEW model, not a rename of any row — no MODEL_SUCCESSORS entry points
     # at it. OpenAI's flagship and Codex's own bundled default since 0.153.4.
     # The platform's codex-cli default is DECLARED (core/layers/codex
-    # ModelPolicy.default_model = GPT-6 Sol, tier 2): Astra costs 5× GPT-6
-    # Sol on an API key, so a frontier model stays a deliberate choice —
+    # ModelPolicy.default_model = GPT-6.1 Sol, tier 2): Astra costs 5× the
+    # Sol tier on an API key, so a frontier model stays a deliberate choice —
     # registry order no longer decides the "Auto" default.
     # Context: the same 272k pricing-tier line as the 5.6 family (1.05M real:
     # 922k in + 128k out; input beyond 272k bills the whole request at
@@ -1866,10 +1981,9 @@ MODEL_REGISTRY: dict[str, dict] = {
         "good_at": "high-volume routine work",
     },
     # (Older GPT-5.x builtins — gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex
-    # — were retired with the 5.6 family, and 5.6 Sol / 5.6 Luna with the
-    # GPT-6 pair. Agents pinned to a retired id with a successor
-    # move at boot; the others keep running; admins can re-add any of them
-    # as custom models via discover-models.)
+    # — were retired with the 5.6 family, 5.6 Sol / 5.6 Luna with the GPT-6
+    # pair, GPT-6 Sol with 6.1 Sol. Pins with a successor move at boot; the
+    # others keep running; admins can re-add any as a custom model.)
 
     # --- Groq models (direct-llm; OpenAI-compatible API) ---
     # gpt-oss-120b is GroqCloud production; qwen3.6-27b is Groq "preview" (kept
@@ -1987,10 +2101,10 @@ def get_model_supports_xhigh(model: str) -> bool:
 def get_model_supports_ultra(model: str) -> bool:
     """Return True if the model accepts the platform's "ultra" effort level.
 
-    Ultra is Codex-only (GPT-6 Sol, gpt-5.6 Terra, GPT-6 Astra): max reasoning plus
+    Ultra is Codex-only (GPT-6.1 Sol, gpt-5.6 Terra, GPT-6 Astra): max reasoning plus
     Codex-native proactive multi-agent orchestration. Registry-only on purpose — custom
     admin-added models have no supports_ultra column (the wire clamp in
-    map_effort_to_codex is prefix-based, so a custom "gpt-6-sol-*" id still
+    map_effort_to_codex is prefix-based, so a custom "gpt-6.1-sol-*" id still
     maps correctly; the dashboard just won't offer the option). Unknown
     models → False: a stored "ultra" then clamps to the model's ceiling in
     every execution layer rather than risking an API rejection.
@@ -2034,7 +2148,7 @@ def get_model_layers(model: str) -> list[str]:
     Resolution: MODEL_REGISTRY (builtins) → DB execution_layer_models (custom).
     Empty list = unknown model. Used to keep an agent's PRIMARY execution layer
     consistent with its default model — a model only runs on its own layer
-    (e.g. ``gpt-6-sol`` is ``codex-cli`` only), so the no-picker default (primary
+    (e.g. ``gpt-6.1-sol`` is ``codex-cli`` only), so the no-picker default (primary
     layer + default model) must agree or tasks hard-reject the model.
     """
     if not model:
@@ -2056,7 +2170,7 @@ def get_model_layers(model: str) -> list[str]:
 # Used when a model isn't in MODEL_REGISTRY (e.g., dynamically discovered models).
 # A future per-model pricing table in the DB can override these defaults.
 PROVIDER_DEFAULT_PRICING: dict[str, tuple[float, float, float, float]] = {
-    "anthropic": (2.0, 10.0, 2.50, 0.20),   # Sonnet-level (tracks Sonnet 5's standard $2/$10, 2026-08)
+    "anthropic": (2.0, 10.0, 2.50, 0.20),   # Sonnet-level (Sonnet 5.5's $2/$10; Sonnet 5's before it)
     "openai":    (2.0, 8.0, 0, 1.0),          # GPT-4.1 level
     "groq":      (0.20, 0.20, 0, 0),          # very cheap hosted inference
     "ollama":            (0, 0, 0, 0),         # local, free
@@ -2070,12 +2184,11 @@ MODEL_DEFAULT_CONTEXT_WINDOW = 200_000
 # to the END of its chain via successor_model, so the dict's order never
 # strands a pin on an intermediate retired id) so every persisted PIN of
 # a retired id — agents.default_model, chats.model, dynamic_tasks.override_model
-# — moves to the successor. Why pins need this at all: sync_builtin_models
-# retires the old row, the retired id then fails the model-allowed check, and a
-# pinned agent's NEW chats would silently fall back to the layer's first
-# enabled model (not necessarily the successor). Agents on "Auto" never need
-# it — they follow MODEL_REGISTRY order. Only list lossless swaps (same or
-# lower price, same capabilities); a retirement WITHOUT a successor just
+# — moves to the successor (every layer at once: a successor that serves
+# fewer layers than the retired id would strand the other layer's pins).
+# sync_builtin_models retires the old row and the retired id then fails the
+# model-allowed check. Only list lossless swaps (same or lower price, same
+# capabilities, the same layers); a retirement WITHOUT a successor just
 # leaves the pins to the fallback. One line per retirement, no startup code.
 # The walk skips a retired id an admin has re-added as a custom row (the
 # admin chose to keep it; its pins stay). Pins the walk never sees — a
@@ -2087,6 +2200,8 @@ MODEL_SUCCESSORS: dict[str, str] = {
     "claude-opus-5": "claude-opus-5-5",       # 2026-09-24 — cheaper on every element of the tuple
     "gpt-5.6-sol": "gpt-6-sol",               # 2026-09-24 — cheaper on every element, keeps ultra
     "gpt-5.6-luna": "gpt-6-luna",             # 2026-09-24 — cheaper on every element, max-only as before
+    "claude-sonnet-5": "claude-sonnet-5-5",   # the same tuple, window, flags and layers
+    "gpt-6-sol": "gpt-6.1-sol",               # cheaper cached input, the rest equal
 }
 
 
@@ -2205,7 +2320,7 @@ def get_layer_models(layer: str, *, offers_ultra: bool = False) -> list[dict]:
 
 # Precomputed once at module load: model_id → index in MODEL_REGISTRY order.
 # Used to sort the DB fallback so builtins surface in the order they appear
-# in MODEL_REGISTRY.keys() (e.g. Fable 5 before Opus 5 before Sonnet 5). Python
+# in MODEL_REGISTRY.keys() (Fable 5.1 before Opus 5.5 before Sonnet 5.5). Python
 # 3.7+ guarantees dict insertion order, so this is stable.
 _MODEL_REGISTRY_ORDER: dict[str, int] = {
     model_id: i for i, model_id in enumerate(MODEL_REGISTRY.keys())
@@ -2245,7 +2360,7 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
          DOWN the tiers from the declared default and never up: tiers at or
          below the default's tier first (tier order, builtins first, then
          registry order, then created_at); tiers ABOVE it only when nothing
-         else is enabled — so disabling Opus 5 lands on Sonnet 5, not Fable.
+         else is enabled — so disabling Opus 5.5 lands on Sonnet 5.5, not Fable.
       4. Raise RuntimeError — no silent Anthropic fallback, no env-var
          default. The caller decides how to surface this to the user.
 
@@ -2452,6 +2567,20 @@ DEFAULT_EXECUTOR_WORKERS = max(1, int(_cfg("DEFAULT_EXECUTOR_WORKERS", "32")))
 # uvicorn limit_concurrency: past this many open connections (WebSockets
 # included) a new HTTP request gets 503. 0 disables.
 HTTP_LIMIT_CONCURRENCY = int(_cfg("HTTP_LIMIT_CONCURRENCY", "4000"))
+# A WebSocket's write buffer (app.py, _BoundedWebSocketProtocol): past this
+# many buffered bytes a sender waits for the reader instead of growing the
+# buffer, and a reader that drains none of it for WS_WRITE_STALL_S is
+# dropped. The stall sits past the keepalive's ping plus pong timeout so a
+# satellite that merely stalls its loop for a moment is never cut by it.
+WS_WRITE_BUFFER_MAX_BYTES = max(64 * 1024, int(_cfg("WS_WRITE_BUFFER_MAX_BYTES", str(4 * 1024 * 1024))))
+WS_WRITE_STALL_S = max(1.0, float(_cfg("WS_WRITE_STALL_S", "60")))
+# Satellite transfers (REMOTE-AGENTS.md "Chunked transfer"): the file bytes
+# a connection may have in flight to a satellite (its pong queues behind
+# every byte already handed to the transport), and how long a push or a
+# pull may go without any transfer frame on its connection before it fails.
+BULK_CREDIT_BYTES = max(64 * 1024, int(_cfg("BULK_CREDIT_BYTES", str(1024 * 1024))))
+PUSH_STALL_S = max(10.0, float(_cfg("PUSH_STALL_S", "90")))
+PULL_STALL_S = max(10.0, float(_cfg("PULL_STALL_S", "90")))
 
 # ---------------------------------------------------------------------------
 # Concurrency admission (core/concurrency.py + core/sandbox/host_resources.py)
@@ -2643,6 +2772,17 @@ if not _jwt:
     _boot_note(f"Generated JWT_SECRET — saved to {_config_env}")
 JWT_SECRET = _jwt
 JWT_EXPIRY_HOURS = int(_cfg("JWT_EXPIRY_HOURS", "168"))
+# The shortest JWT_SECRET or credential key a boot accepts as newly set
+# (storage.identity.credential_store.judge_secret_floor).
+SECRET_MIN_LENGTH = 32
+
+
+def credential_key_setting() -> str:
+    """The ``CREDENTIAL_ENCRYPTION_KEY`` line: the process environment, then
+    config.env (a Docker install bind-mounts the file, so its lines never
+    reach the environment). Comma-separated: the first key encrypts, the
+    others only decrypt."""
+    return _cfg("CREDENTIAL_ENCRYPTION_KEY")
 DASHBOARD_PUBLIC_URL = _cfg("DASHBOARD_PUBLIC_URL", "")
 
 
@@ -2689,11 +2829,17 @@ elif _local_pbx_raw in ("0", "false", "no", "off"):
 else:
     LOCAL_PBX_ENABLED = not OTODOCK_CLOUD
 
-def _warn_untrusted_edge(in_docker: bool, public_url: str, trusted: list[str]) -> bool:
+def untrusted_edge(in_docker: bool, public_url: str, trusted: list[str]) -> bool:
     """In a container the edge never connects from 127.0.0.1, so an https
     public URL with no TRUSTED_PROXY means every visitor shares the edge's
-    address. Said at boot, never refused: fronted installs must still start."""
-    if not (in_docker and public_url.strip().lower().startswith("https://") and not trusted):
+    address (the admin's forwarding warnings carry it too)."""
+    return in_docker and public_url.strip().lower().startswith("https://") and not trusted
+
+
+def _warn_untrusted_edge(in_docker: bool, public_url: str, trusted: list[str]) -> bool:
+    """``untrusted_edge``, said at boot and never refused: fronted installs
+    must still start."""
+    if not untrusted_edge(in_docker, public_url, trusted):
         return False
     _boot_note(
         "ERROR: DASHBOARD_PUBLIC_URL is https but TRUSTED_PROXY is empty: behind a "
@@ -2888,7 +3034,17 @@ OIDC_AUTHORIZE_URL = _cfg("OIDC_AUTHORIZE_URL", "")
 OIDC_TOKEN_URL = _cfg("OIDC_TOKEN_URL", "")
 OIDC_USERINFO_URL = _cfg("OIDC_USERINFO_URL", "")
 OIDC_LOGOUT_URL = _cfg("OIDC_LOGOUT_URL", "")
+# The ID token's signature keys and issuer (auth/providers/oidc_provider.py
+# verify_id_token): the discovery document's unless set; with neither, the
+# token's own issuer when it shares the token endpoint's origin.
+OIDC_JWKS_URL = _cfg("OIDC_JWKS_URL", "")
+OIDC_ISSUER = _cfg("OIDC_ISSUER", "")
+# The ID token signing algorithms the provider announces (discovery).
+OIDC_ID_TOKEN_ALGS: list[str] = []
 OIDC_SCOPES = _cfg("OIDC_SCOPES", "openid profile email groups")
+if "openid" not in OIDC_SCOPES.split():
+    # The sign-in needs an ID token, which only the openid scope returns.
+    OIDC_SCOPES = f"openid {OIDC_SCOPES}".strip()
 OIDC_REDIRECT_URI = _cfg("OIDC_REDIRECT_URI", "") or (
     f"{DASHBOARD_PUBLIC_URL.rstrip('/')}/auth/callback" if DASHBOARD_PUBLIC_URL else ""
 )
@@ -2920,10 +3076,16 @@ def apply_oidc_discovery(meta: dict) -> None:
     auth.providers.oidc_provider (for an IdP that boots slower than the proxy).
     """
     global OIDC_AUTHORIZE_URL, OIDC_TOKEN_URL, OIDC_USERINFO_URL, OIDC_LOGOUT_URL
+    global OIDC_JWKS_URL, OIDC_ISSUER, OIDC_ID_TOKEN_ALGS
     OIDC_AUTHORIZE_URL = OIDC_AUTHORIZE_URL or meta.get("authorization_endpoint", "")
     OIDC_TOKEN_URL = OIDC_TOKEN_URL or meta.get("token_endpoint", "")
     OIDC_USERINFO_URL = OIDC_USERINFO_URL or meta.get("userinfo_endpoint", "")
     OIDC_LOGOUT_URL = OIDC_LOGOUT_URL or meta.get("end_session_endpoint", "")
+    OIDC_JWKS_URL = OIDC_JWKS_URL or meta.get("jwks_uri", "")
+    OIDC_ISSUER = OIDC_ISSUER or meta.get("issuer", "")
+    algs = meta.get("id_token_signing_alg_values_supported")
+    if not OIDC_ID_TOKEN_ALGS and isinstance(algs, list):
+        OIDC_ID_TOKEN_ALGS = [a for a in algs if isinstance(a, str) and a.lower() != "none"]
 
 
 # OIDC discovery: if OIDC_DISCOVERY_URL is set, fetch .well-known and

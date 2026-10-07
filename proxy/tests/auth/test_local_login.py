@@ -196,6 +196,54 @@ def test_the_tarpit_arms_at_five_under_concurrency(monkeypatch):
     assert len(calls) == 5 and codes.count(401) == 5 and codes.count(429) == 3
 
 
+# ── a full login gives back its own attempt only ──────────────────────────
+
+
+def test_a_full_login_leaves_the_addresss_other_failures_counted(monkeypatch):
+    """A person's own sign-in never wipes the failures the address counted
+    against other accounts: they stay counted until their window lapses."""
+    monkeypatch.setattr(password, "dummy_verify", lambda: None)
+    _user()
+    cap = config.RATE_LIMIT_RULES["login"]["max"]
+    ip = "198.51.100.60"
+
+    async def scenario():
+        misses = [await _login(f"nobody{i}@t.com", "x" * 12, ip=ip) for i in range(cap - 1)]
+        assert misses == [401] * (cap - 1)
+        assert await _login(_EMAIL, _PW, ip=ip) == 200
+        return [await _login(f"later{i}@t.com", "x" * 12, ip=ip) for i in range(2)]
+
+    assert asyncio.run(scenario()) == [401, 429]
+
+
+def test_a_2fa_completion_gives_back_its_own_attempt_only():
+    import pyotp
+
+    from auth.totp import encrypt_totp_secret
+    sub = _user()
+    secret = pyotp.random_base32()
+    db.update_user_auth_fields(sub, totp_secret_enc=encrypt_totp_secret(secret), totp_enabled=True)
+    ip = "198.51.100.61"
+
+    async def scenario():
+        step = await identity.auth_login_local(
+            identity.LocalLoginRequest(email=_EMAIL, password=_PW), _request(ip))
+
+        def code(value):
+            return identity.TwoFactorRequest(totp_session_token=step["totp_session_token"],
+                                             code=value)
+
+        for _ in range(3):
+            with pytest.raises(identity.HTTPException) as e:
+                await identity.auth_login_2fa(code("1234567"), _request(ip))
+            assert e.value.status_code == 401
+        r = await identity.auth_login_2fa(code(pyotp.TOTP(secret).now()), _request(ip))
+        assert r.status_code == 200
+
+    asyncio.run(scenario())
+    assert rate_limiter._attempts[("2fa", ip)]["count"] == 3
+
+
 # ── the tarpit ────────────────────────────────────────────────────
 
 
@@ -302,6 +350,21 @@ def test_a_full_hash_gate_leaves_the_account_count_unchanged(monkeypatch):
     assert asyncio.run(attempt("203.0.113.141")) == 503
     row = db.get_user(sub)
     assert row.get("failed_login_attempts") == 3
+
+
+def test_the_failure_undo_is_the_users_stores_own_statement():
+    """One less, the last failure kept while another remains, never below
+    zero; it sits beside ``record_failed_login`` in the store."""
+    sub = _user()
+    db.record_failed_login(sub)
+    db.record_failed_login(sub)
+    db.undo_failed_login(sub)
+    row = db.get_user(sub)
+    assert row["failed_login_attempts"] == 1 and row["last_failed_login"] is not None
+    db.undo_failed_login(sub)
+    db.undo_failed_login(sub)
+    row = db.get_user(sub)
+    assert row["failed_login_attempts"] == 0 and row["last_failed_login"] is None
 
 
 def test_a_full_hash_gate_gives_the_device_attempt_back(monkeypatch):

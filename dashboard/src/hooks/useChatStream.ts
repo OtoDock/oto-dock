@@ -3,10 +3,11 @@ import { useDashboardWs } from './useDashboardWs'
 import type { ThreadGoal } from './useDashboardWs.types'
 import type { LimitPayload } from '../api/usage'
 import { useChatStore } from '@/store/chatStore'
+import { notePushedDocument, pushedDocumentFromFrame } from '@/store/documentPaneStore'
 import { getDeviceLocation } from '../lib/geolocation'
 import { TARGET_LOCAL } from '../lib/placement'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
-import { attachmentBlocks, dbMessagesToDisplay, eventToBlock, costBilledOf, latestCostBilled } from '../lib/messageBlocks'
+import { attachmentBlocks, dbMessagesToDisplay, delegateResultBadge, delegateResultBlocks, delegateResultSignature, eventToBlock, costBilledOf, latestCostBilled } from '../lib/messageBlocks'
 import { toQueuedMessage, type QueuedMessage } from '@/store/types'
 import type { SteeredFrame } from '../api/wireEvents'
 
@@ -41,6 +42,7 @@ import type { UseChatStreamOptions } from './chatStream/types'
 import { DELEGATE_TOOL, ROLE, toolRole } from '../lib/tools/roles'
 import { HOOK_ITEM, SYSTEM_SUBTYPE, WIRE } from '../api/wireEvents'
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from '../lib/status/run'
+import { CHAT_PHASE } from '../lib/status/chat'
 import { evictedBy, isArtifactBlock } from '../lib/kinds/artifact'
 
 // Tools that should NOT generate tool_start/tool_end blocks (they have dedicated display
@@ -67,12 +69,14 @@ const SUBSCRIPTION_REASONS = new Set([
 
 export function warmupFailSubtype(
   reason: string | undefined,
-): 'no_subscription' | 'pool_cap' | 'target_unavailable' | 'session_error' {
+): 'no_subscription' | 'pool_cap' | 'target_unavailable' | 'session_error' | 'below_editor' {
   if (reason && SUBSCRIPTION_REASONS.has(reason)) return 'no_subscription'
   // The pool's subscription cap refused the spawn: its own card, with the
   // cap's wording and a way to the Usage tab.
   if (reason === 'pool_cap') return 'pool_cap'
   if (reason === 'target_unavailable') return 'target_unavailable'
+  // A chat that runs as the agent, below the editor role: a role card.
+  if (reason === 'below_editor') return 'below_editor'
   return 'session_error'
 }
 
@@ -85,6 +89,40 @@ export function warmupFailSubtype(
  * model dropdown, workspace, draft/queue storage, send/abort entry points)
  * stays in the page and is wired in through the options above.
  */
+/**
+ * The rebuilt (DB-authoritative) message list plus the trailing OPTIMISTIC
+ * user bubbles of the previous list (send-minted `user-<ts>` ids; history
+ * rows are `db-*`) that the rebuilt tail does not already hold, text-deduped
+ * against it: a send can race a slow history load, and a wholesale replace
+ * would erase the prompt until the next reload. Empty `stream-<ts>`
+ * assistant placeholders are never carried (streaming re-mints its bubble).
+ */
+function withCarriedUserBubbles(prev: DisplayMessage[], displayMsgs: DisplayMessage[]): DisplayMessage[] {
+  const carried: DisplayMessage[] = []
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const m = prev[i]
+    if (!/^(user|stream)-\d+$/.test(m.id)) break
+    if (m.role === 'user') carried.unshift(m)
+  }
+  if (carried.length === 0) return displayMsgs
+  const textOf = (m: DisplayMessage) => {
+    const t = m.blocks.find((b) => b.type === 'text')
+    return t && t.type === 'text' ? t.content : ''
+  }
+  const dbUserTail = new Set(
+    displayMsgs.filter((m) => m.role === 'user').slice(-6).map(textOf),
+  )
+  const fresh = carried.filter((m) => {
+    const t = textOf(m)
+    return !(t && dbUserTail.has(t))
+  })
+  return fresh.length > 0 ? [...displayMsgs, ...fresh] : displayMsgs
+}
+
+// How long a history whose live attach was promised waits for its
+// live_state before it paints alone.
+const HELD_HISTORY_MS = 1500
+
 export function useChatStream(options: UseChatStreamOptions) {
   const { agents } = options
 
@@ -110,21 +148,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendBlock, seedDbHistory: seedDbRows, loadOlder, removePlaceholders,
     appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive,
-    ensureAssistantMsg, removePreviewBlocks,
+    ensureAssistantMsg, upsertPreviewBlock,
   } = useChatMessages({ agents, meetingSpeakerRef, chatIdRef })
   const [mode, setMode] = useState(options.defaultMode ?? 'default')
   const [model, setModel] = useState('')
-
-  // Dismiss (user X'd a preview block): drop the matching local blocks
-  // ref-safely. `key` scopes to one instance (a frozen "previous version");
-  // without it the file's whole preview trail goes (the live block's close).
-  // The live/frozen/chip states themselves are a render-time derivation
-  // (previewChainModes) — there is no collapse bookkeeping to update here.
-  const dismissPreview = useCallback((
-    fileId: string, key?: { snapshotId?: string; dbMessageId?: number },
-  ) => {
-    removePreviewBlocks(fileId, key)
-  }, [removePreviewBlocks])
 
   // Execution target for the active session (set by warmup_ready). When the
   // session falls back to local, fallbackReason is set so the header can render
@@ -254,6 +281,12 @@ export function useChatStream(options: UseChatStreamOptions) {
   useEffect(() => {
     pendingSteerRef.current = []
     setPendingSteers([])
+    erroredRef.current = false
+    const held = heldHistoryRef.current
+    if (held && held.chatId !== chatId) {
+      clearTimeout(held.timer)
+      heldHistoryRef.current = null
+    }
   }, [chatId])
   // Guard against stale WS events during chat switch / run switch. Set true by
   // the page on navigation, cleared in onChatHistory / onWarmupReady. While
@@ -276,6 +309,50 @@ export function useChatStream(options: UseChatStreamOptions) {
   // while the flag was still armed from the turn-opening send and its chip
   // silently vanished until the post-turn drain.
   const sentWithBubbleRef = useRef<string | null>(null)
+  // The turn ended on an error (a pump's `error` frame, which names the
+  // chat and its ending): the card renders live from the frame, so the
+  // `done` that follows must not refetch the history (a full remount of the
+  // list for nothing). Cleared at the next send and on a chat switch.
+  const erroredRef = useRef(false)
+  // A history frame whose live attach follows (`live_pending`): its rebuilt
+  // rows wait here for the turn's live_state, so opening a generating chat
+  // paints once (the rows and the live answer together, the timer already
+  // running). Painted as they are by the next history frame, done, error,
+  // abort or the timer; dropped on a chat switch.
+  const heldHistoryRef = useRef<{ chatId: string; msgs: DisplayMessage[];
+                                  timer: ReturnType<typeof setTimeout> } | null>(null)
+
+  const dropHeldHistory = () => {
+    const held = heldHistoryRef.current
+    if (held) {
+      clearTimeout(held.timer)
+      heldHistoryRef.current = null
+    }
+  }
+  /** The held history's rows taken for a paint (once), null when none is
+   *  held for the chat this view shows. */
+  const takeHeldHistory = (): DisplayMessage[] | null => {
+    const held = heldHistoryRef.current
+    if (!held) return null
+    dropHeldHistory()
+    return held.chatId === chatIdRef.current ? held.msgs : null
+  }
+  /** Paint the held rows as they are: no live_state came (the turn ended
+   *  first, the attach failed). The timer and the chat's state as an
+   *  ordinary history leaves them. */
+  const paintHeldHistory = () => {
+    const msgs = takeHeldHistory()
+    if (!msgs) return
+    setMessages((prev) => withCarriedUserBubbles(prev, msgs))
+    setTurnStartTime(null)
+    if (chatIdRef.current) useChatStore.getState().setReady(chatIdRef.current)
+  }
+  const holdHistory = (cid: string, msgs: DisplayMessage[]) => {
+    const timer = setTimeout(() => {
+      if (heldHistoryRef.current?.timer === timer) paintHeldHistory()
+    }, HELD_HISTORY_MS)
+    heldHistoryRef.current = { chatId: cid, msgs, timer }
+  }
 
   /** Render any held steers: user bubble(s) in accept order, then (while the
    * turn keeps streaming) a fresh assistant continuation that subsequent
@@ -300,6 +377,28 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
     currentMsgRef.current = continuation
     setMessages((prev) => [...prev, ...userMsgs, continuation])
+  }
+
+  // The meeting half of a history frame's server-computed `restore` (the
+  // full history and a delta apply it alike): an active meeting sets the
+  // indicator's state, anything else ends it.
+  const applyMeetingRestore = (mt: any) => {
+    if (mt && mt.active) {
+      setMeetingActive(true)
+      // Normalize: older proxies sent the DB's slug STRINGS here while the
+      // live meeting_started event sends {slug, display_name, color}
+      // objects — the string form crashed MeetingIndicator (undefined
+      // .charAt) and blanked the app pre-ErrorBoundary.
+      const parts = Array.isArray(mt.participants) ? mt.participants : []
+      setMeetingParticipants(parts.map((p: any) =>
+        typeof p === 'string'
+          ? { slug: p, display_name: p, color: '' }
+          : { slug: p?.slug || '', display_name: p?.display_name || p?.slug || '', color: p?.color || '' }
+      ))
+      setMeetingMaxRounds(mt.max_turns || 30)
+    } else {
+      setMeetingActive(false)
+    }
   }
 
   // --- WebSocket callbacks ---
@@ -412,7 +511,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       pendingSteerRef.current = []  // held steers belong to the previous view
       setPendingSteers([])
       liveStateSeededRef.current = false  // view is DB-authoritative again
-      setTurnStartTime(null)
+      if (!data.live_pending) setTurnStartTime(null)
       setThinkingActive(false)
       setCompressingActive(false)
       setPermissionPending(false)
@@ -430,7 +529,10 @@ export function useChatStream(options: UseChatStreamOptions) {
       // turnStartTime). Only the VIEWED chat (the staleness guard above) — a
       // non-viewed streaming chat keeps its sidebar dot (its pump isn't attached
       // on this socket, so no live_state would re-arm it).
-      {
+      // A frame whose live attach follows holds its paint (below), the
+      // timer and the chat's state with it: the live_state sets them.
+      const livePending = !!data.live_pending
+      if (!livePending) {
         const _cid = data.chat_id || chatIdRef.current
         if (_cid) useChatStore.getState().setReady(_cid)
       }
@@ -456,27 +558,12 @@ export function useChatStream(options: UseChatStreamOptions) {
       // against the rebuilt tail in case the prompt DID make it into the read.
       // Empty `stream-<ts>` assistant placeholders are NOT carried:
       // currentMsgRef was just reset above, so streaming re-mints its bubble.
-      setMessages((prev) => {
-        const carried: DisplayMessage[] = []
-        for (let i = prev.length - 1; i >= 0; i--) {
-          const m = prev[i]
-          if (!/^(user|stream)-\d+$/.test(m.id)) break
-          if (m.role === 'user') carried.unshift(m)
-        }
-        if (carried.length === 0) return displayMsgs
-        const textOf = (m: DisplayMessage) => {
-          const t = m.blocks.find((b) => b.type === 'text')
-          return t && t.type === 'text' ? t.content : ''
-        }
-        const dbUserTail = new Set(
-          displayMsgs.filter((m) => m.role === 'user').slice(-6).map(textOf),
-        )
-        const fresh = carried.filter((m) => {
-          const t = textOf(m)
-          return !(t && dbUserTail.has(t))
-        })
-        return fresh.length > 0 ? [...displayMsgs, ...fresh] : displayMsgs
-      })
+      dropHeldHistory()
+      if (livePending) {
+        holdHistory(data.chat_id || chatIdRef.current || '', displayMsgs)
+      } else {
+        setMessages((prev) => withCarriedUserBubbles(prev, displayMsgs))
+      }
       // Restore total cost from DB; the gauge follows the newest turn's flag
       // (reset on every load — a chat switch must not inherit the last one's)
       if (data.total_cost) setTotalCost(data.total_cost)
@@ -506,26 +593,65 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (data.restore) {
         setCurrentTodos(Array.isArray(data.restore.todos) ? data.restore.todos : [])
         setCurrentGoal(data.restore.goal ?? null)
-        const mt = data.restore.meeting
-        if (mt && mt.active) {
-          setMeetingActive(true)
-          // Normalize: older proxies sent the DB's slug STRINGS here while the
-          // live meeting_started event sends {slug, display_name, color}
-          // objects — the string form crashed MeetingIndicator (undefined
-          // .charAt) and blanked the app pre-ErrorBoundary.
-          const parts = Array.isArray(mt.participants) ? mt.participants : []
-          setMeetingParticipants(parts.map((p: any) =>
-            typeof p === 'string'
-              ? { slug: p, display_name: p, color: '' }
-              : { slug: p?.slug || '', display_name: p?.display_name || p?.slug || '', color: p?.color || '' }
-          ))
-          setMeetingMaxRounds(mt.max_turns || 30)
-        } else {
-          setMeetingActive(false)
-        }
+        applyMeetingRestore(data.restore.meeting)
       }
 
       options.onChatHistoryLoaded?.(data)
+    },
+
+    onChatHistoryDelta: (data) => {
+      // A watched task chat's turn end: the rows this view lacks, appended
+      // to the raw rows it holds (deduped by id, kept in id order), and the
+      // view re-derived from all of them (the converter has cross-row
+      // state). Never the first frame of a view: the pagination cursor and
+      // the discard guard are untouched, and a frame for another chat is
+      // dropped.
+      if (!data.chat_id || !chatIdRef.current || data.chat_id !== chatIdRef.current) return
+      if (discardingRef.current) return
+      options.onChatHistoryMeta?.(data)
+      const incoming = Array.isArray(data.messages) ? data.messages : []
+      const byId = new Map<number, any>()
+      for (const r of rawRowsRef.current) byId.set(r.id, r)
+      for (const r of incoming) byId.set(r.id, r)
+      const rows = [...byId.values()].sort((a, b) => a.id - b.id)
+      rawRowsRef.current = rows
+      const displayMsgs = dbMessagesToDisplay(rows, agents)
+      currentMsgRef.current = null
+      // The same carry rule as onChatHistory: trailing optimistic user
+      // bubbles the rows do not hold yet stay; the finished turn's live
+      // bubble is replaced by its rows. A held history is superseded (the
+      // view re-derives from every row).
+      dropHeldHistory()
+      if (data.live_pending) {
+        holdHistory(data.chat_id, displayMsgs)
+      } else {
+        setMessages((prev) => withCarriedUserBubbles(prev, displayMsgs))
+      }
+      if (data.total_cost) setTotalCost(data.total_cost)
+      setCostBilled(latestCostBilled(rows))
+      if (data.context_used) setContextUsed(data.context_used)
+      if (data.context_max) setContextMax(data.context_max)
+      if (data.cache_write) setCacheStats({
+        cacheRead: data.cache_read ?? 0,
+        cacheWrite: data.cache_write ?? 0,
+        inputTokens: 0,
+        outputTokens: data.output_tokens ?? 0,
+      })
+      const dbPlans = Array.isArray(data.plans) ? data.plans : []
+      if (dbPlans.length > 0) {
+        setSessionPlans(dbPlans.map((p: any) => ({
+          filename: p.filename,
+          content: p.content,
+          status: p.status as 'pending' | 'implemented' | 'rejected',
+        })))
+      }
+      // The panels and the meeting indicator as the full history restores
+      // them: a meeting that concluded during the turn ends here too.
+      if (data.restore) {
+        setCurrentTodos(Array.isArray(data.restore.todos) ? data.restore.todos : [])
+        setCurrentGoal(data.restore.goal ?? null)
+        applyMeetingRestore(data.restore.meeting)
+      }
     },
 
     onText: (content) => {
@@ -751,31 +877,30 @@ export function useChatStream(options: UseChatStreamOptions) {
         })),
       )
 
-      // Insert delegate result as inline agent message. One delivery can reach
-      // this socket as TWO frames (the ladder's pump push + the WS handler's
-      // own send) — dedupe on task_id + identical content so the bubble
-      // renders once (a recurring task's later round has different output and
-      // still renders).
-      if (data.output_text) {
+      // Insert delegate result as inline agent message (the worker's report
+      // text and the files it attached). One delivery can reach this socket
+      // as TWO frames (the ladder's pump push + the WS handler's own send) —
+      // dedupe on task_id + identical blocks so the bubble renders once (a
+      // recurring task's later round has different output or files and
+      // still renders). A result with neither text nor files mints nothing.
+      const blocks = delegateResultBlocks(data)
+      if (blocks.length) {
         const delegateAgent = agents?.find(a => a.name === data.agent)
         const dedupPrefix = `delegate-result-${data.task_id || data.task_name}-`
+        const signature = delegateResultSignature(blocks)
         const isDup = (m: { id: string, blocks: MessageBlock[] }) =>
-          m.id.startsWith(dedupPrefix)
-          && m.blocks.some((b) => b.type === 'text' && b.content === data.output_text)
+          m.id.startsWith(dedupPrefix) && delegateResultSignature(m.blocks) === signature
         setMessages((prev) => prev.some(isDup) ? prev : [
           ...prev,
           {
             id: `${dedupPrefix}${Date.now()}`,
             role: 'assistant' as const,
-            blocks: [{ type: 'text' as const, content: data.output_text || '' }],
+            blocks,
             createdAt: new Date().toISOString(),
             agentSlug: data.agent || '',
             agentDisplayName: delegateAgent?.display_name,
             agentColor: delegateAgent?.color || '',
-            badge: data.status === DELEGATE_RESULT.CANCELLED ? 'delegate canceled'
-              : data.status === DELEGATE_RESULT.FAILED ? 'delegate failed'
-              : data.status === DELEGATE_RESULT.USER_INTERRUPTED ? 'delegate interrupted'
-              : 'delegate response',
+            badge: delegateResultBadge(data.status),
           },
         ])
       }
@@ -1018,6 +1143,44 @@ export function useChatStream(options: UseChatStreamOptions) {
       })
     },
 
+    // A prompt whose wait ended with no answer (the hook's caller went away,
+    // the wait ran out, a Stop or a close released it): its permission or
+    // held question card leaves, a plan review closes as cancelled (as the
+    // history shows an unanswered one). Only a card that still gates acts:
+    // a stale frame for an answered or unknown id changes nothing.
+    onPromptRetired: (data) => {
+      if (discardingRef.current || !data.request_id) return
+      const rid = data.request_id
+      const isCard = (b: MessageBlock) =>
+        (b.type === 'permission' || b.type === 'plan_review' || b.type === 'question')
+        && b.requestId === rid
+      const gates = (b: MessageBlock) =>
+        ((b.type === 'permission' || b.type === 'plan_review') && !b.resolved)
+        || (b.type === 'question' && !!b.requestId && !b.answered)
+      const before = messagesRef.current
+      if (!before.some((m) => m.blocks.some((b) => isCard(b) && gates(b)))) return
+      setMessages((prev) => prev.map((msg) => {
+        if (!msg.blocks.some(isCard)) return msg
+        const updated = {
+          ...msg,
+          blocks: msg.blocks.flatMap((b): MessageBlock[] => {
+            if (!isCard(b)) return [b]
+            return b.type === 'plan_review' ? [{ ...b, resolved: true, action: 'reject' }] : []
+          }),
+        }
+        if (msg === currentMsgRef.current) currentMsgRef.current = updated
+        return updated
+      }))
+      if (before.some((m) => m.blocks.some((b) => gates(b) && !isCard(b)))) return
+      setPermissionPending(false)
+      // The turn goes on (the hook got its answer or retries): the timer
+      // runs again, only while this chat streams.
+      const cid = chatIdRef.current
+      if (cid && useChatStore.getState().byChat[cid]?.status === CHAT_PHASE.STREAMING) {
+        setTurnStartTime(Date.now())
+      }
+    },
+
     onSystem: (data) => {
       if (discardingRef.current) return
       const subtype = data.subtype
@@ -1107,9 +1270,11 @@ export function useChatStream(options: UseChatStreamOptions) {
       }
 
       // Non-meeting system events: default behavior. `message` carries the
-      // body for informational cards (e.g. session_reseeded).
+      // body for informational cards (e.g. session_reseeded); `reason` picks
+      // a card's wording (undelivered_input's `queued`, sent live when the
+      // drive gate refuses a held message).
       ensureAssistantMsg()
-      appendBlock({ type: 'system', subtype, message: data.message })
+      appendBlock({ type: 'system', subtype, message: data.message, reason: data.reason })
     },
 
     onImages: (data) => {
@@ -1230,20 +1395,21 @@ export function useChatStream(options: UseChatStreamOptions) {
     onDocumentPreview: (data) => {
       if (discardingRef.current) return
       ensureAssistantMsg()
-      // Append the new preview to the current assistant message (same pattern
-      // as onImage/onFile). The old block for this file transitions to a
-      // view-only "previous version" (and older ones to chips) at RENDER time
-      // via previewChainModes — each block defers its own transition while
-      // the user is engaged with it, so nothing here needs to collapse state.
-      appendBlock({
+      // The turn's flush delivers the pushes: the card goes into the chat
+      // and the chat's document pane opens on the newest (the frame is the
+      // "turn ended with a push" signal; history never comes this way).
+      upsertPreviewBlock({
         type: 'document_preview',
-        wopiUrl: data.wopi_url,
         filename: data.filename,
         fileId: data.file_id,
         downloadUrl: data.download_url,
         snapshotId: data.snapshot_id || undefined,
         generation: data.generation || undefined,
+        version: data.version || undefined,
       })
+      const doc = pushedDocumentFromFrame(data)
+      const chat = data.chat_id || chatIdRef.current
+      if (doc && chat) notePushedDocument(chat, doc)
     },
 
     onQuestion: (data) => {
@@ -1317,6 +1483,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // suppress a same-text queued message.
       sentWithBubbleRef.current = null
       if (discardingRef.current) return
+      paintHeldHistory()
       abortedRef.current = false  // terminal frame — straggler window over
       // A steer the turn consumed at its very last round boundary (no block
       // followed) still owes its user bubble — render it before the cleanup.
@@ -1391,7 +1558,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       // bg badge (Codex: the main turn ends while the sub keeps going). Once the
       // sub finishes, the next turn's onDone (bgStillRunning false) runs the
       // refetch and history then correctly shows it done.
-      if (options.enableDefensiveRefetch && !bgStillRunning) {
+      const errored = erroredRef.current
+      erroredRef.current = false
+      if (options.enableDefensiveRefetch && !bgStillRunning && !errored) {
         // Capture the bubble NOW (synchronously). The queueMicrotask above nulls
         // currentMsgRef BEFORE this 400ms timeout fires, so reading the ref inside
         // the timeout always saw null → "no content" → refetch EVERY turn →
@@ -1414,7 +1583,9 @@ export function useChatStream(options: UseChatStreamOptions) {
           setTimeout(() => {
             const cid = chatIdRef.current
             if (!cid) return
-            const refetch = () => { try { ws.resumeChat(cid) } catch { /* ignore */ } }
+            // The rows this view lacks are enough; the server answers in full
+            // when it holds no base for the chat.
+            const refetch = () => { try { ws.resumeChat(cid, { delta: true }) } catch { /* ignore */ } }
             // The refetch rebuilds every message id → full remount — a
             // hard cut for any playing audio. Route through the caller's
             // defer hook so it waits out live TTS (runs immediately when
@@ -1426,9 +1597,10 @@ export function useChatStream(options: UseChatStreamOptions) {
       }
     },
 
-    onError: (message) => {
+    onError: (message, ending) => {
       sentWithBubbleRef.current = null  // turn ended — clear the bubble-dedup marker
       if (discardingRef.current) return
+      paintHeldHistory()
       // If we were warming up, the session failed to start — reset state so the
       // user sees the error and can retry instead of being stuck on "Starting
       // session..." forever. The optimistic user bubble + placeholder (if any)
@@ -1443,13 +1615,23 @@ export function useChatStream(options: UseChatStreamOptions) {
         options.onWarmupReset?.()
       }
       options.onErrorExtra?.()
-      if (currentMsgRef.current) {
+      if (ending?.reason) {
+        // A typed ending is the card the chat keeps after a reload (the
+        // server persists the `turn_ended` row inside the turn), rendered
+        // live from the frame in the open bubble, or a bubble of its own.
+        erroredRef.current = true
+        ensureAssistantMsg()
+        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.TURN_ENDED,
+                      reason: ending.reason, message })
+      } else if (currentMsgRef.current) {
         appendToLastTextBlock(`\n\n**Error:** ${message}`)
       }
       // The error ends the turn (no done follows): an accepted steer still
       // owes its user bubble, like at done and abort.
       flushPendingSteer(false)
-      currentMsgRef.current = null
+      // Deferred like at done: the append above is a batched updater that
+      // checks this ref when it runs.
+      queueMicrotask(() => { currentMsgRef.current = null })
       setTurnStartTime(null)
     },
 
@@ -1516,28 +1698,74 @@ export function useChatStream(options: UseChatStreamOptions) {
     // contaminating the new chat's mode/model.
     onModeChanged: (m) => { if (discardingRef.current) return; setMode(m) },
     onModelChanged: (m) => { if (discardingRef.current) return; setModel(m) },
+    // Not a per-chat frame on the wire (a new chat's pick carries no id), so
+    // the chat is matched here: only the viewed chat's stored mode applies.
+    onExecutionModeChanged: (f) => {
+      if (discardingRef.current || !f.chat_id || f.chat_id !== chatIdRef.current) return
+      options.onExecutionModeChanged?.(f.execution_mode)
+    },
 
     onQueued: (data) => {
       if (discardingRef.current) return
-      // Skip the queue display ONLY when this exact message already has a
-      // bubble (the reconnect/stale-pump dedup) — any OTHER text is a real
-      // mid-turn queue (claude's steer fallback) and must show its chip.
+      if (data.queue_id) {
+        // The chip is in the store (the socket hook files it by chat). A
+        // send the page showed as a new turn that the proxy queued instead
+        // (another turn drives the chat): its bubble becomes the chip.
+        if (sentWithBubbleRef.current === data.text) {
+          sentWithBubbleRef.current = null
+          setMessages((prev) => {
+            const n = prev.length
+            if (n >= 2 && prev[n - 1].role === 'assistant' && prev[n - 1].blocks.length === 0
+                && prev[n - 2].role === 'user') {
+              if (currentMsgRef.current === prev[n - 1]) currentMsgRef.current = null
+              return prev.slice(0, -2)
+            }
+            return prev
+          })
+        }
+        return
+      }
+      // A 1.7.0 proxy: skip the chip ONLY when this exact message already
+      // has a bubble (the reconnect/stale-pump dedup).
       if (sentWithBubbleRef.current === data.text) return
       options.queue.addQueued(data.index, toQueuedMessage(data))
     },
     onQueueRemoved: (_msg) => {
-      // No-op for queuedMessages — the page's cancel/edit handlers already
-      // removed from state before sending cancel_queued to the backend.
-      // onQueueEditReturn handles pulling text back to input.
+      // The chip left the store in the socket hook (by its id); a 1.7.0
+      // proxy's chip was removed by the page's cancel handler. The author's
+      // copy hands the text back (onQueueEditReturn).
     },
     onQueueSent: (data) => {
       if (discardingRef.current) return
-      options.queue.clearQueued()
+      // A 1.7.0 proxy names no message: every chip goes.
+      if (!data.queue_ids) options.queue.clearQueued()
       // If the page already added a user bubble + placeholder for THIS message,
       // don't duplicate — just refresh the timer for the actual streaming start.
       if (sentWithBubbleRef.current === data.text) {
         sentWithBubbleRef.current = null
         setTurnStartTime(Date.now())
+        return
+      }
+      if (sentWithBubbleRef.current !== null && data.queue_ids?.length) {
+        // A fresh send took this person's waiting messages ahead of itself
+        // (one turn, their rows first): their bubble goes before the one the
+        // page just added.
+        const fresh = sentWithBubbleRef.current
+        const drained: DisplayMessage = {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          blocks: [...attachmentBlocks(data.images, data.files), { type: 'text', content: data.text }],
+          createdAt: new Date().toISOString(),
+        }
+        setMessages((prev) => {
+          const at = prev.length - 2
+          const optimistic = prev[at]
+          if (at >= 0 && optimistic.role === 'user'
+              && optimistic.blocks.some((b) => b.type === WIRE.TEXT && b.content === fresh)) {
+            return [...prev.slice(0, at), drained, ...prev.slice(at)]
+          }
+          return [...prev, drained]
+        })
         return
       }
       // Queue processed — add user bubble (chips + text) + assistant placeholder.
@@ -1568,22 +1796,26 @@ export function useChatStream(options: UseChatStreamOptions) {
     onSteered: (data) => {
       if (discardingRef.current) return
       // Mid-turn steer accepted: the message went INTO the running turn (so
-      // no queue entry and no timer reset). The engine consumes it at the
-      // NEXT sampling-round boundary — while an assistant message is still
-      // open and streaming, splitting here cut its text mid-sentence, so
-      // hold the bubble and let the next block boundary render it (the
+      // no queue entry and no timer reset). A frame naming its row
+      // (`message_id`) comes at the point of the stream where the proxy saved
+      // the turn so far and wrote the steer's row after it: the bubble
+      // renders here and the answer continues below it, as a reload shows
+      // it. A 1.7.0 proxy's frame names no row and arrives before the engine
+      // read it: the bubble waits for the next block boundary (the
       // flushPendingSteer calls in the block handlers + turn end).
       const held: HeldSteer = {
         text: data.text, images: data.images, files: data.files, meta: data.event_data,
       }
-      if (currentMsgRef.current) {
+      if (currentMsgRef.current && !data.message_id) {
         pendingSteerRef.current.push(held)
         setPendingSteers(pendingSteerRef.current.map(toQueuedMessage))
         return
       }
-      // Idle position (between blocks): render at the live position and
-      // continue the assistant's response in a NEW message below it.
-      const userMsg = steeredUserMessage(held, `user-${Date.now()}`)
+      // Idle position (between blocks), or the proxy's own place for it:
+      // render at the live position and continue the assistant's response
+      // in a NEW message below it.
+      const userMsg = steeredUserMessage(
+        held, data.message_id ? `db-${data.message_id}` : `user-${Date.now()}`)
       const continuation: DisplayMessage = {
         id: `stream-${Date.now()}`,
         role: 'assistant',
@@ -1619,6 +1851,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     onAborted: (data) => {
       sentWithBubbleRef.current = null  // turn ended — clear the bubble-dedup marker
       if (discardingRef.current) return
+      paintHeldHistory()
       // The actual cleanup ran in handleAbort already (proactive — so the UI
       // clears even if the server's confirmation event never arrives). Re-running
       // it here is cheap (idempotent) and covers any blocks that arrived between
@@ -1635,9 +1868,15 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     onQueueEditReturn: (data) => {
       // Pull the text back into the composer for editing, and the
-      // attachments the queued message carried with it. An attachment-only
+      // attachments the queued message carried with it. A draft the person
+      // is typing stays, the returned text after it (a failed turn or a
+      // Stop returns messages they did not ask back). An attachment-only
       // message returns no text: the composer's draft stays as it is.
-      if (data.text) setEditText(data.text)
+      if (data.text) {
+        const cid = chatIdRef.current
+        const draft = cid ? (useChatStore.getState().byChat[cid]?.draftInput ?? '') : ''
+        setEditText(draft.trim() ? `${draft}\n\n${data.text}` : data.text)
+      }
       if (data.images?.length || data.files?.length) {
         options.queue.restoreAttachments?.(data.images ?? [], data.files ?? [])
       }
@@ -1645,6 +1884,9 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     onLiveState: (data) => {
       if (discardingRef.current) return
+      // The rows of a history that waited for this frame: painted below in
+      // the same update as the live answer.
+      const heldRows = takeHeldHistory()
       // Reconnected to an actively streaming chat — restore live state.
       // A residual snapshot (streaming === false: turn ended, bg subagents
       // still running) must not start a turn timer.
@@ -1662,6 +1904,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // For meetings: split at meeting_turn_start to create separate messages per agent.
       const liveBlocks = Array.isArray(data.live_blocks) ? data.live_blocks : []
       const hasContent = liveBlocks.length > 0 || data.thinking_active || data.thinking_text
+      if (heldRows && !hasContent) setMessages((prev) => withCarriedUserBubbles(prev, heldRows))
       // Mid-turn attach with reconstructed content: mark the view snapshot-
       // seeded so onDone reconciles it against DB once the turn ends. A
       // residual snapshot (streaming === false) is already post-persist.
@@ -1680,7 +1923,7 @@ export function useChatStream(options: UseChatStreamOptions) {
           (lb: any) => lb.type === 'system' && lb.subtype === SYSTEM_SUBTYPE.MEETING_STARTED
         )
 
-        if (newMsgs.length > 0 || hasMeetingStartedBlock) {
+        if (newMsgs.length > 0 || hasMeetingStartedBlock || heldRows) {
           if (newMsgs.length > 0) {
             currentMsgRef.current = newMsgs[newMsgs.length - 1]
           }
@@ -1694,7 +1937,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             }
           }
           setMessages((prev) => {
-            let updated = [...prev]
+            let updated = heldRows ? withCarriedUserBubbles(prev, heldRows) : [...prev]
             if (hasMeetingStartedBlock) {
               for (let i = updated.length - 1; i >= 0; i--) {
                 if (updated[i].role === 'assistant') {
@@ -2231,13 +2474,13 @@ export function useChatStream(options: UseChatStreamOptions) {
     meetingMaxRounds,
     meetingLeftParticipants,
     editText, setEditText,
-    dismissPreview,
     // refs
     currentMsgRef,
     thinkingBufRef,
     abortedRef,
     discardingRef,
     sentWithBubbleRef,
+    erroredRef,
     meetingSpeakerRef,
     // handlers
     handlePermissionRespond,

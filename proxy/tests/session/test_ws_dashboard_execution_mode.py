@@ -54,6 +54,35 @@ class TestExecutionModeChange:
                 assert temp_db.get_chat(chat_id)["execution_mode"] == before
         run_ws_scenario(scenario)
 
+    def test_the_row_write_runs_off_the_loop_before_the_ack(self, temp_db, monkeypatch):
+        import asyncio
+        from storage import database as task_store
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        real = task_store.update_chat
+
+        def guarded(*a, **kw):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return real(*a, **kw)
+            raise AssertionError("update_chat ran on the event loop")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, _sid = await warm_new_chat(ws, layer, slug)
+                # Armed after the warmup: the guard is about this frame's write.
+                monkeypatch.setattr(task_store, "update_chat", guarded)
+                ws.client_send({"type": "execution_mode_change",
+                                "execution_mode": "-p", "chat_id": chat_id})
+                await ws.expect({"type": "execution_mode_changed",
+                                 "execution_mode": "-p", "chat_id": chat_id})
+                # Awaited before the ack: the row already holds the mode.
+                assert temp_db.get_chat(chat_id)["execution_mode"] == "-p"
+        run_ws_scenario(scenario)
+
     def test_a_frame_naming_its_chat_is_persisted(self, temp_db, monkeypatch):
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
@@ -66,15 +95,16 @@ class TestExecutionModeChange:
 
                 ws.client_send({"type": "execution_mode_change",
                                 "execution_mode": "-p", "chat_id": chat_id})
+                # The ack names its chat: the dashboard applies it to that chat only.
                 await ws.expect({"type": "execution_mode_changed",
-                                 "execution_mode": "-p"})
+                                 "execution_mode": "-p", "chat_id": chat_id})
                 await sync_dispatch(ws)
                 assert temp_db.get_chat(chat_id)["execution_mode"] == "-p"
 
                 ws.client_send({"type": "execution_mode_change",
                                 "execution_mode": "interactive", "chat_id": chat_id})
                 await ws.expect({"type": "execution_mode_changed",
-                                 "execution_mode": "interactive"})
+                                 "execution_mode": "interactive", "chat_id": chat_id})
                 await sync_dispatch(ws)
                 assert temp_db.get_chat(chat_id)["execution_mode"] == "interactive"
 

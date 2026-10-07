@@ -75,6 +75,9 @@ AGENT_NAME = os.environ.get("OTO_AGENT_NAME", "")
 # (core/sandbox/oto_env.py): a separate process cannot import the proxy and
 # carries no role vocabulary of its own.
 CAN_MANAGE = os.environ.get("OTO_CAN_MANAGE_AGENT", "") == "true"
+# The editor-tier question: the authoring check tool's audience (the
+# ``mcp-authoring`` skill it comes with is for the same tier).
+CAN_EDIT = os.environ.get("OTO_CAN_EDIT_AGENT", "") == "true"
 SCOPE = os.environ.get("OTO_SCOPE", "")
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -86,15 +89,18 @@ def _resolve_tool_set() -> set[str]:
 
     The matrix:
 
-    - ``scope=user`` × below the owner tier (a viewer, a contributor, an
-      editor) → empty (only the owner tier manages MCPs; the others
-      collaborate on the workspace).
-    - ``scope=user`` × a manager → read + request tools.
+    - ``scope=user`` × below the editor tier (a viewer, a contributor) →
+      empty (only the owner tier manages MCPs; the others collaborate on
+      the workspace).
+    - ``scope=user`` × an editor → ``validate_mcp_package`` alone (the
+      authoring check tool; a package is handed to an admin to install).
+    - ``scope=user`` × a manager → read + request tools, plus the check tool.
     - ``scope=user`` × an admin → the same set as a manager.
     - ``scope=agent`` (a Shared-only agent's chat, or a user-tied phone
       route on one) → read-only (no requests — agent-scope can't act on
-      behalf of a user). Task, trigger, meeting and external-caller
-      sessions never load this MCP (the manifest's ``exclude_from``).
+      behalf of a user; the check route needs a signed-in person). Task,
+      trigger, meeting and external-caller sessions never load this MCP
+      (the manifest's ``exclude_from``).
     """
     read = {"list_enabled_mcps", "list_available_mcps", "list_community_mcps",
             "list_community_skills"}
@@ -113,9 +119,13 @@ def _resolve_tool_set() -> set[str]:
         "get_request_status",
         "cancel_my_request",
     }
-    if SCOPE == "user" and CAN_MANAGE:
-        return manager
-    return set()
+    tools: set[str] = set()
+    if SCOPE == "user":
+        if CAN_MANAGE:
+            tools |= manager
+        if CAN_EDIT:
+            tools.add("validate_mcp_package")
+    return tools
 
 
 ENABLED_TOOLS = _resolve_tool_set()
@@ -480,6 +490,29 @@ _ALL_TOOLS: dict[str, Tool] = {
                 "request_id": {"type": "integer"},
             },
             "required": ["request_id"],
+        },
+    ),
+    "validate_mcp_package": Tool(
+        name="validate_mcp_package",
+        description=(
+            "Check an MCP package folder you authored (a manifest.json with "
+            "the files beside it) the way the admin installer will, without "
+            "installing it: the refused content, the manifest's fields, the "
+            "skill and compose files, the catalog's conventions. Read the "
+            "skill `mcp-authoring` first. Pass the folder's path inside your "
+            "workspace (e.g. /workspace/my-mcp). Fix every error and validate "
+            "again; then zip the folder and hand the zip to an admin, who "
+            "installs it from Admin → MCP Servers → Install."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The package folder, a workspace path.",
+                },
+            },
+            "required": ["path"],
         },
     ),
 }
@@ -939,6 +972,45 @@ async def _handle_cancel_request(args: dict) -> str:
     return f"✅ Request #{rid} cancelled."
 
 
+async def _handle_validate_package(args: dict) -> str:
+    path = str(args.get("path") or "").strip()
+    if not path:
+        return "❌ Error: path is required"
+    try:
+        result = await _post("/v1/mcps/local-package/validate", {"path": path})
+    except _ApiError as exc:
+        return f"❌ Error: {exc}"
+    if not isinstance(result, dict):
+        return "❌ Error: unexpected response from validate"
+    errors = [str(e) for e in (result.get("errors") or [])]
+    warnings = [str(w) for w in (result.get("warnings") or [])]
+    summary = result.get("summary") or {}
+    lines: list[str] = []
+    if not result.get("ok"):
+        lines.append("❌ Package is not valid yet:")
+        lines.extend(f"- {e}" for e in errors or ["unknown validation error"])
+        if warnings:
+            lines.append("\nWarnings (the catalog's conventions):")
+            lines.extend(f"- {w}" for w in warnings)
+        lines.append("\nFix these and validate again.")
+        return "\n".join(lines)
+    name = summary.get("name") or "(unnamed)"
+    runtime = summary.get("runtime") or ""
+    source = summary.get("source") or ""
+    lines.append(f"✅ Package `{name}` is valid ({runtime}{', ' if runtime and source else ''}{source}).")
+    if summary.get("skills"):
+        lines.append(f"Skills: {', '.join(summary['skills'])}")
+    if warnings:
+        lines.append("\nWarnings (the catalog's conventions, worth fixing before a catalog entry):")
+        lines.extend(f"- {w}" for w in warnings)
+    lines.append(
+        "\nNext: zip the folder (manifest.json at the zip root or one folder "
+        "down; no node_modules, venv, .git or .env) and hand the zip to an "
+        "admin, who installs it from Admin → MCP Servers → Install."
+    )
+    return "\n".join(lines)
+
+
 _DISPATCH = {
     "list_enabled_mcps": _handle_list_enabled_mcps,
     "list_available_mcps": _handle_list_available_mcps,
@@ -950,6 +1022,7 @@ _DISPATCH = {
     "disable_mcp_for_agent": _handle_disable_mcp,
     "get_request_status": _handle_get_request_status,
     "cancel_my_request": _handle_cancel_request,
+    "validate_mcp_package": _handle_validate_package,
 }
 
 

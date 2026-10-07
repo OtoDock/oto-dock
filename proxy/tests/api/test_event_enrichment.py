@@ -54,8 +54,12 @@ def _event(actor_id: str = "U123") -> NormalizedEvent:
     )
 
 
-def _run(event, *, block, monkeypatch, responder, token="xoxp-tok"):
+def _run(event, *, block, monkeypatch, responder, token="xoxp-tok", check=None):
     monkeypatch.setattr(event_enrichment, "_cache", {})
+
+    async def _public(url):  # the host check has its own tests (vendor_http)
+        return None
+    monkeypatch.setattr(event_enrichment.vendor_http, "check_url", check or _public)
     monkeypatch.setattr(
         "services.webhooks.subscription_manager._resolve_token_or_raise",
         lambda **kw: token() if callable(token) else token,
@@ -150,6 +154,10 @@ def test_enrichment_cache_hit_avoids_second_call(monkeypatch):
         })
 
     monkeypatch.setattr(event_enrichment, "_cache", {})
+
+    async def _public(url):
+        return None
+    monkeypatch.setattr(event_enrichment.vendor_http, "check_url", _public)
     monkeypatch.setattr(
         "services.webhooks.subscription_manager._resolve_token_or_raise",
         lambda **kw: "xoxp-tok")
@@ -172,3 +180,30 @@ def test_enrichment_no_block_is_noop(monkeypatch):
     ev = _event()
     asyncio.run(event_enrichment.enrich_event(ev, row=_ROW, webhooks_block={}))
     assert "name" not in ev.actor
+
+
+def test_a_lookup_to_a_refused_host_is_skipped(monkeypatch):
+    """F62: a lookup URL the host check refuses is never fetched, and the
+    event goes on unenriched."""
+    from services.webhooks import vendor_http
+    calls: list[httpx.Request] = []
+
+    async def _refuse(url):
+        raise vendor_http.VendorURLRefused("private address")
+
+    ev = _event()
+    _run(ev, block=_block(), monkeypatch=monkeypatch,
+         responder=lambda r: calls.append(r) or httpx.Response(200, json={}),
+         check=_refuse)
+    assert calls == [] and "name" not in ev.actor
+
+
+def test_the_event_value_is_encoded_into_the_url(monkeypatch):
+    seen: list[str] = []
+
+    async def _check(url):
+        seen.append(url)
+
+    _run(_event("U1&channel=x#y"), block=_block(), monkeypatch=monkeypatch,
+         responder=lambda r: httpx.Response(200, json={}), check=_check)
+    assert seen == ["https://slack.test/api/users.info?user=U1%26channel%3Dx%23y"]

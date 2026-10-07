@@ -114,13 +114,102 @@ async def test_stale_entry_read_from_a_worker_thread_refreshes_there(temp_db, mo
     assert not nm._audience_tasks
 
 
+async def test_an_invalidation_during_a_worker_refresh_keeps_the_entry_stale(monkeypatch):
+    """A refresh on a worker thread takes the entry's generation before its
+    store read: an invalidation that lands while the read runs keeps the
+    entry stale, so the list read before it is never served as fresh."""
+    nm.reset_audience_cache()
+    members = {"now": ["a"]}
+    during: list = []
+
+    def getter(agent):
+        out = list(members["now"])
+        for step in during:
+            step()
+        return out
+    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", getter)
+    assert await asyncio.to_thread(nm.agent_audience, "x") == ["a"]
+
+    def add_b():  # an attach route, mid-read: the read answered before it
+        members["now"] = ["a", "b"]
+        nm.invalidate_audience("x")
+    monkeypatch.setattr(nm, "_AUDIENCE_TTL_S", 0.0)
+    during.append(add_b)
+    await asyncio.to_thread(nm.agent_audience, "x")
+    during.clear()
+    assert nm._audience["x"].stale
+    monkeypatch.setattr(nm, "_AUDIENCE_TTL_S", 30.0)
+    assert await asyncio.to_thread(nm.agent_audience, "x") == ["a", "b"]
+
+
+async def test_the_first_fan_out_read_on_the_loop_reads_off_the_loop(temp_db, loop_db_guard, monkeypatch):
+    """An agent with no entry yet (created after the boot warm-up): its first
+    turn-edge fan-out on the loop answers at once with nobody and fills the
+    entry in one ``run_db`` job; the next edge reaches the agent's audience."""
+    import threading
+
+    agent = _agent_with("user-viewer")
+    nm.reset_audience_cache()
+    real = nm.notification_store.get_agent_user_subs
+    readers: list[int] = []
+
+    def recording(a):
+        readers.append(threading.get_ident())
+        return real(a)
+    monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", recording)
+    with loop_db_guard.active():
+        first = nm.chat_status_targets(f"agent::{agent}", agent)
+    assert threading.get_ident() not in readers, "store read on the loop"
+    assert first == [] and nm._audience_tasks
+    await _settle()
+    with loop_db_guard.active():
+        assert set(nm.chat_status_targets(f"agent::{agent}", agent)) == {ADMIN, "user-viewer"}
+
+
+async def test_a_new_agents_first_invalidation_fills_its_entry(temp_db, loop_db_guard):
+    """Agent creation and a community install invalidate the new agent on
+    the loop before any chat exists: with no entry to mark, that fills one
+    in a ``run_db`` job, so the agent's first turn edge finds its audience."""
+    agent = _agent_with("user-viewer")
+    nm.reset_audience_cache()
+    with loop_db_guard.active():
+        nm.invalidate_audience(agent)
+    await _settle()
+    with loop_db_guard.active():
+        assert set(nm.chat_status_targets(f"agent::{agent}", agent)) == {ADMIN, "user-viewer"}
+
+
+async def test_an_authorization_read_never_answers_from_a_placeholder(temp_db):
+    """The trigger notify-reach check decides a refusal: right after a
+    fan-out found no entry on the loop, it still sees the agent's members
+    (the placeholder serves fan-outs only)."""
+    from core.session import visibility as _vis
+    from services.scheduler import trigger_manager as tm
+
+    agent = _agent_with("user-viewer")
+    nm.reset_audience_cache()
+    nm.chat_status_targets(f"agent::{agent}", agent)
+    tm._check_notify_reach(agent=agent, created_by="user-alice", target_scope=_vis.SCOPE_USER,
+                           target="user-viewer", caller_is_admin=False)
+    await _settle()
+
+
 async def test_a_failed_cold_read_caches_nothing_and_the_getter_is_pinned(temp_db, monkeypatch):
     nm.reset_audience_cache()
 
     def boom(agent):
         raise RuntimeError("db down")
     monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", boom)
+    assert await asyncio.to_thread(nm.chat_status_targets, "agent::x", "x") == []
+    assert "x" not in nm._audience
+    # On the loop the fan-out's miss answers nobody; the failed fill leaves
+    # only the placeholder, which the next read tries again.
     assert nm.chat_status_targets("agent::x", "x") == []
+    await _settle()
+    entry = nm._audience["x"]
+    assert entry.placeholder and entry.stale and not entry.refreshing
+    with pytest.raises(RuntimeError, match="db down"):
+        nm.agent_audience("x")
     assert "x" not in nm._audience
     # A test-style replacement of the getter misses the cache (the entry
     # remembers which function filled it).

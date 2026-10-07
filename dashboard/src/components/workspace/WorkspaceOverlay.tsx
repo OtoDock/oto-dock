@@ -10,6 +10,7 @@ import {
   useCopyAgentPaths,
   useZipAgentPaths,
   useRecoverBin,
+  batchFailureMessage,
   type FileNode,
 } from '../../api/agents'
 import { useAuth } from '../../contexts/AuthContext'
@@ -35,7 +36,7 @@ import InlineRename from './InlineRename'
 import SelectionModeBar from './SelectionModeBar'
 import ClipboardIndicator from './ClipboardIndicator'
 import { buildSections, listChildren, type ScopeKey, type WorkspaceSection } from './sections'
-import { onFileUpdate } from '../../lib/fileUpdates'
+import { useFileUpdateBurst } from '../../hooks/useFileUpdateBurst'
 import { buildActions as buildActionsImpl, buildEmptyActions as buildEmptyActionsImpl } from './fileMenuActions'
 import { useWorkspaceKeyboardShortcuts } from './useWorkspaceKeyboardShortcuts'
 
@@ -109,6 +110,7 @@ const IS_DESKTOP = typeof window === 'undefined' ? true : !window.matchMedia('(h
  * via `useWorkspaceState`; this component just routes user input through
  * the supplied action callbacks.
  */
+
 export default function WorkspaceOverlay({
   agent,
   canManage,
@@ -141,13 +143,12 @@ export default function WorkspaceOverlay({
   // (a Collabora save or an agent/disk write), refresh the file tree so
   // new/edited files appear. Any open Collabora preview reloads independently
   // via useCollaboraLiveReload. Safe + non-destructive — just a refetch.
-  useEffect(() => {
-    return onFileUpdate((u) => {
-      if (u.agent_slug === agent) {
-        qc.invalidateQueries({ queryKey: ['agent-files', agent] })
-      }
-    })
+  // Once per burst: a sync of many files arrives as one frame per file and
+  // the tree is walked once for them.
+  const refetchTree = useCallback(() => {
+    qc.invalidateQueries({ queryKey: ['agent-files', agent] })
   }, [agent, qc])
+  useFileUpdateBurst(agent, refetchTree)
 
   const allSections = useMemo(
     () => buildSections(tree, canManage, effectiveCanEdit, user?.username),
@@ -460,16 +461,17 @@ export default function WorkspaceOverlay({
       )
       if (valid.length === 0) return
       try {
-        await movePaths.mutateAsync({ agent, srcPaths: valid, destDir: destPath })
+        const res = await movePaths.mutateAsync({ agent, srcPaths: valid, destDir: destPath })
         actions.clearSelection()
         // Any of the moved paths that were also sitting in the clipboard
         // (e.g. the user cut them and then dragged them in the same gesture)
         // would 404 on a subsequent Ctrl+V. Drop them from the clipboard so
         // the user never sees a paste fail because of a now-missing source.
         actions.dropFromClipboard(valid)
+        const left = batchFailureMessage('moved', res.failed)
+        if (left) alert(left)
       } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error('move-drop failed', e)
+        alert(e instanceof Error ? e.message : 'The move failed')
       }
     },
     [movePaths, agent, actions],
@@ -482,13 +484,19 @@ export default function WorkspaceOverlay({
       if (!actions.clipboard) return
       const { mode, paths } = actions.clipboard
       try {
+        let left = ''
         if (mode === 'cut') {
-          await movePaths.mutateAsync({ agent, srcPaths: paths, destDir })
+          const res = await movePaths.mutateAsync({ agent, srcPaths: paths, destDir })
           actions.clearClipboard()
+          left = batchFailureMessage('moved', res.failed)
         } else {
-          await copyPaths.mutateAsync({ agent, srcPaths: paths, destDir })
+          const res = await copyPaths.mutateAsync({ agent, srcPaths: paths, destDir })
+          left = batchFailureMessage('copied', res.failed)
         }
         actions.clearSelection()
+        // A path the server refused (the copy caps among the reasons) is
+        // named, else the paste looks done with nothing landed.
+        if (left) alert(left)
       } catch (e) {
         // On a cut-mode failure the sources are almost certainly already
         // moved by a prior drag (the common cause is exactly that: user
@@ -497,8 +505,7 @@ export default function WorkspaceOverlay({
         // keep failing. Copy-mode failures keep the clipboard so the user
         // can retry against a different destination.
         if (mode === 'cut') actions.clearClipboard()
-        // eslint-disable-next-line no-console
-        console.error('paste failed', e)
+        alert(e instanceof Error ? e.message : 'The paste failed')
       }
     },
     [actions, movePaths, copyPaths, agent],
@@ -728,7 +735,7 @@ export default function WorkspaceOverlay({
                   }
                 }}
                 placeholder={`Search ${activeSection.label}…`}
-                className="flex-1 min-w-0 px-2 py-1 text-xs rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light focus:outline-none focus:border-brand/60"
+                className="flex-1 min-w-0 px-2 py-1 text-xs pointer-coarse:text-base rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light focus:outline-none focus:border-brand/60"
               />
               {searchQuery && (
                 <button

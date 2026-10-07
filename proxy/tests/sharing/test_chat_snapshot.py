@@ -198,14 +198,21 @@ def test_grantee_reads_the_snapshot_and_its_copies_after_the_chat_changed():
     ui = client.get(f"/v1/shares/{share_id}/ui/tok-ui-1")
     assert ui.status_code == 200 and "chart" in ui.text
     assert "sandbox allow-scripts" in ui.headers["content-security-policy"]
+    # Nobody signed in: the frame's own sign-in page, never a JSON refusal.
+    app.dependency_overrides.pop(get_current_user, None)
+    anon = client.get(f"/v1/shares/{share_id}/ui/tok-ui-1")
+    assert anon.status_code == 401 and anon.headers["content-type"].startswith("text/html")
+    assert "Sign in to OtoDock" in anon.text
+    _as(_user(OTHER, agents=(), agent_roles={}))
     img = client.get(f"/v1/shares/{share_id}/media/img-1")
     assert img.status_code == 200 and img.headers["content-type"].startswith("image/png")
     pdf = client.get(f"/v1/shares/{share_id}/media/tok-file-1")
     assert pdf.status_code == 200
     assert client.get(f"/v1/shares/{share_id}/media/nope").status_code == 404
-    # "Shared with me" names the page.
-    mine = client.get("/v1/shares/mine").json()["shares"]
-    assert mine[0]["href"] == f"/shared/{share_id}" and mine[0]["target_kind"] == "chat"
+    # The section names the page; a chat needs no decision.
+    items = client.get("/v1/shares/inbox").json()["items"]
+    assert [(i["href"], i["kind"], i["actions"]) for i in items] == \
+        [(f"/shared/{share_id}", "chat", ["open", "hide"])]
     # A stranger gets the same 404 as a missing share; a revoke closes it.
     _as(_user(EDITOR, agent_roles={AGENT: "editor"}))
     assert client.get(f"/v1/shares/{share_id}/snapshot").status_code == 404
@@ -240,6 +247,32 @@ def test_chat_delete_removes_the_copies_and_the_reaper_sweeps_the_rest():
     assert stats["share_snapshots_deleted"] == 2
     assert not orphan.exists()
     assert not (config.AGENTS_DIR / share2["snapshot_ref"]).exists()
+
+
+def test_the_daily_sweep_removes_a_revoked_chat_share_s_copy_then_its_row():
+    """Thirty days after a revoke the sweep removes the copy (its own pass,
+    which finds the folder through the row) and then the row."""
+    from datetime import datetime, timedelta, timezone
+    from services.infra import retention
+    from services.infra.retention import LiveSnapshot
+    from storage.pg import get_conn
+    chat_id = _chat()
+    share = share_store.get_share(_share(chat_id)["share"]["id"])
+    root = config.AGENTS_DIR / share["snapshot_ref"]
+    assert root.is_dir()
+    share_store.revoke_share(share["id"])
+    old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    with get_conn() as conn:
+        conn.execute("UPDATE shares SET revoked_at=%s WHERE id=%s", (old, share["id"]))
+        conn.commit()
+    from unittest.mock import patch
+    from services.sharing import chat_snapshot
+    # The orphan sweep would take the copy in either order: with it off,
+    # only the revoked-row path, which needs the row, can remove it.
+    with patch.object(chat_snapshot, "sweep_orphans", return_value=0):
+        stats = retention._run_sweep_sync(30, False, LiveSnapshot(), False)
+    assert stats["share_snapshots_deleted"] >= 1 and stats["shares_deleted"] == 1
+    assert not root.exists() and share_store.get_share(share["id"]) is None
 
 
 def test_chat_link_serves_the_snapshot_outside():

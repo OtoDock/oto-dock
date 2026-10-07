@@ -271,7 +271,12 @@ async def test_the_boot_reconcile_moves_orphaned_rows_to_the_owner_and_skips_unk
     _task("quinn-a", A, quinn)
     _task("api-a", A, "api")
     _task("slug-a", A, "tr-b")
-    _task("gone-a", A, "local:never-existed")
+    # Deleted before retired_usernames existed: a local subject no user row
+    # carries any more moves like a retired one; an unknown IdP subject is
+    # named in the notice and left in place.
+    _task("gone-a", A, "local:0f6c2a1e-3b4d-4c5e-8f90-1a2b3c4d5e6f")
+    _task("idp-a", A, "00u1abcdEFGHijkl2345")
+    _task("key-a", A, "api-key")
     # Pat: demoted on A without an event (a lost one), deleted from nothing.
     db.set_user_agents(w.pat, [A, B], w.admin, agent_roles={A: "viewer", B: "editor"})
     # Rae: deleted without an event.
@@ -285,12 +290,17 @@ async def test_the_boot_reconcile_moves_orphaned_rows_to_the_owner_and_skips_unk
     by_id = {t["id"]: t for t in _rows("dynamic_tasks", "TRUE")}
     assert by_id["pat-a"]["created_by"] == w.owner and by_id["pat-a"]["transferred_from"] == w.pat
     assert by_id["rae-b"]["created_by"] == w.owner and by_id["rae-b"]["transferred_from"] == rae
+    gone = "local:0f6c2a1e-3b4d-4c5e-8f90-1a2b3c4d5e6f"
+    assert by_id["gone-a"]["created_by"] == w.owner and by_id["gone-a"]["transferred_from"] == gone
     for untouched, creator in (("pat-b", w.pat), ("quinn-a", quinn), ("api-a", "api"),
-                               ("slug-a", "tr-b"), ("gone-a", "local:never-existed")):
+                               ("slug-a", "tr-b"), ("idp-a", "00u1abcdEFGHijkl2345"),
+                               ("key-a", "api-key")):
         assert by_id[untouched]["created_by"] == creator and not by_id[untouched]["transferred_from"]
     assert _rows("triggers", "slug='pat-hook'")[0]["created_by"] == w.owner
     [note] = w.fired
     assert note["target"] == w.owner and "pat-a" in note["body"] and "rae-b" in note["body"]
+    assert "gone-a" in note["body"] and "00u1abcdEFGHijkl2345" in note["body"]
+    assert "api-key" not in note["body"] and "(tr-b" not in note["body"]
     assert "They minted" not in note["body"]
     # A second boot finds nothing to do.
     assert await transfer.reconcile_at_boot() == {}
@@ -509,11 +519,15 @@ def test_a_transferred_run_keeps_the_prompts_author(world):
 
 @pytest.fixture
 def as_user(world, monkeypatch):
+    from api.events import triggers as triggers_api
+    from api.notifications import notifications as notifications_api
     from api.tasks import tasks as tasks_api
     from services.scheduler import scheduler
     monkeypatch.setattr(scheduler, "_register_task", lambda task: None)
     app = FastAPI()
     app.include_router(tasks_api.router)
+    app.include_router(triggers_api.router)
+    app.include_router(notifications_api.router)
     current = {}
 
     async def _current_user():
@@ -584,3 +598,87 @@ async def test_register_subscribes_after_the_closer_and_the_lifespan_calls_it(wo
              and isinstance(n.func, ast.Attribute) and n.func.attr == "register"
              and isinstance(n.func.value, ast.Name) and n.func.value.id == "offboarding_transfer"]
     assert calls, "startup.py must register the offboarding transfer"
+
+
+def test_the_rows_name_who_they_were_transferred_from(world, as_user):
+    """Task, trigger and notification rows moved at offboarding carry the
+    first creator and the time, and the name to show: a live person's
+    display name, a deleted person's retired username."""
+    w = world
+    _task("sched-x", A, w.pat)
+    _task("trig-x", A, w.pat, task_type="trigger")
+    _trigger("hook-x", A, w.pat, task_id="trig-x")
+    _notification(A, w.pat)
+    db.set_user_agents(w.pat, [A], w.admin, agent_roles={A: "viewer"})
+    assert db.transfer_agent_scope_automations(A, w.pat, w.admin, list(transfer.KINDS))
+    client = as_user(w.admin, "admin", {})
+
+    def _views():
+        tasks = {t["id"]: t for t in client.get(f"/v1/tasks?agent={A}").json()["tasks"]}
+        trig = next(t for t in client.get(f"/v1/triggers?agent={A}").json()["triggers"]
+                    if t["slug"] == "hook-x")
+        notes = client.get(f"/v1/notifications?view=definitions&agent={A}").json()
+        note = next(n for n in (notes.get("notifications") or notes) if n.get("created_by") == w.admin
+                    and n.get("transferred_from") == w.pat)
+        return tasks["sched-x"], client.get("/v1/tasks/sched-x").json(), trig, note
+
+    for row in _views():
+        assert row["transferred_from"] == w.pat and row["transferred_at"]
+        assert row["transferred_from_name"] == "Pat"
+    # Deleted: the retired username names them.
+    assert db.delete_user(w.pat)
+    for row in _views():
+        assert row["transferred_from_name"] == w.pat_name
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_creator_alone_is_named_once_and_moves_nothing(world):
+    """A creator the install cannot place (an IdP subject with no user row)
+    is listed for the owner to review; nothing moves, and a second boot says
+    it again only in its own notice."""
+    w = world
+    _task("idp-only", A, "00u9zzzzYYYYxxxx0000")
+    moved = await transfer.reconcile_at_boot()
+    await _settle()
+    assert moved == {}
+    assert _rows("dynamic_tasks", "id='idp-only'")[0]["created_by"] == "00u9zzzzYYYYxxxx0000"
+    [note] = w.fired
+    assert note["target"] == w.owner and note["title"] == "Automations to review"
+    assert "00u9zzzzYYYYxxxx0000" in note["body"] and A in note["body"]
+    # Named once: the next boot is silent about it.
+    assert await transfer.reconcile_at_boot() == {}
+    await _settle()
+    assert len(w.fired) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_departed_persons_stored_wakes_go_with_their_standing(world):
+    """A wake stored for the person (or scheduled by them) on an agent they
+    lost is dropped; one on a Shared-only agent goes when they fall below
+    the editor tier; everyone else's wakes and their wakes elsewhere stay."""
+    w = world
+    agent_store.create_agent("tr-so", "SO", collaborative=False, default_scope="agent")
+    db.set_user_agents(w.pat, [A, B, "tr-so"], w.admin,
+                       agent_roles={A: "editor", B: "editor", "tr-so": "editor"})
+    for chat, agent in (("w-a", A), ("w-b", B), ("w-so", "tr-so")):
+        db.create_chat(chat, f"agent::{agent}", agent)
+        db.append_pending_delegate_wake(chat, "pat's", person=w.pat, role="editor")
+        db.append_pending_delegate_wake(chat, "admin's", person=w.admin, role="admin")
+    db.append_pending_delegate_wake("w-a", "scheduled by pat", role="editor", by=w.pat)
+    # Pat leaves A, falls to contributor on the Shared-only agent, keeps B.
+    db.set_user_agents(w.pat, [B, "tr-so"], w.admin,
+                       agent_roles={B: "editor", "tr-so": "contributor"})
+    await transfer.reconcile_person(w.pat, actor=w.admin, reason=offboarding.REMOVED)
+    assert db.claim_pending_delegate_wake("w-a") == ["admin's"]
+    assert db.claim_pending_delegate_wake("w-so") == ["admin's"]
+    assert db.claim_pending_delegate_wake("w-b") == ["pat's", "admin's"]
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_drops_every_stored_wake_of_the_person(world):
+    w = world
+    db.create_chat("w-del", f"agent::{B}", B)
+    db.append_pending_delegate_wake("w-del", "pat's", person=w.pat, role="editor")
+    assert db.delete_user(w.pat)
+    await transfer.reconcile_person(w.pat, actor=w.admin, reason=offboarding.DELETED)
+    assert db.claim_pending_delegate_wake("w-del") == []

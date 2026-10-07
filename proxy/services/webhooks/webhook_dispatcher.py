@@ -35,6 +35,7 @@ import json
 import logging
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from auth import webhook_providers
@@ -164,6 +165,51 @@ def reset_caches() -> None:
 # Public entry-point
 # ---------------------------------------------------------------------------
 
+@dataclass
+class ReceiveContext:
+    """A subscription that may receive, with what its first step loaded."""
+
+    row: dict
+    manifest: Any
+    signing_secret: str
+
+    @property
+    def webhooks_block(self) -> dict:
+        creds = self.manifest.credentials if self.manifest is not None else None
+        return (creds.webhooks or {}) if creds else {}
+
+
+def _receive_refusal(row: dict | None, provider_id: str):
+    if not row:
+        return (404, {"error": "subscription not found"}, _JSON_CT)
+    if row.get("provider_id") != provider_id:
+        return (404, {"error": "provider mismatch"}, _JSON_CT)
+    if row.get("status") == webhook_subscription_store.DISABLED:
+        return (410, {"error": "subscription disabled"}, _JSON_CT)
+    if row.get("status") not in webhook_subscription_store.RECEIVING:
+        return (410, {"error": f"subscription status={row.get('status')!r}"}, _JSON_CT)
+    return None
+
+
+async def load_receive_context(
+    provider_id: str, subscription_id: str,
+) -> tuple[ReceiveContext | None, tuple | None]:
+    """Step 1 of a receive, run before the body is read so the route can
+    pick its cap from it: the row, its manifest and signing secret in one
+    executor job behind the pre-auth gate. Returns the context, or the
+    early answer (busy, unknown, disabled) instead."""
+    try:
+        async with _preauth_slot():
+            row, manifest, signing_secret = await run_db(
+                _load_receive_context, subscription_id)
+    except _Busy:
+        return None, _BUSY
+    refusal = _receive_refusal(row, provider_id)
+    if refusal is not None:
+        return None, refusal
+    return ReceiveContext(row, manifest, signing_secret), None
+
+
 async def dispatch_webhook(
     *,
     provider_id: str,
@@ -172,6 +218,7 @@ async def dispatch_webhook(
     headers: dict[str, str],
     query_params: dict[str, str],
     http_method: str = "POST",
+    context: ReceiveContext | None = None,
 ) -> tuple[int, dict | str, dict[str, str]]:
     """End-to-end webhook receive.
 
@@ -185,22 +232,13 @@ async def dispatch_webhook(
     don't want trigger-fire errors to cause infinite retries). Answers 503
     with ``Retry-After`` when the pre-auth gate is saturated.
     """
-    # 1. Load subscription row, manifest and signing secret: one executor job.
-    try:
-        async with _preauth_slot():
-            row, manifest, signing_secret = await run_db(
-                _load_receive_context, subscription_id)
-    except _Busy:
-        return _BUSY
-    if not row:
-        return (404, {"error": "subscription not found"}, {"content-type": "application/json"})
-    if row.get("provider_id") != provider_id:
-        return (404, {"error": "provider mismatch"}, {"content-type": "application/json"})
-    if row.get("status") == webhook_subscription_store.DISABLED:
-        return (410, {"error": "subscription disabled"}, {"content-type": "application/json"})
-    if row.get("status") not in webhook_subscription_store.RECEIVING:
-        return (410, {"error": f"subscription status={row.get('status')!r}"},
-                {"content-type": "application/json"})
+    # 1. Load subscription row, manifest and signing secret: one executor
+    # job (the receive route has usually loaded it before the body).
+    if context is None:
+        context, refusal = await load_receive_context(provider_id, subscription_id)
+        if refusal is not None:
+            return refusal
+    row, manifest, signing_secret = context.row, context.manifest, context.signing_secret
 
     # 2. Resolve manifest + provider implementation.
     if manifest is None:
@@ -270,7 +308,7 @@ async def dispatch_webhook(
         return (401, {"error": "signature verification failed", "reason": verify.reason},
                 {"content-type": "application/json"})
     if parsed_body is None:
-        parsed_body = _safe_parse_json(raw_body)
+        parsed_body = await _parse_body(raw_body)
 
     # 5-8. Normalize → canonicalize → gate → dedup → match → fire → aggregate.
     # Shared with the relay-forwarded ingest (which verifies the relay's
@@ -344,7 +382,7 @@ async def dispatch_relay_webhook(
         return (401, {"error": "forward signature verification failed",
                       "reason": verify.reason}, json_ct)
 
-    parsed_body = _safe_parse_json(raw_body)
+    parsed_body = await _parse_body(raw_body)
     workspace_id = walk_path(
         body=parsed_body, headers=headers_lc, path=workspace_id_path,
     )
@@ -576,6 +614,8 @@ async def _process_subscription_events(
 # An HMAC over a body this large is worth a thread hop; below it the hop
 # costs more loop time than the digest (the receive caps bound the body).
 _VERIFY_OFF_LOOP_BYTES = 256 * 1024
+# A body this large is parsed in a worker thread (a 25 MB delivery).
+_PARSE_OFF_LOOP_BYTES = 1024 * 1024
 
 
 async def _verified(provider, *, raw_body: bytes, **kw):
@@ -584,6 +624,13 @@ async def _verified(provider, *, raw_body: bytes, **kw):
     if len(raw_body) > _VERIFY_OFF_LOOP_BYTES:
         return await asyncio.to_thread(provider.verify_signature, raw_body=raw_body, **kw)
     return provider.verify_signature(raw_body=raw_body, **kw)
+
+
+async def _parse_body(raw: bytes) -> Any:
+    """``_safe_parse_json``, in a worker thread for a large body."""
+    if len(raw) > _PARSE_OFF_LOOP_BYTES:
+        return await asyncio.to_thread(_safe_parse_json, raw)
+    return _safe_parse_json(raw)
 
 
 def _safe_parse_json(raw: bytes) -> Any:
@@ -614,8 +661,19 @@ def _load_receive_context(subscription_id: str) -> tuple[dict | None, Any, str]:
     return row, manifest, secret
 
 
+async def note_body_refusal(row: dict, cap: int) -> None:
+    """A delivery over its cap, shown on the subscription like a refused
+    signature (the vendor rarely retries one)."""
+    await _note_refusal(row, f"body over {cap // (1024 * 1024)} MB refused")
+
+
 async def _note_signature_failure(row: dict, reason: str) -> None:
-    """Count a refused signature; write the row's ``last_error`` at most once
+    await _note_refusal(row, f"signature: {reason}")
+
+
+async def _note_refusal(row: dict, what: str) -> None:
+    """Count a refused delivery (a signature, a body over its cap); write
+    the row's ``last_error`` at most once
     per ``_SIGNATURE_NOTE_INTERVAL_S`` per subscription, with the refusals
     since the previous note. A row still ``creating`` takes no note (its
     first deliveries may arrive before the vendor confirms)."""
@@ -634,9 +692,9 @@ async def _note_signature_failure(row: dict, reason: str) -> None:
     _signature_failures[sid] = (0, now)
     try:
         await run_db(webhook_subscription_store.note_last_error,
-                     sid, f"signature: {reason} ({count} refused)")
+                     sid, f"{what} ({count} refused)")
     except Exception:
-        logger.warning("signature note failed for sub=%s", sid, exc_info=True)
+        logger.warning("refusal note failed for sub=%s", sid, exc_info=True)
 
 
 def _read_forward_secret() -> str:

@@ -50,12 +50,11 @@ you and ask you to — normally **they** type credentials in the real window.
 ## What you can reach (origin limits)
 
 - Navigation is limited to ordinary web origins. A per-agent **allow-list** may
-  restrict you to specific sites; by default any normal site is reachable except
-  the machine's own **loopback** services (`localhost` / `127.0.0.1`), which are
-  blocked. A loopback origin the admin explicitly put on the agent's
-  allow-list (e.g. a local dev install at `http://localhost:8400`) IS
-  reachable — if a `localhost` URL you need is blocked, ask the admin to
-  allow-list it (or use the machine's LAN IP instead).
+  restrict you to specific sites; without one you reach what this machine
+  reaches, its own local services (`localhost`) included. When a site you need
+  is refused, ask the admin to add it to the agent's allowed origins.
+- The capture studio (`studio_goto`) applies the same origin limits as the
+  everyday tools, and takes `http(s)` URLs only.
 - Do **not** try to open browser-internal pages such as `chrome://settings`,
   `chrome://settings/passwords`, `edge://`, `about:`, `view-source:` or `file://`
   URLs. They are not part of any task here, and reading saved passwords / local
@@ -108,7 +107,10 @@ page the user was already on. What changes:
   Allow in their browser — tell them exactly that (install from the Chrome
   Web Store; regenerate the token on the extension's page and save it in the
   machine settings; click Allow). Unattended sessions (scheduled tasks, calls,
-  meetings) need the saved token; without it they cannot use the browser.
+  meetings) can use it only when a token is saved and the machine's owner (an
+  admin, for a platform machine) ticked "Also let unattended runs (scheduled
+  tasks, triggers, calls, meetings) use this browser"; otherwise they cannot
+  use the browser.
 - **A "Welcome" tab in your group is the extension's own connect page** —
   you cannot see or drive it; ignore it and never try to close it.
 - `browser_close` disconnects your group; your tabs stay open in the user's

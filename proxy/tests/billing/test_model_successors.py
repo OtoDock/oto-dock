@@ -20,8 +20,11 @@ def test_successor_model_follows_the_chain_to_its_end():
     # Opus 4.8 → Opus 5 → Opus 5.5: the intermediate id is retired too.
     assert app_config.successor_model("claude-opus-4-8[1m]") == "claude-opus-5-5"
     assert app_config.successor_model("claude-opus-5") == "claude-opus-5-5"
-    assert app_config.successor_model("gpt-5.6-sol") == "gpt-6-sol"
+    # 5.6 Sol → GPT-6 Sol → GPT-6.1 Sol; Sonnet 5 → Sonnet 5.5.
+    assert app_config.successor_model("gpt-5.6-sol") == "gpt-6.1-sol"
+    assert app_config.successor_model("gpt-6-sol") == "gpt-6.1-sol"
     assert app_config.successor_model("gpt-5.6-luna") == "gpt-6-luna"
+    assert app_config.successor_model("claude-sonnet-5") == "claude-sonnet-5-5"
     # A current id, a custom id and nothing pass through unchanged.
     assert app_config.successor_model("claude-opus-5-5") == "claude-opus-5-5"
     assert app_config.successor_model("my-custom") == "my-custom"
@@ -61,6 +64,18 @@ class TestBootWalk:
         assert _pin("walk-a") == "claude-opus-5-5"
         assert _pin("walk-b") == "claude-opus-5-5"
         assert remapped["claude-opus-5"] >= 1 and remapped["claude-opus-4-8[1m]"] >= 1
+
+    def test_the_walk_refreshes_the_agent_cache_it_wrote_under(self):
+        # The agents API answers from an in-process cache; the walk writes
+        # the rows with SQL. A boot that read the agents before the walk (the
+        # scheduler's reconcile does) kept serving the retired id, and the
+        # dashboard seeded new chats from the first offered model instead
+        # (seen on T1 at the 1.7.1 bump: Fable 5.1 for a Sonnet default).
+        agent_store.create_agent("walk-e", "Walk E", execution_path="claude-code-cli",
+                                 default_model="claude-opus-5")
+        assert (agent_store.get_agent("walk-e") or {}).get("default_model") == "claude-opus-5"  # cached
+        subscription_store.remap_retired_models({"claude-opus-5": "claude-opus-5-5"})
+        assert (agent_store.get_agent("walk-e") or {}).get("default_model") == "claude-opus-5-5"
 
     def test_a_retired_id_an_admin_re_added_keeps_its_pins(self):
         subscription_store.add_model("claude-code-cli", "claude-opus-5", "Opus 5 (kept)",

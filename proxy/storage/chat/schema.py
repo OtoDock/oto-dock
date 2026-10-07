@@ -53,7 +53,9 @@ def init_chats(conn) -> None:
             pending_history_seed TEXT NOT NULL DEFAULT '',
             -- non-empty = delegate-result wakes that could not be delivered
             -- (every ladder rung failed — e.g. dead interactive parent whose
-            -- resume also failed). JSON array of rendered wake prompts,
+            -- resume also failed). JSON array of {"prompt", "person", "role",
+            -- "by"} (the person and role the delivery ran as, "" for no
+            -- person; "by" the creator whose role a no-person wake runs at),
             -- claimed atomically at the chat's next warmup/turn and injected
             -- so the orchestrator continues.
             pending_delegate_wake TEXT NOT NULL DEFAULT '',
@@ -97,7 +99,9 @@ def init_chats(conn) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_sub)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_agent ON chats(agent)")
+    # No single-column agent index: idx_chats_agent_updated below serves the
+    # agent lookups by its prefix, and one index fewer keeps a chats UPDATE
+    # cheaper (run_migrations drops the old one on an existing database).
     # The newest chats of an agent (the chat and task lists stop at their
     # limit instead of sorting every chat), a session's chat (every hook with
     # chat side effects), the project and worker lookups polled every 10 s,
@@ -185,6 +189,31 @@ def init_chats(conn) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_media_tokens_chat ON media_tokens(chat_id)")
+
+    # A message typed while the chat's turn runs, waiting for the next turn:
+    # one row per message while it waits, deleted when the turn accepts it
+    # (its chat_messages row then carries the queue_id). Keyed by the chat
+    # and the client-minted queue_id so a re-send after a reconnect is acked
+    # once. The chat's drop cascades. Created at every boot (IF NOT EXISTS),
+    # nothing to migrate: an older proxy never reads it.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_input_queue (
+            id SERIAL PRIMARY KEY,
+            chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            queue_id TEXT NOT NULL,
+            author_sub TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '',
+            cli_text TEXT NOT NULL DEFAULT '',
+            event_data TEXT NOT NULL DEFAULT '',
+            images TEXT NOT NULL DEFAULT '',
+            origin_conn TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE (chat_id, queue_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_input_queue_chat ON chat_input_queue (chat_id, id)"
+    )
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_plans (

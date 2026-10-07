@@ -20,7 +20,7 @@ services:
       - "host.docker.internal:host-gateway"
 
   collabora:
-    image: collabora/code:25.04.9.4.1
+    image: collabora/code:25.04.10.3.1
     container_name: collabora-agent
     restart: always
     ports:
@@ -29,7 +29,9 @@ services:
       - aliasgroup1=${WOPI_BASE_URL:-http://host.docker.internal:8400}
       # Collabora's start script unquotes `${extra_params}` and passes each
       # space-separated token as a separate `coolwsd` arg, so each --o:KEY=VAL
-      # must be a single token (no spaces in the value). We pass two overrides:
+      # must be a single token (no spaces in the value). We pass ten:
+      # ssl.enable=false, server_name (the frame-ancestors host) and
+      # net.proxy_prefix=true, plus the seven below:
       #   --o:net.frame_ancestors=<host>   — single host that may embed the
       #     iframe. Auto-derived from DASHBOARD_PUBLIC_URL host by the proxy.
       #     Same-domain sub-path setups don't need this (browser auto-allows
@@ -44,7 +46,17 @@ services:
       #     DASHBOARD_PUBLIC_URL scheme (plain-http installs need false).
       #   --o:per_document.idle_timeout_secs=7200 — viewing a document sends no
       #     traffic; the stock 3600 unloads it mid-read and the preview dies.
-      - "extra_params=--o:ssl.enable=false --o:ssl.termination=${COLLABORA_SSL_TERMINATION:-true} --o:net.frame_ancestors=${COLLABORA_FRAME_ANCESTORS:-} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:server_name=${COLLABORA_FRAME_ANCESTORS:-} --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200"
+      #   --o:per_document.background_autosave=false and
+      #   --o:per_document.background_manualsave=false — a save runs in the
+      #     document's own process instead of a forked one: a forked save on
+      #     25.04.10.3.1 hung past its 120 s timeout and the edit was lost.
+      #     A save now holds the document for its duration.
+      #   --o:per_document.idlesave_duration_secs=10 — an edit is saved 10 s
+      #     after the last keystroke (the stock 30), beside the saves the
+      #     dashboard asks for: the agent reads the stored file. Each save
+      #     is the whole file pushed to every machine running a live
+      #     session of the agent.
+      - "extra_params=--o:ssl.enable=false --o:ssl.termination=${COLLABORA_SSL_TERMINATION:-true} --o:net.frame_ancestors=${COLLABORA_FRAME_ANCESTORS:-} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:server_name=${COLLABORA_FRAME_ANCESTORS:-} --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200 --o:per_document.background_autosave=false --o:per_document.background_manualsave=false --o:per_document.idlesave_duration_secs=10 --o:logging.level_startup=warning"
     # `host.docker.internal` resolves to the Linux host gateway so Collabora's
     # WOPI callbacks can reach the proxy when the proxy runs on the bare-metal
     # host (the bare-metal default — `WOPI_BASE_URL` auto-derives to

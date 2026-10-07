@@ -3,7 +3,7 @@
 
 def _index_exists(conn, index_name: str) -> bool:
     row = conn.execute(
-        "SELECT 1 FROM pg_indexes WHERE indexname = %s",
+        "SELECT 1 FROM pg_indexes WHERE indexname = %s AND schemaname = current_schema()",
         (index_name,),
     ).fetchone()
     return row is not None

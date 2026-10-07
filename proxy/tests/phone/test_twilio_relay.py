@@ -133,6 +133,18 @@ def test_webhook_relay_rejects_non_numeric_server_id(client, daemon):
     assert daemon.requests == []
 
 
+def test_webhook_relay_caps_the_body_at_the_unauthenticated_tier(client, daemon):
+    """The middleware cuts an anonymous body at 64 KB before the route reads
+    it (middleware.body_cap, MAX_UNAUTH_BODY_BYTES); the route's own bound is
+    the same number, so a body past it is refused here too, never forwarded."""
+    assert twilio_relay._MAX_BODY_BYTES == 64 * 1024
+    resp = client.post("/v1/twilio/inbound/7", content=b"x" * (64 * 1024 + 1))
+    assert resp.status_code == 413
+    assert daemon.requests == []
+    resp = client.post("/v1/twilio/inbound/7", content=b"x" * (64 * 1024))
+    assert resp.status_code == 200
+
+
 def test_media_ws_bridges_frames_and_forwards_signature(client, daemon):
     with client.websocket_connect(
         "/v1/twilio/media/7", headers={"X-Twilio-Signature": "wsig=="},

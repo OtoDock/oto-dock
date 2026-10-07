@@ -1,8 +1,11 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
 import type { NotificationDelivery } from '../../../api/notifications'
 import type { AgentSummary } from '../../../api/agents'
+import type { ShareInboxItem } from '../../../api/shares'
 import NotificationBody from './NotificationBody'
 import NotificationAgentHeader from './NotificationAgentHeader'
+import ShareInboxSection from '../../sharing/ShareInboxSection'
+import SwipeableRow from './SwipeableRow'
 
 interface Props {
   deliveries: NotificationDelivery[]
@@ -15,6 +18,15 @@ interface Props {
   onAcknowledge: (id: string) => void
   onNavigate?: (agentSlug: string, chatId: string, href?: string) => void
   onClose: () => void
+  /** "Shared with you" (SHARING.md): the block above the groups, fed by
+   * the hook that owns the panel so this component calls no query itself. */
+  inbox?: ShareInboxItem[]
+  inboxBusyId?: string
+  inboxError?: string
+  onAcceptShare?: (item: ShareInboxItem, agent: string) => void
+  onDeclineShare?: (item: ShareInboxItem) => void
+  onHideShare?: (item: ShareInboxItem) => void
+  onOpenShare?: (item: ShareInboxItem) => void
 }
 
 const SEVERITY_BORDER: Record<string, string> = {
@@ -30,6 +42,11 @@ const SEVERITY_ICON: Record<string, string> = {
   warning: 'text-p-accent-yellow',
   danger: 'text-p-accent-red',
 }
+
+// The dark brand surface sits one step above the dark panel, so dark mode
+// tints unread rows from the brand colour itself. Unread rows keep a tint on
+// hover: the read rows' hover would make them look read under the pointer.
+const UNREAD_ROW = 'bg-brand-surface/60 hover:bg-brand-surface dark:bg-brand/15 dark:hover:bg-brand/20'
 
 function relativeTime(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime()
@@ -61,90 +78,11 @@ function groupByDate(items: NotificationDelivery[]): { label: string; items: Not
   return groups
 }
 
-// --- Swipeable row: swipe left to dismiss ---
-function SwipeableRow({ onSwipeDismiss, children }: { onSwipeDismiss: () => void; children: React.ReactNode }) {
-  const rowRef = useRef<HTMLDivElement>(null)
-  const [offsetX, setOffsetX] = useState(0)
-  const [swiping, setSwiping] = useState(false)
-  const [dismissed, setDismissed] = useState(false)
-  const startX = useRef(0)
-  const startY = useRef(0)
-  const locked = useRef(false)  // true = horizontal swipe confirmed
 
-  const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    startX.current = e.touches[0].clientX
-    startY.current = e.touches[0].clientY
-    locked.current = false
-    setSwiping(false)
-  }, [])
-
-  const handleTouchMove = useCallback((e: React.TouchEvent) => {
-    const dx = e.touches[0].clientX - startX.current
-    const dy = e.touches[0].clientY - startY.current
-
-    // Lock direction after 10px of movement
-    if (!locked.current && !swiping) {
-      if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-        locked.current = true
-        setSwiping(true)
-      } else if (Math.abs(dy) > 10) {
-        return  // Vertical scroll, don't interfere
-      } else {
-        return  // Not enough movement yet
-      }
-    }
-    if (!locked.current) return
-
-    // Only allow left swipe (negative dx)
-    const clampedX = Math.min(0, dx)
-    setOffsetX(clampedX)
-  }, [swiping])
-
-  const handleTouchEnd = useCallback(() => {
-    if (!locked.current) {
-      setOffsetX(0)
-      setSwiping(false)
-      return
-    }
-    const width = rowRef.current?.offsetWidth || 300
-    if (Math.abs(offsetX) > width * 0.3) {
-      // Swiped past threshold — animate out and dismiss
-      setDismissed(true)
-      setTimeout(onSwipeDismiss, 200)
-    } else {
-      // Spring back
-      setOffsetX(0)
-    }
-    setSwiping(false)
-    locked.current = false
-  }, [offsetX, onSwipeDismiss])
-
-  return (
-    <div ref={rowRef} className="relative overflow-hidden" style={{ maxHeight: dismissed ? 0 : undefined, transition: dismissed ? 'max-height 200ms ease-out' : undefined }}>
-      {/* Red background revealed on swipe */}
-      <div className="absolute inset-0 bg-p-accent-red flex items-center justify-end pr-4">
-        <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-        </svg>
-      </div>
-      {/* Foreground content */}
-      <div
-        className="relative bg-white dark:bg-p-surface"
-        style={{
-          transform: dismissed ? 'translateX(-100%)' : `translateX(${offsetX}px)`,
-          transition: swiping ? 'none' : 'transform 200ms ease-out',
-        }}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-      >
-        {children}
-      </div>
-    </div>
-  )
-}
-
-export default function NotificationPanel({ deliveries, loading, agents, onMarkRead, onMarkAllRead, onDismiss, onAcknowledge, onNavigate, onClose }: Props) {
+export default function NotificationPanel({
+  deliveries, loading, agents, onMarkRead, onMarkAllRead, onDismiss, onAcknowledge, onNavigate, onClose,
+  inbox, inboxBusyId, inboxError, onAcceptShare, onDeclineShare, onHideShare, onOpenShare,
+}: Props) {
   const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -158,6 +96,7 @@ export default function NotificationPanel({ deliveries, loading, agents, onMarkR
   }, [onClose])
 
   const groups = groupByDate(deliveries)
+  const inboxItems = inbox ?? []
 
   return (
     <div
@@ -177,16 +116,31 @@ export default function NotificationPanel({ deliveries, loading, agents, onMarkR
         )}
       </div>
 
-      {/* Content */}
+      {/* Content: the shares block first (it has its own data and shows
+          while the deliveries load), then the dated groups. */}
       <div className="flex-1 overflow-y-auto">
+        {inboxItems.length > 0 && (
+          <ShareInboxSection
+            items={inboxItems}
+            agents={agents}
+            busyId={inboxBusyId}
+            error={inboxError}
+            onAccept={(item, agent) => onAcceptShare?.(item, agent)}
+            onDecline={(item) => onDeclineShare?.(item)}
+            onHide={(item) => onHideShare?.(item)}
+            onOpen={(item) => onOpenShare?.(item)}
+          />
+        )}
         {loading ? (
           <div className="flex items-center justify-center py-8 text-p-text-light text-sm">
             Loading...
           </div>
         ) : groups.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-p-text-light text-sm">
-            No notifications
-          </div>
+          inboxItems.length === 0 && (
+            <div className="flex items-center justify-center py-8 text-p-text-light text-sm">
+              No notifications
+            </div>
+          )
         ) : (
           groups.map(group => (
             <div key={group.label}>
@@ -196,9 +150,9 @@ export default function NotificationPanel({ deliveries, loading, agents, onMarkR
               {group.items.map(d => (
                 <SwipeableRow key={d.id} onSwipeDismiss={() => onDismiss(d.id)}>
                   <div
-                    className={`flex items-start gap-2 px-3 py-2.5 border-l-[3px] hover:bg-p-surface/50 transition-colors cursor-pointer
+                    className={`flex items-start gap-2 px-3 py-2.5 border-l-[3px] transition-colors cursor-pointer
                                 ${SEVERITY_BORDER[d.severity] || 'border-l-p-border'}
-                                ${!d.read ? 'bg-brand-surface/30' : ''}`}
+                                ${!d.read ? UNREAD_ROW : 'hover:bg-p-surface/50'}`}
                     onClick={() => { onAcknowledge(d.id); if (!d.read) onMarkRead(d.id) }}
                   >
                     <div className="flex-1 min-w-0">

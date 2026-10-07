@@ -6,10 +6,10 @@ land in scope-correct upload subdirs:
 - User-scoped chats (regular agents): ``users/<u>/workspace/uploads/photos/``
 - Agent-scoped chats (internal agents):     ``workspace/uploads/photos/``
 
-We unit-test `_save_base64_image` and `_host_to_sandbox_path` since the
-chat WS handler delegates path creation + write to them. The handler's
-`img_dir` value is constructed via simple `Path` concatenation; these
-helpers cover the file-write + path-translation sides.
+We unit-test `_save_base64_image`, which the chat WS handler delegates the
+decode, re-encode and write to, and `_process_attachments`, which checks
+re-attached photos and attached files in worker threads and builds the
+prompt's sandbox-virtual paths (the agent-relative path with a leading `/`).
 """
 
 import asyncio
@@ -271,38 +271,212 @@ def test_a_huge_non_jpeg_is_refused_with_a_reason(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_host_to_sandbox_path_user_scoped(tmp_path):
-    """User-scoped: `<agent_dir>/users/{u}/workspace/uploads/photos/img.jpg`
-    becomes `/users/{u}/workspace/uploads/photos/img.jpg` (sandbox-virtual).
-    """
-    from ws.dashboard import _host_to_sandbox_path
+def test_a_converted_jpeg_keeps_no_profile_of_its_old_mode(tmp_path):
+    """A CMYK JPEG is saved as RGB; the profile it carried describes CMYK
+    values, so the RGB copy carries none (read as sRGB, the space the
+    conversion writes) rather than one that misdescribes its pixels."""
+    from PIL import Image, ImageCms
+    from ws.dashboard import _save_base64_image
 
-    agent_dir = tmp_path / "agents" / "personal-assistant"
-    photo_dir = agent_dir / "users" / "alice" / "workspace" / "uploads" / "photos"
-    photo_dir.mkdir(parents=True)
-    photo_path = photo_dir / "img_abc.jpg"
-    photo_path.write_bytes(b"\x00")
-
-    sandbox = _host_to_sandbox_path(str(photo_path), agent_dir)
-
-    assert sandbox == "/users/alice/workspace/uploads/photos/img_abc.jpg"
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    saved = _save_base64_image(
+        _data_url(Image.new("CMYK", (64, 64), (0, 50, 50, 0)), "JPEG", icc_profile=profile),
+        save_dir=tmp_path)
+    out = _saved_image(saved)
+    assert out.mode == "RGB"
+    assert "icc_profile" not in out.info
 
 
-def test_host_to_sandbox_path_agent_scoped(tmp_path):
-    """Agent-scoped: `<agent_dir>/workspace/uploads/photos/img.jpg`
-    becomes `/workspace/uploads/photos/img.jpg`.
-    """
-    from ws.dashboard import _host_to_sandbox_path
+# ── _process_attachments ───────────────────────────────────────────────────
 
-    agent_dir = tmp_path / "agents" / "internal-bot"
-    photo_dir = agent_dir / "workspace" / "uploads" / "photos"
-    photo_dir.mkdir(parents=True)
-    photo_path = photo_dir / "img_xyz.jpg"
-    photo_path.write_bytes(b"\x00")
+_AGENT = "photo-agent"
+_SCOPE = "users/alice/workspace/"
 
-    sandbox = _host_to_sandbox_path(str(photo_path), agent_dir)
 
-    assert sandbox == "/workspace/uploads/photos/img_xyz.jpg"
+def _attach(images, files=(), *, direct=False):
+    """``_process_attachments`` for a user-scoped chat of ``alice``."""
+    import config
+    from ws.dashboard_chat_support import ChatSupportMixin
+    return ChatSupportMixin._process_attachments(
+        SimpleNamespace(), "look", list(images), list(files),
+        agent=_AGENT, agent_dir=config.AGENTS_DIR / _AGENT,
+        is_agent_scoped=False, username="alice", is_direct_llm=direct)
+
+
+@pytest.fixture
+def agents_root(tmp_path, monkeypatch):
+    """A private agents root, and no satellite push (no remote session)."""
+    import config
+    import api.media.uploads as uploads
+    import ws.dashboard  # noqa: F401  (assembles the support mixin first)
+
+    async def _no_push(*_a, **_k):
+        return None
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(uploads, "_push_upload_to_active_remote_sessions", _no_push)
+    return tmp_path
+
+
+def _saved_photo(root: Path, rel: str, data: bytes = b"") -> str:
+    from PIL import Image
+    import io
+    path = root / _AGENT / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not data:
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(buf, format="PNG")
+        data = buf.getvalue()
+    path.write_bytes(data)
+    return rel
+
+
+def test_a_refused_message_keeps_none_of_the_photos_it_saved(agents_root):
+    """A later photo refusing the message (over 50 MP here) removes the
+    photos this message already saved; a photo re-attached by its saved
+    path belongs to an earlier message and stays."""
+    from PIL import Image
+    from ws.dashboard_chat_support import AttachmentsRefused
+
+    earlier = _saved_photo(agents_root, _SCOPE + "uploads/photos/img_earlier.png")
+    huge = _data_url(Image.new("1", (7200, 7200), 1), "PNG")
+    with pytest.raises(AttachmentsRefused, match="megapixels"):
+        asyncio.run(_attach([
+            {"path": earlier, "name": "earlier.png"},
+            {"data": _TINY_PNG_DATA_URL, "name": "a.png"},
+            {"data": _TINY_PNG_DATA_URL, "name": "b.png"},
+            {"data": huge, "name": "huge.png"},
+        ]))
+    photos = agents_root / _AGENT / _SCOPE / "uploads" / "photos"
+    assert sorted(p.name for p in photos.iterdir()) == ["img_earlier.png"]
+
+
+def test_a_photo_that_waits_too_long_for_a_slot_refuses_the_message(agents_root, monkeypatch):
+    """Both photo slots busy past the wait: the message is refused with the
+    busy sentence and the photo saved before it is removed."""
+    from ws import dashboard_chat_support as support
+
+    monkeypatch.setattr(support, "_PHOTO_WAIT_S", 0.05)
+    real = support._save_base64_image
+    held: dict = {}
+
+    def _take_both_slots():
+        for _ in range(support._PHOTO_SLOTS):
+            held["loop"].create_task(support._photo_slot().acquire())
+
+    def _save_then_fill_the_slots(data_url, *, save_dir):
+        out = real(data_url, save_dir=save_dir)
+        held["loop"].call_soon_threadsafe(_take_both_slots)
+        return out
+
+    monkeypatch.setattr(support, "_save_base64_image", _save_then_fill_the_slots)
+
+    async def run():
+        held["loop"] = asyncio.get_running_loop()
+        await _attach([{"data": _TINY_PNG_DATA_URL, "name": "a.png"},
+                       {"data": _TINY_PNG_DATA_URL, "name": "b.png"}])
+
+    with pytest.raises(support.AttachmentsRefused, match="busy saving other photos"):
+        asyncio.run(run())
+    photos = agents_root / _AGENT / _SCOPE / "uploads" / "photos"
+    assert list(photos.iterdir()) == []
+
+
+def test_a_send_cancelled_while_a_photo_saves_keeps_no_photo(agents_root, monkeypatch):
+    """A cancel cannot stop a save's thread: the send waits for it, removes
+    the file it wrote, and holds the photo slot until the thread ends."""
+    import threading
+    import time
+    from ws import dashboard_chat_support as support
+
+    real = support._save_base64_image
+    started, go, done = threading.Event(), threading.Event(), threading.Event()
+
+    def _slow_save(data_url, *, save_dir):
+        started.set()
+        go.wait(5)
+        try:
+            return real(data_url, save_dir=save_dir)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(support, "_save_base64_image", _slow_save)
+
+    async def run():
+        task = asyncio.create_task(_attach([{"data": _TINY_PNG_DATA_URL, "name": "a.png"}]))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        go.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return done.is_set()
+
+    ended_first = asyncio.run(run())
+    done.wait(5)
+    time.sleep(0.05)
+    photos = agents_root / _AGENT / _SCOPE / "uploads" / "photos"
+    assert not photos.exists() or list(photos.iterdir()) == []
+    assert ended_first, "the send ended before its save's thread"
+
+
+def test_a_reattached_photo_is_checked_and_read_in_one_job(agents_root):
+    """The scope check, the open and the read of a photo re-attached by its
+    saved path run together in the worker thread, after the slot wait: a
+    photos directory replaced by a link while the photo waits is refused,
+    never followed."""
+    import os
+    from ws import dashboard_chat_support as support
+
+    mine = _saved_photo(agents_root, _SCOPE + "uploads/photos/img_same.png")
+    other = _saved_photo(agents_root, "users/bob/workspace/uploads/photos/img_same.png",
+                         data=b"\x89PNG not alice's")
+    photos = agents_root / _AGENT / _SCOPE / "uploads" / "photos"
+
+    async def run():
+        sem = support._photo_slot()
+        for _ in range(support._PHOTO_SLOTS):
+            await sem.acquire()
+        task = asyncio.create_task(_attach([{"path": mine, "name": "same.png"}], direct=True))
+        await asyncio.sleep(0.05)               # waiting for a slot
+        photos.rename(photos.with_name("photos-moved"))
+        os.symlink(agents_root / _AGENT / os.path.dirname(other), photos)
+        for _ in range(support._PHOTO_SLOTS):
+            sem.release()
+        return await task
+
+    _cli, attached, meta, _files = asyncio.run(run())
+    assert attached == [] and meta == []
+
+
+def test_no_attachment_path_is_resolved_on_the_loop(agents_root, monkeypatch):
+    """Re-attached photos and attached files are scope-checked in a worker
+    thread: nothing in the attachment path touches the filesystem on the
+    event loop."""
+    import pathlib
+
+    photo = _saved_photo(agents_root, _SCOPE + "uploads/photos/img_one.png")
+    doc = _saved_photo(agents_root, _SCOPE + "uploads/files/notes.txt", data=b"hi")
+
+    def _off_loop(real):
+        def guarded(self, *a, **k):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return real(self, *a, **k)
+            raise AssertionError(f"Path.{real.__name__} on the event loop: {self}")
+        return guarded
+
+    async def run():
+        for name in ("resolve", "is_file", "exists", "stat"):
+            monkeypatch.setattr(pathlib.Path, name, _off_loop(getattr(pathlib.Path, name)))
+        return await _attach([{"path": photo, "name": "one.png"}],
+                             [{"path": doc, "name": "notes.txt"}])
+
+    cli, _attached, meta, files = asyncio.run(run())
+    monkeypatch.undo()
+    assert meta == [{"name": "one.png", "path": photo}]
+    assert files == [{"path": doc, "name": "notes.txt"}]
+    assert f"- /{photo}" in cli and f"- /{doc} " in cli
 
 
 class TestSharedPhotoAuthority:

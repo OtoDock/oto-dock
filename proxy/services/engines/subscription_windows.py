@@ -309,6 +309,21 @@ def exhausted_overall(w: Windows) -> bool:
     return w.reached in w.specs
 
 
+def has_headroom(w: Windows, key: str) -> bool:
+    """Whether the reading shows the window ``key`` (a declared window key,
+    or ``scoped:<scope key>`` for a model family's window) below its spill
+    mark and not reached: what ends a usage-limit rest early. False when the
+    reading does not carry the window."""
+    if key.startswith("scoped:"):
+        s = w.scoped_for(key[len("scoped:"):])
+        return s is not None and s.pct < _scoped_spill() and w.reached != key
+    win = w.windows.get(key)
+    spec = w.specs.get(key)
+    if win is None or spec is None:
+        return False
+    return win.pct < spill_pct(spec) and w.reached != key
+
+
 def frees_at(w: Windows, scope_key: str = "") -> datetime | None:
     """The earliest reset instant among the windows that exhaust this account
     (how the all-exhausted fallback orders candidates)."""
@@ -419,19 +434,28 @@ def exhausted_any(w: Windows) -> bool:
 def record(sub_id: str, w: Windows) -> bool:
     """Store one reading. When the account just crossed into exhaustion —
     overall, or for some model — ask the pool to move the scopes pinned to
-    it. Returns whether a row was written (a coalesced repeat is not)."""
+    it; a rested window the reading shows with headroom again ends the
+    pool's rest early (``subscription_pool.clear_rests_with_headroom``, a
+    coalesced repeat included). Returns whether a row was written (a
+    coalesced repeat is not)."""
     if not is_enabled():
         return False
     from storage.billing import subscription_store
     before = subscription_store.latest_window_samples([sub_id]).get(sub_id)
     was_exhausted = bool(before) and exhausted_any(effective(from_row(before, w.specs), w.observed_at))
     written = subscription_store.insert_window_sample(sub_id, **to_row(w))
-    if written and not was_exhausted and exhausted_any(effective(w, w.observed_at)):
+    now_reading = effective(w, w.observed_at)
+    if written and not was_exhausted and exhausted_any(now_reading):
         try:
             from services.engines import subscription_pool
             subscription_pool.schedule_rebalance("window exhausted")
         except Exception:
             logger.debug("windows: rebalance scheduling failed", exc_info=True)
+    try:
+        from services.engines import subscription_pool
+        subscription_pool.clear_rests_with_headroom(sub_id, now_reading)
+    except Exception:
+        logger.debug("windows: rest check failed", exc_info=True)
     return written
 
 

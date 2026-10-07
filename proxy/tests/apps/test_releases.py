@@ -382,6 +382,18 @@ def test_a_file_apps_release_is_never_cut_from_a_link(agent_tree, tmp_path):
     assert not releases.app_release_dir(row).exists()
 
 
+def test_an_oversize_single_file_app_is_refused_by_its_size(agent_tree):
+    row = task_store.upsert_app(AGENT, "alice", "alice-sub", "big", title="Big",
+                                rel_path="users/alice/workspace/apps/big.html")
+    working = agent_tree / row["rel_path"]
+    working.parent.mkdir(parents=True, exist_ok=True)
+    working.write_bytes(b"<p>" + b"x" * (9 * 1024 * 1024) + b"</p>")
+    with pytest.raises(releases.ReleaseInvalid) as e:
+        releases.cut_release(row, working)
+    assert e.value.reason == "big.html is larger than 8 MB"
+    assert not releases.app_release_dir(row).exists()
+
+
 def test_the_walk_keeps_its_answers_and_refuses_a_linked_root(agent_tree, tmp_path):
     outside = tmp_path / "elsewhere"
     (outside / "sub").mkdir(parents=True)

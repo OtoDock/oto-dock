@@ -51,6 +51,12 @@ class OAuthState:
     # (derived value) goes on the URL via `extra`; the verifier stays
     # server-side to prove possession during code exchange.
     code_verifier: str = ""
+    # A connect through the client this install registered at the MCP
+    # server's own authorization server (services/oauth/mcp_authorization.py):
+    # the registration row, its client id, the issuer, the resource and the
+    # endpoints the start resolved. The state binds the person, the MCP, the
+    # provider and this registration; the callback uses exactly these.
+    mcp_authorization: dict[str, Any] | None = None
     # monotonic timestamp at which this state expires
     expiry: float = 0.0
 
@@ -91,6 +97,7 @@ def create_state(
     mobile: bool = False,
     redirect_uri: str = "",
     extra: dict[str, str] | None = None,
+    mcp_authorization: dict[str, Any] | None = None,
 ) -> str:
     """Mint and store a new OAuth state token. Returns the opaque token.
 
@@ -128,6 +135,7 @@ def create_state(
         redirect_uri=redirect_uri,
         extra=extra_merged,
         code_verifier=code_verifier,
+        mcp_authorization=dict(mcp_authorization) if mcp_authorization else None,
         expiry=time.monotonic() + _STATE_TTL_SECONDS,
     )
     _purge_expired()
@@ -169,6 +177,18 @@ def peek_state_extra(token: str) -> dict[str, str]:
     if time.monotonic() > state.expiry:
         return {}
     return dict(state.extra)
+
+
+def peek_state_issuer(token: str) -> tuple[str, bool]:
+    """Non-consuming read of the issuer a registered-client state named and
+    whether that issuer advertises the ``iss`` response parameter, or
+    ``("", False)``: the callback checks an error response's ``iss`` against
+    it without burning the state."""
+    state = _states.get(token)
+    if state is None or time.monotonic() > state.expiry or not state.mcp_authorization:
+        return "", False
+    auth = state.mcp_authorization
+    return str(auth.get("issuer") or ""), bool(auth.get("iss_parameter_supported"))
 
 
 def _purge_expired() -> None:
@@ -288,7 +308,7 @@ class ExchangeResult:
     state: OAuthState
 
 
-async def do_oauth_exchange(*, code: str, state_token: str) -> ExchangeResult:
+async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> ExchangeResult:
     """Drive the full exchange + persist flow.
 
     Steps:
@@ -318,6 +338,11 @@ async def do_oauth_exchange(*, code: str, state_token: str) -> ExchangeResult:
     if manifest is None or not manifest.credentials.oauth:
         raise RuntimeError(
             f"Manifest '{state.mcp_name}' has no oauth credential block"
+        )
+
+    if state.mcp_authorization:
+        return await _exchange_registered_client(
+            state, code=code, iss=iss, provider=provider, manifest=manifest,
         )
 
     if relay_client.hosted_oauth_active(state.mcp_name, manifest):
@@ -386,25 +411,148 @@ async def do_oauth_exchange(*, code: str, state_token: str) -> ExchangeResult:
     account_label = state.account_label_hint.strip() or userinfo.email
 
     # Persist — writes the user_credential_accounts row, the credential
-    # rows, and the on-disk token file as one orchestrated operation.
+    # rows, and the on-disk token file as one orchestrated operation, under
+    # the account lock the refresh worker holds across its own rewrite.
+    from core.credentials import credential_locks
     from services.oauth import oauth_account_store
-    await asyncio.to_thread(
-        oauth_account_store.persist_oauth_account,
-        user_sub=state.user_sub,
-        mcp_name=state.mcp_name,
-        provider_id=state.provider_id,
-        account_label=account_label,
-        services=state.services,
-        token_set=token_set,
-        userinfo=userinfo,
-        client_id=client_id,
-        client_secret=client_secret,
-        token_url=token_url,
-    )
+    async with credential_locks.get_lock(state.user_sub, state.provider_id, account_label):
+        await asyncio.to_thread(
+            oauth_account_store.persist_oauth_account,
+            user_sub=state.user_sub,
+            mcp_name=state.mcp_name,
+            provider_id=state.provider_id,
+            account_label=account_label,
+            services=state.services,
+            token_set=token_set,
+            userinfo=userinfo,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_url=token_url,
+        )
 
     return ExchangeResult(
         email=userinfo.email,
         name=userinfo.name,
         account_label=account_label,
         state=state,
+    )
+
+
+async def _exchange_registered_client(
+    state: OAuthState, *, code: str, iss: str, provider, manifest,
+) -> ExchangeResult:
+    """The exchange of a connect through the client this install registered
+    at the MCP server's own authorization server (``state.mcp_authorization``).
+
+    The registration row is re-read and must be live and carry the client id
+    and issuer the state names (a code for another registration is
+    refused); an ``iss`` on the callback must name the state's issuer and
+    must be present when the issuer advertises it (RFC 9207). The identity
+    comes from a userinfo probe only when the manifest's ``userinfo_url``
+    sits on the resource host; else from the token response's declared
+    fields, the typed label, or the provider id. The persist runs under the
+    account lock; when it fails after the exchange the grant is revoked.
+    """
+    from urllib.parse import urlsplit
+
+    from auth.oauth_providers.base import OAuthTokenError
+    from core.credentials import credential_locks
+    from services.oauth import mcp_authorization, oauth_account_store
+    from storage.identity import oauth_client_registrations as regs
+    from storage.pg import run_db
+
+    auth = state.mcp_authorization or {}
+    issuer = str(auth.get("issuer") or "")
+    if iss and iss.rstrip("/") != issuer.rstrip("/"):
+        raise RuntimeError("The authorization response names another issuer")
+    if not iss and auth.get("iss_parameter_supported"):
+        raise RuntimeError("The authorization response carries no issuer")
+    row = await run_db(regs.get, int(auth.get("registration_id") or 0))
+    if (
+        row is None or row.get("revoked_at")
+        or row.get("client_id") != auth.get("client_id")
+        or row.get("issuer") != issuer
+    ):
+        raise RuntimeError("The client registration this sign-in used is no longer valid")
+    method = str(row.get("token_endpoint_auth_method") or "none")
+    secret = ""
+    if method != "none":
+        secret = await run_db(regs.client_secret, row["id"])
+        if secret is None:
+            raise RuntimeError("The client registration's secret cannot be read")
+    try:
+        token_set = await mcp_authorization.exchange_code(
+            state.provider_id,
+            token_endpoint=str(auth.get("token_endpoint") or ""),
+            code=code, redirect_uri=state.redirect_uri,
+            code_verifier=state.code_verifier, resource=str(auth.get("resource") or ""),
+            method=method, client_id=str(row["client_id"]), client_secret=secret,
+        )
+    except OAuthTokenError as exc:
+        if exc.code == "invalid_client":
+            await run_db(regs.revoke, row["id"], "vendor_revoked")
+        raise
+
+    block = (manifest.credentials.oauth or {}).get("authorization_server") or {}
+    resource_host = (urlsplit(str(auth.get("resource") or "")).hostname or "").lower()
+    userinfo_parts = urlsplit(provider.userinfo_url or "")
+    userinfo_host = (userinfo_parts.hostname or "").lower()
+
+    async def _revoke_grant() -> None:
+        await mcp_authorization.revoke(
+            str(auth.get("revocation_endpoint") or ""), issuer=issuer,
+            token=token_set.refresh_token or token_set.access_token,
+            method=method, client_id=str(row["client_id"]), client_secret=secret,
+        )
+
+    try:
+        # The identity probe goes to the resource host over https or not at
+        # all: a token issued for the MCP server reaches nothing else.
+        if provider.userinfo_url and userinfo_parts.scheme == "https" and userinfo_host == resource_host:
+            userinfo = await provider.fetch_userinfo(access_token=token_set.access_token)
+            if not userinfo.email:
+                userinfo.email = userinfo.account_id or userinfo.name
+            account_label = state.account_label_hint.strip() or userinfo.email or state.provider_id
+            if not userinfo.email:
+                userinfo.email = account_label
+        else:
+            account_label, userinfo = mcp_authorization.identity_from_token_response(
+                token_set.raw, block, provider_id=state.provider_id,
+                label_hint=state.account_label_hint,
+            )
+        oauth_account_store.validate_account_label(account_label)
+    except Exception:
+        await _revoke_grant()
+        raise
+
+    token_set.raw = {
+        **token_set.raw,
+        "flow": oauth_account_store.MCP_AUTHORIZATION_FLOW,
+        "registration_id": row["id"],
+        "issuer": issuer,
+        "resource": str(auth.get("resource") or ""),
+        "revocation_endpoint": str(auth.get("revocation_endpoint") or ""),
+        "token_endpoint_auth_method": method,
+    }
+    async with credential_locks.get_lock(state.user_sub, state.provider_id, account_label):
+        try:
+            await asyncio.to_thread(
+                oauth_account_store.persist_oauth_account,
+                user_sub=state.user_sub,
+                mcp_name=state.mcp_name,
+                provider_id=state.provider_id,
+                account_label=account_label,
+                services=state.services,
+                token_set=token_set,
+                userinfo=userinfo,
+                client_id=str(row["client_id"]),
+                client_secret="",
+                token_url=str(auth.get("token_endpoint") or ""),
+            )
+        except Exception:
+            await _revoke_grant()
+            raise
+    await run_db(regs.touch, row["id"])
+    return ExchangeResult(
+        email=userinfo.email, name=userinfo.name, account_label=account_label, state=state,
     )

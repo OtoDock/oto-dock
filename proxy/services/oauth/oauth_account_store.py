@@ -123,8 +123,7 @@ def account_token_path(token_dir: Path, account_label: str) -> Path:
 # Most providers declare no aliases — their files are pure canonical.
 # ---------------------------------------------------------------------------
 
-def _write_generic_oauth_v1_token(
-    token_path: Path,
+def render_generic_oauth_v1_token(
     *,
     provider_id: str,
     account_id: str,
@@ -137,13 +136,14 @@ def _write_generic_oauth_v1_token(
     token_url: str,
     extra: dict | None = None,
     aliases: dict[str, str] | None = None,
-) -> None:
-    """Persist a token bundle in the canonical ``generic_oauth_v1`` shape.
+) -> dict:
+    """The canonical ``generic_oauth_v1`` payload (``_write_generic_oauth_v1_token``
+    writes it; the refresh worker writes it through its own guarded write).
 
     Optionally emits alias keys (declared by the MCP's manifest as
-    ``token_format.aliases``) into the same file so legacy-shape MCP
-    readers (workspace-mcp's google.auth lib) see their expected keys
-    alongside the canonical ones. Most providers pass no aliases.
+    ``token_format.aliases``) so legacy-shape MCP readers (workspace-mcp's
+    google.auth lib) see their expected keys alongside the canonical ones.
+    Most providers pass no aliases.
 
     Special case: when an alias targets ``expires_at``, the alias value
     is written in the naive ISO format (``%Y-%m-%dT%H:%M:%S``) that
@@ -180,6 +180,32 @@ def _write_generic_oauth_v1_token(
                 payload[alias_key] = expires_at_naive
             elif canonical_key in payload:
                 payload[alias_key] = payload[canonical_key]
+    return payload
+
+
+def _write_generic_oauth_v1_token(
+    token_path: Path,
+    *,
+    provider_id: str,
+    account_id: str,
+    access_token: str,
+    refresh_token: str,
+    expires_in: int,
+    scopes: list[str],
+    client_id: str,
+    client_secret: str,
+    token_url: str,
+    extra: dict | None = None,
+    aliases: dict[str, str] | None = None,
+) -> None:
+    """Persist a token bundle in the canonical ``generic_oauth_v1`` shape
+    (``render_generic_oauth_v1_token``), atomically."""
+    payload = render_generic_oauth_v1_token(
+        provider_id=provider_id, account_id=account_id, access_token=access_token,
+        refresh_token=refresh_token, expires_in=expires_in, scopes=scopes,
+        client_id=client_id, client_secret=client_secret, token_url=token_url,
+        extra=extra, aliases=aliases,
+    )
     partial = token_path.with_suffix(token_path.suffix + ".partial")
     partial.write_text(json.dumps(payload, indent=2))
     # Token file holds access/refresh tokens + (self-managed) client_secret —
@@ -223,6 +249,39 @@ def resolve_account_credential_keys(
 def get_canonical_access_token(raw: dict) -> str:
     """Extract the access token from a ``generic_oauth_v1`` token dict."""
     return raw.get("access_token") or ""
+
+
+# The ``extra.flow`` of a token issued by the MCP server's own authorization
+# server to the client this install registered (services/oauth/mcp_authorization.py).
+MCP_AUTHORIZATION_FLOW = "mcp_authorization"
+# The flows whose files carry no refresh token by design.
+_FLOWS_WITHOUT_REFRESH = ("client_credentials", "personal_access_token")
+
+
+def token_dead_reason(raw: dict) -> str:
+    """Why a token file can no longer serve a session, or ``""``: the worker
+    recorded a permanent refresh failure (``extra.refresh_failed``), or the
+    access token expired with no refresh token to renew it. A never-expiring
+    file (empty ``expires_at``), a client-credentials or PAT file, and a
+    file with a live refresh token are left to the vendor's verdict."""
+    extra = raw.get("extra") or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    failed = str(extra.get("refresh_failed") or "")
+    if failed:
+        return "revoked" if failed in ("invalid_grant", "invalid_client") else failed
+    expiry = str(raw.get("expires_at") or "")
+    if not expiry or raw.get("refresh_token"):
+        return ""
+    if str(extra.get("flow") or "") in _FLOWS_WITHOUT_REFRESH:
+        return ""
+    try:
+        expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if expiry_dt.tzinfo is None:
+            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    return "expired" if expiry_dt <= datetime.now(timezone.utc) else ""
 
 
 def read_account_token(token_dir: Path, account_label: str) -> dict | None:

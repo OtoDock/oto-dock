@@ -20,8 +20,10 @@ Five tables:
                                  read that user's tokens. There is no platform
                                  "service account" storage.
 
-All values are Fernet-encrypted at rest. Encryption key is derived from
-CREDENTIAL_ENCRYPTION_KEY env var (fallback: JWT_SECRET).
+All values are Fernet-encrypted at rest under a MultiFernet: the keys of
+``CREDENTIAL_ENCRYPTION_KEY`` (config.env or the environment; the first one
+encrypts) and then the key derived from JWT_SECRET, so a row written before
+a key was configured still opens.
 
 All functions are synchronous (called via asyncio.to_thread from async code).
 """
@@ -30,8 +32,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import json
 import logging
-import os
 from datetime import datetime, timezone
 
 import config
@@ -46,17 +49,31 @@ logger = logging.getLogger(__name__)
 _fernet = None
 
 
+def _configured_keys() -> list[str]:
+    return [k.strip() for k in config.credential_key_setting().split(",") if k.strip()]
+
+
+def _derived_key(raw: str) -> bytes:
+    """A value's Fernet key: ``sha256(value)``, the derivation 1.7.0 used for
+    ``CREDENTIAL_ENCRYPTION_KEY`` and ``JWT_SECRET`` alike, so any string
+    works and a key set in the environment before keeps its rows."""
+    return base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest())
+
+
 def _get_fernet():
     global _fernet
     if _fernet is not None:
         return _fernet
     try:
-        from cryptography.fernet import Fernet
+        from cryptography.fernet import Fernet, MultiFernet
     except ImportError:
         raise RuntimeError("cryptography package required – pip install cryptography")
-    raw = os.environ.get("CREDENTIAL_ENCRYPTION_KEY") or config.JWT_SECRET
-    key = base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest())
-    _fernet = Fernet(key)
+    keys = _configured_keys()
+    # 1.7.0 took the whole value as one key: one with a comma or surrounding
+    # whitespace in it still opens the rows it wrote (decrypt only).
+    whole = config.credential_key_setting()
+    raws = keys + ([whole] if whole and whole not in keys else []) + [config.JWT_SECRET]
+    _fernet = MultiFernet([Fernet(_derived_key(raw)) for raw in raws])
     return _fernet
 
 
@@ -363,6 +380,88 @@ def list_agent_account_bindings(user_sub: str, mcp_name: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+#: The platform setting that remembers the fingerprint of every value the
+#: secret floor accepted, per secret (never listed by any route).
+FLOOR_SETTING = "secret_floor_fingerprints"
+_FLOOR_LABEL = b"otodock secret floor"
+_FLOOR_KEEP = 16
+
+
+def _fingerprint(value: str) -> str:
+    return hmac.new(value.encode(), _FLOOR_LABEL, hashlib.sha256).hexdigest()[:32]
+
+
+def _install_has_users() -> bool:
+    with get_conn() as conn:
+        return conn.execute("SELECT EXISTS (SELECT 1 FROM users) AS e").fetchone()["e"]
+
+
+def judge_secret_floor() -> None:
+    """The length floor on ``JWT_SECRET`` and on the first configured
+    credential key (``config.SECRET_MIN_LENGTH``), judged at boot after the
+    schema. A short value an install already ran on only warns: one seen at
+    an earlier boot, or, at the first boot that judges (the upgrade), the
+    value an install with users is running on. A short value never seen
+    before (a fresh install, or a value newly set) refuses the boot. Every
+    accepted fingerprint is remembered, so restoring an earlier value (the
+    key canary's own advice) is never refused. A database error skips the
+    judge: the boot must not fail on it."""
+    checks = [("JWT_SECRET", config.JWT_SECRET)]
+    keys = _configured_keys()
+    if keys:
+        checks.append(("CREDENTIAL_ENCRYPTION_KEY", keys[0]))
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT value FROM platform_settings WHERE key=%s",
+                               (FLOOR_SETTING,)).fetchone()
+        record = json.loads(row["value"]) if row and row["value"] else None
+        has_users = _install_has_users() if record is None else True
+    except Exception as e:
+        logger.debug("secret floor skipped: %s", e)
+        return
+    seen: dict[str, list[str]] = record if isinstance(record, dict) else {}
+    floor = config.SECRET_MIN_LENGTH
+    refused: list[str] = []
+    for name, value in checks:
+        fp = _fingerprint(value)
+        known = list(seen.get(name) or [])
+        if len(value) >= floor or fp in known or (record is None and has_users):
+            if fp not in known:
+                seen[name] = (known + [fp])[-_FLOOR_KEEP:]
+            if len(value) < floor:
+                logger.warning(_floor_advice(name, len(value)))
+        else:
+            refused.append(name)
+    if refused:
+        msg = (f"{' and '.join(refused)} must be at least {floor} characters: a new value "
+               f"shorter than that is refused. Set a random value (openssl rand -base64 48) "
+               f"in config.env and restart.")
+        logger.critical(msg)
+        raise RuntimeError(msg)
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO platform_settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                (FLOOR_SETTING, json.dumps(seen, sort_keys=True)))
+            conn.commit()
+    except Exception as e:
+        logger.debug("secret floor record not written: %s", e)
+
+
+def _floor_advice(name: str, length: int) -> str:
+    if name == "JWT_SECRET":
+        return (f"JWT_SECRET is {length} characters, shorter than the "
+                f"{config.SECRET_MIN_LENGTH} the platform asks for. Replacing it alone "
+                "makes every stored secret unreadable; rotate it this way: in config.env "
+                "set CREDENTIAL_ENCRYPTION_KEY=<a new random value>,<the current JWT_SECRET>, "
+                "then set JWT_SECRET to a new random value (openssl rand -base64 48) and "
+                "restart. Everyone signs in again.")
+    return (f"CREDENTIAL_ENCRYPTION_KEY's first key is {length} characters, shorter than "
+            f"the {config.SECRET_MIN_LENGTH} the platform asks for: put a new random value "
+            "first and keep this one after it (it then only decrypts), and restart.")
+
+
 def startup_key_canary() -> None:
     """Boot-time probe: can the current key decrypt what's already stored?
 
@@ -370,9 +469,11 @@ def startup_key_canary() -> None:
     a recreated config.env silently orphans every encrypted row: 2FA 500s at
     login, provider subscriptions report "no subscription", MCP/phone creds
     read back empty. Sampling a few rows per store at boot turns that
-    multi-hour mystery into one log line. Diagnosis only — never raises,
-    never blocks boot.
+    multi-hour mystery into one log line. The probe itself is diagnosis
+    only and never raises; the secret floor it runs first refuses a new
+    short secret (``judge_secret_floor``).
     """
+    judge_secret_floor()
     probes = [
         ("user MCP credentials",
          "SELECT credential_value_enc AS v FROM user_credentials "
@@ -409,8 +510,8 @@ def startup_key_canary() -> None:
     if bad:
         logger.error(
             "CREDENTIAL KEY MISMATCH: stored %s cannot be decrypted with the "
-            "current key. The encryption key derives from JWT_SECRET in "
-            "config.env — if config.env was recreated (e.g. the install moved "
+            "current key. The encryption key derives from JWT_SECRET (and "
+            "CREDENTIAL_ENCRYPTION_KEY when set) in config.env — if config.env was recreated (e.g. the install moved "
             "to a new folder), every previously saved secret is unreadable: "
             "2FA login will fail with 500, provider subscriptions will report "
             "'no subscription', MCP/phone credentials will read back empty. "
@@ -703,17 +804,26 @@ def set_service_agent_binding(
 
 
 def remove_service_agent_binding(
-    mcp_name: str, agent_name: str,
-) -> None:
+    mcp_name: str, agent_name: str, *,
+    owner_sub: str | None = None, account_label: str | None = None,
+) -> bool:
     """Drop the per-agent service binding (the agent is left with no service
-    identity for this MCP until a new binding is set)."""
+    identity for this MCP until a new binding is set). With ``owner_sub`` and
+    ``account_label`` only while the binding still names that lender's
+    account: a clear that ran for seconds never removes the binding a
+    manager set meanwhile. Returns whether a row went."""
+    sql = "DELETE FROM service_agent_bindings WHERE mcp_name=%s AND agent_name=%s"
+    params: tuple = (mcp_name, agent_name)
+    if owner_sub is not None:
+        sql += " AND account_owner_sub=%s"
+        params += (owner_sub,)
+    if account_label is not None:
+        sql += " AND account_label=%s"
+        params += (account_label,)
     with get_conn() as conn:
-        conn.execute(
-            "DELETE FROM service_agent_bindings "
-            "WHERE mcp_name=%s AND agent_name=%s",
-            (mcp_name, agent_name),
-        )
+        gone = conn.execute(sql, params).rowcount
         conn.commit()
+    return bool(gone)
 
 
 def list_service_agent_bindings(mcp_name: str) -> list[dict]:

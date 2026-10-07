@@ -164,3 +164,86 @@ def test_a_sibling_of_the_state_root_stays_a_home_band_question(state, monkeypat
     from satellite.host import satellite_policy
     monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
     _check(state, str(state.parent / ".oto-dock-notes" / "a.md"))  # no raise
+
+
+# ---------------------------------------------------------------------------
+# Windows: no network or device path, the device prefix never hides a root,
+# and the legacy <home>/.oto-dock is the machine's state too
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def windows(monkeypatch):
+    from satellite import config
+    monkeypatch.setattr(config, "HOST", config.ROWS[config.WINDOWS])
+
+
+@pytest.mark.parametrize("raw", [
+    "//?/C:/Users/e/OtoDock/satellite.conf",
+    "\\\\?\\C:\\Users\\e\\OtoDock\\satellite.conf",
+    "//./C:/Users/e/x.txt",
+    "//server/share/x.txt",
+    "\\\\localhost\\c$\\Users\\e\\OtoDock\\satellite.conf",
+])
+def test_a_network_or_device_path_is_refused_on_windows(windows, raw):
+    with pytest.raises(ValueError, match="network or device"):
+        sm._validate_satellite_host_path(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    "C:/Users/e/x.txt", "C:\\Users\\e\\x.txt", "d:/data/report.pdf", "Z:\\share\\x.txt",
+    # Root-relative (the satellite's current drive): the policy check after
+    # realpath judges where it lands.
+    "/Users/e/x.txt", "\\Users\\e\\x.txt",
+])
+def test_drive_and_root_relative_windows_paths_pass(windows, raw):
+    sm._validate_satellite_host_path(raw)
+
+
+def test_posix_paths_keep_their_rule(monkeypatch):
+    from satellite import config
+    monkeypatch.setattr(config, "HOST", config.ROWS[config.LINUX])
+    sm._validate_satellite_host_path("/home/e/x.txt")
+
+
+class _WinPath(str):
+    """A Windows spelling that ``Path.resolve`` would not touch on this host."""
+
+    def resolve(self):
+        return self
+
+    def __truediv__(self, other):
+        return _WinPath(f"{self}/{other}")
+
+
+def test_a_device_prefix_in_the_resolved_path_never_hides_the_state(windows, monkeypatch):
+    """``realpath`` keeps (or adds, for a long path) the ``\\\\?\\`` prefix;
+    the compare sees the plain spelling."""
+    from satellite import config
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    monkeypatch.setattr(config, "otodock_dir", lambda: _WinPath("C:/Users/e/OtoDock"))
+    real = os.path.realpath
+    resolved = {"C:/Users/e/OtoDock/agents/a2/x.md": "\\\\?\\C:\\Users\\e\\OtoDock\\agents\\a2\\x.md",
+                "C:/Users/e/OtoDock": "C:\\Users\\e\\OtoDock"}
+    monkeypatch.setattr(sm.os.path, "realpath",
+                        lambda p, *a, **k: resolved.get(str(p).replace("\\", "/"), real(p, *a, **k)))
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        sm._check_satellite_host_policy("C:/Users/e/OtoDock/agents/a2/x.md")
+
+
+def test_the_legacy_state_folder_is_refused_on_windows(windows, tmp_path, monkeypatch):
+    """The browser profiles live under ``<home>/.oto-dock`` on Windows (the
+    proxy refuses that folder too); the satellite refuses it itself."""
+    from satellite import config
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    home = tmp_path / "winhome"
+    (home / ".oto-dock" / "browser-profiles").mkdir(parents=True)
+    monkeypatch.setattr(config, "otodock_dir", lambda: home / "OtoDock")
+    monkeypatch.setattr(sm.Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        sm._check_satellite_host_policy(str(home / ".oto-dock" / "browser-profiles" / "p" / "Cookies"))
+    sm._check_satellite_host_policy(str(home / ".oto-dock-notes" / "a.md"))  # a sibling: no raise
+    monkeypatch.setattr(config, "HOST", config.ROWS[config.LINUX])
+    sm._check_satellite_host_policy(str(home / ".oto-dock" / "x"))  # the extra root is Windows only

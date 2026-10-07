@@ -229,7 +229,13 @@ async def hook_file_written(
     For remote sessions, this flushes the newly-written platform-cache file
     back to the satellite so subsequent reads (from the agent CLI on the
     satellite, or from display-mcp running there, or from another Docker
-    MCP) see the updated content. No-op for local sessions.
+    MCP) see the updated content.
+
+    On both kinds of session an agent-tree file of the session's agent then
+    gets a ``file_updated(source="disk")`` unless it still holds the bytes
+    its newest push's document knows (``_announce_written``): every open
+    view of it (another device's pane, a teammate's, a workspace preview)
+    reloads when clean or offers Reload over unsaved edits.
 
     Returns {"ok": bool} indicating whether the push to satellite succeeded.
     Docker MCPs should log but not fail on a False result — the write has
@@ -238,6 +244,11 @@ async def hook_file_written(
     await verify_session_match_async(authorization, req.session_id)
     from core.remote import remote_file_flow
     if not remote_file_flow.is_remote_session(req.session_id):
+        ctx = get_session_security(req.session_id)
+        slug = getattr(ctx, "agent", "") if ctx is not None else ""
+        rel = req.path.lstrip("/")
+        if slug and rel.startswith(f"{slug}/"):
+            await _announce_written(slug, rel[len(slug) + 1:])
         return {"ok": True, "local": True}
     # Satellite-host cache paths push back to the original
     # absolute path via the sidecar metadata instead of the agent-tree
@@ -265,7 +276,33 @@ async def hook_file_written(
         if slug and rel.startswith(prefix) and is_canonical_rel_path(rel[len(prefix):]):
             rel = rel[len(prefix):]
     ok = await remote_file_flow.push_back(req.session_id, rel)
+    # The platform copy changed whatever the push answered.
+    ctx = get_session_security(req.session_id)
+    slug = getattr(ctx, "agent", "") if ctx is not None else ""
+    if slug:
+        await _announce_written(slug, rel)
     return {"ok": bool(ok)}
+
+
+async def _announce_written(agent_slug: str, rel: str) -> None:
+    """``file_updated(source="disk")`` for a file-tools write of an agent
+    tree file (a canonical agent-tree path only), unless the file still
+    holds the bytes its newest push's document knows (a ``preview_document``
+    of an untouched file changed nothing: a view with unsaved edits must not
+    be told otherwise)."""
+    from core.remote.file_sync import is_canonical_rel_path
+    if not is_canonical_rel_path(rel):
+        return
+    from api.hooks import preview
+    from api.media.wopi import encode_file_id
+    agents_rel = f"{agent_slug}/{rel}"
+    file_id = encode_file_id(agents_rel)
+    if preview.pushed_generation(file_id):
+        digest = await asyncio.to_thread(preview.file_digest, config.AGENTS_DIR / agents_rel)
+        if preview.unchanged_since_push(file_id, agents_rel, digest):
+            return
+    from services.notifications import notification_manager
+    await notification_manager.broadcast_file_updated(agent_slug, rel, source="disk")
 
 
 class PermissionResponseRequest(BaseModel):

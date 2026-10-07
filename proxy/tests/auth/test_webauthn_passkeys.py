@@ -20,6 +20,7 @@ import config
 from api.auth import webauthn as wa
 from app import app
 from auth.password import hash_password
+from auth import rate_limiter
 from auth.providers import UserContext, get_current_user
 from auth.rate_limiter import clear_rate_limit
 from storage import database as db
@@ -34,11 +35,14 @@ _EMAIL = "pk@t.com"
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://dash.example.com")
-    clear_rate_limit("passkey", "testclient")
+    monkeypatch.setattr(config, "RUNNING_IN_DOCKER", False)
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
+    monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 0)
+    rate_limiter._attempts.clear()
     wa._challenges.clear()
     wa._native_tokens.clear()
     yield
-    clear_rate_limit("passkey", "testclient")
+    rate_limiter._attempts.clear()
     wa._challenges.clear()
     wa._native_tokens.clear()
     app.dependency_overrides.pop(get_current_user, None)
@@ -328,10 +332,11 @@ def test_credentials_cascade_on_user_delete(monkeypatch):
     assert webauthn_store.get_credential(cred_id) is None
 
 
-def _native_token(monkeypatch, cred_id: str, handoff: str) -> str:
+def _native_token(monkeypatch, cred_id: str, handoff: str,
+                  browser: TestClient | None = None) -> str:
     """The system browser's leg: the ceremony with native=true and the
     WebView's nonce."""
-    browser = TestClient(app)
+    browser = browser or TestClient(app)
     state = browser.post("/auth/passkey/options").json()["state"]
     monkeypatch.setattr(wa, "verify_authentication_response",
                         lambda **kw: SimpleNamespace(new_sign_count=1))
@@ -520,3 +525,67 @@ def test_native_exchange_rejects_expired_and_garbage(monkeypatch):
         resp = client.post("/auth/passkey/native/exchange", json={"token": tok})
         assert resp.status_code == 401
         assert "session" not in resp.cookies
+
+
+# ── the internal listener is not the local network (AUTH.md "Bucket key") ──
+
+_INTERNAL = 45123
+_LAN = ("192.168.1.20", 40000)
+
+
+def _internal() -> TestClient:
+    return TestClient(app, base_url=f"http://127.0.0.1:{_INTERNAL}", client=("127.0.0.1", 40000))
+
+
+def _local_only_passkey(monkeypatch) -> str:
+    sub = _mk_user()
+    cred_id = _register(monkeypatch, sub)
+    db.update_user_auth_fields(sub, local_only=True)
+    app.dependency_overrides.pop(get_current_user, None)
+    return cred_id
+
+
+def _passkey_login(c: TestClient, cred_id: str):
+    state = c.post("/auth/passkey/options").json()["state"]
+    return c.post("/auth/passkey/verify", json={"state": state, "credential": {"id": cred_id}})
+
+
+def test_a_local_only_passkey_is_judged_after_its_assertion(monkeypatch):
+    """The LAN rule answers only a verified assertion: a caller holding a
+    credential id alone cannot learn that the account is LAN only."""
+    monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", _INTERNAL)
+    cred_id = _local_only_passkey(monkeypatch)
+
+    def _boom(**kw):
+        raise InvalidAuthenticationResponse("bad signature")
+
+    monkeypatch.setattr(wa, "verify_authentication_response", _boom)
+    assert _passkey_login(_internal(), cred_id).status_code == 401
+    assert _passkey_login(TestClient(app), cred_id).status_code == 401
+    monkeypatch.setattr(wa, "verify_authentication_response",
+                        lambda **kw: SimpleNamespace(new_sign_count=4))
+    resp = _passkey_login(_internal(), cred_id)
+    assert resp.status_code == 403 and "session" not in resp.cookies
+    # A refused sign-in records no use of the credential.
+    assert webauthn_store.get_credential(cred_id)["sign_count"] == 0
+    resp = _passkey_login(TestClient(app, client=_LAN), cred_id)
+    assert resp.status_code == 200 and "session" in resp.cookies
+    keys = set(rate_limiter._attempts)
+    assert ("passkey", "internal-listener") in keys and ("passkey", "127.0.0.1") not in keys
+
+
+def test_the_app_exchange_on_the_internal_listener_refuses_local_only(monkeypatch):
+    monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", _INTERNAL)
+    cred_id = _local_only_passkey(monkeypatch)
+    lan_browser = TestClient(app, client=_LAN)
+
+    webview = _internal()
+    handoff = webview.post("/auth/passkey/native/start").json()["handoff"]
+    token = _native_token(monkeypatch, cred_id, handoff, browser=lan_browser)
+    resp = webview.post("/auth/passkey/native/exchange", json={"token": token})
+    assert resp.status_code == 403 and "session" not in resp.cookies
+
+    webview = TestClient(app, client=_LAN)
+    handoff = webview.post("/auth/passkey/native/start").json()["handoff"]
+    token = _native_token(monkeypatch, cred_id, handoff, browser=lan_browser)
+    assert webview.post("/auth/passkey/native/exchange", json={"token": token}).status_code == 200

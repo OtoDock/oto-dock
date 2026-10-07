@@ -30,7 +30,7 @@ that this module's ``router`` includes (``proxy/app.py`` mounts only this one):
                       sessions/{id}/permission-response, location/request
 
 A test that patches a name a route reads patches the module that holds the
-route (``api.hooks.artifacts.verify_session_match``), never this facade.
+route (``api.hooks.artifacts.verify_session_match_async``), never this facade.
 """
 
 from fastapi import APIRouter

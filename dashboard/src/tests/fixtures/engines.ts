@@ -53,7 +53,8 @@ export function descriptor(over: DescriptorOverrides = {}): LayerCapabilities {
     runtime: {
       has_os_process: false, hard_abort_kills_process: false, supports_remote_execution: false,
       supports_interactive_pty: false, interactive_first_prompt_via_argv: false,
-      supports_reattach_after_restart: false, binary: '', pin_key: '', config_dir_name: '',
+      supports_reattach_after_restart: false, readopts_idle_session: false,
+      binary: '', pin_key: '', config_dir_name: '',
       self_wakes: false, event_queue_depth: 0, interactive_submit_backstop: false,
       installed_name: '',
     },

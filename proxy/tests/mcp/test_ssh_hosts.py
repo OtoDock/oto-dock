@@ -10,6 +10,7 @@ framework seam; the context-only (transport "none") mechanism tests below
 use a synthetic manifest — the mechanism outlived ssh-hosts's server flip.
 """
 
+import contextlib
 import dataclasses
 import sys
 from pathlib import Path
@@ -388,6 +389,20 @@ def _session_user(agent="agent", agent_roles=None):
     )
 
 
+@contextlib.contextmanager
+def _live_session(sid="sid-1", role="editor"):
+    """The session's registered SecurityContext, as every layer registers it
+    before the session's process starts."""
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    session_state.set_session_security(sid, SecurityContext(
+        role=role, username="pm", agent="agent", is_admin_agent=False))
+    try:
+        yield
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
 def _endpoint_patches(instances):
     manifest = SimpleNamespace(name="ssh-hosts")
     return (
@@ -407,7 +422,7 @@ def test_endpoint_session_caller_gets_hosts_with_commands():
     )
     p1, p2, p3 = _endpoint_patches(rows)
     client = TestClient(_ssh_hosts_app(_session_user()))
-    with p1, p2, p3:
+    with p1, p2, p3, _live_session():
         resp = client.get("/v1/agents/agent/ssh-hosts")
     assert resp.status_code == 200
     hosts = resp.json()["hosts"]
@@ -424,7 +439,7 @@ def test_endpoint_target_os_windows_drops_mux():
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
     p1, p2, p3 = _endpoint_patches(rows)
     client = TestClient(_ssh_hosts_app(_session_user()))
-    with p1, p2, p3:
+    with p1, p2, p3, _live_session():
         resp = client.get("/v1/agents/agent/ssh-hosts?target_os=windows")
     assert resp.status_code == 200
     assert "ControlMaster" not in resp.json()["hosts"][0]["command"]
@@ -446,9 +461,10 @@ def test_endpoint_403_when_not_enabled_for_agent():
     manifest = SimpleNamespace(name="ssh-hosts")
     client = TestClient(_ssh_hosts_app(_session_user()))
     with patch("services.mcp.mcp_registry.get_manifest", return_value=manifest), \
-         patch("services.mcp.mcp_registry.get_agent_mcps", return_value=[]):
+         patch("services.mcp.mcp_registry.get_agent_mcps", return_value=[]), _live_session():
         resp = client.get("/v1/agents/agent/ssh-hosts")
     assert resp.status_code == 403
+    assert resp.json()["detail"] == "ssh-hosts is not enabled for this agent"
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +548,59 @@ def test_endpoint_no_user_session_is_judged_on_its_live_context():
             assert client.get("/v1/agents/agent/ssh-hosts").status_code == 403
     finally:
         session_state._session_security.pop("sid-task", None)
+
+
+def test_endpoint_judges_a_persons_session_on_its_live_context_too():
+    """A person's session lists the hosts only when the session itself takes
+    the keys: a live context that is neither a check's judge (read-only) nor
+    an external caller's, beside the person's live editor role. An editor's
+    ordinary session still lists."""
+    from fastapi.testclient import TestClient
+    from core.session import session_state
+
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
+    p1, p2, p3 = _endpoint_patches(rows)
+    client = TestClient(_ssh_hosts_app(_session_user()))
+    try:
+        session_state.set_session_security("sid-1", _ctx("editor"))
+        with p1, p2, p3:
+            assert client.get("/v1/agents/agent/ssh-hosts").status_code == 200
+        for ctx in (_ctx("editor", read_only=True), _ctx("manager", read_only=True),
+                    _ctx("editor", principal="external")):
+            session_state.set_session_security("sid-1", ctx)
+            with p1, p2, p3:
+                assert client.get("/v1/agents/agent/ssh-hosts").status_code == 403, ctx
+        session_state._session_security.pop("sid-1", None)
+        with p1, p2, p3:
+            assert client.get("/v1/agents/agent/ssh-hosts").status_code == 403  # none live
+        # The live role still rules: an editor context of a person demoted since.
+        session_state.set_session_security("sid-1", _ctx("editor"))
+        demoted = TestClient(_ssh_hosts_app(_session_user(agent_roles={"agent": "viewer"})))
+        with p1, p2, p3:
+            assert demoted.get("/v1/agents/agent/ssh-hosts").status_code == 403
+    finally:
+        session_state._session_security.pop("sid-1", None)
+
+
+def test_endpoint_refuses_an_agent_scope_judge():
+    """An agent-scope check's judge carries a manager context marked
+    read-only: it is not handed the keys, so it does not list the hosts."""
+    from fastapi.testclient import TestClient
+    from auth import roles
+    from auth.providers import UserContext
+    from core.session import session_state
+
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
+    p1, p2, p3 = _endpoint_patches(rows)
+    user = UserContext(sub="session:sid-judge", email="", name="", role=roles.SERVICE,
+                       is_api_key=True, session_id="sid-judge", agent="agent")
+    client = TestClient(_ssh_hosts_app(user))
+    session_state.set_session_security("sid-judge", _ctx("manager", username="", read_only=True))
+    try:
+        with p1, p2, p3:
+            assert client.get("/v1/agents/agent/ssh-hosts").status_code == 403
+    finally:
+        session_state._session_security.pop("sid-judge", None)
 
 
 def test_clear_removes_a_leftover_key_dir(tmp_path):

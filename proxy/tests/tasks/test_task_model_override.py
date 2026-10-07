@@ -429,6 +429,134 @@ class TestGetTask:
         assert client.get("/v1/tasks/stats").status_code == 200
 
 
+class TestContinuedLaneModelChange:
+    """A continue round that changed the worker's model
+    (``respawn_for_model``, set by the delegation route) closes the chat's
+    live session after its last lane gate, under the holding layer's session
+    lock, and never rides the warm session — so the round resumes the
+    conversation on the new model. A plain continue round keeps today's path."""
+
+    SID = "44444444-4444-4444-8444-444444444444"
+    CHAT = "worker-model-change"
+
+    def _drive(self, monkeypatch, *, respawn: bool) -> dict:
+        import asyncio
+        import contextlib
+        from types import SimpleNamespace
+
+        from core import concurrency
+        from core.config import task_config_builder
+        from core.session import session_manager, session_state
+        from services.scheduler import lanes, runner, shared
+        from storage import remote_store
+
+        task_store.create_chat(self.CHAT, "user-admin", AGENT, "auto",
+                               origin="delegated", model=MODEL_STRONG,
+                               execution_path="claude-code-cli")
+        task_store.update_chat(self.CHAT, session_id=self.SID)
+        events: list = []
+        seen: dict = {"events": events, "reuse": 0, "acquire": []}
+
+        class _Holder:
+            """The layer holding the chat's live session."""
+
+            @contextlib.asynccontextmanager
+            async def session_lock(self, sid):
+                events.append(("lock", sid))
+                yield
+                events.append(("unlock", sid))
+
+            async def close_session(self, sid):
+                events.append(("close", sid))
+
+        holder = _Holder()
+        monkeypatch.setattr(session_manager, "find_layer_for_session",
+                            lambda sid: holder if sid == self.SID else None)
+
+        class _Stop(Exception):
+            pass
+
+        class _RoundLayer:
+            async def can_resume_session(self, sid, **kw):
+                return True
+
+            async def start_session(self, sid, cfg):
+                events.append(("start", sid, cfg.resume, cfg.model))
+                raise _Stop("the test ends the round at the spawn")
+
+            async def close_session(self, sid):
+                events.append(("failure-close", sid))
+
+        cfg = SimpleNamespace(execution_target="local", execution_path="claude-code-cli",
+                              interactive=False, resume=False, extra_env={}, chat_id="",
+                              subscription_id="", model=MODEL_STRONG)
+
+        async def _cfg(agent, task_def, sid, **kw):
+            return cfg
+
+        async def _reuse(*a, **k):
+            seen["reuse"] += 1
+            return False
+
+        async def _acquire(sid, kind, **kw):
+            seen["acquire"].append((sid, kind, kw.get("blocking")))
+
+        @contextlib.asynccontextmanager
+        async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
+            yield
+
+        monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
+        monkeypatch.setattr(concurrency, "acquire", _acquire)
+        monkeypatch.setattr(task_config_builder, "build_task_agent_config", _cfg)
+        monkeypatch.setattr(task_config_builder, "resolve_task_identity",
+                            lambda *a, **k: task_config_builder.TaskIdentity(
+                                "", "manager", "agent", None))
+        monkeypatch.setattr(session_manager, "get_execution_layer",
+                            lambda *a, **k: _RoundLayer())
+        monkeypatch.setattr(remote_store, "resolve_execution_target",
+                            lambda *a, **k: ("local", None))
+        monkeypatch.setattr(lanes, "_try_reuse_warm_session", _reuse)
+        monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
+
+        task = shared.TaskDefinition(
+            id="t-model-change", name="follow", agent=AGENT, prompt="go on",
+            scope="agent", notification_mode="none", continue_session=self.SID,
+            target_chat_id=self.CHAT, override_model=MODEL_STRONG,
+            override_execution_path="claude-code-cli", respawn_for_model=respawn,
+        )
+        run_id = "run-model-change"
+        task_store.create_run(run_id, task.id, task.agent, "manual", None, task.prompt,
+                              "delegate", task.scope, None)
+        shared._active_task_ids[task.id] = run_id
+        try:
+            asyncio.run(asyncio.wait_for(
+                runner._run_task(run_id, self.SID, task, task.prompt, "manual", None, 1),
+                timeout=30))
+        finally:
+            session_state._sessions.pop(self.SID, None)
+            shared._active_task_ids.pop(task.id, None)
+        return seen
+
+    def test_a_model_change_round_closes_the_live_session_first(self, temp_db, monkeypatch):
+        seen = self._drive(monkeypatch, respawn=True)
+        # Closed under the holder's session lock, before the round's spawn,
+        # which resumes the conversation on the new model.
+        assert seen["events"][:4] == [
+            ("lock", self.SID), ("close", self.SID), ("unlock", self.SID),
+            ("start", self.SID, True, MODEL_STRONG),
+        ]
+        # Never the warm session; the close's slot release is taken back.
+        assert seen["reuse"] == 0
+        assert seen["acquire"] == [(self.SID, "task", True)]
+
+    def test_a_plain_continue_round_keeps_the_live_session(self, temp_db, monkeypatch):
+        seen = self._drive(monkeypatch, respawn=False)
+        assert ("close", self.SID) not in seen["events"]
+        assert seen["events"][0] == ("start", self.SID, True, MODEL_STRONG)
+        assert seen["reuse"] == 1
+        assert seen["acquire"] == []
+
+
 class TestFireOfAGoneRow:
     def test_a_fire_of_a_deleted_or_paused_row_removes_the_job_and_runs_nothing(
             self, client, monkeypatch):

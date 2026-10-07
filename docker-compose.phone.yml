@@ -33,7 +33,7 @@ services:
     # Fallback must track VERSIONS.md like docker-compose.yml does — a stale
     # default here made bare `docker compose` builds tag phone images 1.2.0
     # (and a bare pull would fetch the genuinely old published 1.2.0).
-    image: ghcr.io/otodock/otodock-phone:${OTODOCK_VERSION:-1.7.0}
+    image: ghcr.io/otodock/otodock-phone:${OTODOCK_VERSION:-1.7.1}
     # Pull the release image when missing; `--build` (or scripts/compose.sh
     # up -d --build) still builds from source using the block below.
     pull_policy: missing

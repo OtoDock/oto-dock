@@ -82,7 +82,8 @@ def fake_mcp(tmp_path, monkeypatch):
         def get_env_overrides(self):
             return {}
 
-    def fake_build(agent, row, mcps):
+    def fake_build(agent, row, mcps, session_id=""):
+        assert session_id.startswith("appx-")
         ctx = SecurityContext(role="manager", username=row.get("username") or "",
                               agent=agent, is_admin_agent=False)
         return cfg, {}, {}, _NoWrap(), ctx
@@ -513,3 +514,18 @@ def test_the_app_identity_token_files_ride_the_bundles_of_the_started_mcps(monke
     out = hx._bundles_with_token_files(AGENT, identity, {}, frozenset({"test-mcp"}))
     assert seen == [(AGENT, {"user_sub": "hx-alice-sub", "session_scope": "user"})]
     assert set(out) == {"test-mcp"}
+
+
+def test_the_pooled_session_is_held_while_live_and_closing_after(fake_mcp):
+    from core.session import session_state
+
+    async def main():
+        r = await hx.execute_app_tool(_shared_row(), ACTION, {"text": "hi"})
+        sid = json.loads(r["result"])["sid"]
+        assert session_state.session_is_held(sid)
+        await hx.close_all()
+        assert not session_state.session_is_held(sid)
+        assert session_state.session_is_live(sid)
+        session_state.reset_liveness_for_tests()
+
+    asyncio.run(main())

@@ -143,7 +143,11 @@ async def spawn_detached_prewarm(
         )
         return new_sid
     except Exception as e:
-        logger.error(f"detached pre-warm failed: {e}", exc_info=True)
+        from core.sandbox.session_config_dir import AgentStateRefused
+        if isinstance(e, AgentStateRefused):
+            logger.info(f"detached pre-warm skipped (below the editor tier) agent={agent}")
+        else:
+            logger.error(f"detached pre-warm failed: {e}", exc_info=True)
         from core.concurrency import release_chat_slot
         release_chat_slot(new_sid)
         if layer is not None and await layer.is_session_alive(new_sid):

@@ -45,6 +45,7 @@ export const TOOL_ROLES: Record<string, string> = {
   'AskUserQuestion': 'question',
   'request_user_input': 'question',
   'CodexEscalation': 'escalation',
+  'CodexTerminalInput': 'escalation',
 }
 
 export const TOOL_PAYLOADS: Record<string, string> = {
@@ -82,6 +83,7 @@ export const TOOL_PAYLOADS: Record<string, string> = {
   'AskUserQuestion': '',
   'request_user_input': '',
   'CodexEscalation': '',
+  'CodexTerminalInput': '',
 }
 
 /** The input keys a payload kind is read from, in order (the first present

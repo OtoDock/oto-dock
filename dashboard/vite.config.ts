@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
 import path from 'path'
+import type { ClientRequest, IncomingMessage } from 'http'
 import { precompressDir } from './build/precompress'
 import { stampBuildId } from './build/buildId'
 
@@ -172,6 +173,15 @@ function precompressAssets(): Plugin {
   }
 }
 
+// The dev server's own pages reach the proxy under the proxy's origin.
+function ownOriginToTarget(proxyReq: ClientRequest, req: IncomingMessage) {
+  const origin = proxyReq.getHeader('origin')
+  if (!origin || !req.headers.host) return
+  try {
+    if (new URL(String(origin)).host === req.headers.host) proxyReq.setHeader('origin', 'http://localhost:8400')
+  } catch { /* not a URL: left as it is */ }
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -227,13 +237,23 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // changeOrigin rewrites Host to the target; the proxy also refuses a
+      // cookie write whose Origin is another host (its origin check), so a
+      // page of this dev server names the target's origin instead (any
+      // other origin passes through and is refused, as in production).
       '/v1': {
         target: 'http://localhost:8400',
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReq', ownOriginToTarget)
+        },
       },
       '/auth': {
         target: 'http://localhost:8400',
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyReq', ownOriginToTarget)
+        },
       },
       // No changeOrigin: the proxy's dashboard socket accepts a page whose
       // Origin names the Host it was sent to, so the browser's Host must

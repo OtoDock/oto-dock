@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 // The popover composes the share list, the add form and the link over the
 // shares hooks; the hooks are stubbed, the server rules are theirs.
+type Directory = { users: unknown[] | null; agents: unknown[]; departments: unknown[] }
+const closed = (): Directory => ({ users: null, agents: [], departments: [] })
 const state = vi.hoisted(() => ({
   shares: [] as unknown[],
-  directory: null as unknown[] | null,
+  directory: { users: null, agents: [], departments: [] } as Directory | undefined,
   settings: { max_expiry_days: null } as { max_expiry_days: number | null } | undefined,
   create: vi.fn(),
   createAsync: vi.fn(),
@@ -28,16 +30,23 @@ vi.mock('@/api/auth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/auth')>()),
   startOidcConfirm: startOidc,
 }))
-vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: { sub: 'u-me' } }) }))
+const authUser = vi.hoisted(() => ({ current: { sub: 'u-me', role: 'member', agents: ['dev', 'ops'], agent_roles: { dev: 'editor', ops: 'editor' } } as Record<string, unknown> }))
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: authUser.current }) }))
 
 import SharePopover from '@/components/sharing/SharePopover'
 import { ConfirmRequired } from '@/api/shares'
 import { savePending, saveConfirm } from '@/lib/shareConfirm'
 
 const app = {
-  id: 'app-1', title: 'Schedule', slug: 'schedule', scope: 'personal' as const,
+  id: 'app-1', title: 'Schedule', slug: 'schedule', scope: 'personal' as const, agent: 'dev',
   actions: [{ id: 'book', label: 'Book', type: 'fire_task' as const, task_id: 't1' }],
 }
+const teamApp = { ...app, id: 'app-2', title: 'Board', slug: 'board', scope: 'shared' as const }
+const directoryWithAll = (): Directory => ({
+  users: [{ sub: 'u9', name: 'Ana Ruiz', username: 'ana' }],
+  agents: [{ slug: 'dev', display_name: 'Dev', color: '' }, { slug: 'ops', display_name: 'Ops Desk', color: '' }],
+  departments: [{ id: 'dept-1', name: 'Engineering' }],
+})
 
 function renderPopover(onClose = vi.fn(), extra: { initialTab?: 'people' | 'link'; confirmError?: string } = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -50,14 +59,16 @@ function renderPopover(onClose = vi.fn(), extra: { initialTab?: 'people' | 'link
 
 beforeEach(() => {
   state.shares = []
-  state.directory = null
+  state.directory = closed()
   state.settings = { max_expiry_days: null }
+  authUser.current = { sub: 'u-me', role: 'member', agents: ['dev', 'ops'], agent_roles: { dev: 'editor', ops: 'editor' } }
   state.create.mockReset()
   state.createAsync.mockReset()
   state.patch.mockReset()
   state.patchAsync.mockReset()
   startOidc.mockClear()
   localStorage.clear()
+  sessionStorage.clear()
 })
 
 const openLinkTab = () => fireEvent.click(screen.getByRole('button', { name: 'Link' }))
@@ -94,24 +105,109 @@ describe('SharePopover', () => {
     expect(state.patch).toHaveBeenCalledWith({ id: 's2', resume: true }, expect.anything())
   })
 
-  it('shares by a directory pick (the sub) or by what was typed, with the expiry', () => {
-    state.directory = [{ sub: 'u9', name: 'Ana Ruiz', username: 'ana' }]
+  it('shares by a directory pick (the sub) or by what was typed, with the expiry and the role', () => {
+    state.directory = { ...directoryWithAll(), agents: [], departments: [] }
     renderPopover()
     const who = screen.getByLabelText('Who to share with') as HTMLInputElement
     expect(who.placeholder).toBe('Name or username')
+    // A personal app offers people only, so no "Share with" picker; the
+    // owner is its manager, so every cap is on offer, viewer first.
+    expect(screen.queryByLabelText('Share with')).toBeNull()
+    expect(Array.from((screen.getByLabelText('Role') as HTMLSelectElement).options).map((o) => o.value))
+      .toEqual(['viewer', 'contributor', 'editor', 'manager'])
     fireEvent.change(who, { target: { value: 'Ana Ruiz' } })
     fireEvent.change(screen.getByLabelText('Expiry'), { target: { value: '30d' } })
+    fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'editor' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenCalledWith(
-      { target_kind: 'app', target_id: 'app-1', grantee: 'u9', expires_in: '30d' },
+      { target_kind: 'app', target_id: 'app-1', grantee_kind: 'person', grantee: 'u9', expires_in: '30d', role_cap: 'editor' },
       expect.anything(),
     )
     fireEvent.change(who, { target: { value: 'someone@example.com' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenLastCalledWith(
-      { target_kind: 'app', target_id: 'app-1', grantee: 'someone@example.com', expires_in: '30d' },
+      { target_kind: 'app', target_id: 'app-1', grantee_kind: 'person', grantee: 'someone@example.com', expires_in: '30d', role_cap: 'editor' },
       expect.anything(),
     )
+    // The notice names what the share did.
+    act(() => { state.create.mock.calls[1][1].onSuccess({ status: 'ok', share: { target_kind: 'app', grantee: { name: 'Ana Ruiz' }, to_agent: null, to_department: null } }) })
+    expect(screen.getByText('Waiting for Ana Ruiz to accept.')).toBeTruthy()
+  })
+
+  it('a team app offers an agent and, to an admin, a department; the caps stop at my role', () => {
+    // The server lists departments to an admin only; an editor's directory
+    // carries none.
+    state.directory = { ...directoryWithAll(), departments: [] }
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { unmount } = render(
+      <QueryClientProvider client={qc}>
+        <SharePopover app={teamApp} onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    const withSel = screen.getByLabelText('Share with') as HTMLSelectElement
+    // An editor: no department option, caps up to editor; the app's own
+    // agent is not a place for it.
+    expect(Array.from(withSel.options).map((o) => o.value)).toEqual(['person', 'agent'])
+    expect(Array.from((screen.getByLabelText('Role') as HTMLSelectElement).options).map((o) => o.value))
+      .toEqual(['viewer', 'contributor', 'editor'])
+    fireEvent.change(withSel, { target: { value: 'agent' } })
+    const agentSel = screen.getByLabelText('Which agent') as HTMLSelectElement
+    expect(Array.from(agentSel.options).map((o) => o.value)).toEqual(['', 'ops'])
+    expect((screen.getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(agentSel, { target: { value: 'ops' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Share' }))
+    expect(state.create).toHaveBeenLastCalledWith(
+      { target_kind: 'app', target_id: 'app-2', grantee_kind: 'agent', grantee: 'ops', expires_in: '', role_cap: 'viewer' },
+      expect.anything(),
+    )
+    act(() => { state.create.mock.calls[0][1].onSuccess({ status: 'ok', share: { target_kind: 'app', grantee: null, to_agent: { slug: 'ops', name: 'Ops Desk' }, to_department: null } }) })
+    expect(screen.getByText("Added to Ops Desk's apps.")).toBeTruthy()
+    unmount()
+    // An admin: the department option too, every cap.
+    authUser.current = { sub: 'u-me', role: 'admin', agents: [], agent_roles: {} }
+    state.directory = directoryWithAll()
+    render(
+      <QueryClientProvider client={qc}>
+        <SharePopover app={teamApp} onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    const sel = screen.getByLabelText('Share with') as HTMLSelectElement
+    expect(Array.from(sel.options).map((o) => o.value)).toEqual(['person', 'agent', 'department'])
+    fireEvent.change(sel, { target: { value: 'department' } })
+    fireEvent.change(screen.getByLabelText('Which department'), { target: { value: 'dept-1' } })
+    fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'manager' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Share' }))
+    expect(state.create).toHaveBeenLastCalledWith(
+      { target_kind: 'app', target_id: 'app-2', grantee_kind: 'department', grantee: 'dept-1', expires_in: '', role_cap: 'manager' },
+      expect.anything(),
+    )
+  })
+
+  it('lists agent and department shares with their state, and a declined person may be shared again', () => {
+    state.directory = directoryWithAll()
+    state.shares = [
+      { id: 'a1', scope: 'internal', state: 'active', grantee: null, to_agent: { slug: 'ops', name: 'Ops Desk' }, to_department: null, role_cap: 'editor', decision: 'accepted', expires_at: null },
+      { id: 'd1', scope: 'internal', state: 'active', grantee: null, to_agent: null, to_department: { id: 'dept-1', name: 'Engineering' }, role_cap: 'viewer', decision: 'accepted', expires_at: null },
+      { id: 'p1', scope: 'internal', state: 'active', grantee: { sub: 'u9', name: 'Ana Ruiz', username: 'ana' }, to_agent: null, to_department: null, role_cap: 'viewer', decision: 'declined', decided_by_name: 'Ana Ruiz', expires_at: null },
+      { id: 'p2', scope: 'internal', state: 'active', target_kind: 'app', grantee: { sub: 'u8', name: 'Bo Lind', username: 'bo' }, to_agent: null, to_department: null, role_cap: 'editor', decision: 'accepted', placed_agent: 'lite', expires_at: null },
+    ]
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <SharePopover app={teamApp} onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    const list = screen.getByTestId('share-list')
+    expect(list.textContent).toContain('Agent: Ops Desk')
+    expect(list.textContent).toContain('editor')
+    expect(list.textContent).toContain('Department: Engineering')
+    expect(list.textContent).toContain('declined by Ana Ruiz')
+    expect(list.textContent).toContain('accepted')
+    expect(list.textContent).not.toContain('lite')
+    // Ana is still a candidate: the datalist offers her again.
+    expect(screen.getByText('ana').tagName.toLowerCase()).toBe('option')
+    fireEvent.click(screen.getByLabelText('Remove Ops Desk'))
+    expect(state.patch).toHaveBeenCalledWith({ id: 'a1', revoke: true }, expect.anything())
   })
 
   it('lists people and links together under either tab', () => {
@@ -130,6 +226,7 @@ describe('SharePopover', () => {
   })
 
   it('takes an exact username or email when the directory is closed and shows the link', () => {
+    state.directory = closed()
     renderPopover()
     expect((screen.getByLabelText('Who to share with') as HTMLInputElement).placeholder).toBe('Exact username or email')
     expect(screen.getByText(/\/apps\/app-1$/)).toBeTruthy()
@@ -147,8 +244,8 @@ describe('SharePopover', () => {
 })
 
 describe('SharePopover — chats', () => {
-  it('shares a chat as a snapshot, with the tool calls only when asked', () => {
-    state.directory = [{ sub: 'u9', name: 'Ana Ruiz', username: 'ana' }]
+  it('shares a chat as a snapshot, with the tool calls only when asked, people only and no role', () => {
+    state.directory = directoryWithAll()
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(
       <QueryClientProvider client={qc}>
@@ -156,13 +253,15 @@ describe('SharePopover — chats', () => {
       </QueryClientProvider>,
     )
     expect(screen.getByText(/read-only copy of the conversation/)).toBeTruthy()
-    // No app link line for a chat.
+    // No app link line for a chat, no agent or department target, no role.
     expect(screen.queryByText(/\/apps\//)).toBeNull()
+    expect(screen.queryByLabelText('Share with')).toBeNull()
+    expect(screen.queryByLabelText('Role')).toBeNull()
     fireEvent.click(screen.getByLabelText('Include tool calls'))
     fireEvent.change(screen.getByLabelText('Who to share with'), { target: { value: 'ana' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenCalledWith(
-      { target_kind: 'chat', target_id: 'chat-1', grantee: 'u9', expires_in: '', include_tools: true },
+      { target_kind: 'chat', target_id: 'chat-1', grantee_kind: 'person', grantee: 'u9', expires_in: '', include_tools: true },
       expect.anything(),
     )
   })
@@ -283,7 +382,7 @@ describe('SharePopover — links', () => {
     expect(state.createAsync).not.toHaveBeenCalled()
     // The entries were taken: a second popover finds nothing.
     expect(localStorage.getItem('otodock-share-pending:u-me')).toBeNull()
-    expect(localStorage.getItem('otodock-confirm:u-me')).toBeNull()
+    expect(sessionStorage.getItem('otodock-confirm:u-me')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Make link' }))
     await flush()
     expect(state.createAsync).toHaveBeenCalledWith(expect.objectContaining({
@@ -298,7 +397,7 @@ describe('SharePopover — links', () => {
       fields: { public: false, expiry: '30d', buttons: false, include_tools: false },
     })
     // The token is stale.
-    localStorage.setItem('otodock-confirm:u-me', JSON.stringify({ token: 'old', at: Date.now() - 6 * 60 * 1000 }))
+    sessionStorage.setItem('otodock-confirm:u-me', JSON.stringify({ token: 'old', at: Date.now() - 6 * 60 * 1000 }))
     const { unmount } = renderPopover(vi.fn(), { initialTab: 'link' })
     expect(screen.getByRole('alert').textContent).toContain('took too long')
     unmount()

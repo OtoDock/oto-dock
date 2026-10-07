@@ -60,6 +60,27 @@ class HookAppSlugRequest(BaseModel):
     visibility: str = ""
 
 
+class HookAppOpenRequest(HookAppSlugRequest):
+    # The home agent of an app a share placed in this one (APPS.md "Live
+    # apps"): empty looks among this agent's own rows, then the placed ones.
+    agent: str = ""
+
+
+def placement_identity(ctx) -> tuple[str, str | None]:
+    """``(own role, person_sub)`` for a session's placement reads
+    (SHARING.md "Agents use a placed app"): the role is the person's row on
+    the session's agent (``viewer`` without one) when the session carries a
+    person, else the no-user word; ``person_sub`` names the person only
+    when the session mounts their scope (``mount_username``), so a
+    Shared-only chat and an agent-scope task see no person placement. The
+    app proxy's caller applies the same rule. Synchronous."""
+    if not ctx.username:
+        return roles.SERVICE, None
+    sub = task_store.get_user_sub_by_username(ctx.username) or ""
+    own = (roles.row_role(task_store.get_user_agent_roles(sub), ctx.agent) or roles.VIEWER) if sub else roles.VIEWER
+    return own, (sub if (ctx.mount_username and sub) else None)
+
+
 class HookAppPushRequest(BaseModel):
     session_id: str
     slug: str
@@ -640,9 +661,12 @@ async def write_state_row(row: dict, patch, *, replace: bool, updated_by: str) -
 
 
 @router.post("/v1/hooks/apps/open")
-async def hook_app_open(req: HookAppSlugRequest, authorization: str | None = Header(None)):
+async def hook_app_open(req: HookAppOpenRequest, authorization: str | None = Header(None)):
     """Put the app on the screen of the human in this conversation: the
-    sender of the chat's last turn when known, else the session user."""
+    sender of the chat's last turn when known, else the session user. The
+    app is this agent's own, or one a share placed here (SHARING.md): by
+    slug, with ``agent`` naming the home agent when a native app shares
+    the slug; the hide read for a placed app is that human's hide HERE."""
     await verify_session_match_async(authorization, req.session_id)
     ctx = get_session_security(req.session_id)
     if ctx is None:
@@ -653,7 +677,42 @@ async def hook_app_open(req: HookAppSlugRequest, authorization: str | None = Hea
             detail="open_app needs a session with a user — this session has "
                    "none (agent-scope task/trigger/service)",
         )
-    _vis, row = await _find_app_row(ctx, req.slug, req.visibility)
+    home = (req.agent or "").strip().lower()
+    slug = (req.slug or "").strip().lower()
+    own: dict | None = None
+    if home in ("", ctx.agent):
+        try:
+            own = (await _find_app_row(ctx, req.slug, req.visibility))[1]
+        except HTTPException as e:
+            if e.status_code != 404 or home == ctx.agent:
+                raise
+    session_sub = await run_db(task_store.get_user_sub_by_username, ctx.username) or ""
+
+    def _placed_for(sub: str) -> dict | None:
+        # The placements of one person (their own person placements
+        # included); a shared row before a personal one of the same slug;
+        # the slug placed from two home agents needs ``agent`` to pick one.
+        from storage.sharing import share_store
+        rows = [r for r in share_store.placements_for_agent(ctx.agent, sub)
+                if r.get("slug") == slug and (not home or r.get("agent") == home)]
+        homes = sorted({r.get("agent") or "" for r in rows})
+        if len(homes) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"slug '{slug}' is placed here from {' and '.join(homes)} — pass agent to pick one",
+            )
+        rows.sort(key=lambda r: bool(r.get("username")))
+        return rows[0] if rows else None
+
+    placed = await run_db(_placed_for, session_sub) if home != ctx.agent else None
+    if own is not None and placed is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"slug '{slug}' is both this agent's own app and one placed here from "
+                   f"{placed.get('agent')} — pass agent to pick one",
+        )
+    if own is None and placed is None:
+        raise HTTPException(status_code=404, detail="no pinned app with that slug in your scope")
     from api.hooks import routing
     chat_id = await routing.resolve_hook_chat_id(req.session_id)
     if not chat_id or session_kind.is_task_chat_id(chat_id):
@@ -662,10 +721,15 @@ async def hook_app_open(req: HookAppSlugRequest, authorization: str | None = Hea
     from auth.providers import user_context_for_sub
     from services.notifications import notification_manager
     origin = notification_manager.chat_turn_origin(chat_id)
-    target_sub = origin[2] if origin else (
-        await run_db(task_store.get_user_sub_by_username, ctx.username) or "")
+    target_sub = origin[2] if origin else session_sub
     if not target_sub:
         return {"status": "no_screen", "reason": "the session user could not be resolved"}
+    if placed is not None and target_sub != session_sub:
+        # The human whose screen opens holds their own person placements.
+        placed = await run_db(_placed_for, target_sub)
+        if placed is None:
+            raise HTTPException(status_code=404, detail="no pinned app with that slug in your scope")
+    row = own if own is not None else placed
 
     def _check() -> str:
         chat = task_store.get_chat(chat_id) or {}
@@ -677,8 +741,12 @@ async def hook_app_open(req: HookAppSlugRequest, authorization: str | None = Hea
         if user is None or row.get("hidden") or not app_access(row, user):
             return "not_visible"
         from storage.sharing import share_store
-        if task_store.is_hidden_for_user(row["id"], target_sub) \
-                or share_store.grant_hidden("app", row["id"], target_sub):
+        if placed is not None:
+            hidden = bool(placed.get("hidden_for_me"))
+        else:
+            hidden = task_store.is_hidden_for_user(row["id"], target_sub) \
+                or share_store.grant_hidden("app", row["id"], target_sub)
+        if hidden:
             return "hidden"
         if not user_pref_on(target_sub, PREF_AGENTS_MAY_OPEN):
             return "off"
@@ -719,6 +787,9 @@ async def hook_app_open(req: HookAppSlugRequest, authorization: str | None = Hea
         "type": wire.OPEN_APP, "app_id": row["id"],
         "title": row.get("title") or row.get("slug") or "",
         "agent": row.get("agent") or "",
+        # A placed app's frame names its home agent; the agent whose session
+        # asked rides beside it, so the shell's notice names that one.
+        **({"opened_by": ctx.agent} if (row.get("agent") or "") != ctx.agent else {}),
         "scope_chat_id": row.get("scope_chat_id") or "",
         "scope_project_id": row.get("scope_project_id") or "",
     }
@@ -736,7 +807,11 @@ async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Hea
     so the agent reuses slugs deliberately instead of guessing. Includes
     soft-unpinned rows flagged ``unpinned`` — pin_app(slug) restores one
     with its manifest and approval intact. Chat/project-scoped Dock pins are
-    appended after the standing list with their ``pin_scope``."""
+    appended after the standing list with their ``pin_scope``. The apps a
+    share placed in this agent ride a separate ``placed`` list (SHARING.md
+    "Agents use a placed app"): another agent's rows, named by their home
+    agent and slug with their id, the role this session acts at on them and
+    their exported methods; never in the pinned order of ``apps``."""
     from api.apps import manifest as _mf
     from services.apps import releases as _releases
 
@@ -757,7 +832,31 @@ async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Hea
     for r in rows:
         if _mf.parse_secrets(r):
             waiting[r["id"]] = await asyncio.to_thread(_waiting_reason, r)
-    return {"apps": [{
+
+    def _placed() -> list[dict]:
+        from storage.sharing import share_store
+        own, person_sub = placement_identity(ctx)
+        hide_sub = task_store.get_user_sub_by_username(ctx.username) if ctx.username else ""
+        out = []
+        for r in share_store.placements_for_agent(ctx.agent, person_sub, hide_sub=hide_sub or ""):
+            p = r["placement"]
+            out.append({
+                "id": r["id"],
+                "agent": r.get("agent") or "",
+                "slug": r["slug"],
+                "title": r["title"],
+                "from_agent_name": p.get("from_agent_name") or "",
+                "kind": r.get("kind") or "file",
+                "placement": {"kind": p["kind"], "share_id": p["share_id"], "role_cap": p["role_cap"]},
+                "role": share_store.effective_placement_role(own, p["role_cap"], p.get("person_cap")),
+                "exports": {"methods": _mf.parse_exports(r).get("methods") or {}},
+                "actions_approved": task_store.app_actions_approved(r),
+                "hidden_for_me": bool(r.get("hidden_for_me")),
+            })
+        return out
+
+    placed = await asyncio.to_thread(_placed)
+    return {"placed": placed, "apps": [{
         "id": r["id"],
         "kind": r.get("kind") or "file",
         "slug": r["slug"],

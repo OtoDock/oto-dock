@@ -9,7 +9,7 @@ import LoginPage from '../pages/LoginPage'
 import SetupWizard from '../pages/SetupWizard'
 
 export default function RequireAuth() {
-  const { user, loading, authConfig, login } = useAuth()
+  const { user, loading, authConfig, loginError, login } = useAuth()
   const location = useLocation()
   const navigate = useNavigate()
 
@@ -44,8 +44,24 @@ export default function RequireAuth() {
       return <SetupWizard />
     }
 
-    // 2. Bypass mode: go straight to OIDC (existing Authentik behavior)
+    // 2. Bypass mode: go straight to OIDC (existing Authentik behavior).
+    // A refused start says why (the server's reason, a 429's wait
+    // included) and is not repeated until the person asks again.
     if (authConfig?.auth_provider_bypass && authConfig?.oidc_enabled) {
+      if (loginError) {
+        return (
+          <div className="flex flex-col items-center justify-center gap-3 min-h-screen bg-p-bg px-4 text-center">
+            <p role="alert" className="text-sm text-p-accent-red max-w-md">{loginError}</p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text hover:bg-p-surface"
+            >
+              Try again
+            </button>
+          </div>
+        )
+      }
       login()
       return (
         <div className="flex items-center justify-center min-h-screen bg-p-bg">

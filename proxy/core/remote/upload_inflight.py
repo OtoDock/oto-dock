@@ -43,8 +43,9 @@ from typing import Coroutine
 logger = logging.getLogger("claude-proxy.upload-inflight")
 
 # Hard ceiling on how long a turn waits for in-flight uploads. Generous
-# enough for a multi-MB file on a slow WAN link (chunked pushes ack every
-# window; a DEAD link fails its ack wait in ~30s inside ``push_file``),
+# enough for a multi-MB file on a slow WAN link (every chunk is acked, a
+# DEAD connection is rejected at once and a stalled one fails after
+# ``PUSH_STALL_S`` inside ``push_file``),
 # small enough that a wedged push can't hang the chat.
 BARRIER_TIMEOUT_S = 60.0
 

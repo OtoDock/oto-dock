@@ -193,13 +193,15 @@ async def install_skill_package_from_extracted(
     target_dir = target_parent / folder_name
 
     await _emit(progress_cb, "install", 60, "Applying package files")
+    # The file step strips an existing folder (an installed package's or a
+    # leftover one) to its preserved items: back it up so a failure restores it.
     backup_dir: Path | None = None
-    if is_update and target_dir.exists():
+    if target_dir.exists():
         backup_dir = target_dir.with_suffix(".bak")
-    await asyncio.to_thread(
-        _apply_extracted_files, pkg_root, target_dir, is_update, backup_dir,
-    )
     try:
+        await asyncio.to_thread(
+            _apply_extracted_files, pkg_root, target_dir, is_update, backup_dir,
+        )
         await asyncio.to_thread(mcp_registry.scan_manifests)
         if is_update and prior_enabled is not None:
             await asyncio.to_thread(mcp_store.set_mcp_enabled, name, prior_enabled)

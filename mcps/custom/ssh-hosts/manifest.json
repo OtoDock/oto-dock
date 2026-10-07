@@ -57,6 +57,7 @@
     "keys": "keys/"
   },
   "assignment_mode": "explicit",
+  "audience": "editor",
   "exclude_from": ["external"],
   "skills": [],
   "permissions": {

@@ -170,7 +170,7 @@ async def _drive_meeting(scripted_results):
          patch.object(MO.task_store, "update_meeting"), \
          patch.object(MO.task_store, "add_meeting_turn",
                       side_effect=lambda *a: saved.append(a)):
-        pump = SimpleNamespace(message_queue=[], system_queue=[])
+        pump = SimpleNamespace(chat_id="chat-mtg", system_queue=[])
         await MO.meeting_produce(
             "m1", {"mod": "s-mod", "p1": "s-p1"}, asyncio.Queue(), pump)
     return calls, saved
@@ -288,7 +288,7 @@ async def test_restate_runs_alone_before_other_routed_agents():
          patch.object(MO.task_store, "get_meeting", return_value=meeting_row), \
          patch.object(MO.task_store, "update_meeting"), \
          patch.object(MO.task_store, "add_meeting_turn"):
-        pump = SimpleNamespace(message_queue=[], system_queue=[])
+        pump = SimpleNamespace(chat_id="chat-mtg", system_queue=[])
         await MO.meeting_produce(
             "m1", {"mod": "s0", "p1": "s1", "p2": "s2"}, asyncio.Queue(), pump)
 
@@ -444,6 +444,124 @@ async def test_participant_end_meeting_does_not_end_the_meeting():
     assert len(saved) == 3
 
 
+def _agent_row_off_the_loop(slug):
+    """``agent_store.get_agent`` that refuses to run on an event loop: a
+    cache miss reads every agent row from the database."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return {"display_name": slug.upper(), "color": "#123456"}
+    raise AssertionError(f"agent row of {slug} read on the event loop")
+
+
+@pytest.mark.asyncio
+async def test_the_turn_start_reads_the_agent_row_off_the_loop():
+    meeting = {
+        "id": "m1", "topic": "t", "moderator": "mod",
+        "parent_chat_id": "chat-relay-5",
+        "participants": json.dumps(["mod", "p1", "p2"]),
+    }
+    layers = {f"sid-{a}": _ScriptedLayer([_text(f"{a} says hello.")]) for a in ("p1", "p2")}
+    queue: asyncio.Queue = asyncio.Queue()
+    # The prompt builder (meeting_context) is judged on its own; here only
+    # the runners' own reads.
+    with patch.object(MO.agent_store, "get_agent", new=_agent_row_off_the_loop), \
+         patch.object(MO, "build_turn_prompt", new=lambda *a, **k: "prompt"), \
+         patch.dict(MO._meeting_session_layers, layers):
+        sessions = {"p1": "sid-p1", "p2": "sid-p2"}
+        await MO._run_live_turn("p1", sessions, meeting, [], {}, queue, "m1")
+        await MO._run_parallel_batch(["p1", "p2"], sessions, meeting, [], {}, queue, "m1")
+    starts = []
+    while not queue.empty():
+        ev = queue.get_nowait()
+        if ev.data.get("subtype") == "meeting_turn_start":
+            starts.append(ev.data["agent_display_name"])
+    assert sorted(starts) == ["P1", "P1", "P2"]
+
+
+class _TurnBudget:
+    """A ``max_turns`` that counts the round loop's condition checks: the
+    loop re-tests ``total_turns < max_turns`` on every pass, a pass that runs
+    no turn included, so a loop that would spin raises here (the producer
+    reports it as an error) instead of running away."""
+
+    def __init__(self, passes: int, turns: int = 30):
+        self.left = passes
+        self.turns = turns
+        self.spun = False
+
+    def __gt__(self, total_turns):
+        self.left -= 1
+        if self.left < 0:
+            self.spun = True
+            raise RuntimeError("the round loop spun")
+        return total_turns < self.turns
+
+
+@pytest.mark.asyncio
+async def test_a_moderator_who_leaves_mid_meeting_never_stalls_the_round_loop():
+    """The moderator leaves in a parallel batch while the others still have
+    work: once nobody is ready the loop must end, never queue a wrap-up for
+    a moderator who is no longer active and go round again."""
+    budget = _TurnBudget(passes=200)
+    row = {
+        "id": "m1", "status": "active", "topic": "t",
+        "moderator": "mod", "max_turns": budget, "parent_chat_id": "chat-relay-4",
+        "active_participants": json.dumps(["mod", "p1", "p2"]),
+        "participants": json.dumps(["mod", "p1", "p2"]),
+    }
+    script = {
+        "mod": deque([_result("mod", "p1, report please.", directed=["p1"]),
+                      _result("mod", "I have to go.", called=("leave_meeting",))]),
+        "p1": deque([_result("p1", "Report for everyone."),
+                     _result("p1", "Noted, nothing to add.", directed=[])]),
+        "p2": deque([_result("p2", "p1, one more detail?", directed=["p1"])]),
+    }
+
+    def _next(agent):
+        q = script.get(agent)
+        return q.popleft() if q else _result(agent, "Summary.", called=("end_meeting",))
+
+    rounds: list[list[str]] = []
+
+    async def fake_live(agent_slug, *a):
+        rounds.append([agent_slug])
+        return _next(agent_slug)
+
+    async def fake_batch(ready_agents, *a):
+        rounds.append(list(ready_agents))
+        return [_next(x) for x in ready_agents]
+
+    closed: list[str] = []
+
+    class _Layer:
+        async def close_session(self, sid):
+            closed.append(sid)
+
+    q: asyncio.Queue = asyncio.Queue()
+    with patch.object(MO, "_run_live_turn", new=fake_live), \
+         patch.object(MO, "_run_parallel_batch", new=fake_batch), \
+         patch.dict(MO._meeting_session_layers, {s: _Layer() for s in ("s0", "s1", "s2")}), \
+         patch.object(MO.task_store, "get_meeting", return_value=row), \
+         patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "remove_active_participant", return_value=["p1", "p2"]), \
+         patch.object(MO.task_store, "add_meeting_turn"), \
+         patch.object(MO.agent_store, "get_agent", new=_agent_row_off_the_loop):
+        pump = SimpleNamespace(chat_id="chat-mtg", system_queue=[])
+        await MO.meeting_produce("m1", {"mod": "s0", "p1": "s1", "p2": "s2"}, q, pump)
+    ends = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev.data.get("subtype") == "meeting_concluded":
+            ends.append(ev.data)
+    assert not budget.spun, "the round loop spun once the moderator had left"
+    assert ends and "error" not in ends[-1]
+    # The moderator's leave ends the meeting after that round, as its
+    # failure does.
+    assert rounds == [["mod"], ["p1"], ["mod", "p2"]]
+    assert closed == ["s0"]
+
+
 def test_turn_prompts_say_replies_arrive_next_turn():
     meeting = _meeting_row()
     start = build_turn_prompt(meeting, "mod", [], prompt_type="start")
@@ -451,3 +569,38 @@ def test_turn_prompts_say_replies_arrive_next_turn():
     from services.meetings.meeting_context import _MEETING_AGENT_SUFFIX
     assert "NEXT turn" in _MEETING_AGENT_SUFFIX
     assert "denies every tool call" in _MEETING_AGENT_SUFFIX
+
+
+@pytest.mark.asyncio
+async def test_a_round_reads_the_chats_queue_for_the_moderator():
+    """A message typed while the meeting runs waits in the chat's queue (a
+    meeting turn takes no steer): the next round takes it, the pump writes
+    its row after the round's content (the QUEUE_TURN carries the item)."""
+    from core.events import input_queue
+    from core.events.common_events import QUEUE_TURN, TurnInput
+    input_queue._registry.pop("chat-mtg", None)
+    q = input_queue.get("chat-mtg")
+    q.items.append(input_queue.QueuedInput(
+        queue_id="q-1", chat_id="chat-mtg", author_sub="user-admin",
+        item=TurnInput("check the gate", cli_text="check the gate /tmp/plan.pdf")))
+    events: asyncio.Queue = asyncio.Queue()
+
+    async def fake_live(agent_slug, agent_sessions, meeting, transcript,
+                        pending, event_queue, meeting_id):
+        return _result("mod", "Thanks.", called=("end_meeting",))
+
+    try:
+        with patch.object(MO, "_run_live_turn", new=fake_live), \
+             patch.object(MO.task_store, "get_meeting", return_value=_meeting_row()), \
+             patch.object(MO.task_store, "update_meeting"), \
+             patch.object(MO.task_store, "add_meeting_turn"):
+            await MO.meeting_produce("m1", {"mod": "s-mod", "p1": "s-p1"}, events,
+                                     SimpleNamespace(chat_id="chat-mtg", system_queue=[]))
+    finally:
+        input_queue._registry.pop("chat-mtg", None)
+    every = []
+    while not events.empty():
+        every.append(events.get_nowait())
+    turns = [e for e in every if e.type == QUEUE_TURN]
+    assert [qi.queue_id for t in turns for qi in t.data["inputs"]] == ["q-1"]
+    assert q.items == []

@@ -57,14 +57,14 @@ from typing import BinaryIO
 
 __all__ = [
     "SafeFsError", "UnsafePathError", "SymlinkRefused", "EscapeRefused",
-    "NotRegularFile", "HardlinkRefused", "FileTooLarge",
+    "NotRegularFile", "HardlinkRefused", "FileTooLarge", "TooManyEntries", "CopyBudget",
     "openat2_available", "open_root", "open_beneath", "open_dir_beneath",
     "open_regular_for_read", "open_file_for_read", "read_bytes_beneath",
     "copy_fd", "iter_fd", "fd_path", "lstat_beneath", "readlink_beneath",
     "mkdirs_beneath", "atomic_writer", "atomic_write_beneath",
     "copy_file_beneath", "copytree_beneath", "rename_beneath", "move_beneath",
     "unlink_beneath", "rmtree_beneath", "walk_beneath", "WalkStep",
-    "rel_under", "split_under", "canonical_rel",
+    "rel_under", "split_under", "canonical_rel", "is_partial_of",
 ]
 
 
@@ -98,6 +98,11 @@ class FileTooLarge(SafeFsError):
     """The file is bigger than the caller's cap."""
 
 
+class TooManyEntries(SafeFsError):
+    """A copy would pass the caller's cap on the number of entries (files,
+    directories and links)."""
+
+
 RESOLVE_NO_MAGICLINKS = 0x02
 RESOLVE_NO_SYMLINKS = 0x04
 RESOLVE_BENEATH = 0x08
@@ -121,6 +126,8 @@ _DIR_LIST = os.O_RDONLY | os.O_DIRECTORY | _O_CLOEXEC
 _COPY_CHUNK = 1024 * 1024
 # A temp name is ``.<name>.<12 hex>.partial`` and must fit NAME_MAX (255).
 _TEMP_NAME_BYTES = 200
+_TEMP_TAG_BYTES = 6
+_HEX_DIGITS = frozenset(b"0123456789abcdef")
 
 
 class _OpenHow(ctypes.Structure):
@@ -573,7 +580,21 @@ def _rename_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
 def _temp_name(name: str) -> str:
     # ``.partial``: the sync manifest skips it and retention reaps an orphan.
     base = os.fsdecode(os.fsencode(name)[:_TEMP_NAME_BYTES])
-    return f".{base}.{secrets.token_hex(6)}.partial"
+    return f".{base}.{secrets.token_hex(_TEMP_TAG_BYTES)}.partial"
+
+
+def is_partial_of(entry: str, name: str) -> bool:
+    """Whether the directory entry ``entry`` is a temp ``atomic_writer``
+    made for ``name``: ``_temp_name``'s exact shape, compared as bytes, so a
+    name cut inside a multibyte character matches its listed temp. Two names
+    sharing their first 200 bytes share their temps too."""
+    raw = os.fsencode(entry)
+    head = b"." + os.fsencode(name)[:_TEMP_NAME_BYTES] + b"."
+    tail = b".partial"
+    if len(raw) != len(head) + 2 * _TEMP_TAG_BYTES + len(tail):
+        return False
+    tag = raw[len(head):-len(tail)]
+    return raw.startswith(head) and raw.endswith(tail) and all(c in _HEX_DIGITS for c in tag)
 
 
 def _fsync_dir(dirfd: int) -> None:
@@ -780,9 +801,37 @@ def _link_stays_inside(dir_rel: str, target: str) -> bool:
     return landed != ".." and not landed.startswith("../")
 
 
+class CopyBudget:
+    """What a run of copies may still take, shared by every copy it is
+    passed to: entries (a file, a directory or a link each) and bytes,
+    ``None`` for no cap. Each entry is taken before it is made
+    (``TooManyEntries`` when none is left; the bytes left cap a file,
+    ``FileTooLarge`` past them) and charged after."""
+
+    __slots__ = ("entries_left", "bytes_left")
+
+    def __init__(self, *, max_entries: int | None = None, max_bytes: int | None = None) -> None:
+        self.entries_left = max_entries
+        self.bytes_left = max_bytes
+
+    def take(self, shown: str) -> int | None:
+        """The bytes the next entry may copy (``None``: no cap)."""
+        if self.entries_left is not None and self.entries_left <= 0:
+            raise TooManyEntries(errno.EFBIG, "more entries than the copy cap", shown)
+        return self.bytes_left
+
+    def charge(self, copied: int = 0) -> None:
+        """One entry of ``copied`` bytes is spent."""
+        if self.entries_left is not None:
+            self.entries_left -= 1
+        if self.bytes_left is not None:
+            self.bytes_left -= copied
+
+
 def copytree_beneath(src_root, src_rel, dst_root, dst_rel, *,
                      symlinks: str = "skip", dirs_exist_ok: bool = False,
-                     ignore: Callable[[str, list[str]], Iterable[str]] | None = None) -> list[str]:
+                     ignore: Callable[[str, list[str]], Iterable[str]] | None = None,
+                     budget: CopyBudget | None = None) -> list[str]:
     """``shutil.copytree`` between two roots. Regular files keep their bits
     (never setuid, setgid or sticky) and times; directories are created
     fresh. A symlink is skipped (``symlinks="skip"``), ends the copy with
@@ -791,11 +840,15 @@ def copytree_beneath(src_root, src_rel, dst_root, dst_rel, *,
     when the link stays inside the destination root at its new place;
     one that would leave it is skipped. FIFOs, sockets and devices are
     always skipped. ``ignore(rel_dir, names)`` names entries to leave out.
-    A failure removes the directory the copy created. Returns the source
-    paths it skipped."""
+    ``budget`` bounds the entries made (each directory, file and recreated
+    link) and the bytes copied (``TooManyEntries`` or ``FileTooLarge`` past
+    it). A failure removes the directory the copy
+    created and gives back what it charged to ``budget`` (a copy into an
+    existing directory keeps both). Returns the source paths it skipped."""
     if symlinks not in ("skip", "refuse", "copy"):
         raise ValueError("symlinks must be 'skip', 'refuse' or 'copy'")
     skipped: list[str] = []
+    budget_at_start = None if budget is None else (budget.entries_left, budget.bytes_left)
     src_parts, base = _components(src_rel), _components(dst_rel)
     with open_root(src_root) as srcfd, open_root(dst_root) as dstfd:
         same = os.fstat(srcfd)[1:3] == os.fstat(dstfd)[1:3]
@@ -816,7 +869,11 @@ def copytree_beneath(src_root, src_rel, dst_root, dst_rel, *,
         try:
             for step in walk_beneath(srcfd, src_rel):
                 sub = step.rel.split("/")[len(src_parts):] if step.rel else []
+                if budget is not None:
+                    budget.take(step.rel)
                 outfd = _ensure_dirs(dstfd, base + sub, 0o777)
+                if budget is not None:
+                    budget.charge()
                 try:
                     out = os.fstat(outfd)
                     made.add((out.st_dev, out.st_ino))
@@ -841,6 +898,8 @@ def copytree_beneath(src_root, src_rel, dst_root, dst_rel, *,
                         if symlinks == "copy":
                             target = os.readlink(name, dir_fd=step.dirfd)
                             if _link_stays_inside(dst_dir_rel, target):
+                                if budget is not None:
+                                    budget.take(step.path(name))
                                 try:
                                     os.symlink(target, name, dir_fd=outfd)
                                 except FileExistsError:
@@ -849,26 +908,34 @@ def copytree_beneath(src_root, src_rel, dst_root, dst_rel, *,
                                         raise
                                     os.unlink(name, dir_fd=outfd)
                                     os.symlink(target, name, dir_fd=outfd)
+                                if budget is not None:
+                                    budget.charge()
                                 continue
                         skipped.append(step.path(name))
                     skipped.extend(step.path(n) for n in step.other if n not in left_out)
                     for name in step.files:
                         if name in left_out:
                             continue
+                        room = None if budget is None else budget.take(step.path(name))
                         try:
-                            copy_file_beneath(step.dirfd, name, outfd, name)
+                            copied = copy_file_beneath(step.dirfd, name, outfd, name, max_size=room)
                         except SymlinkRefused:
                             if symlinks == "refuse":
                                 raise
                             skipped.append(step.path(name))
                         except NotRegularFile:
                             skipped.append(step.path(name))
+                        else:
+                            if budget is not None:
+                                budget.charge(copied)
                 finally:
                     os.close(outfd)
         except BaseException:
             if created_base:
                 with contextlib.suppress(OSError):
                     rmtree_beneath(dstfd, dst_rel)
+                if budget is not None:
+                    budget.entries_left, budget.bytes_left = budget_at_start
             raise
     return skipped
 

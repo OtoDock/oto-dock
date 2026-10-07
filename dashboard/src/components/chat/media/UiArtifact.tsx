@@ -8,7 +8,7 @@ import FilePreviewPortal from '../../workspace/FilePreviewPortal'
 /**
  * Sandboxed display_ui artifact — agent-authored HTML served by /v1/ui/{token}.
  *
- * STANDALONE by design: never reuse DocumentPreview / FilePreviewBody or their
+ * STANDALONE by design: never reuse CollaboraFrame / FilePreviewBody or their
  * `sandbox` string here — those carry `allow-same-origin` for the TRUSTED
  * Collabora editor, and applying it to agent HTML is a full sandbox escape
  * (the document would run same-origin with the dashboard: cookies, storage,
@@ -406,8 +406,8 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
       </div>
 
       {/* Fullscreen portal — a SECOND sandboxed instance (no-store content;
-          same URL). Mirrors DocumentPreview's STRUCTURE only, never its
-          sandbox string. */}
+          same URL). Mirrors the document pane's fullscreen STRUCTURE only,
+          never its sandbox string. */}
       {fullscreen && (
         <FilePreviewPortal
           filename={label}

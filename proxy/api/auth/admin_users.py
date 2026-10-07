@@ -83,7 +83,7 @@ class SetLocalOnlyRequest(BaseModel):
 async def admin_list_users(user: UserContext | None = Depends(get_current_user)):
     """List all users with their agent assignments. Admin only."""
     require_admin(user)
-    users = task_store.list_users()
+    users = await asyncio.to_thread(task_store.list_users)
     # list_users is SELECT * — strip secret-bearing columns before the wire.
     # ``invite_pending`` = a local account still waiting on its invite link
     # (no password set yet), so the admin UI can badge it.
@@ -109,21 +109,26 @@ async def admin_set_user_agents(
 ):
     """Set agent assignments for a user. Admin only."""
     u = require_admin(user)
-    target = task_store.get_user(sub)
+
+    def _load() -> tuple[dict | None, list[str], set[str]]:
+        target = task_store.get_user(sub)
+        if not target:
+            return None, [], set()
+        # Security: high-clearance agents only assignable to admins
+        blocked = ([] if _roles.is_admin(target["role"])
+                   else [a for a in req.agents if agent_store.is_admin_only(a)])
+        return target, blocked, set(agent_store.get_agent_slugs())
+
+    target, blocked, valid_agents = await asyncio.to_thread(_load)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-
-    # Security: high-clearance agents only assignable to admins
-    if not _roles.is_admin(target["role"]):
-        blocked = [a for a in req.agents if agent_store.is_admin_only(a)]
-        if blocked:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Agents {blocked} require admin role",
-            )
+    if blocked:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agents {blocked} require admin role",
+        )
 
     # Validate agent names
-    valid_agents = set(agent_store.get_agent_slugs())
     invalid = [a for a in req.agents if a not in valid_agents]
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unknown agents: {invalid}")
@@ -137,6 +142,15 @@ async def admin_set_user_agents(
     for a, r in roles.items():
         if r not in _roles.AGENT_ROLES:
             raise HTTPException(status_code=400, detail=f"Invalid agent_role '{r}' for {a}")
+
+    # A Shared-only agent takes the editor tier: no new or changed row below
+    # it there (a row an older install holds passes while unchanged).
+    from services.agents import shared_only_members
+    requested = {a: roles.get(a, _roles.VIEWER) for a in req.agents}
+    stored = await asyncio.to_thread(task_store.get_user_agent_roles, sub)
+    refused = await asyncio.to_thread(shared_only_members.refused_assignments, requested, stored)
+    if refused:
+        raise HTTPException(status_code=400, detail=shared_only_members.refusal_message(refused))
 
     # Detect newly-added attachments BEFORE the DELETE+INSERT
     # pattern in set_user_agents wipes the existing rows. The diff lets us
@@ -153,9 +167,12 @@ async def admin_set_user_agents(
     from services.notifications.notification_manager import invalidate_audience
     for added in added_agents:
         invalidate_audience(added)
+    agent_losses = offboarding.losses(change.platform_role, change.before,
+                                      change.platform_role, change.after)
+    from services.agents import offboarding_bindings
+    await offboarding_bindings.clear_at_demotion(sub, agent_losses)
     await offboarding.dispatch_losses(
-        sub, offboarding.losses(change.platform_role, change.before,
-                                change.platform_role, change.after),
+        sub, agent_losses,
         u.sub, person=target, platform_before=change.platform_role,
         platform_after=change.platform_role,
     )
@@ -206,17 +223,26 @@ async def admin_add_user_agent(
     community seeding below).
     """
     u = require_admin(user)
-    target = task_store.get_user(sub)
+
+    def _load() -> tuple[dict | None, bool, bool]:
+        return (task_store.get_user(sub), agent_store.agent_exists(agent),
+                agent_store.is_admin_only(agent))
+
+    target, agent_exists, admin_only = await asyncio.to_thread(_load)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    if not agent_store.agent_exists(agent):
+    if not agent_exists:
         raise HTTPException(status_code=404, detail="Agent not found")
     if req.role not in _roles.AGENT_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid agent_role '{req.role}'")
-    if not _roles.is_admin(target["role"]) and agent_store.is_admin_only(agent):
+    if not _roles.is_admin(target["role"]) and admin_only:
         raise HTTPException(
             status_code=403, detail=f"Agent '{agent}' requires admin role"
         )
+    from services.agents import shared_only_members
+    stored = await asyncio.to_thread(task_store.get_user_agent_roles, sub)
+    if await asyncio.to_thread(shared_only_members.refused_assignments, {agent: req.role}, stored):
+        raise HTTPException(status_code=400, detail=shared_only_members.refusal_message([agent]))
 
     inserted = await asyncio.to_thread(
         task_store.add_user_agent, sub, agent, req.role, u.sub
@@ -252,7 +278,7 @@ async def admin_update_role(
         raise HTTPException(status_code=400, detail="Cannot change your own role")
     if req.role not in _roles.PLATFORM_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role: {req.role}")
-    target = task_store.get_user(sub)
+    target = await asyncio.to_thread(task_store.get_user, sub)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -278,11 +304,18 @@ async def apply_platform_role_change(sub: str, person: dict, new_role: str,
     """What a platform role change means once the users row carries it, for
     the admin route and a login whose identity provider changed the role
     (``actor_sub=""``: no person made the change, the subscribers fall back to
-    the owner). Every admin stands in every agent's audience; below admin the
-    admin-only agent rows go (the roles of the rows that stay are kept) and
-    the person's subscriptions leave the shared platform pool; then the losses
-    are dispatched to the offboarding subscribers."""
+    the owner). A lowered platform role ends every sign-in and agent session
+    token of the person first (their token epoch moves, decision 16; a
+    sign-in whose identity provider lowered it keeps the cookie it is being
+    issued, minted after the move). Every admin stands in every agent's
+    audience; below admin the admin-only agent rows go (the roles of the rows
+    that stay are kept) and the person's subscriptions leave the shared
+    platform pool; then the losses are dispatched to the offboarding
+    subscribers."""
     before = person.get("role")
+    if _roles.PLATFORM_RANK.get(new_role, -1) < _roles.PLATFORM_RANK.get(before, -1):
+        from api.auth.identity import end_every_sign_in
+        await end_every_sign_in(sub, person.get("username") or "", "platform_role_lowered")
     if _roles.is_admin(new_role) != _roles.is_admin(before):
         from services.notifications.notification_manager import invalidate_audience
         invalidate_audience()
@@ -294,14 +327,18 @@ async def apply_platform_role_change(sub: str, person: dict, new_role: str,
     # stay correct.
     if not _roles.is_admin(new_role):
         def _drop_admin_only() -> tuple[list[str], list[str]]:
-            current = task_store.get_user_agents(sub)
+            # The rows as they stand now, read in the job that writes them:
+            # a snapshot from before the call would write back a row another
+            # change removed or re-roled meanwhile.
+            current_roles = task_store.get_user_agent_roles(sub)
+            current = list(current_roles)
             safe = [a for a in current if not agent_store.is_admin_only(a)]
             if len(safe) != len(current):
                 # Keep the roles on the agents that stay (without them every
                 # row fell back to viewer).
                 task_store.set_user_agents(
                     sub, safe, actor_sub,
-                    agent_roles={a: rows_before[a] for a in safe if a in rows_before})
+                    agent_roles={a: current_roles[a] for a in safe})
             return current, safe
 
         current_agents, safe_agents = await asyncio.to_thread(_drop_admin_only)
@@ -327,8 +364,15 @@ async def apply_platform_role_change(sub: str, person: dict, new_role: str,
         return task_store.get_user_agent_roles(sub), agent_store.get_agent_slugs()
 
     rows_after, all_agents = await asyncio.to_thread(_after)
+    agent_losses = offboarding.losses(before, rows_before, new_role, rows_after, all_agents)
+    if actor_sub:
+        # An admin's change clears inline; a sign-in the identity provider
+        # demoted does not wait on vendor calls (the binding store already
+        # refuses a lender who no longer manages; the subscriber clears).
+        from services.agents import offboarding_bindings
+        await offboarding_bindings.clear_at_demotion(sub, agent_losses)
     await offboarding.dispatch_losses(
-        sub, offboarding.losses(before, rows_before, new_role, rows_after, all_agents),
+        sub, agent_losses,
         actor_sub, person=person, platform_before=before, platform_after=new_role,
     )
 
@@ -434,7 +478,7 @@ async def admin_delete_user(
     # copies live in the agent trees under their own bucket).
     try:
         from services.sharing import chat_snapshot
-        uname = task_store.get_username_by_sub(sub) or ""
+        uname = await asyncio.to_thread(task_store.get_username_by_sub, sub) or ""
         await asyncio.to_thread(chat_snapshot.remove_user_snapshots, uname)
     except Exception:
         logger.exception(
@@ -445,6 +489,11 @@ async def admin_delete_user(
     deleted = await asyncio.to_thread(task_store.delete_user, sub)
     if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
+    # The row's deletion refuses every cookie and agent session token of the
+    # person (a token epoch on a gone row would change nothing); a pass the
+    # holder cache already holds must not outlive it.
+    from auth import token_holder
+    token_holder.forget(sub)
     logger.info(f"Admin {mask_email(u.email)} deleted user {sub}")
     await offboarding.dispatch_losses(
         sub, offboarding.losses(target["role"], rows_before, None, {}, all_agents),
@@ -537,8 +586,11 @@ async def admin_create_user(
                 send_invite_email, req.email, invite_url, u.display_name or u.name,
             )
 
-    new_user = await asyncio.to_thread(task_store.get_user, sub)
-    result = {"user": _build_user_response(new_user) if new_user else {}}
+    def _created_user() -> dict:
+        new_user = task_store.get_user(sub)
+        return _build_user_response(new_user) if new_user else {}
+
+    result = {"user": await asyncio.to_thread(_created_user)}
     if temp_password:
         result["temp_password"] = temp_password
     if invite_url:

@@ -34,6 +34,7 @@ from core.session.session_state import (
     set_session_mode,
     resolve_permission,
     cleanup_session_permission_state,
+    mark_closing, clear_starting,
 )
 
 logger = logging.getLogger("remote-layer")
@@ -90,6 +91,9 @@ class RemoteExecutionLayer(
     def __init__(self, connection_manager: SatelliteConnectionManager):
         self._cm = connection_manager
         self._sessions: dict[str, RemoteSessionInfo] = {}
+        # Session ids a start is spawning now: a connect report naming one
+        # (the satellite's previous process of that id) leaves it to the start.
+        self._spawning: set[str] = set()
         # Background deferred-pull tasks: held so create_task'd coroutines
         # aren't GC'd mid-flight; each removes itself on completion.
         self._deferred_sync_tasks: set[asyncio.Task] = set()
@@ -104,12 +108,47 @@ class RemoteExecutionLayer(
             raise RuntimeError(f"{info.execution_path} has no remote adapter")
         return adapter
 
+    def is_spawning(self, session_id: str) -> bool:
+        return session_id in self._spawning
+
+    async def _insert_session(self, info: RemoteSessionInfo) -> None:
+        """Hold ``info`` as its session's record. A record already held under
+        the id (a re-warm of a live session, a session adopted while this
+        start ran) has its engine state ended first: its router reads a queue
+        nothing feeds any more."""
+        prior = self._sessions.get(info.session_id)
+        if prior is not None and prior is not info:
+            try:
+                await self._adapter(prior).close_state(prior)
+            except Exception:
+                logger.exception("Insert of %s: the replaced record's state did not close",
+                                 info.session_id[:8])
+        self._sessions[info.session_id] = info
+
     # --- ExecutionLayer interface: control surface ---
+
+    async def close_unadopted(self, machine_id: str, session_id: str,
+                              incarnation: str = "") -> None:
+        """End a process a satellite reported after a restart that the
+        platform does not take back (closed on purpose, or placed on another
+        machine). Only the satellite's process: nothing of the session's
+        state here is touched, since it may belong to the session on its own
+        machine. ``incarnation`` (the report's) makes the satellite close only
+        the object it reported, never one a later start put under the id."""
+        frame = {"type": "close_session", "session_id": session_id}
+        if incarnation:
+            frame["incarnation"] = incarnation
+        try:
+            await self._cm.send_command(machine_id, frame, timeout=15.0)
+        except Exception as e:
+            logger.warning("Remote close of unadopted %s failed: %s", session_id[:8], e)
 
     async def close_session(self, session_id: str) -> None:
         info = self._sessions.pop(session_id, None)
         if not info:
             return
+        mark_closing(session_id)
+        clear_starting(session_id)
         info.alive = False
         # The engine's per-session state goes first — BEFORE the event queue
         # is removed (a Codex router is that queue's sole consumer), so nothing
@@ -290,6 +329,10 @@ class RemoteExecutionLayer(
         sessions does this layer know about" means those records (liveness
         gates, the token-confinement check, the lane wedge sweep)."""
         return list(self._sessions)
+
+    def session_ids_on(self, machine_id: str) -> list[str]:
+        """The session records this layer holds on one machine."""
+        return [sid for sid, info in self._sessions.items() if info.machine_id == machine_id]
 
     async def get_session(self, session_id: str):
         return self._sessions.get(session_id)

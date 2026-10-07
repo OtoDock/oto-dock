@@ -13,6 +13,7 @@ import contextlib
 import functools
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -23,9 +24,15 @@ from storage.automation import run_status
 from services.scheduler import interactive, lanes, shared
 from core import placement
 from core.session import session_kind
-from core.session.visibility import is_synthetic_owner, is_task_chat_owner
+from core.session.visibility import (
+    is_shared_chat_owner, is_synthetic_owner, is_task_chat_owner,
+)
 from auth import roles
 from ws import wire_events as wire
+from services.scheduler.delivery_identity import (  # noqa: F401
+    _shared_chat_person, _standing_of, _wake_refused, _wake_visibility,
+    resolve_delivery_person,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,78 +49,39 @@ logger = logging.getLogger("claude-proxy.scheduler")
 _SWEEP_CONCURRENCY = 4
 
 
-def _standing_of(sub: str, agent: str) -> tuple[str, str]:
-    """A person's current standing on the agent (``roles.NO_ACCESS`` when they
-    hold none; ADMIN for a platform admin) and their agent row (the role a
-    delegate delivery runs at). Synchronous: call it on the DB executor."""
-    from auth.providers import effective_role_of
-    return (effective_role_of(sub, agent),
-            roles.row_role(task_store.get_user_agent_roles(sub), agent))
-
-
-def _wake_refused(standing: str, *, shared: bool) -> bool:
-    """A person gets no wake when they no longer hold the agent, and on a
-    Shared-only chat (it runs from the agent's own state) when they are below
-    the editor tier: offboarding treats that as gone from the agent too."""
-    return standing == roles.NO_ACCESS or (shared and not roles.can_edit(standing))
-
-
-def _shared_chat_person(chat: dict | None, created_by: str | None) -> str:
-    """The person a delivery into a Shared-only chat runs as: the one its task
-    row recorded (a continuation's creator, the person whose session delegated
-    the work), when the chat is the agent's shared history and the agent is
-    Shared-only now. "" when no person is on record (a session without one
-    records the agent's own slug) or the chat is of another kind (a chat
-    left from before a mode change keeps the agent's identity: its
-    conversation lives where it was written). Synchronous: call it on the DB
-    executor."""
+def _chat_pin(chat: dict | None, user_sub: str | None) -> str:
+    """Where a chat woken as a person runs when it is that person's own chat
+    or a Shared-only chat: the chat row's own placement, as the dashboard
+    resumes it (``pinned_target``), since the person's own resolution (their
+    machine, the tier rule for an admin-paired one) may name a machine the
+    chat never ran on. "" for every other delivery, which resolves from its
+    person and role. Synchronous: call it on the DB executor."""
     from core.session.visibility import is_shared_only, shared_chat_owner
     agent = (chat or {}).get("agent") or ""
-    if (not agent or not created_by or created_by == agent
-            or (chat or {}).get("user_sub") != shared_chat_owner(agent)
-            or not is_shared_only(agent)):
+    if not user_sub or not agent:
         return ""
-    return created_by
-
-
-def _shared_chat_pin(chat: dict | None, user_sub: str | None) -> str:
-    """Where a Shared-only chat woken as a person runs: the chat row's own
-    placement, as the dashboard resumes it (``pinned_target``), since the
-    person's own resolution (their machine, the tier rule for an admin-paired
-    one) may name a machine the chat never ran on. "" for every other
-    delivery, which resolves as before. Synchronous: call it on the DB
-    executor."""
-    from core.session.visibility import is_shared_only, shared_chat_owner
-    agent = (chat or {}).get("agent") or ""
-    if (not user_sub or not agent or chat.get("user_sub") != shared_chat_owner(agent)
-            or not is_shared_only(agent)):
+    owner = chat.get("user_sub")
+    if owner == user_sub:
+        # A chat with no recorded placement resolves from its person, as
+        # the dashboard resumes it.
+        pin = chat.get("execution_target") or ""
+        if not pin:
+            return ""
+    elif owner != shared_chat_owner(agent) or not is_shared_only(agent):
         return ""
-    pin = chat.get("execution_target") or placement.LOCAL
+    else:
+        pin = chat.get("execution_target") or placement.LOCAL
     if placement.is_local(pin):
         return placement.LOCAL
     from services.remote.remote_status import is_reachable
     return pin if is_reachable(pin) else placement.offline_sentinel(pin)
 
 
-def _wake_visibility(agent: str, username: str, role: str,
-                     user_sub: str | None) -> "VisibilityResolution":
-    """The visibility of a respawned session, from the same inputs as its
-    security context (``build_delivery_security_context``): the person's own
-    tree for a personal chat, the agent scope with the person present on a
-    Shared-only agent, the agent scope with nobody otherwise. Synchronous:
-    call it on the DB executor."""
-    from core.session.visibility import SCOPE_AGENT, SCOPE_USER, resolve_visibility
-    return resolve_visibility(
-        agent, username=username, user_role=role or "", user_sub=user_sub or "",
-        scope_override=SCOPE_USER if user_sub else SCOPE_AGENT,
-    )
-
-
 def _wake_credential_env(agent: str, session_id: str, *, user_sub: str | None, role: str,
                          vis: "VisibilityResolution", where: placement.PlacementCapabilities,
                          mcp_config: "Path | None", flat_env: dict[str, str] | None,
                          bash_env_keys: set, mcp_format: str | None,
-                         ) -> "tuple[Path | None, dict[str, str], dict[str, str]]":
+                         ) -> "tuple[Path | None, dict[str, str], dict[str, str], int]":
     """The credential environment of a respawned session, as the chat builder
     (``core/config/config_builder.py``) assembles it: the MCP build's flat env,
     each manifest's ``path_env`` at the mount, the ``OTO_*`` set and a session
@@ -121,8 +89,9 @@ def _wake_credential_env(agent: str, session_id: str, *, user_sub: str | None, r
     the layers' own token would name nobody; the credential environment is
     applied last by every spawn path). A TOML config gets it injected (Codex
     stdio MCPs inherit nothing from the parent), the bash-only keys excluded.
-    Returns ``(mcp_config, credential_env, multi_value_envs)``. Synchronous:
-    call it off the loop."""
+    Returns ``(mcp_config, credential_env, multi_value_envs, minted_at)``, the
+    last the token's ``iat`` (the session's floor). Synchronous: call it off
+    the loop."""
     from auth.session_token import create_session_token
     from core.sandbox import oto_env
     from services import path_roles
@@ -156,47 +125,110 @@ def _wake_credential_env(agent: str, session_id: str, *, user_sub: str | None, r
         available_scopes=vis.available_scopes,
         force_config=vis.config_visible,
     ))
-    env["PROXY_API_KEY"] = create_session_token(session_id, agent, user_sub or "")
+    minted_at = int(time.time())
+    env["PROXY_API_KEY"] = create_session_token(session_id, agent, user_sub or "",
+                                                issued_at=minted_at)
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
     if mcp_format == "toml" and mcp_config:
         mcp_config = mcp_registry.inject_credential_env_into_toml(
             mcp_config, env, exclude_keys=bash_env_keys,
         )
-    return mcp_config, env, multi_value_envs
+    return mcp_config, env, multi_value_envs, minted_at
 
 
-def _wake_config_and_prompt(
+def _wake_delegation_targets(agent: str, user_sub: str | None, role: str) -> list[str]:
+    """The agents a respawned session may delegate to, as the chat builder
+    resolves them: the agent's configured targets, those of a person's wake
+    narrowed to the agents the person holds (a platform admin keeps them
+    all), and the agent itself first. Synchronous: call it on the DB executor."""
+    from storage.agents import agent_store
+    targets = agent_store.get_delegation_targets(agent)
+    if user_sub and not roles.is_admin(role) and not roles.is_admin(
+            (task_store.get_user(user_sub) or {}).get("role")):
+        held = set(task_store.get_user_agents(user_sub))
+        targets = [t for t in targets if t in held]
+    return targets if agent in targets else [agent] + targets
+
+
+def _wake_mcp_build(
     agent: str, user_sub: str | None, *, username: str, role: str,
     vis: "VisibilityResolution", chat_id: str, where: placement.PlacementCapabilities,
-    browser: "BrowserTargetSettings", mcp_format: str | None, exec_path: str,
-    security: "SecurityContext",
-) -> tuple[tuple, str]:
-    """The MCP build of a respawned session and its system prompt, for the
-    delivery's person, as the chat builder makes them: the prompt from the
-    same visibility and role as the config (the mount's username, folders
-    and user context, the role's view of the workspace) followed by the
-    identity, scope and folder sections of the session's security context.
-    Returns ``(the build's five values, prompt)``. Synchronous: both read
-    agent files and platform settings, so call it off the loop."""
-    from auth.path_policy import build_permission_context
+    browser: "BrowserTargetSettings", mcp_format: str | None, session_id: str,
+    targets: list[str],
+) -> tuple:
+    """The MCP build of a respawned session for the delivery's person, as the
+    chat builder makes it (the delegation targets included). Returns the
+    build's five values. Synchronous: it reads agent files and platform
+    settings, so call it off the loop."""
     from services.mcp import mcp_registry
-    built = mcp_registry.build_session_mcp_config(
+    return mcp_registry.build_session_mcp_config(
         agent, user_sub or None, task_mode=True, task_scope=vis.mount_scope,
         username=username or "", user_role=role or "", chat_id=chat_id or "",
         placement=where, target_browser=browser, mcp_config_format=mcp_format,
+        session_id=session_id, delegation_targets=targets,
     )
-    excluded = built[2] or {}
+
+
+def _wake_prompt(
+    agent: str, *, role: str, vis: "VisibilityResolution",
+    where: placement.PlacementCapabilities, exec_path: str, security: "SecurityContext",
+    excluded: dict, dynamic_contexts: list | None,
+) -> str:
+    """The system prompt of a respawned session, as the chat builder makes
+    it: from the same visibility and role as the config (the mount's
+    username, folders and user context, the role's view of the workspace),
+    with the dynamic MCP context, followed by the identity, scope and folder
+    sections of the session's security context. Synchronous: it reads agent
+    files and platform settings, so call it off the loop."""
+    from auth.path_policy import build_permission_context
+    from services.mcp import mcp_registry
     prompt = config.build_agent_prompt(
         agent, username=vis.mount_username, role=role or roles.MANAGER,
-        excluded_mcps=excluded or None, client_type=session_kind.TASK.name,
-        placement=where, mount_shared=vis.mount_shared, execution_path=exec_path or "",
+        excluded_mcps=excluded or None, dynamic_contexts=dynamic_contexts or None,
+        client_type=session_kind.TASK.name, placement=where,
+        mount_shared=vis.mount_shared, execution_path=exec_path or "",
     )
     assigned = [m.name for m in (mcp_registry.get_agent_mcps(agent, placement=where) or [])
                 if m.name not in excluded]
-    prompt = (prompt or "") + build_permission_context(
+    return (prompt or "") + build_permission_context(
         security, assigned_mcp_names=tuple(assigned), execution_path=exec_path or "",
     )
-    return built, prompt
+
+
+# A respawned session's dynamic MCP context asks remote MCPs: bounded, so a
+# slow one never holds the wake's admission slot.
+_WAKE_CONTEXT_TIMEOUT_S = 30.0
+
+
+async def _wake_dynamic_contexts(
+    agent: str, excluded: dict, *, user_sub: str | None, role: str,
+    targets: list[str], where: placement.PlacementCapabilities,
+) -> list | None:
+    """The dynamic MCP context of a respawned session, as the chat builder
+    asks for it (the attached MCPs, the delegation roster, the meetings
+    access); None when it cannot be had in time."""
+    from services.mcp import dynamic_context, mcp_registry
+    assigned = [m.name for m in (await asyncio.to_thread(
+        functools.partial(mcp_registry.get_agent_mcps, agent, placement=where)) or [])
+                if m.name not in (excluded or {})]
+
+    async def _contexts() -> list:
+        return await dynamic_context.get_dynamic_contexts(
+            agent, assigned, user_sub=user_sub or "", user_role=role,
+            trigger_payload=None, delegation_targets=targets,
+            delegation_roster=await asyncio.to_thread(
+                dynamic_context.build_delegation_roster, targets),
+            meetings_access=await asyncio.to_thread(
+                dynamic_context.build_meetings_access, user_sub or "", role or ""),
+            nouser_reads=not user_sub, placement=where,
+        )
+
+    try:
+        return await asyncio.wait_for(_contexts(), _WAKE_CONTEXT_TIMEOUT_S)
+    except Exception:
+        logger.warning("Wake respawn: the dynamic MCP context of agent '%s' was not built",
+                       agent, exc_info=True)
+        return None
 
 
 def _wake_superseded(session_id: str, chat_id: str) -> bool:
@@ -231,30 +263,38 @@ def _release_wake_slot(session_id: str, chat_id: str) -> None:
         concurrency.release_unless_live(session_id)
 
 
-async def _store_undelivered_wakes(chat_id: str, wakes: list[str]) -> bool:
+async def _store_undelivered_wakes(chat_id: str, wakes: list[str], *, person: str = "",
+                                   role: str = "", by: str = "") -> bool:
     """Every rung failed: keep the wakes on the chat for its next warmup or
-    turn. A live terminal on the chat (a person opened it while the wake
-    waited) takes them at once. True when stored."""
+    turn, each naming the person and role it runs as (``by``: the creator
+    whose role a wake with no person runs at). A live terminal on the chat
+    (a person opened it while the wake waited) takes them at once. True when
+    stored."""
     from storage.pg import run_db
     from core.session import interactive_session
 
     stored = False
     for wake in wakes:
-        stored = bool(await run_db(task_store.append_pending_delegate_wake, chat_id, wake)) or stored
+        stored = bool(await run_db(functools.partial(
+            task_store.append_pending_delegate_wake, chat_id, wake,
+            person=person, role=role, by=by))) or stored
     if not stored:
         return False
     isess = interactive_session.find_live_for_chat(chat_id)
     if isess is not None and isess.alive:
-        for wake in await run_db(task_store.claim_pending_delegate_wake, chat_id):
-            if isess.queue_prompt(wake, "delegate_result_replay", chat_id=chat_id) is None:
-                await run_db(task_store.append_pending_delegate_wake, chat_id, wake)
+        for rec in await run_db(task_store.claim_pending_wake_records, chat_id):
+            if isess.queue_prompt(rec["prompt"], "delegate_result_replay", chat_id=chat_id) is None:
+                await run_db(functools.partial(
+                    task_store.append_pending_delegate_wake, chat_id, rec["prompt"],
+                    person=rec["person"], role=rec["role"], by=rec["by"]))
     return True
 
 
 async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, output_text: str,
                                *, worker_chat_id: str = "", output_cursor: int = 0,
                                prompt_row_id: int = 0, prompt_text: str = "",
-                               run_started_at: str = "") -> None:
+                               run_started_at: str = "", ending=None,
+                               run_id: str = "") -> None:
     """Deliver completed task result to originating session/chat.
 
     The originating ``on_complete_session_id`` is the primary route key
@@ -270,6 +310,11 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
     complete round including ``[User interjected]`` rows. It also feeds the
     ``{{chat_id}}`` template token. ``run_started_at`` bounds the check
     verdict a failed run carries to this run (a worker chat is reused).
+    ``ending`` (``core.events.turn_ending.TurnEnding``) is the turn's typed
+    ending when the engine stopped it: the callback names it and the next step.
+    ``run_id`` names the run whose attached files the result names
+    (``services/delegation/result_files``): read after the lane settled,
+    never copied here; a second delivery of the run names the same rows.
     """
     row = await asyncio.to_thread(task_store.get_dynamic_task, task.id)
     on_complete_agent = (row.get("on_complete_agent") if row else None) or task.on_complete_agent
@@ -326,7 +371,10 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
                         worker_chat_id, ceiling_seconds=1800.0,
                     )
                 chat = await asyncio.to_thread(task_store.get_chat, worker_chat_id)
-                if chat and chat.get("last_turn_aborted"):
+                # A run the engine ended (a typed ending) stays failed: the
+                # abort flag it also stamps is for the next turn's context.
+                if (chat and chat.get("last_turn_aborted")
+                        and status != run_status.FAILED):
                     status = run_status.USER_INTERRUPTED
                 collected = await asyncio.to_thread(
                     lanes._collect_lane_output_since, worker_chat_id,
@@ -339,6 +387,8 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
                     f"Lane finalization failed for chat {worker_chat_id[:8]} — "
                     f"delivering the run's own collection"
                 )
+            finally:
+                lanes.release_report(worker_chat_id)
         # A worker that failed a check (CHECKS.md): the parent receives the
         # final failing result WITH the verdict, never an unchecked one.
         verdict = None
@@ -349,6 +399,19 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
                     _checks.latest_failure, worker_chat_id, run_started_at)
             except Exception:
                 logger.debug("delegate verdict lookup failed", exc_info=True)
+        # The files the worker attached; a store error names none.
+        files: list = []
+        files_skipped: list = []
+        files_note = ""
+        if run_id:
+            try:
+                from services.delegation import result_files as _result_files
+                from storage.pg import run_db as _run_db
+                # The run's attach lock: a copy still in flight records first.
+                async with _result_files.run_lock(run_id):
+                    files, files_skipped, files_note = await _run_db(_result_files.delivery_lists, run_id)
+            except Exception:
+                logger.exception(f"Result files lookup failed for run {run_id}")
         result_prompt = (on_complete_prompt
             .replace("{{output}}", output or "")
             .replace("{{task_id}}", task.id)
@@ -359,20 +422,54 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
         if verdict:
             result_prompt += (f"\n\n[Check {verdict['check']} did not pass after "
                               f"{verdict['round']} round(s): {verdict.get('summary') or ''}]")
+        # Appended here, not a template token: task rows stored before this
+        # carry the old template and get the note all the same.
+        if ending is not None:
+            result_prompt += f"\n\n[{ending.callback_note(worker_chat_id)}]"
+        if files_note:
+            result_prompt += f"\n\n{files_note}"
         await _do_deliver(
             on_complete_session_id, on_complete_agent, result_prompt, task,
             chat_id=on_complete_chat_id,
             output_text=output,
             status=status,
             verdict=verdict,
+            ending=ending,
+            files=files,
+            files_skipped=files_skipped,
         )
 
+    # The worker chat owes this report until the collection above (taken
+    # before the task exists, so no turn starts between them).
+    lanes.hold_report(worker_chat_id)
     asyncio.create_task(_finalize_and_deliver())
+
+
+def _ending_fields(ending) -> dict:
+    """The delegate_result event's typed ending fields (none without one)."""
+    if ending is None:
+        return {}
+    return {"reason": ending.reason, "resets_at": ending.resets_at}
+
+
+def _result_extras(verdict: dict | None, files: list | None,
+                   files_skipped: list | None) -> dict:
+    """The delegate_result event's optional keys beyond the typed ending: a
+    failed run's check verdict, and the worker's attached files (both lists
+    ride together once either has an entry; absent otherwise, so a result
+    without files keeps its old shape)."""
+    out: dict = {"verdict": verdict} if verdict else {}
+    if files or files_skipped:
+        out["files"] = list(files or [])
+        out["files_skipped"] = list(files_skipped or [])
+    return out
 
 
 async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: shared.TaskDefinition,
                       *, chat_id: str | None = None, output_text: str = "",
-                      status: str = run_status.COMPLETED, verdict: dict | None = None) -> None:
+                      status: str = run_status.COMPLETED, verdict: dict | None = None,
+                      ending=None, files: list | None = None,
+                      files_skipped: list | None = None) -> None:
     """Deliver a delegate result via the session-delivery ladder.
 
     The routing itself (WS notify → pump → persistent → one-shot) lives in
@@ -407,7 +504,8 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
             "agent": task.agent,
             "output_text": output_preview,
             "status": status,
-            **({"verdict": verdict} if verdict else {}),
+            **_result_extras(verdict, files, files_skipped),
+            **(_ending_fields(ending)),
         }
         delegate_event_data = json.dumps({
             "task_id": task.id,
@@ -415,7 +513,8 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
             "agent": task.agent,
             "output_text": output_preview,
             "status": status,
-            **({"verdict": verdict} if verdict else {}),
+            **_result_extras(verdict, files, files_skipped),
+            **(_ending_fields(ending)),
         }, default=str)
 
         from core.events import chat_writer
@@ -446,40 +545,22 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
         # The chat decides who wakes: a person's own chat as its owner, a
         # Shared-only chat as the person whose session delegated the work,
         # any other (a task or phone chat, none at all) by the worker's scope.
-        target_chat = (await run_db(task_store.get_chat, chat_id) if chat_id
-                       else await run_db(task_store.get_chat_by_session, session_id))
-        owner = (target_chat or {}).get("user_sub") or ""
-        shared_person = await run_db(_shared_chat_person, target_chat, task.created_by)
-        if shared_person:
-            person = shared_person
-        elif owner and not is_synthetic_owner(owner):
-            person = owner
-        else:
-            person = task.created_by if task.scope == "user" else ""
-        if person:
-            deliver_user_sub: str | None = person
-            standing, row = await run_db(_standing_of, person, agent)
-            if _wake_refused(standing, shared=bool(shared_person)):
-                # The person no longer holds the agent: the result is kept on
-                # the chat and nothing is warmed for them (no rung, no stored
-                # wake to replay later).
-                await _persist_refused_result(
-                    chat_id, session_id, delegate_event, delegate_event_data)
-                logger.info(
-                    f"Task result kept as an event only: {person[:8]} no longer "
-                    f"holds agent '{agent}': chat={(chat_id or '-')[:8]}, task={task.name}"
-                )
-                return
-            # On a Shared-only chat the wake runs from the agent's own state,
-            # at the role the person's own turn there runs at (their effective
-            # role). Elsewhere the creator's row alone (a viewer without one):
-            # the echo rung of an admin's task resolves its target as a viewer
-            # would, while the run's own session read the admin; aligning the
-            # two is left to the operator.
-            deliver_role = standing if shared_person else (row or roles.VIEWER)
-        else:
-            deliver_user_sub = None
-            deliver_role = roles.MANAGER
+        identity = await resolve_delivery_person(
+            chat_id, session_id, task.created_by, task.scope, agent)
+        shared_person = identity.person if identity.shared else ""
+        if identity.refused:
+            # The person no longer holds the agent: the result is kept on
+            # the chat and nothing is warmed for them (no rung, no stored
+            # wake to replay later).
+            await _persist_refused_result(
+                chat_id, session_id, delegate_event, delegate_event_data)
+            logger.info(
+                f"Task result kept as an event only: {identity.person[:8]} no longer "
+                f"holds agent '{agent}': chat={(chat_id or '-')[:8]}, task={task.name}"
+            )
+            return
+        deliver_user_sub: str | None = identity.person or None
+        deliver_role = identity.role
 
         async def _on_outcome(outcome: "DeliveryOutcome") -> None:
             # Durable replay: every rung failed, so the orchestrator was never
@@ -498,7 +579,9 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
                         f"agent '{agent}': chat={chat_id[:8]}, task={task.name}"
                     )
                     return
-                if await _store_undelivered_wakes(chat_id, [result_prompt]):
+                if await _store_undelivered_wakes(chat_id, [result_prompt],
+                                                  person=deliver_user_sub or "",
+                                                  role=deliver_role):
                     logger.info(
                         f"Delegate wake undeliverable: stored for replay on next "
                         f"warmup: chat={chat_id[:8]}, task={task.name}"
@@ -551,6 +634,8 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
                     "delegate_agent": task.agent,
                     "output_text": output_preview,
                     "status": status,
+                    **_result_extras(verdict, files, files_skipped),
+                    **_ending_fields(ending),
                 },
                 pump_event=delegate_event,
                 persist_event=_persist_delegate_event,
@@ -616,13 +701,15 @@ async def _persist_refused_result(chat_id: str | None, session_id: str,
     broadcast_chat_frame(target, delegate_event)
 
 
-async def redeliver_pending_wakes(machine_id: str | None = None) -> int:
+async def redeliver_pending_wakes(machine_id: str | None = None,
+                                  session_ids: list[str] | tuple[str, ...] = ()) -> int:
     """Redeliver delegate wakes parked on chats (stored when every delivery
     rung failed — typically the proxy restarted inside the delivery window).
 
     Startup runs it once after boot settles; every satellite reconnect runs it
-    scoped to that machine's pinned chats (an idle satellite chat's wake can
-    only deliver once its machine is back). Per-chat claims are atomic, so a
+    scoped to that machine's chats, pinned there or running one of
+    ``session_ids`` (an idle satellite chat's wake can only deliver once its
+    machine is back). Per-chat claims are atomic, so a
     concurrent warmup/turn claim wins cleanly and this pass no-ops for that
     chat. A chat whose session is parked for Mode C re-adopt is skipped —
     the reconnect pass retries it after the adopt settles. Failed deliveries
@@ -630,7 +717,7 @@ async def redeliver_pending_wakes(machine_id: str | None = None) -> int:
     ``_deliver_task_result``). Chats are delivered ``_SWEEP_CONCURRENCY`` at a
     time. Returns the number of chats woken."""
     rows = await asyncio.to_thread(
-        task_store.list_chats_with_pending_wakes, machine_id,
+        task_store.list_chats_with_pending_wakes, machine_id, session_ids,
     )
     gate = asyncio.Semaphore(_SWEEP_CONCURRENCY)
 
@@ -649,10 +736,10 @@ async def redeliver_pending_wakes(machine_id: str | None = None) -> int:
 
 
 async def _redeliver_chat(chat: dict) -> bool:
-    """One chat of the wake sweep; True when a rung woke it."""
+    """One chat of the wake sweep; True when a rung woke it. The claimed
+    wakes go in groups, one per person and role they were stored for, one
+    group after another (a person's own chat: all as its owner)."""
     from services.scheduler import run_recovery
-    from core.session.session_delivery import deliver_prompt
-
     from storage.pg import run_db
 
     chat_id = chat["id"]
@@ -660,93 +747,152 @@ async def _redeliver_chat(chat: dict) -> bool:
         return False
     agent = chat.get("agent") or ""
     owner = chat.get("user_sub") or ""
-    # A person's chat is woken as that person, and only while they still hold
-    # the agent; checked before the claim, so a failed read leaves the wakes
-    # stored. ``task::`` owners are the unified task chats: agent-scope
-    # delivery semantics, never a personal remote-target pin; the other
-    # synthetic owners (a shared chat, the phone) are no person either and
-    # keep the viewer role they were delivered at.
-    deliver_user_sub: str | None = None
-    if not owner or is_task_chat_owner(owner):
-        role = roles.MANAGER
-    elif is_synthetic_owner(owner):
-        role = roles.VIEWER
-    else:
-        standing, row = await run_db(_standing_of, owner, agent)
+    personal = bool(owner) and not is_synthetic_owner(owner)
+    if personal:
+        # Checked before the claim, so a failed read leaves the wakes stored.
+        standing, _row = await run_db(_standing_of, owner, agent)
         if standing == roles.NO_ACCESS:
-            dropped = await asyncio.to_thread(task_store.claim_pending_delegate_wake, chat_id)
+            dropped = await run_db(task_store.claim_pending_delegate_wake, chat_id)
             logger.info(
                 "Wake redelivery: chat %s dropped %d wake(s): its owner no longer "
                 "holds agent '%s'", chat_id[:8], len(dropped), agent,
             )
             return False
-        deliver_user_sub = owner
-        role = row or roles.VIEWER
-    wakes = await asyncio.to_thread(
-        task_store.claim_pending_delegate_wake, chat_id,
-    )
-    if not wakes:
-        return False
-    try:
-
-        async def _on_outcome(outcome: "DeliveryOutcome") -> None:
-            # Same contract as _do_deliver's hook: every rung failed →
-            # re-store the original wakes; pump-driven turns return ""
-            # (already persisted); dead resumes return None.
-            if outcome.path == "none":
-                if deliver_user_sub and (await run_db(
-                        _standing_of, deliver_user_sub, agent))[0] == roles.NO_ACCESS:
-                    return
-                await _store_undelivered_wakes(chat_id, wakes)
-            if outcome.response and outcome.chat_id:
-                from core.events import chat_writer
-                await chat_writer.submit(
-                    outcome.chat_id,
-                    functools.partial(task_store.add_chat_message, outcome.chat_id,
-                                      "assistant", outcome.response),
-                    label="delegate_echo",
-                )
-
-        outcome = await deliver_prompt(
-            chat_id, "\n\n".join(wakes),
-            source="delegate_result_replay",
-            session_id=chat.get("session_id") or "",
-            agent=agent,
-            user_sub=deliver_user_sub,
-            role=role,
-            persistent_fn=_deliver_via_persistent,
-            oneshot_fn=_deliver_via_oneshot,
-            on_outcome=_on_outcome,
-        )
-    except Exception:
-        # One chat's broken spawn (bad config, dead layer) must neither
-        # kill the sweep nor eat the CLAIMED wakes: re-persist and move
-        # on (a corrupt user config.toml fails the oneshot, and the
-        # claimed wake must not be lost with the sweep).
-        logger.exception(
-            "Wake redelivery: chat %s delivery raised, re-storing %d "
-            "wake(s)", chat_id[:8], len(wakes),
-        )
-        for w in wakes:
-            await asyncio.to_thread(
-                task_store.append_pending_delegate_wake, chat_id, w,
+    records = await run_db(task_store.claim_pending_wake_records, chat_id)
+    groups: dict[tuple[str, str, str], list[str]] = {}
+    for rec in records:
+        key = (owner, "", "") if personal else (rec["person"], rec["role"], rec["by"])
+        groups.setdefault(key, []).append(rec["prompt"])
+    woken = False
+    for (person, role, by), prompts in groups.items():
+        try:
+            woken = await _redeliver_group(chat, prompts, person=person, role=role,
+                                           by=by) or woken
+        except Exception:
+            # One group's broken spawn (bad config, dead layer) must neither
+            # kill the sweep nor eat the CLAIMED wakes: re-persist and move
+            # on (a corrupt user config.toml fails the oneshot, live-hit).
+            logger.exception(
+                "Wake redelivery: chat %s delivery raised, re-storing %d wake(s)",
+                chat_id[:8], len(prompts),
             )
+            for w in prompts:
+                await run_db(functools.partial(
+                    task_store.append_pending_delegate_wake, chat_id, w,
+                    person=person, role=role, by=by))
+    return woken
+
+
+def _sweep_identity(chat: dict, person: str, role: str, by: str,
+                    ) -> tuple[str | None, str, bool, bool]:
+    """Who one group of stored wakes runs as: ``(user_sub, role, shared,
+    refused)``. A person's own chat runs as its owner at their row; a stored
+    person as that person (on a Shared-only chat at their standing, refused
+    below the editor tier); no person at the role the wake was stored with,
+    read again from its creator's row when a creator is on record, else the
+    owner kind's default (a task chat or none: manager; a shared or phone
+    chat: viewer). Synchronous: call it on the DB executor."""
+    agent = chat.get("agent") or ""
+    owner = chat.get("user_sub") or ""
+    if owner and not is_synthetic_owner(owner):
+        standing, row = _standing_of(owner, agent)
+        return owner, row or roles.VIEWER, False, standing == roles.NO_ACCESS
+    if person:
+        shared = bool(_shared_chat_person(chat, person))
+        standing, row = _standing_of(person, agent)
+        return (person, standing if shared else (row or roles.VIEWER), shared,
+                _wake_refused(standing, shared=shared))
+    if by and by != agent:
+        return None, roles.row_role(task_store.get_user_agent_roles(by), agent) or roles.VIEWER, \
+            False, False
+    if role:
+        return None, role, False, False
+    if not owner or is_task_chat_owner(owner):
+        return None, roles.MANAGER, False, False
+    return None, roles.VIEWER, False, False
+
+
+async def _redeliver_group(chat: dict, prompts: list[str], *, person: str, role: str,
+                           by: str) -> bool:
+    """Deliver one group of claimed wakes; True when a rung woke the chat.
+    A wake that runs as nobody below the editor tier can start no session
+    (it would run from the agent's own state, which the start floor
+    refuses), so it rides a live process only: undelivered, it stays for a
+    person's next turn on a shared chat and is dropped elsewhere."""
+    from core.session.session_delivery import deliver_prompt
+    from storage.pg import run_db
+
+    chat_id = chat["id"]
+    agent = chat.get("agent") or ""
+    owner = chat.get("user_sub") or ""
+    user_sub, deliver_role, shared, refused = await run_db(
+        _sweep_identity, chat, person, role, by)
+    if refused:
+        logger.info(
+            "Wake redelivery: chat %s dropped %d wake(s): %s no longer holds agent '%s'%s",
+            chat_id[:8], len(prompts), (user_sub or "-")[:8], agent,
+            " at the editor tier" if shared else "",
+        )
         return False
+    spawns = user_sub is not None or roles.can_edit(deliver_role)
+    # Kept for a person's next turn only on a shared chat of an agent that is
+    # Shared-only now: the chat of an agent that left the mode takes no such
+    # turn, so the wake is dropped there as the continuation fire drops it.
+    keep = spawns
+    if not keep and is_shared_chat_owner(owner):
+        from core.session.visibility import is_shared_only
+        keep = bool(await run_db(is_shared_only, agent))
+
+    async def _on_outcome(outcome: "DeliveryOutcome") -> None:
+        # Same contract as _do_deliver's hook: every rung failed →
+        # re-store the original wakes; pump-driven turns return ""
+        # (already persisted); dead resumes return None.
+        if outcome.path == "none":
+            if user_sub and _wake_refused(
+                    (await run_db(_standing_of, user_sub, agent))[0], shared=shared):
+                return
+            if not keep:
+                logger.info(
+                    "Wake redelivery: chat %s dropped %d wake(s): no live process took "
+                    "them and none may start below the editor tier", chat_id[:8], len(prompts),
+                )
+                return
+            await _store_undelivered_wakes(chat_id, prompts, person=person, role=role, by=by)
+        if outcome.response and outcome.chat_id:
+            from core.events import chat_writer
+            await chat_writer.submit(
+                outcome.chat_id,
+                functools.partial(task_store.add_chat_message, outcome.chat_id,
+                                  "assistant", outcome.response),
+                label="delegate_echo",
+            )
+
+    outcome = await deliver_prompt(
+        chat_id, "\n\n".join(prompts),
+        source="delegate_result_replay",
+        session_id=chat.get("session_id") or "",
+        agent=agent,
+        user_sub=user_sub,
+        role=deliver_role,
+        persistent_fn=_deliver_via_persistent,
+        oneshot_fn=_deliver_via_oneshot if spawns else None,
+        on_outcome=_on_outcome,
+    )
     if outcome.path == "none":
         logger.info(
-            "Wake redelivery: chat %s undeliverable, re-stored %d wake(s)",
-            chat_id[:8], len(wakes),
+            "Wake redelivery: chat %s undeliverable (%d wake(s))", chat_id[:8], len(prompts),
         )
         return False
     logger.info(
         "Wake redelivery: chat %s woken via %s (%d wake(s))",
-        chat_id[:8], outcome.path, len(wakes),
+        chat_id[:8], outcome.path, len(prompts),
     )
     return True
 
 
 async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
-                                agent: str, result_prompt: str) -> str | None:
+                                agent: str, result_prompt: str, *,
+                                person: str = "", only_as_chat_turn: bool = False) -> str | None:
     """Run a delegate-echo turn through a headless ChatStreamPump on the
     delegating chat.
 
@@ -763,22 +909,43 @@ async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
     falls through / logs the refusal). A stalled turn is reaped by the task
     watchdog with its partial output persisted; that still counts as delivered
     (the delegate_result event row is the source of truth either way).
+
+    A turn on a live process runs in the chat's own permission mode: when
+    its next step waits on a person while nobody views the chat, ``person``
+    (the delivery's, else the chat's owner when a person owns it) is told
+    once, so the card does not wait unseen.
+
+    The turn ends at the engine's result, as the chat's own turns do, and the
+    chat's monitors take what it leaves running (``lanes.takes_chat_contract``);
+    only inside a run's report window, or in a phone chat, does it wait on its
+    background work as a task turn.
     """
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.events.task_producer import task_produce
     from core.session import visibility as _vis
     from core.session.session_state import get_permission_queue
+    from storage.pg import run_db
 
-    if _active_pumps.get(chat_id) is not None:
-        # A turn started on the chat between the ladder's pump check and now —
-        # never dual-pump a chat.
+    # Read before the pump check: nothing may await between it and the
+    # pump's registration.
+    chat_row = await run_db(task_store.get_chat, chat_id)
+    from core.events import input_queue
+    if _active_pumps.get(chat_id) is not None or input_queue.get(chat_id).claimed:
+        # A turn started on the chat between the ladder's pump check and now,
+        # or a send, a drain or a queued delivery holds the chat for the turn
+        # it is starting (its pump registers a few steps later): never
+        # dual-pump a chat. The caller keeps the prompt (a stored wake, a
+        # review's next round).
         return None
+    chat_turn = lanes.takes_chat_contract(chat_row, session_id)
+    if only_as_chat_turn and not chat_turn:
+        return None   # a review never runs inside a run's report
     echo_id = f"echo-{chat_id[:8]}"
     event_queue: asyncio.Queue = asyncio.Queue()
-    producer = asyncio.create_task(task_produce(
-        layer, session_id, result_prompt, event_queue, echo_id,
-        settle_timeout=30.0,
-    ))
+    producer = asyncio.create_task(
+        lanes._chat_turn_produce(layer, session_id, result_prompt, event_queue)
+        if chat_turn else task_produce(
+            layer, session_id, result_prompt, event_queue, echo_id, settle_timeout=30.0))
     pump = ChatStreamPump(
         chat_id=chat_id,
         session_id=session_id,
@@ -789,11 +956,32 @@ async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
     )
     _active_pumps[chat_id] = pump
     pump.start()
+    async def _tell_parked() -> None:
+        who = person
+        if not who:
+            owner = (chat_row or {}).get("user_sub") or ""
+            who = "" if is_synthetic_owner(owner) else owner
+        if not who:
+            return
+        from services.notifications import notification_manager
+        await notification_manager.fire_notification(
+            "A chat waits on your answer",
+            f"{agent} was woken in a chat (a delegated result, a scheduled wake or a "
+            f"finished background job) and its next step waits for your answer there. "
+            f"Open the chat to answer.",
+            severity="info", scope="user", target=who, source="delegation",
+            agent_slug=agent, chat_id=chat_id,
+        )
+
     # A _TaskTurnStalled reap persisted the partial turn and closed the chat
     # status — delivered as far as it went; never fall through to another rung
     # (that would run a SECOND echo turn).
     with contextlib.suppress(lanes._TaskTurnStalled):
-        await lanes._watch_task_pump(layer, pump, echo_id, chat_id, session_id)
+        await lanes._watch_task_pump(layer, pump, echo_id, chat_id, session_id,
+                                     on_parked=_tell_parked)
+    if chat_turn:
+        from core.events.pump_bg_monitors import arm_bg_monitors
+        arm_bg_monitors(layer, session_id, chat_id)
     return ""
 
 
@@ -813,7 +1001,7 @@ async def _deliver_via_persistent(
 
     from storage.pg import run_db
     chat_row = await run_db(task_store.get_chat, chat_id) if (chat_id and user_sub) else None
-    pin = await run_db(_shared_chat_pin, chat_row, user_sub)
+    pin = await run_db(_chat_pin, chat_row, user_sub)
     try:
         layer = get_execution_layer(agent, user_sub=user_sub, role=role, execution_target=pin)
     except RuntimeError:
@@ -830,7 +1018,7 @@ async def _deliver_via_persistent(
             _state._save_sessions()
         if chat_id:
             return await _run_echo_turn_pumped(
-                layer, session_id, chat_id, agent, result_prompt,
+                layer, session_id, chat_id, agent, result_prompt, person=user_sub or "",
             )
         parts: list[str] = []
         async with layer.session_lock(session_id):
@@ -884,7 +1072,7 @@ async def _deliver_via_oneshot(
         _chat_row = await asyncio.to_thread(task_store.get_chat, chat_id)
         chat_exec = (_chat_row or {}).get("execution_path") or ""
     exec_path = resolve_execution_path(agent, chat_exec)
-    pin = await run_db(_shared_chat_pin, _chat_row, user_sub)
+    pin = await run_db(_chat_pin, _chat_row, user_sub)
     target = pin or (await run_db(
         remote_store.resolve_execution_target, agent, user_sub, role))[0]
     if placement.is_offline_sentinel(target):
@@ -1019,13 +1207,21 @@ async def _spawn_wake_session(
     # and the per-MCP secret bundles reach the session through its config.
     from core.session.session_manager import capabilities_for_path
     _mcp_format = capabilities_for_path(exec_path).mcp_config_format
-    (mcp_config, flat_env, _excluded, secret_bundles, bash_env_keys), agent_prompt = (
-        await asyncio.to_thread(functools.partial(
-            _wake_config_and_prompt, agent, user_sub, username=username, role=role, vis=vis,
+    targets = await run_db(_wake_delegation_targets, agent, user_sub, role)
+    mcp_config, flat_env, excluded, secret_bundles, bash_env_keys = await asyncio.to_thread(
+        functools.partial(
+            _wake_mcp_build, agent, user_sub, username=username, role=role, vis=vis,
             chat_id=chat_id, where=_os_placement, browser=_os_browser,
-            mcp_format=_mcp_format, exec_path=exec_path, security=oneshot_security,
-        )))
-    mcp_config, credential_env, multi_value_envs = await asyncio.to_thread(
+            mcp_format=_mcp_format, session_id=session_id, targets=targets,
+        ))
+    contexts = await _wake_dynamic_contexts(
+        agent, excluded or {}, user_sub=user_sub, role=role, targets=targets,
+        where=_os_placement)
+    agent_prompt = await asyncio.to_thread(functools.partial(
+        _wake_prompt, agent, role=role, vis=vis, where=_os_placement, exec_path=exec_path,
+        security=oneshot_security, excluded=excluded or {}, dynamic_contexts=contexts,
+    ))
+    mcp_config, credential_env, multi_value_envs, token_minted_at = await asyncio.to_thread(
         functools.partial(
             _wake_credential_env, agent, session_id,
             user_sub=user_sub, role=role, vis=vis, where=_os_placement,
@@ -1102,6 +1298,7 @@ async def _spawn_wake_session(
         # The chat's own thread: without it a Codex resume starts a new one
         # (Claude resumes by the session id and stores none).
         resume_handle=(chat_row or {}).get("codex_thread_id") or "",
+        token_minted_at=token_minted_at,
         extra_env=sub_env,
         subscription_id=subscription_id,
         subscription_user_sub=creds_sub or "",
@@ -1143,7 +1340,7 @@ async def _spawn_wake_session(
             release_config_seat(session_id, oneshot_cfg)
     if chat_id:
         return True, await _run_echo_turn_pumped(
-            layer, session_id, chat_id, agent, result_prompt,
+            layer, session_id, chat_id, agent, result_prompt, person=user_sub or "",
         )
     parts: list[str] = []
     async with layer.session_lock(session_id):

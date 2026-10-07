@@ -25,14 +25,15 @@ from psycopg import errors as pg_errors
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_auth, require_user
 from services.mcp import mcp_registry
 from services.webhooks import subscription_manager
 from storage import database as task_store
 from storage.automation import trigger_store, webhook_subscription_store
 
 logger = logging.getLogger("claude-proxy.api.subscriptions")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 # =====================================================================

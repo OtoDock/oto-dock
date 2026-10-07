@@ -109,3 +109,33 @@ async def test_run_deferred_pulls_failure_skips_bookkeeping_and_broadcast(tmp_pa
     cm.pull_file_to_path.assert_awaited_once()
     rec.assert_not_called()       # no base advance on a failed pull
     bcast.assert_not_awaited()    # no dashboard refresh for a file that didn't land
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_pull_is_handed_the_named_path(tmp_path):
+    """The destination is the path as named, never where an in-tree link
+    on the way points, so the pull opens it by components and refuses the
+    link; a path that is not canonical is never pulled."""
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from services.infra import safe_fs
+    ws = tmp_path / "agent-1" / "workspace"
+    (ws / "real").mkdir(parents=True)
+    (ws / "alias").symlink_to("real")
+    cm = MagicMock()
+    cm.pull_file_to_path = AsyncMock(return_value=False)
+    layer = RemoteExecutionLayer(cm)
+    actions = [
+        FileAction("workspace/real/../../config/x.md", "pull", base_hash="sha256:s"),
+        FileAction("workspace/alias/big.bin", "pull", base_hash="sha256:s"),
+    ]
+
+    with patch("core.remote.remote_workspace_sync.logger"), \
+         patch("config.AGENTS_DIR", tmp_path), \
+         patch("core.remote.remote_file_flow._acquire_global_path_lock",
+               new=AsyncMock(return_value=asyncio.Lock())):
+        await layer._run_deferred_pulls("m1", "agent-1", actions, "alice")
+        cm.pull_file_to_path.assert_awaited_once()
+        dest = cm.pull_file_to_path.await_args.args[2]
+        assert dest == ws / "alias" / "big.bin"
+        with pytest.raises(safe_fs.SymlinkRefused):
+            SatelliteConnectionManager._open_pull_root(dest)

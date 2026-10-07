@@ -84,7 +84,7 @@ export default function AppDeployCard({ app, agent }: Props) {
             {manifestChanged
               ? 'What the app may do changed with this release: review it before it goes live.'
               : waiting
-                ? 'The manifest is approved; a secret it needs has no value yet.'
+                ? 'The manifest is approved. A secret it needs has no value yet.'
                 : lowersApproval
                   ? 'Deploys of this app wait for a person until this release is approved.'
                   : 'Deploys of this app always wait for a person.'}

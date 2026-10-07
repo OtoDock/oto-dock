@@ -19,10 +19,10 @@ from storage.mcp import mcp_store
 from storage import database as task_store
 from services.mcp import mcp_registry
 from services.oauth import oauth_account_store
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_admin, require_auth, require_user
 
 logger = logging.getLogger("claude-proxy.credential-api")
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 # --- Request models ---
@@ -77,37 +77,40 @@ def _is_app_credential(name: str) -> bool:
     return False
 
 
-def _read_account_token_scopes(
+def _account_token_status(
     user_sub: str, mcp_name: str, account_label: str,
-) -> list[str]:
-    """Return the list of scopes recorded in an account's token file.
+) -> tuple[list[str], str]:
+    """The scopes recorded in an account's token file and the reason it
+    needs a reconnect (``""`` when it does not), read in one pass.
 
-    Used by ``list_my_integrations`` to compute ``missing_scopes`` for
-    the "Add additional access" UI affordance (incremental scope grant).
-    Returns an empty list if the token file is missing/corrupt; that's
-    treated as "no scopes granted" which surfaces every required scope
-    as missing — UI prompts re-connect, which is correct.
+    ``list_my_integrations`` computes ``missing_scopes`` from the scopes
+    (the "Add additional access" affordance) and ``needs_reconnect`` from
+    the reason (a grant the vendor ended, an expired token nobody can
+    refresh, a file the manifest's way of issuing tokens no longer covers).
+    A missing or corrupt file counts as no scopes granted, which surfaces
+    every required scope as missing: the UI prompts a reconnect.
     """
-    from services.oauth import oauth_account_store
+    from services.oauth import credential_resolver, oauth_account_store
     manifest = mcp_registry.get_manifest(mcp_name)
     provider_id = (
         (manifest.credentials.oauth or {}).get("provider_id", "")
         if manifest else ""
     )
     if not provider_id:
-        return []
+        return [], ""
     username = task_store.get_username_by_sub(user_sub)
     if not username:
-        return []
+        return [], ""
     token_dir = oauth_account_store.get_token_dir(username, provider_id=provider_id)
     data = oauth_account_store.read_account_token(token_dir, account_label)
     if not data:
-        return []
+        return [], ""
+    reason = credential_resolver.account_unusable_reason(data, manifest)
     raw = data.get("scopes", []) or []
     if isinstance(raw, str):
         # Some legacy formats stored as space-separated string.
-        return [s for s in raw.split() if s]
-    return list(raw)
+        return [s for s in raw.split() if s], reason
+    return list(raw), reason
 
 
 def _service_binding_summary(agent_name: str, user: UserContext) -> dict:
@@ -249,12 +252,13 @@ async def list_my_integrations(
             # surface a "Grant additional access" UI hint without forcing
             # a full reconnect.
             missing_scopes: list[str] = []
+            reconnect_reason = ""
             if cred_info and cred_info.get("oauth"):
                 required_scopes = await asyncio.to_thread(
                     mcp_registry.build_oauth_scopes, mcp_name, connected_services,
                 )
-                granted = await asyncio.to_thread(
-                    _read_account_token_scopes,
+                granted, reconnect_reason = await asyncio.to_thread(
+                    _account_token_status,
                     user.sub, mcp_name, acc["account_label"],
                 )
                 missing_scopes = [s for s in required_scopes if s not in granted]
@@ -271,6 +275,10 @@ async def list_my_integrations(
                 ),
                 "missing_scopes": missing_scopes,
                 "service_bindings": service_bindings,
+                # The card says "Reconnect needed" with the reason; the
+                # resolver leaves such an account out of new sessions.
+                "needs_reconnect": bool(reconnect_reason),
+                "reconnect_reason": reconnect_reason,
             })
 
         # Build user-overridable config fields with admin defaults
@@ -303,6 +311,17 @@ async def list_my_integrations(
             if any(m.name == mcp_name for m in enabled):
                 candidate_agents.append(agent)
 
+        oauth_meta = dict(cred_info.get("oauth_meta", {}) if cred_info else {})
+        if oauth_meta.get("authorization_server") and manifest is not None:
+            # Whether a connect goes through the registered client right now
+            # (hosted mode off, no app credentials): the form words itself by it.
+            from services.oauth import mcp_authorization
+            oauth_meta["authorization_server"] = {
+                **oauth_meta["authorization_server"],
+                "active": await asyncio.to_thread(
+                    mcp_authorization.registered_client_mode, manifest,
+                ),
+            }
         entry = {
             "mcp_name": mcp_name,
             "display_name": (cred_info.get("label", "") if cred_info else "") or (manifest.label if manifest else mcp_name),
@@ -312,7 +331,7 @@ async def list_my_integrations(
             "fields": cred_info.get("fields", []) if cred_info else [],
             "oauth": cred_info.get("oauth", False) if cred_info else False,
             "oauth_services": cred_info.get("oauth_services", []) if cred_info else [],
-            "oauth_meta": cred_info.get("oauth_meta", {}) if cred_info else {},
+            "oauth_meta": oauth_meta,
             "supports_multi_account": (
                 (cred_info.get("oauth_meta") or {}).get("supports_multi_account", True)
                 if cred_info else True
@@ -733,14 +752,6 @@ async def clear_agent_service_binding(
 
 # --- Admin: Infrastructure Credentials ---
 
-def _require_admin(user: UserContext | None):
-    user = require_auth(user)
-    if user.is_service:
-        return  # the trusted master key is admin-equivalent (service-to-service)
-    if not user.is_admin:
-        raise HTTPException(403, "Admin only")
-
-
 @router.get("/v1/admin/integrations")
 async def list_admin_integrations(
     user: UserContext = Depends(get_current_user),
@@ -748,7 +759,7 @@ async def list_admin_integrations(
     """List all infrastructure MCPs with their configured-key status, plus
     the email-server config block.
     """
-    _require_admin(user)
+    require_admin(user)
 
     all_infra = await asyncio.to_thread(credential_store.get_all_infra_credentials)
 
@@ -791,7 +802,7 @@ async def set_infra_integration(
     user: UserContext = Depends(get_current_user),
 ):
     """Set infrastructure MCP credentials."""
-    _require_admin(user)
+    require_admin(user)
 
     cred_info = _get_cred_schema(mcp_name)
     is_infra = cred_info and cred_info.get("type") == "infra"
@@ -814,7 +825,7 @@ async def delete_infra_integration(
     user: UserContext = Depends(get_current_user),
 ):
     """Remove infrastructure MCP credentials."""
-    _require_admin(user)
+    require_admin(user)
 
     await asyncio.to_thread(
         credential_store.delete_infra_credentials, mcp_name
@@ -828,7 +839,7 @@ async def set_email_server_config(
     user: UserContext = Depends(get_current_user),
 ):
     """Set default email server configuration (SMTP/IMAP host/port)."""
-    _require_admin(user)
+    require_admin(user)
 
     creds = {}
     if body.smtp_host:
@@ -864,7 +875,7 @@ async def list_bearer_allowlist(
     user: UserContext = Depends(get_current_user),
 ):
     """List approved (provider, host) pairs for OAuth bearer-token injection."""
-    _require_admin(user)
+    require_admin(user)
     from storage.identity import bearer_allowlist
     rows = await asyncio.to_thread(bearer_allowlist.list_allowed)
     return {"entries": rows}
@@ -876,7 +887,7 @@ async def add_bearer_allowlist(
     user: UserContext = Depends(get_current_user),
 ):
     """Approve a (provider, host_pattern) pair. Idempotent on conflict."""
-    _require_admin(user)
+    require_admin(user)
     from storage.identity import bearer_allowlist
     if not body.provider_id.strip() or not body.host_pattern.strip():
         raise HTTPException(400, "provider_id and host_pattern required")
@@ -896,7 +907,7 @@ async def remove_bearer_allowlist(
     """Revoke a (provider, host) pair. Future bearer injections to that
     host are dropped (existing sessions keep their cached header until
     refresh)."""
-    _require_admin(user)
+    require_admin(user)
     from storage.identity import bearer_allowlist
     ok = await asyncio.to_thread(bearer_allowlist.delete_allowed, row_id)
     if not ok:
@@ -910,7 +921,79 @@ async def restore_bearer_allowlist_defaults(
 ):
     """Re-add any deleted vendor-official defaults. Idempotent — admin-added
     entries and existing defaults are untouched. Returns the refreshed list."""
-    _require_admin(user)
+    require_admin(user)
     from storage.identity import bearer_allowlist
     rows = await asyncio.to_thread(bearer_allowlist.restore_defaults)
     return {"entries": rows}
+
+
+# --- The OAuth clients the install registered at vendors (admin) ---------
+#
+# A manifest whose MCP server names its own authorization server
+# (``credentials.oauth.authorization_server``) makes the install register
+# itself there once per callback URL (services/oauth/mcp_authorization.py).
+# Admins see those registrations and can forget one: the row is revoked,
+# never deleted (token files point at it by id), and the next connect
+# registers afresh. A person at the keyboard only: an agent's session token
+# in an admin's chat must not forget the install's registrations.
+
+
+def _registration_mcps(issuer: str, resources: str = "") -> list[str]:
+    """The installed MCPs whose authorization server is ``issuer``: by the
+    MCP server URLs recorded on the row when a connect started through it
+    (``resources``, which outlive a restart), by the cached discovery of
+    their MCP server, by the issuer the manifest declares, or, for a
+    manifest that declares none, by an issuer host equal to the MCP
+    server's host."""
+    from urllib.parse import urlsplit
+    from services.oauth import mcp_authorization
+
+    issuer_host = (urlsplit(issuer).hostname or "").lower()
+    discovered = set(mcp_authorization.resources_of_issuer(issuer)) | set(resources.split())
+    names: list[str] = []
+    for m in mcp_registry.get_all_manifests().values():
+        oauth = (m.credentials.oauth or {}) if m.credentials else {}
+        block = oauth.get("authorization_server")
+        if not isinstance(block, dict):
+            continue
+        resource = mcp_authorization.canonical_resource(m.server.url_template or "")
+        declared = str(block.get("issuer") or "").rstrip("/")
+        if (
+            resource in discovered
+            or (declared and declared == issuer.rstrip("/"))
+            or (not declared and (urlsplit(resource).hostname or "").lower() == issuer_host)
+        ):
+            names.append(m.name)
+    return sorted(names)
+
+
+@router.get("/v1/admin/oauth-client-registrations")
+async def list_client_registrations(
+    user: UserContext = Depends(get_current_user),
+):
+    """Every registration, live rows first, without the encrypted columns."""
+    require_admin(user)
+    from storage.identity import oauth_client_registrations as regs
+    from storage.pg import run_db
+    rows = await run_db(regs.list_all)
+    for row in rows:
+        row["mcps"] = _registration_mcps(row["issuer"], row.get("resources") or "")
+    return {"registrations": rows}
+
+
+@router.post("/v1/admin/oauth-client-registrations/{row_id}/forget")
+async def forget_client_registration(
+    row_id: int,
+    user: UserContext = Depends(get_current_user),
+):
+    """Revoke a live registration: connected accounts keep their tokens
+    (a refresh needs no registration for a public client), the next connect
+    registers the install afresh."""
+    admin = require_admin(user)
+    from storage.identity import oauth_client_registrations as regs
+    from storage.pg import run_db
+    ok = await run_db(regs.revoke, row_id, f"forgotten by {admin.sub[:8]}")
+    if not ok:
+        raise HTTPException(404, "No live registration with that id")
+    return {"status": "ok"}
+

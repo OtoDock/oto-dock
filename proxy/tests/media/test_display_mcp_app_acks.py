@@ -267,3 +267,68 @@ def test_the_skills_the_always_loaded_skill_names_are_shipped():
     text = (MCP_DIR / "skills" / "display-tools.md").read_text()
     named = set(re.findall(r"\b([a-z][a-z0-9]*(?:-[a-z0-9]+)+)(?:\*\*)? skill\b", text))
     assert named and named <= shipped, named - shipped
+
+
+@pytest.mark.asyncio
+async def test_list_apps_prints_placed_apps_apart_and_a_placed_only_list(monkeypatch):
+    """An app a share placed in this agent rides ``placed`` (SHARING.md
+    "Agents use a placed app"): named by its home agent and slug with its
+    id, how it got here, the role this session acts at and the calls it
+    answers; an agent holding only placed apps still reads them."""
+    placed = [{"id": "p-1", "agent": "head", "slug": "register", "title": "Register",
+               "from_agent_name": "Head", "kind": "folder",
+               "placement": {"kind": "agent", "share_id": "sh-1", "role_cap": "editor"},
+               "role": "editor", "actions_approved": True, "hidden_for_me": False,
+               "exports": {"methods": {"status": {"description": "s"},
+                                       "update-project": {"description": "w", "min_role": "editor"}}}},
+              {"id": "p-2", "agent": "head", "slug": "notes", "title": "Notes",
+               "from_agent_name": "Head", "kind": "file",
+               "placement": {"kind": "person", "share_id": "sh-2", "role_cap": "viewer"},
+               "role": "agent", "actions_approved": False, "hidden_for_me": True,
+               "exports": {"methods": {}}}]
+    _patch(monkeypatch, {"apps": [], "placed": placed})
+    text = _texts(await app_tools._handle_app_hook("list", {}))
+    assert "No pinned apps of this agent's own." in text
+    assert "- register of agent head [placed by an agent share at editor, as editor, server app]" in text
+    assert "id p-1; calls: status, update-project (editor and up) → POST $PROXY_URL/v1/apps/p-1/api/<method>" in text
+    assert "- notes of agent head [placed by your own accepted share at viewer, with no person" in text
+    assert "exports no method" in text and "waits for approval on its home agent" in text
+    assert "hidden by the user in this agent" in text
+    _patch(monkeypatch, {"apps": [{"id": "a", "slug": "mine", "title": "Mine", "scope": "shared",
+                                   "path": "/workspace/apps/mine.html", "actions": [],
+                                   "actions_approved": True}], "placed": []})
+    text = _texts(await app_tools._handle_app_hook("list", {}))
+    assert text.startswith("Pinned apps:") and "Placed here" not in text
+    _patch(monkeypatch, {"apps": [], "placed": []})
+    assert _texts(await app_tools._handle_app_hook("list", {})) == "No pinned apps in your scope."
+
+
+@pytest.mark.asyncio
+async def test_describe_app_prints_the_placement_and_binds_only_over_an_edge(monkeypatch):
+    base = {"app_id": "p-1", "agent": "head", "slug": "register", "title": "Register", "approved": True,
+            "exports": {"methods": {"status": {"description": "s"},
+                                    "update-project": {"description": "w", "min_role": "editor"}},
+                        "snapshots": {}, "events": {}}}
+    call = "POST $PROXY_URL/v1/apps/p-1/api/<method> with your session token"
+    _patch(monkeypatch, {**base, "binding": None, "call": call,
+                         "placement": {"kind": "agent", "share_id": "sh", "role_cap": "editor", "role": "viewer"}})
+    text = _texts(await app_tools._handle_describe({"agent": "head", "slug": "register"}))
+    assert "Bind with" not in text and "No binding reaches it" in text
+    assert "Placed in this agent by an agent share at editor: this session calls its exported methods as viewer" in text
+    assert call in text and "[editor and up, judged at your role here as the share gives it]" in text
+    assert "bindings/<name>" not in text
+    assert "delegation edge" not in text and "found through the placement alone" in text
+    _patch(monkeypatch, {**base, "binding": {"agent": "head", "app": "register"}})
+    text = _texts(await app_tools._handle_describe({"agent": "head", "slug": "register"}))
+    assert "Bind with" in text and "Placed in this agent" not in text and "[editor and up, on head]" in text
+
+
+@pytest.mark.asyncio
+async def test_open_app_sends_the_home_agent_of_a_placed_app(monkeypatch):
+    calls = _patch(monkeypatch, {"status": "opened", "app_id": "p-1", "screens": 1})
+    await app_tools._handle_live_hook("open", {"slug": "register", "agent": " Head "})
+    assert calls[-1][0] == "/v1/hooks/apps/open" and calls[-1][1]["agent"] == "head"
+    await app_tools._handle_live_hook("open", {"slug": "register"})
+    assert "agent" not in calls[-1][1]
+    schema = next(t for t in app_tools.APP_TOOLS if t.name == "open_app").inputSchema
+    assert "agent" in schema["properties"]

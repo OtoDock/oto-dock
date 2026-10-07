@@ -362,7 +362,15 @@ async def close_person_sessions(sub: str, username: str, reason: str) -> int:
     chat starts again with a fresh token. Returns how many."""
     victims = [v for v in _live_sessions() if _person_matches(v, sub, username)]
     await _close(victims, f"{sub} {reason}")
-    return len(victims)
+    # A remote session the index kept across a restart, not yet reported by
+    # its machine, is held by nothing: drop its context so the re-adoption
+    # closes it instead of bringing back its old token.
+    from core.session import session_state
+    dropped = session_state.drop_reloaded_contexts_of(username)
+    if dropped:
+        logger.info("offboarding: %s %s: %d reloaded session(s) awaiting re-adoption dropped",
+                    sub[:12], reason, len(dropped))
+    return len(victims) + len(dropped)
 
 
 def register() -> None:

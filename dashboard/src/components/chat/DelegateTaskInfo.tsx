@@ -1,6 +1,11 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { resolveChatPath, type ResolvedChatPath } from '../../api/chats'
+import type { DelegateResultFile, DelegateResultSkipped } from '../../api/wireEvents'
+import { scopeWorkspace, userOf } from '../../lib/layout/tree'
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from '../../lib/status/run'
+import { useChatFileContext } from './ChatFileContext'
+import ChatFilePreview from './ChatFilePreview'
 
 interface Props {
   taskName: string
@@ -89,6 +94,100 @@ export default function DelegateTaskInfo({ taskName, agent, promptPreview, statu
           </pre>
         </div>
       )}
+    </div>
+  )
+}
+
+/** A landed path as the delegating chat's workspace names it: the scope
+ * workspace prefix (`workspace/`, `users/<u>/workspace/`) stripped, so the
+ * label matches the callback note (`inbox/<worker>/report.md`). */
+export function resultFileLabel(path: string): string {
+  const prefix = `${scopeWorkspace(userOf(path))}/`
+  return path.startsWith(prefix) ? path.slice(prefix.length) : path
+}
+
+function sizeText(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+const NOT_FOUND_REVERT_MS = 2500
+
+/**
+ * The files a delegated worker attached to its result, rendered inside the
+ * worker's response bubble. Each landed file opens through the DELEGATING
+ * chat's `resolve-path` (`useChatFileContext()`, this chat's id and agent),
+ * never through the bubble's agent (the worker's slug): the files live in
+ * this chat's tree. Without a chat context (a chat with no id yet) the rows
+ * are inert text. Skipped entries show muted with the proxy's reason.
+ */
+export function DelegateResultFiles({ files, skipped }: {
+  files: DelegateResultFile[]
+  skipped: DelegateResultSkipped[]
+}) {
+  const ctx = useChatFileContext()
+  const [preview, setPreview] = useState<ResolvedChatPath | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [notFound, setNotFound] = useState<string | null>(null)
+  const revertTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (revertTimer.current) clearTimeout(revertTimer.current)
+  }, [])
+
+  const open = async (path: string) => {
+    if (!ctx || busy) return
+    if (revertTimer.current) clearTimeout(revertTimer.current)
+    setNotFound(null)
+    setBusy(path)
+    let resolved: ResolvedChatPath | null = null
+    try {
+      resolved = await resolveChatPath(ctx.chatId, path)
+    } catch {
+      resolved = null
+    }
+    setBusy(null)
+    if (resolved) {
+      setPreview(resolved)
+      return
+    }
+    setNotFound(path)
+    revertTimer.current = setTimeout(() => setNotFound(null), NOT_FOUND_REVERT_MS)
+  }
+
+  return (
+    <div className="my-1.5 rounded-lg bg-[#0d9488]/5 text-xs overflow-hidden" data-testid="delegate-files">
+      <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-p-accent-teal/80">
+        Files from the worker
+      </div>
+      <ul className="px-2 pb-1.5 space-y-0.5">
+        {files.map((f) => (
+          <li key={f.path} className="flex items-center gap-2 min-w-0">
+            <span aria-hidden="true">📄</span>
+            <span className="truncate font-mono text-p-text" title={f.path}>{resultFileLabel(f.path)}</span>
+            <span className="shrink-0 text-p-text-light">{sizeText(f.bytes)}</span>
+            {ctx && (
+              <button
+                type="button"
+                onClick={() => open(f.path)}
+                disabled={busy === f.path}
+                title={notFound === f.path ? 'File not found in this chat\'s workspace' : 'Open file preview'}
+                className="shrink-0 ml-auto px-1.5 py-0.5 rounded-sm text-[10px] font-medium text-p-accent-teal hover:bg-p-accent-teal/10 transition-colors disabled:opacity-60"
+              >
+                {notFound === f.path ? 'not found' : 'Open ↗'}
+              </button>
+            )}
+          </li>
+        ))}
+        {skipped.map((s, i) => (
+          <li key={`skip-${i}`} className="flex items-center gap-2 min-w-0 text-p-text-light">
+            <span aria-hidden="true">⊘</span>
+            <span className="truncate font-mono" title={s.path}>{s.path}</span>
+            <span className="shrink-0 truncate">{s.reason}</span>
+          </li>
+        ))}
+      </ul>
+      {preview && <ChatFilePreview resolved={preview} onClose={() => setPreview(null)} />}
     </div>
   )
 }

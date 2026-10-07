@@ -19,6 +19,11 @@ class TestMatches:
     def test_claude_typographic_apostrophe(self):
         assert _limit_notice("You’ve hit your usage limit · resets 10am") is not None
 
+    def test_claude_model_limit(self):
+        out = ("You've reached your Fable limit. Switch to another model, or manage "
+               "usage credits at claude.ai/settings/usage, to continue.")
+        assert _limit_notice(out) == out
+
     def test_claude_api_style_notice(self):
         assert _limit_notice("Claude AI usage limit reached|1751980800") is not None
 
@@ -34,6 +39,9 @@ class TestMatches:
 
     def test_case_insensitive(self):
         assert _limit_notice("YOU'VE HIT YOUR SESSION LIMIT") is not None
+        # Claude Code's usage-credits wording of the limit notice (first met live 2026-10-04).
+        assert _limit_notice("You're out of usage credits. Switch to another model, "
+                             "or manage usage credits at claude.ai/settings/usage, to continue.") is not None
 
 
 class TestNonMatches:

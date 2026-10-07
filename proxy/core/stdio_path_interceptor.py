@@ -248,7 +248,7 @@ def _fetch_mcp_credentials(
     """Fetch this MCP's secret bundle from the broker, authenticated by the
     per-(session, mcp) capability token — NOT ``PROXY_API_KEY`` (the broker
     endpoint rejects the session JWT, which the agent's own bash holds). Returns
-    ``{"env": {...}, "http_bearer": ...}`` or ``None`` on failure.
+    ``{"env": {...}}`` or ``None`` on failure.
 
     Fail-closed: on failure we inject nothing. The loopback tunnel can answer 503
     right after a (re)connect (before the satellite WS re-auths), so retry with

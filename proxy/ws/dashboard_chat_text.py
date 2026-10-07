@@ -98,3 +98,32 @@ def _queued_outgoing(stop_flags: dict, combined: str) -> str:
     stop_flags["note"] = False
     stop_flags["fired"] = False
     return outgoing
+
+
+# What ``_heal_viewed_session`` answers: the session is ready for the turn; the
+# send was answered there (typed into a live terminal, refused read-only); or
+# the session's machine is still reconnecting after the wait (nothing was
+# touched, the send waits).
+HEAL_READY = "ready"
+HEAL_ANSWERED = "answered"
+HEAL_RECONNECTING = "reconnecting"
+
+# The line a turn gets that could not wait in the queue (its row is already
+# written) while its chat's machine reconnects.
+RECONNECTING_NOT_SENT = ("Not sent: the machine running this chat is reconnecting. "
+                         "Send it again once it is back.")
+
+
+class TurnDeferred(Exception):
+    """A turn's session is still held in its machine's reconnect grace once
+    the wait is over: the start is put off and nothing of the session is
+    touched. Every caller of ``_start_new_stream`` catches it, except
+    ``_run_server_turn``, which lets it reach its own callers."""
+
+
+def grace_layer(session_id: str, fallback):
+    """The layer to ask whether ``session_id``'s machine is reconnecting: the
+    one that holds the session (a chat's resolved layer can be another, e.g.
+    the local one for a chat with no pinned target), else ``fallback``."""
+    from core.session.session_manager import find_layer_for_session
+    return find_layer_for_session(session_id) or fallback

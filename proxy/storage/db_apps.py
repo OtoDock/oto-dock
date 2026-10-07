@@ -404,6 +404,19 @@ def get_app(app_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+
+def get_apps_by_ids(app_ids: list[str]) -> dict[str, dict]:
+    """``app_id → row`` for the ids that exist, one query (the triggers
+    listing names each row's app). An empty list answers ``{}`` with no
+    query."""
+    ids = list(dict.fromkeys(a for a in app_ids if a))
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM pinned_apps WHERE id = ANY(%s)", (ids,)).fetchall()
+    return {r["id"]: dict(r) for r in rows}
+
+
 def get_app_by_slug(agent: str, username: str, slug: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
@@ -417,7 +430,7 @@ _UNSCOPED = "scope_chat_id IS NULL AND scope_project_id IS NULL"
 
 
 def list_apps(agent: str, username: str = "", include_hidden: bool = False,
-              viewer_sub: str = "") -> list[dict]:
+              viewer_sub: str = "", with_placements: bool = False) -> list[dict]:
     """The viewer's merged STANDING list: shared rows first, then the
     viewer's own personal rows, each group by position. ``username=""``
     returns only the shared group (agent-scope callers). order[0] is the
@@ -432,8 +445,11 @@ def list_apps(agent: str, username: str = "", include_hidden: bool = False,
     hidden-affordance needs them); the API layer/client segregate. Personal
     rows always carry ``hidden_for_me=False``. With ``viewer_sub`` and a
     ``username`` the list ends with a third group: other users' personal
-    apps the viewer holds a live internal share on (``granted`` set,
-    ``hidden_for_me`` from the share row; SHARING.md)."""
+    apps the viewer holds a live share on (``granted`` set,
+    ``hidden_for_me`` from the share row; SHARING.md), and with
+    ``with_placements`` (a person at the dashboard, never a bearer) a
+    fourth: the apps of other agents placed here by a share (each with its
+    ``placement``), those already listed left out."""
     hid = "" if include_hidden else "AND NOT hidden "
     hide_col = (", EXISTS(SELECT 1 FROM pinned_app_user_hides h "
                 "WHERE h.app_id = pinned_apps.id AND h.user_sub = %s) "
@@ -463,6 +479,11 @@ def list_apps(agent: str, username: str = "", include_hidden: bool = False,
     if username and viewer_sub and not include_hidden:
         from storage.sharing import share_store
         rows += share_store.granted_app_rows(agent, viewer_sub)
+    if with_placements and viewer_sub and not include_hidden:
+        from storage.sharing import share_store
+        seen = {r["id"] for r in rows}
+        rows += [r for r in share_store.placements_for_agent(agent, viewer_sub)
+                 if r["id"] not in seen]
     return rows
 
 

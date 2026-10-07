@@ -12,6 +12,8 @@ provision / deprovision / bootstrap lifecycle without any provider dependency.
 
 from __future__ import annotations
 
+from adapters.phone import is_outbound
+
 from .base import (
     BootstrapResult,
     HealthStatus,
@@ -46,9 +48,9 @@ class ManualAsteriskAdapter(PhoneServerAdapter):
         )
 
     async def provision_route(self, route: dict) -> RouteHandle:
-        if route.get("direction", "inbound") == "inbound":
-            return self._provision_inbound(route)
-        return self._provision_outbound(route)
+        if is_outbound(route.get("direction")):
+            return self._provision_outbound(route)
+        return self._provision_inbound(route)
 
     async def deprovision_route(self, route: dict) -> None:
         # Nothing to undo on our side. A leftover AstDB entry is harmless; the

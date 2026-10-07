@@ -115,6 +115,33 @@ class TestIsDowngrade:
         assert mcp_updater._is_downgrade("1.0", "") is False
 
 
+class TestCatalogRelation:
+    """The version-of-record axes (a container's tag, a skill package) move an
+    install forward only; an install past the catalog is ``ahead``."""
+
+    def test_newer_catalog_is_an_update(self):
+        assert mcp_updater._catalog_relation("0.0.70", "0.0.69") == mcp_updater.REL_UPDATE
+
+    def test_older_catalog_is_ahead(self):
+        assert mcp_updater._catalog_relation("0.0.69", "0.0.70") == mcp_updater.REL_AHEAD
+
+    def test_same_version_is_same(self):
+        assert mcp_updater._catalog_relation("0.0.70", "0.0.70") == mcp_updater.REL_SAME
+
+    def test_empty_installed_version_is_re_pinned(self):
+        assert mcp_updater._catalog_relation("0.0.70", "") == mcp_updater.REL_UPDATE
+
+    def test_no_catalog_version_is_same(self):
+        assert mcp_updater._catalog_relation(None, "0.0.70") == mcp_updater.REL_SAME
+        assert mcp_updater._catalog_relation("", "0.0.70") == mcp_updater.REL_SAME
+
+    def test_unparseable_different_strings_stay_an_update(self):
+        # A tag that does not parse keeps the old inequality: it is never
+        # called ahead on a guess.
+        assert mcp_updater._catalog_relation("nightly", "0.0.70") == mcp_updater.REL_UPDATE
+        assert mcp_updater._catalog_relation("0.0.69", "latest") == mcp_updater.REL_UPDATE
+
+
 class TestIsHeld:
     def _manifest(self, mcp_dir):
         return type("M", (), {"mcp_dir": mcp_dir})()
@@ -296,3 +323,47 @@ class TestDetectionScopedToCommunity:
         assert updates["camoufox"]["latest"] == "0.0.72"
         # Only the community npm candidate was even probed.
         assert out["checked"] == 2  # notion (npm) + camoufox (docker)
+
+
+class TestAheadOfCatalog:
+    """An install past the catalog's version of record is reported as
+    ``ahead`` and never offered as an update, for a container and for a
+    skill package alike."""
+
+    @pytest.mark.asyncio
+    async def test_container_and_skill_ahead_are_not_updates(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace as NS
+        manifests = {
+            "camoufox": NS(
+                category="community", version="0.0.80",
+                mcp_dir=str(tmp_path / "cam"),
+                server=NS(runtime="docker", source="docker:camoufox", image="",
+                          url_template="", version_constraint=""),
+            ),
+            "theme-factory": NS(
+                category="skill", version="2.0.0",
+                mcp_dir=str(tmp_path / "tf"),
+                server=NS(runtime="none", source="", image="", url_template="",
+                          version_constraint=""),
+            ),
+        }
+        monkeypatch.setattr(
+            mcp_updater.mcp_registry, "get_all_manifests", lambda: manifests)
+
+        async def _fake_registry():
+            return {"mcps": [{"name": "camoufox", "version": "0.0.72",
+                              "runtime": "docker", "source": "docker:camoufox"}]}
+
+        async def _fake_skills():
+            return {"skills": [{"name": "theme-factory", "version": "1.0.0"}]}
+
+        monkeypatch.setattr(community_catalog, "fetch_registry", _fake_registry)
+        monkeypatch.setattr(community_catalog, "fetch_skills_registry", _fake_skills)
+
+        out = await mcp_updater.detect_available_updates()
+        updates = out["updates"]
+        assert updates["camoufox"]["reason"] == "ahead"
+        assert updates["camoufox"]["latest"] == "0.0.72"
+        assert "downgrade" not in updates["camoufox"]
+        assert updates["theme-factory"]["reason"] == "ahead"
+        assert updates["theme-factory"]["latest"] == "1.0.0"

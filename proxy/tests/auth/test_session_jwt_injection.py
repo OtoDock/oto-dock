@@ -391,26 +391,12 @@ class TestDirectA2:
             asyncio.run(conn._start_remote())
         return captured["headers"] or {}
 
-    def test_brokered_bearer_placeholder_is_swapped_for_the_bundle_token(self):
-        """A proxy-terminable HTTP MCP (github/m365) carries the broker
-        placeholder in its entry; the direct layer forwards straight to the
-        sidecar, so it swaps the placeholder for the session's real bearer
-        the way the CLI copy and the tunnel do — a headless app action used
-        to reach GitHub with the literal placeholder (401 Bad credentials)."""
-        from core.credentials import mcp_broker
-        from core.credentials.mcp_broker import SecretBundle
-
-        placeholder = f"Bearer {mcp_broker.BROKER_BEARER_PLACEHOLDER}"
-        mcp_broker.provision("appx-e1", {"github-mcp": SecretBundle(http_bearer="gho_real")})
-        try:
-            headers = self._start_with(placeholder, "appx-e1")
-            assert headers["Authorization"] == "Bearer gho_real"
-            # A store miss leaves the placeholder: the sidecar refuses, fail-closed.
-            assert self._start_with(placeholder, "appx-none")["Authorization"] == placeholder
-            # A real vendor bearer is never touched.
-            assert self._start_with("Bearer gho_vendor", "appx-e1")["Authorization"] == "Bearer gho_vendor"
-        finally:
-            mcp_broker.purge_session("appx-e1")
+    def test_a_header_that_is_not_the_sentinel_is_forwarded_untouched(self):
+        """The direct layer swaps the session-token sentinel alone; a
+        credentialed HTTP MCP's entry names the gateway route with that
+        sentinel (tests/mcp/test_gateway_entry.py), and no other header
+        value is ever rewritten in-process."""
+        assert self._start_with("Bearer gho_vendor", "appx-e1")["Authorization"] == "Bearer gho_vendor"
 
 
 # --------------------------------------------------------------------------

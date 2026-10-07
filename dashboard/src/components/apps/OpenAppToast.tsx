@@ -29,7 +29,7 @@ export default function OpenAppToast({ items, onOpen, onDismiss }: Props) {
             <div className="flex-1 min-w-0">
               <p className="text-sm font-semibold text-brand truncate">{f.title || 'An app'}</p>
               <p className="text-sm text-p-text-secondary">
-                The agent <span className="font-medium text-p-text">{f.agent}</span> wants to show you this app.
+                The agent <span className="font-medium text-p-text">{f.opened_by || f.agent}</span> wants to show you this app.
               </p>
               <button
                 onClick={() => onOpen(f)}

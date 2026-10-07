@@ -53,13 +53,23 @@ export interface AttachedFileMeta {
  * plus the attachment meta the `queued` / `steered` / `queue_snapshot`
  * frames carry, so the bubble shows the chips and a cancel can hand the
  * attachments back to the composer. */
+/** One waiting message of a chat's queue (the chat owns it, the proxy's
+ *  `chat_input_queue`): the chip the composer shows. `queueId` names it on
+ *  the wire (cancel, accept); `authorSub` is who typed it (a shared chat
+ *  shows a teammate's chips, only the author or an admin may cancel). A
+ *  1.7.0 proxy sends neither: the index is the fallback key. */
 export interface QueuedMessage {
   text: string
   images?: AttachedImageMeta[]
   files?: AttachedFileMeta[]
+  queueId?: string
+  authorSub?: string
+  /** What it waits for besides a free turn (`QUEUE_WAITING`). */
+  waiting?: string
 }
 
-/** The frames still carry only `text` for old persisted queues. */
+/** A queue entry as the wire or the persisted store carries it: a frame
+ *  (`queue_id`, `author_sub`), a v2 item, or a v1 bare text. */
 export function toQueuedMessage(m: unknown): QueuedMessage {
   if (typeof m === 'string') return { text: m }
   if (m && typeof m === 'object') {
@@ -67,6 +77,11 @@ export function toQueuedMessage(m: unknown): QueuedMessage {
     const out: QueuedMessage = { text: typeof o.text === 'string' ? o.text : '' }
     if (Array.isArray(o.images) && o.images.length) out.images = o.images as AttachedImageMeta[]
     if (Array.isArray(o.files) && o.files.length) out.files = o.files as AttachedFileMeta[]
+    const queueId = o.queue_id ?? o.queueId
+    if (typeof queueId === 'string' && queueId) out.queueId = queueId
+    const authorSub = o.author_sub ?? o.authorSub
+    if (typeof authorSub === 'string' && authorSub) out.authorSub = authorSub
+    if (typeof o.waiting === 'string' && o.waiting) out.waiting = o.waiting
     return out
   }
   return { text: '' }

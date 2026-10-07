@@ -19,9 +19,13 @@ export default function StrongConfirmModal({
   onConfirm,
   onCancel,
   isPending = false,
+  confirmDisabled = false,
+  extra,
 }: {
   title: string
   description: React.ReactNode
+  /** Block content shown under the description (a list, an error). */
+  extra?: React.ReactNode
   confirmWord: string
   confirmLabel?: string
   busyLabel?: string
@@ -29,6 +33,8 @@ export default function StrongConfirmModal({
   onConfirm: () => void
   onCancel: () => void
   isPending?: boolean
+  /** Keeps the confirm button off while the dialog is not ready to confirm. */
+  confirmDisabled?: boolean
 }) {
   const [typed, setTyped] = useState('')
   // Case-insensitive + trimmed match: the confirm word is a deliberate-friction
@@ -50,6 +56,7 @@ export default function StrongConfirmModal({
           </span>
           {' '}to confirm.
         </p>
+        {extra && <div className="mb-3">{extra}</div>}
         <input
           autoFocus
           value={typed}
@@ -66,7 +73,7 @@ export default function StrongConfirmModal({
           </button>
           <button
             onClick={onConfirm}
-            disabled={!matches || isPending}
+            disabled={!matches || isPending || confirmDisabled}
             className={`px-3 py-1.5 text-sm font-medium rounded-lg text-white transition-colors disabled:cursor-not-allowed disabled:bg-gray-200 disabled:text-gray-400 dark:disabled:bg-gray-700 dark:disabled:text-gray-500 ${destructive ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
           >
             {isPending ? (busyLabel ?? `${confirmLabel}...`) : confirmLabel}

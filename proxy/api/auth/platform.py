@@ -39,6 +39,9 @@ class PlatformSettingsRequest(BaseModel):
     # Session retention (services/infra/retention.py)
     session_retention_enabled: bool | None = None
     session_retention_days: str | None = None
+    # The archive of removed people (services/infra/retention.py)
+    offboarded_retention_enabled: bool | None = None
+    offboarded_retention_days: str | None = None
     # Automatic MCP updates (services/mcp/mcp_autoupdate.py)
     mcp_auto_update_enabled: bool | None = None
     # Read each OAuth account's 5-hour / weekly usage from the vendor
@@ -75,6 +78,10 @@ class PlatformSettingsRequest(BaseModel):
     sharing_public_links_enabled: bool | None = None
     sharing_max_expiry_days: str | None = None
     user_directory_visible_to_members: bool | None = None
+    # Shares to an agent (editor or above on it) and to a department (an
+    # admin) can be turned off; new ones are then refused.
+    sharing_to_agents_enabled: bool | None = None
+    sharing_to_departments_enabled: bool | None = None
 
 
 class LicenseKeyRequest(BaseModel):
@@ -105,20 +112,37 @@ async def _enforce_user_paired_disabled() -> None:
         from core.remote.satellite_connection import get_connection_manager
         from storage import remote_store as _rs
         cm = get_connection_manager()
-        # Live user-paired satellites. Drop their targets, close
-        # the WS with a clear close code, deregister.
-        for machine_id in list(cm.get_connected_machines()):
-            machine = _rs.get_remote_machine(machine_id)
-            if not machine:
-                continue
-            if placement.machine_is_admin_paired(machine):
-                continue  # admin-paired stays connected
-            try:
-                _rs.clear_user_remote_targets_for_machine(machine_id)
-            except Exception:
-                logger.exception(
-                    "failed to clear targets for %s", machine_id[:8],
-                )
+        connected = list(cm.get_connected_machines())
+
+        def _clear_targets() -> list[str]:
+            """Drop the targets of every user-paired machine, live or
+            offline; return the live ones to disconnect."""
+            live: list[str] = []
+            for machine_id in connected:
+                machine = _rs.get_remote_machine(machine_id)
+                if not machine or placement.machine_is_admin_paired(machine):
+                    continue  # admin-paired stays connected
+                try:
+                    _rs.clear_user_remote_targets_for_machine(machine_id)
+                except Exception:
+                    logger.exception(
+                        "failed to clear targets for %s", machine_id[:8],
+                    )
+                live.append(machine_id)
+            # Offline user-paired machines — drop their targets too.
+            for m in _rs.get_all_user_paired_machines():
+                try:
+                    _rs.clear_user_remote_targets_for_machine(m["id"])
+                except Exception:
+                    logger.exception(
+                        "failed to clear targets for offline machine %s",
+                        m["id"][:8],
+                    )
+            return live
+
+        # Live user-paired satellites: close the WS with a clear close code,
+        # deregister. The sockets and the registry are the loop's.
+        for machine_id in await run_db(_clear_targets):
             conn = cm.get_connection(machine_id)
             if conn is not None:
                 with contextlib.suppress(Exception):
@@ -126,15 +150,6 @@ async def _enforce_user_paired_disabled() -> None:
                         code=4005, reason="feature_disabled_by_admin",
                     )
                 await cm.deregister(machine_id)
-        # Offline user-paired machines — drop their targets too.
-        for m in _rs.get_all_user_paired_machines():
-            try:
-                _rs.clear_user_remote_targets_for_machine(m["id"])
-            except Exception:
-                logger.exception(
-                    "failed to clear targets for offline machine %s",
-                    m["id"][:8],
-                )
     except Exception:
         logger.exception("user-paired-disabled cascade failed")
 
@@ -154,6 +169,19 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
     settings = await asyncio.to_thread(task_store.get_all_platform_settings)
     license_info = await asyncio.to_thread(get_current_license)
     user_count = await asyncio.to_thread(task_store.count_users)
+
+    # The license key and every relay answer read the store: one job.
+    def _license_relay_job() -> dict:
+        return {
+            "has_license_key": bool(get_license_key()),
+            "offered": relay_client.relay_offered(),
+            "connected": relay_client.is_connected(),
+            "enabled": relay_client.api_relay_enabled(),
+            "active": relay_client.system_relay_active(),
+            "available": relay_client.is_available(),
+        }
+
+    relay = await run_db(_license_relay_job)
     tcfg = turnstile.load_config(settings)
     return {
         "company_name": settings.get("company_name", ""),
@@ -182,6 +210,11 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # only — junk/orphan cleanup always runs.
         "session_retention_enabled": settings.get("session_retention_enabled", "") != "0",
         "session_retention_days": settings.get("session_retention_days", "") or "180",
+        # The archive of removed people: its own toggle (unset = ON) and days
+        # (default 180; 0 keeps the archives for ever).
+        "offboarded_retention_enabled": settings.get("offboarded_retention_enabled", "") != "0",
+        # The value the sweep uses (an unreadable stored one keeps every archive).
+        "offboarded_retention_days": str(_retention_days_shown(settings.get("offboarded_retention_days", ""))),
         # Provider windows (services/engines/subscription_windows.py). Default
         # ON (unset = "1" semantics): the pool reads each OAuth account's
         # session and weekly usage from Claude and ChatGPT.
@@ -202,7 +235,9 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         "storage_quotas_enforced": storage_quota.hard_enabled(),
         # Reverse-proxy misconfigurations seen in the last hour (the address
         # that sent forwarding headers without being a trusted proxy, or a
-        # trusted proxy that appends no X-Forwarded-For): auth/lan_check.py.
+        # trusted proxy that appends no X-Forwarded-For), and the boot check
+        # (an https public URL with no TRUSTED_PROXY in a container):
+        # auth/lan_check.py.
         "forwarding_warnings": lan_check.forwarding_warnings(),
         # SMTP
         "smtp_host": settings.get("smtp_host", ""),
@@ -220,7 +255,7 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         "turnstile_managed": tcfg.managed,
         # License — never return the raw key (it's stored
         # encrypted); the dashboard only needs to know one is on file.
-        "has_license_key": bool(get_license_key()),
+        "has_license_key": relay["has_license_key"],
         "license_tier": license_info.tier,
         "license_max_users": license_info.max_users,
         "license_users_count": user_count,
@@ -233,7 +268,7 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         "license_activation_state": license_info.activation_state,  # none|activated
         "license_check_status": license_info.check_status,
         "license_last_check_at": settings.get("license_last_check_at", ""),
-        "air_gapped": not relay_client.relay_offered(),
+        "air_gapped": not relay["offered"],
         # Deployment axis — the UI adapts (cloud shows plan + usage; self-host
         # shows the license-key entry).
         "cloud": config.OTODOCK_CLOUD,
@@ -247,11 +282,11 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # the effective state (relay usable AND enabled AND connected); forced =
         # operator-managed (cloud).
         "otodock_connection": {
-            "connected": relay_client.is_connected(),
-            "enabled": relay_client.api_relay_enabled(),
-            "active": relay_client.system_relay_active(),
-            "relay_available": relay_client.is_available(),
-            "air_gapped": not relay_client.relay_offered(),
+            "connected": relay["connected"],
+            "enabled": relay["enabled"],
+            "active": relay["active"],
+            "relay_available": relay["available"],
+            "air_gapped": not relay["offered"],
             "forced": "otodock_api_relay_enabled" in config.forced_settings(),
         },
         # Password policy
@@ -267,6 +302,8 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         "sharing_public_links_enabled": settings.get("sharing_public_links_enabled", "") != "0",
         "sharing_max_expiry_days": settings.get("sharing_max_expiry_days", ""),
         "user_directory_visible_to_members": settings.get("user_directory_visible_to_members", "") != "0",
+        "sharing_to_agents_enabled": settings.get("sharing_to_agents_enabled", "") != "0",
+        "sharing_to_departments_enabled": settings.get("sharing_to_departments_enabled", "") != "0",
     }
 
 
@@ -297,6 +334,11 @@ async def _refuse_require_2fa_that_would_hold(u: UserContext) -> None:
         )
 
 
+def _retention_days_shown(raw: str) -> int:
+    from services.infra import retention as _retention
+    return _retention.offboarded_days_from(raw)
+
+
 @router.put("/v1/admin/platform-settings")
 async def set_platform_settings(
     req: PlatformSettingsRequest,
@@ -304,6 +346,20 @@ async def set_platform_settings(
 ):
     """Update platform settings. Admin only."""
     u = require_admin(user)
+    # A destructive setting is judged before anything is written: an
+    # unreadable value is refused, never guessed ("-1" meant as "for ever"
+    # must not become 180 days).
+    archive_days = None
+    if req.offboarded_retention_days is not None:
+        from services.infra import retention as _retention
+        try:
+            archive_days = int(str(req.offboarded_retention_days).strip())
+        except (TypeError, ValueError):
+            archive_days = -1
+        if not 0 <= archive_days <= _retention.OFFBOARDED_MAX_DAYS:
+            raise HTTPException(
+                400, f"offboarded_retention_days must be a whole number from 0 (keep for ever) "
+                     f"to {_retention.OFFBOARDED_MAX_DAYS}")
     if req.require_2fa:
         await _refuse_require_2fa_that_would_hold(u)
     if req.company_name is not None:
@@ -355,7 +411,8 @@ async def set_platform_settings(
         )
         subscription_windows.invalidate_setting_cache()
     for key in ("sharing_external_enabled", "sharing_public_links_enabled",
-                "user_directory_visible_to_members"):
+                "user_directory_visible_to_members", "sharing_to_agents_enabled",
+                "sharing_to_departments_enabled"):
         val = getattr(req, key)
         if val is not None:
             await asyncio.to_thread(task_store.set_platform_setting, key, "1" if val else "0")
@@ -383,6 +440,13 @@ async def set_platform_settings(
             "session_retention_enabled",
             "1" if req.session_retention_enabled else "0",
         )
+    if archive_days is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, "offboarded_retention_days", str(archive_days))
+    if req.offboarded_retention_enabled is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, "offboarded_retention_enabled",
+            "1" if req.offboarded_retention_enabled else "0")
     if req.mcp_auto_update_enabled is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting,
@@ -503,7 +567,7 @@ async def set_license(
         lic = await asyncio.to_thread(L.validate_license_key, new_key)
         if lic is None:
             message = "Invalid or unverifiable license key."
-        elif (lic.lifetime or lic.license_mode == "subscription") and relay_client.is_available():
+        elif (lic.lifetime or lic.license_mode == "subscription") and await run_db(relay_client.is_available):
             await asyncio.to_thread(task_store.set_platform_setting, "license_last_check_at", _license_now_iso())
             try:
                 receipt = await relay_client.activate_license(new_key)
@@ -564,6 +628,15 @@ async def recheck_license(
         logger.exception("Manual license re-check failed (fail-open)")
     lic_now = await asyncio.to_thread(get_current_license)
     return {"status": lic_now.status, "activation_state": lic_now.activation_state}
+
+
+@router.get("/v1/admin/forwarding-warnings")
+async def get_forwarding_warnings(user: UserContext | None = Depends(get_current_user)):
+    """The reverse-proxy misconfigurations an admin should fix
+    (``lan_check.forwarding_warnings``) for the dashboard's admin banner.
+    On the OtoDock cloud the operator owns the edge: none."""
+    require_admin(user)
+    return {"warnings": [] if config.OTODOCK_CLOUD else lan_check.forwarding_warnings()}
 
 
 @router.get("/v1/admin/concurrency-stats")

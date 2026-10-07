@@ -116,8 +116,12 @@ class TestKillSwitch:
 
 
 class TestUserScope:
-    @pytest.mark.parametrize("role", ["viewer", "editor", "manager"])
+    @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager"])
     def test_real_user_any_role_allowed(self, delegation_env, role):
+        """F67, decided (2026-10-02): a user-scope worker runs in its
+        starter's own space at their own role on the target, the chat they
+        may open there already, so its floor is access to the target, as
+        for a user-scope task; the editor floor is agent scope's."""
         authz = _spawn(_real_user(COLLAB_USER, role))
         assert authz.created_by == "user-alice"
         assert authz.acting_sub == "user-alice"
@@ -155,8 +159,9 @@ class TestUserScope:
 
 
 class TestAgentScope:
-    def test_viewer_denied(self, delegation_env):
-        _denied(_real_user(COLLAB_AGENT, "viewer"), 403,
+    @pytest.mark.parametrize("role", ["viewer", "contributor"])
+    def test_below_the_editor_tier_denied(self, delegation_env, role):
+        _denied(_real_user(COLLAB_AGENT, role), 403,
                 target=COLLAB_AGENT, scope="agent")
 
     @pytest.mark.parametrize("role", ["editor", "manager"])

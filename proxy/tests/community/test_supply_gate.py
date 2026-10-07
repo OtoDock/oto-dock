@@ -1,11 +1,15 @@
 """The community install gate: a Docker-Compose refusal is judged before any
 file moves, the incoming-tree checks run off the event loop, a catalog Python
 folder ships no requirements file, the git source identity keeps host and
-scheme, and ``server.docker_compose`` names a file inside the MCP folder."""
+scheme, ``server.docker_compose`` names a file inside the MCP folder, a hung
+package install times out and rolls back, and a remnant folder keeps only its
+preserved data."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -240,3 +244,80 @@ def test_a_confined_compose_path_parses(tmp_path):
     d.mkdir()
     (d / "manifest.json").write_text(json.dumps(_docker_manifest(docker_compose="deploy/compose.yml")))
     assert mmp._parse_manifest(d / "manifest.json").server.docker_compose == "deploy/compose.yml"
+
+
+# ── a hung package install times out and rolls back ────────────────────
+
+def _npm_manifest(version: str = "1.0.0") -> dict:
+    return {"name": "node-mcp", "label": "n", "description": "d", "version": version,
+            "category": "community",
+            "server": {"runtime": "node", "transport": "stdio", "command": "node",
+                       "args": ["node_modules/pkg/index.js"], "source": "npm:pkg"}}
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
+async def test_a_hung_package_install_times_out_and_rolls_back(mcps_dir, tmp_path, monkeypatch):
+    """The installer's timeout bounds the package manager's whole run: a hung
+    npm is killed with its children, the update fails with "Install timed
+    out" and the previous version is back in place."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pids = tmp_path / "npm.pids"
+    hang = tmp_path / "npm.hang"
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        f'echo $$ >> "{pids}"\n'
+        f'if [ -f "{hang}" ]; then sleep 20 & echo $! >> "{pids}"; sleep 20; exit 0; fi\n'
+        "mkdir -p node_modules/pkg && printf '{\"version\":\"1.0.0\"}' > node_modules/pkg/package.json\n")
+    npm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '/usr/bin')}")
+    monkeypatch.setattr(ci, "_INSTALL_TIMEOUT_SECONDS", 1)
+
+    await ci.install_from_extracted_folder(_folder(tmp_path, _npm_manifest(), "a"))
+    target = mcps_dir / "community" / "node-mcp"
+    hang.write_text("")
+    with pytest.raises(HTTPException) as ei:
+        await asyncio.wait_for(
+            ci.install_from_extracted_folder(_folder(tmp_path, _npm_manifest("2.0.0"), "b")), 10)
+    assert ei.value.status_code == 500
+    assert "Install timed out" in ei.value.detail
+    assert (target / "README.md").read_text() == "Dock a.\n"
+    assert not target.with_suffix(".bak").exists()
+    for _ in range(40):
+        if not any(_alive(int(p)) for p in pids.read_text().split()):
+            break
+        await asyncio.sleep(0.05)
+    assert not [p for p in pids.read_text().split() if _alive(int(p))]
+
+
+# ── a remnant folder loses what the incoming folder does not carry ─────
+
+@pytest.mark.asyncio
+async def test_a_stray_patch_in_a_remnant_folder_is_gone_before_the_package_installs(
+        mcps_dir, tmp_path, monkeypatch):
+    seen: list[bool] = []
+
+    async def _install(mcp_dir, runtime, source, **kw):
+        seen.append((Path(mcp_dir) / "patches").exists())
+        return ci.mcp_installer.InstallResult(ok=True, log="", version_hash="h",
+                                              resolved_version="1.0.0")
+
+    monkeypatch.setattr(ci.mcp_installer, "install_mcp", _install)
+    remnant = mcps_dir / "community" / "node-mcp"
+    (remnant / "patches").mkdir(parents=True)
+    (remnant / "patches" / "stray.patch").write_text("x")
+    (remnant / "keys").mkdir()
+    (remnant / "keys" / "id").write_text("k")
+    await ci.install_from_extracted_folder(_folder(tmp_path, _npm_manifest(), "a"))
+    assert seen == [False]
+    assert (remnant / "keys" / "id").read_text() == "k"

@@ -78,6 +78,11 @@ _permission_request_sessions: dict[str, str] = {}  # request_id -> session_id (r
 # them on abort/close (empty answers → the held request unwinds cleanly).
 _question_events: dict[str, asyncio.Event] = {}  # request_id -> event
 _question_answers: dict[str, dict] = {}  # request_id -> answers map
+# The prompts whose card a caller retires when their wait ends with no answer
+# (``watch_prompt``): request_id -> True once the wait ran out or an abort /
+# close released it. Only watched ids are recorded, and the caller always
+# takes its id back (``took_no_answer``), so the table holds live waits only.
+_prompt_watch: dict[str, bool] = {}
 # SSE emitters: when a hook requests permission in "default" mode, this callback
 # emits the permission_request/question event to the downstream SSE stream
 _permission_emitters: dict[str, asyncio.Queue] = {}  # session_id -> queue of permission requests
@@ -95,6 +100,10 @@ _permission_emitters: dict[str, asyncio.Queue] = {}  # session_id -> queue of pe
 # finds no context and is denied.
 _session_security: dict = {}  # session_id -> path_policy.SecurityContext
 _session_security_ts: dict = {}  # session_id -> float (warmup epoch; for the load-time TTL prune)
+# What the security index kept of a session's runtime state across a
+# restart (its permission mode and token floor), read when its satellite
+# re-adopts it: session_id -> (mode or "", floor or 0).
+_reloaded_state: dict[str, tuple[str, int]] = {}
 _SECURITY_INDEX = config.SESSIONS_DIR / "security_index.json"
 # Drop persisted contexts older than the session-JWT lifetime — one that old
 # can't be replayed anyway, so this bounds the file across non-graceful crashes.
@@ -208,7 +217,7 @@ class SubagentRegistry:
     """
 
     __slots__ = (
-        "spawned", "completed", "pending_stops",
+        "spawned", "completed", "reviewed", "pending_stops",
         "task_to_tuid", "labels", "workflow_tuids", "chat_id",
         "_all_done_event",
     )
@@ -216,6 +225,9 @@ class SubagentRegistry:
     def __init__(self) -> None:
         self.spawned: set[str] = set()        # task_ids registered via task_started (whitelist)
         self.completed: set[str] = set()       # task_ids marked done (⊆ spawned)
+        # Completed task_ids a review turn already named (a run's producer or
+        # a chat monitor): only ``completed - reviewed`` is still owed one.
+        self.reviewed: set[str] = set()
         self.pending_stops: set[str] = set()   # SubagentStop that raced ahead of task_started
         self.task_to_tuid: dict[str, str] = {}  # task_id → spawning tool_use_id
         # task_id → model-facing label ('"probe auth flow" [a7b95…]' for CLI
@@ -264,6 +276,14 @@ class SubagentRegistry:
             self.pending_stops.add(task_id)
         return False
 
+    def mark_reviewed(self, task_ids) -> None:
+        self.reviewed.update(t for t in task_ids if t in self.completed)
+
+    @property
+    def owed(self) -> set[str]:
+        """Finished agents no review turn has named yet."""
+        return self.completed - self.reviewed
+
     def tuid_for(self, task_id: str) -> str:
         """Resolve a task_id to its spawning tool_use_id (dashboard key)."""
         return self.task_to_tuid.get(task_id, "")
@@ -310,6 +330,7 @@ class SubagentRegistry:
         pending = self.spawned - self.completed
         self.spawned = set(pending)         # keep only still-running agents
         self.completed = set()              # none of `pending` is completed by definition
+        self.reviewed = set()
         self.task_to_tuid = {
             t: u for t, u in self.task_to_tuid.items() if t in pending
         }
@@ -870,6 +891,28 @@ def flush_session_index() -> None:
     _index_writer.flush_sync()
 
 
+def mark_recover_pending(session_id: str) -> None:
+    """The graceful shutdown left this session's turn running on its
+    satellite: after the restart the turn is replayed into the chat whether
+    it is still running or finished meanwhile (``run_recovery``)."""
+    if session_id:
+        entry = _sessions.setdefault(session_id, {"created": True, "message_count": 0})
+        entry["recover_pending"] = True
+        # A mark its machine never reports ages out with the entry.
+        entry.setdefault("last_active", datetime.now(timezone.utc).isoformat())
+        _save_sessions()
+
+
+def take_recover_pending(session_id: str) -> bool:
+    """Whether the shutdown marked the session for its turn's replay; the mark
+    goes with the read."""
+    entry = _sessions.get(session_id)
+    if not entry or not entry.pop("recover_pending", False):
+        return False
+    _save_sessions()
+    return True
+
+
 # Load on import
 _load_sessions()
 
@@ -1025,17 +1068,27 @@ def _save_pending_result(
 
 
 def get_session_mode(session_id: str) -> str:
-    """Get the permission mode for a session."""
-    return _session_modes.get(session_id, "auto")
+    """Get the permission mode for a session. A reloaded session its machine
+    reported, in the moment before its re-adoption restores it, already
+    answers in the mode the security index kept for it."""
+    mode = _session_modes.get(session_id)
+    if mode is None:
+        mode = _reloaded_state.get(session_id, ("", 0))[0]
+    return mode or "auto"
 
 
 def set_session_mode(session_id: str, mode: str) -> None:
     """Set the permission mode for a session.
 
     Used by dashboard, pump, execution layers, hooks, and session API.
-    Replaces direct _session_modes[sid] = mode writes.
+    Replaces direct _session_modes[sid] = mode writes. A CHANGE of a session
+    with a security context is persisted with it (the index), so a session
+    its satellite keeps across a restart comes back in its own mode.
     """
+    prev = _session_modes.get(session_id)
     _session_modes[session_id] = mode
+    if prev is not None and prev != mode and session_id in _session_security:
+        _save_session_security()
 
 
 def remember_session_tool_allow(session_id: str, tool_name: str) -> None:
@@ -1133,10 +1186,14 @@ def _save_session_security() -> None:
     now = time.time()
     data = {}
     for sid, ctx in _session_security.items():
+        # A reloaded session not re-adopted yet keeps what the index held.
+        kept_mode, kept_floor = _reloaded_state.get(sid, ("", 0))
         try:
             data[sid] = {
                 **_serialize_security_ctx(ctx),
                 "_saved_at": _session_security_ts.get(sid, now),
+                "_mode": _session_modes.get(sid, kept_mode),
+                "_floor": _session_token_floor.get(sid, kept_floor),
             }
         except Exception:
             continue  # a non-serializable entry must not block the rest
@@ -1167,6 +1224,7 @@ def load_session_security() -> None:
                 continue
             _session_security[sid] = _deserialize_security_ctx(d)
             _session_security_ts[sid] = saved_at or now
+            _reloaded_state[sid] = (str(d.get("_mode") or ""), int(d.get("_floor") or 0))
             loaded += 1
         except Exception:
             logger.warning("Skipping unreadable security index entry %s", sid[:8])
@@ -1204,19 +1262,242 @@ def get_session_security(session_id: str):
     return _session_security.get(session_id)
 
 
-def register_session_state(session_id: str, permission_mode: str, security_context) -> None:
+def register_session_state(session_id: str, permission_mode: str, security_context,
+                           *, token_minted_at: int = 0) -> None:
     """Register a session's permission mode + security context.
 
-    Every local layer calls this BEFORE it spawns the session's process: the
+    Every layer calls this BEFORE it spawns the session's process: the
     session JWT minted into that process's env derives its external claim
     from the registered context (``auth/session_token.py``), and the
     permission hook fails closed without one. A layer whose spawn fails
     calls :func:`cleanup_session_permission_state` so a replayed token never
     finds a live context for a session that never ran.
+
+    ``token_minted_at`` is the ``iat`` of a token the builder minted before
+    this registration (the config's, a wake's); a builder that mints
+    nothing passes 0 and the registration instant is the floor, since every
+    layer mint runs after it. The floor is set only for a session id nothing
+    holds yet (:func:`session_is_held`): a re-warm of a live session keeps
+    the running process's token valid.
     """
-    set_session_mode(session_id, permission_mode)
+    if not session_is_held(session_id):
+        _session_token_floor[session_id] = int(token_minted_at or time.time())
+        # A new life of the id: a replay mark of an earlier one is void.
+        entry = _sessions.get(session_id)
+        if entry is not None and entry.pop("recover_pending", False):
+            _save_sessions()
+    _session_modes[session_id] = permission_mode
+    _reloaded_state.pop(session_id, None)
     if security_context is not None:
-        set_session_security(session_id, security_context)
+        set_session_security(session_id, security_context)  # persists mode + floor
+
+
+def security_context_expired(session_id: str) -> bool:
+    """Whether the session's context is older than the session-token TTL:
+    the token its process carries has expired with it."""
+    ts = _session_security_ts.get(session_id)
+    return ts is not None and time.time() - ts > _SECURITY_TTL_S
+
+
+def reloaded_state(session_id: str) -> tuple[str, int]:
+    """The permission mode and token floor the security index kept for a
+    session across a restart: ("", 0) when it kept none (an entry written
+    before they were persisted, or no entry)."""
+    return _reloaded_state.get(session_id, ("", 0))
+
+
+def live_state(session_id: str) -> tuple[str, int]:
+    """The permission mode and token floor this process holds for a session
+    now: ("", 0) when it holds none. A session taken back in the same process
+    (its record dropped when its machine came back after an expired grace)
+    keeps these."""
+    return _session_modes.get(session_id, ""), _session_token_floor.get(session_id, 0)
+
+
+def drop_reloaded_contexts_of(username: str) -> list[str]:
+    """Forget the person's reloaded contexts nothing holds yet: sessions the
+    index kept across a restart whose machine has not reported them. A
+    sign-out of the person (a password change, sign out everywhere) reaches
+    only held sessions through the closer; without this, such a session
+    came back with its old token when the machine reported. A missing
+    context is the record that it was closed: the re-adoption then ends the
+    process on its machine. Returns the ids dropped."""
+    if not username:
+        return []
+    dropped = [
+        sid for sid, ctx in list(_session_security.items())
+        if sid in _reloaded_state
+        and getattr(ctx, "username", "") == username
+        and not session_is_held(sid)
+    ]
+    for sid in dropped:
+        cleanup_session_permission_state(sid)
+    return dropped
+
+
+def restore_session_state(session_id: str, permission_mode: str, token_floor: int) -> None:
+    """A session its satellite kept across a restart, re-adopted: its mode as
+    it was and the floor of the token its process carries (0 = no floor, as
+    for an index written before floors were persisted). Called right before
+    the registry insert: unlike :func:`register_session_state` it never sets
+    the floor to "now", which would refuse the running process's own token.
+    The context is the reloaded one; its load-time stamp is kept, so a
+    restart never extends the index's prune window."""
+    _session_modes[session_id] = permission_mode
+    if token_floor:
+        _session_token_floor[session_id] = int(token_floor)
+    else:
+        _session_token_floor.pop(session_id, None)
+    _reloaded_state.pop(session_id, None)
+    if session_id in _session_security:
+        _save_session_security()
+
+
+# ---------------------------------------------------------------------------
+# Session liveness: the one authority a session token is judged by
+# ---------------------------------------------------------------------------
+#
+# A session token is accepted only while its session is live, and a token
+# minted for an earlier life of the same session id is refused
+# (``middleware.py``, the app proxy, the tunnel, the phone relay, the
+# principal resolver all ask here). Live means: a layer registry, the
+# interactive registry or the headless exec pool holds the id (held), or the
+# id is starting or closing inside its window. The tables are per process
+# and never persisted: after a restart a session is live again only once a
+# layer holds it (a satellite's report marks its sessions starting for the
+# re-adoption window).
+
+# The window a session stays live after its registry pop: at least the
+# close's own waits (10 s local, 15 s remote), so the Stop hook and a last
+# MCP call of a closing session resolve.
+CLOSING_WINDOW_S = 30.0
+# The starting marks' backstops (each start clears its mark in a ``finally``):
+# a local start's (the startup reap grace), a remote start's (refreshed on
+# every install progress event and before the start command), a session
+# re-adopted from a satellite's report after a restart.
+START_MARK_TTL_S = 600.0
+REMOTE_START_MARK_TTL_S = 900.0
+READOPT_MARK_TTL_S = 180.0
+_SWEEP_EVERY_S = 60.0
+
+_starting: dict[str, float] = {}       # session_id -> monotonic deadline
+_closing: dict[str, float] = {}        # session_id -> monotonic deadline
+_headless_live: set[str] = set()       # the headless exec pool's sids
+_session_token_floor: dict[str, int] = {}   # session_id -> the iat floor (epoch s)
+_next_sweep = 0.0
+
+# The one clock the tables read (a test advances it).
+_now = time.monotonic
+
+
+def mark_starting(session_id: str, ttl_s: float) -> None:
+    """The session is starting: live for ``ttl_s`` seconds or until
+    :func:`clear_starting`. Marked again to extend a long start."""
+    if session_id:
+        _starting[session_id] = _now() + ttl_s
+
+
+def clear_starting(session_id: str) -> None:
+    _starting.pop(session_id, None)
+
+
+def mark_closing(session_id: str, ttl_s: float | None = None) -> None:
+    """The session's registry entry was just popped: live for the closing
+    window so the hooks and MCP calls of its last moments resolve."""
+    if session_id:
+        _closing[session_id] = _now() + (CLOSING_WINDOW_S if ttl_s is None else ttl_s)
+
+
+def mark_headless_live(session_id: str) -> None:
+    if session_id:
+        _headless_live.add(session_id)
+
+
+def clear_headless_live(session_id: str) -> None:
+    _headless_live.discard(session_id)
+
+
+def session_is_held(session_id: str) -> bool:
+    """A layer registry, the interactive registry or the headless exec pool
+    holds the id: a process (or its record) exists for it."""
+    if not session_id:
+        return False
+    if session_id in _headless_live:
+        return True
+    from core.session import interactive_session
+    if interactive_session.get(session_id) is not None:
+        return True
+    from core.session.session_manager import find_layer_for_session
+    return find_layer_for_session(session_id) is not None
+
+
+def _in_window(table: dict[str, float], session_id: str, now: float) -> bool:
+    deadline = table.get(session_id)
+    if deadline is None:
+        return False
+    if deadline < now:
+        table.pop(session_id, None)
+        return False
+    return True
+
+
+def _sweep_liveness(now: float) -> None:
+    """Drop marks past their deadline and the floors of sessions nothing
+    holds or marks; once a minute, from a liveness read."""
+    global _next_sweep
+    if now < _next_sweep:
+        return
+    _next_sweep = now + _SWEEP_EVERY_S
+    for table in (_starting, _closing):
+        for sid in [s for s, deadline in table.items() if deadline < now]:
+            table.pop(sid, None)
+    for sid in [s for s in _session_token_floor
+                if s not in _starting and s not in _closing and not session_is_held(s)]:
+        _session_token_floor.pop(sid, None)
+
+
+def session_is_live(session_id: str) -> bool:
+    """True while the session is held, or starting or closing inside its
+    window."""
+    if not session_id:
+        return False
+    now = _now()
+    _sweep_liveness(now)
+    return (
+        session_is_held(session_id)
+        or _in_window(_starting, session_id, now)
+        or _in_window(_closing, session_id, now)
+    )
+
+
+def session_token_refusal(payload: dict) -> str:
+    """Why a session token's session refuses it: ``"not live"`` when nothing
+    holds or marks its id, ``"stale"`` when the id is held and the token was
+    minted before the current life's floor; ``""`` when it is accepted. The
+    comparison is skipped for a token without ``iat``, a session without a
+    floor, and a session that is only starting or closing, except a reloaded
+    session in its re-adoption window: its token is compared with the floor
+    the security index kept for its running process."""
+    sid = payload.get("sid") or ""
+    if not isinstance(sid, str) or not session_is_live(sid):
+        return "not live"
+    iat = payload.get("iat")
+    if not isinstance(iat, int):
+        return ""
+    floor = _session_token_floor.get(sid)
+    if floor is None:
+        kept = _reloaded_state.get(sid, ("", 0))[1]
+        return "stale" if kept and iat < kept else ""
+    if iat >= floor or not session_is_held(sid):
+        return ""
+    return "stale"
+
+
+def reset_liveness_for_tests() -> None:
+    _starting.clear()
+    _closing.clear()
+    _headless_live.clear()
+    _session_token_floor.clear()
 
 
 def refresh_target_allow_full_fs(machine_id: str, allow_full_fs: bool) -> int:
@@ -1322,6 +1603,22 @@ def get_permission_queue(session_id: str) -> asyncio.Queue:
     return _permission_emitters[session_id]
 
 
+# How long a prompt waits on a person (a permission card, a plan review, a
+# question), local and remote alike. A parked prompt keeps its engine process
+# alive (the reapers spare a session while one is pending), so it is bounded.
+PROMPT_WAIT_S = 3 * 24 * 3600
+
+
+def has_pending_prompt(session_id: str) -> bool:
+    """Whether the session waits on a person: a permission card, a plan
+    review or a question. The reapers spare it meanwhile; the prompt's own
+    wait (``PROMPT_WAIT_S``) bounds that."""
+    return any(
+        rid in _permission_events or rid in _question_events
+        for rid in _session_permission_requests.get(session_id, ())
+    )
+
+
 async def wait_for_permission(
     request_id: str, session_id: str = "", timeout: float = 120.0,
 ) -> bool:
@@ -1341,6 +1638,7 @@ async def wait_for_permission(
     except asyncio.TimeoutError:
         # Fail CLOSED: an unanswered gate must never turn into an approval
         # (matches the hook gate's transport-failure posture).
+        _note_no_answer(request_id)
         return False
     finally:
         _permission_events.pop(request_id, None)
@@ -1351,6 +1649,23 @@ async def wait_for_permission(
                 reqs.discard(request_id)
                 if not reqs:
                     _session_permission_requests.pop(session_id, None)
+
+
+def watch_prompt(request_id: str) -> None:
+    """Record whether this prompt's wait ends with no answer: it runs out, or
+    an abort or a session close releases it. The caller takes the verdict
+    with ``took_no_answer`` once the wait is over."""
+    _prompt_watch[request_id] = False
+
+
+def took_no_answer(request_id: str) -> bool:
+    """Whether the watched prompt's wait ended with no answer; forgets it."""
+    return _prompt_watch.pop(request_id, False)
+
+
+def _note_no_answer(request_id: str) -> None:
+    if request_id in _prompt_watch:
+        _prompt_watch[request_id] = True
 
 
 def resolve_permission(request_id: str, approved: bool) -> bool:
@@ -1375,7 +1690,7 @@ def get_permission_request_session(request_id: str) -> str | None:
 
 
 async def wait_for_question(
-    request_id: str, session_id: str = "", timeout: float = 604800.0,
+    request_id: str, session_id: str = "", timeout: float = PROMPT_WAIT_S,
 ) -> dict:
     """Block until the user answers a Codex ``request_user_input`` question.
 
@@ -1393,6 +1708,7 @@ async def wait_for_question(
         await asyncio.wait_for(event.wait(), timeout=timeout)
         return _question_answers.pop(request_id, {})
     except asyncio.TimeoutError:
+        _note_no_answer(request_id)
         return {}
     finally:
         _question_events.pop(request_id, None)
@@ -1448,6 +1764,7 @@ def resolve_session_permissions(session_id: str, approved: bool = False) -> int:
     rids = list(_session_permission_requests.get(session_id, ()))
     released = 0
     for rid in rids:
+        _note_no_answer(rid)
         if rid in _question_events:
             if resolve_question(rid, {}):
                 released += 1
@@ -1545,6 +1862,8 @@ def cleanup_session_permission_state(session_id: str) -> None:
     _permission_emitters.pop(session_id, None)
     _had_security = _session_security.pop(session_id, None) is not None
     _session_security_ts.pop(session_id, None)
+    _session_token_floor.pop(session_id, None)
+    _reloaded_state.pop(session_id, None)
     if _had_security:
         _save_session_security()  # drop from disk so a replayed JWT is denied
     _session_claude_dirs.pop(session_id, None)

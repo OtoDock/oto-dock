@@ -323,6 +323,20 @@ def test_previewable_true_for_workspace_docx(temp_db, _as):
     assert body["previewable"] is True
 
 
+def test_previewable_true_for_user_workspace_pdf(temp_db, _as):
+    # A PDF chip (or a PDF a worker attached to its result) previews in the
+    # chat as the Files tab previews it, not download-only.
+    d = _mk_agent()
+    _mk_file(d, "users/alice/workspace/report.pdf")
+    _ensure_user("user-alice", "alice")
+    cid = _mk_chat()
+    _as(_user())
+    body = _resolve(cid, "users/alice/workspace/report.pdf").json()
+    assert body["found"] is True
+    assert body["path"] == "users/alice/workspace/report.pdf"
+    assert body["previewable"] is True
+
+
 def test_previewable_false_for_knowledge_docx(temp_db, _as):
     # Readable (knowledge/ is in every role's read scope) but outside the
     # wopi-url confinement (workspace/ + users/ only) → not previewable.

@@ -7,16 +7,19 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 """
 
 import asyncio
+import json
 import logging
 import re as _re
+import time
 import uuid
 
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from auth.path_policy import TIER_ADMIN, TIER_EDIT, TIER_READ, check_tool_access
 from core.events import tool_roles
-from api.sessions.sessions import verify_session_match_async
+from api.sessions.sessions import _session_payload, verify_session_match_async
 from core.session.session_state import (
     get_session_mode,
     set_session_mode,
@@ -27,7 +30,10 @@ from core.session.session_state import (
     get_permission_queue,
     wait_for_permission,
     wait_for_question,
+    watch_prompt,
+    took_no_answer,
     get_session_security,
+    PROMPT_WAIT_S,
 )
 from api.hooks import routing
 from core.session import session_kind
@@ -63,6 +69,90 @@ class HookPermissionRequest(BaseModel):
     permission_mode: str = ""
 
 
+# A decision that waits on a person streams a whitespace keepalive this
+# often and the JSON last (JSON readers skip leading whitespace): the stream
+# is never idle on its way through a satellite's tunnel, and a caller that
+# went away is noticed at the next write, which releases its wait.
+_KEEPALIVE_S = 30.0
+# A decision ready within this answers as a plain JSON response.
+_QUICK_S = 1.0
+# A prompt ends this long before its session token expires: an answer after
+# that would let the one tool run and refuse every hook that follows.
+_TOKEN_MARGIN_S = 60
+
+
+def _prompt_wait_s(authorization: str | None, session_id: str) -> float:
+    """How long a prompt of this caller may wait: ``PROMPT_WAIT_S``, cut to
+    the life its session token has left (the master key has no expiry). The
+    route verified the token already; this only reads its expiry."""
+    try:
+        payload = _session_payload(authorization, session_id)
+    except HTTPException:
+        payload = None
+    exp = (payload or {}).get("exp")
+    if not isinstance(exp, (int, float)):
+        return PROMPT_WAIT_S
+    return max(1.0, min(PROMPT_WAIT_S, exp - time.time() - _TOKEN_MARGIN_S))
+
+
+async def _wait_on_person(queue: asyncio.Queue, request_id: str, wait):
+    """Await a prompt's answer (``wait``: its ``wait_for_permission`` or
+    ``wait_for_question``). A wait that ends with no answer retires the
+    prompt's card: an item on the queue the prompt was raised on, which the
+    pump frees its slot for and forwards as ``prompt_retired``. The caller
+    gone (the hook's stream dropped, the decision cancelled) is the case a
+    retried call raises its own card for; a wait that ran out or that an
+    abort or a session close released is the other."""
+    watch_prompt(request_id)
+    gone = False
+    try:
+        return await wait
+    except asyncio.CancelledError:
+        gone = True
+        raise
+    finally:
+        if took_no_answer(request_id) or gone:
+            item = {"event_type": wire.ITEM_PROMPT_RETIRED, "request_id": request_id}
+            if gone:
+                item["caller_gone"] = True
+            queue.put_nowait(item)
+
+
+async def _answer_with_keepalive(decision, deny: dict):
+    """The decision as plain JSON when it is quick; otherwise a streamed
+    answer of whitespace keepalives and the JSON last. The stream always
+    ends with one JSON object (``deny`` when the decision raised) and never
+    after it; a disconnect cancels the decision, so its wait is released."""
+    task = asyncio.ensure_future(decision)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), _QUICK_S)
+    except asyncio.TimeoutError:
+        pass
+    except BaseException:
+        task.cancel()  # the request went away before the stream began
+        raise
+
+    async def body():
+        try:
+            while True:
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(task), _KEEPALIVE_S)
+                    break
+                except asyncio.TimeoutError:
+                    yield b" "
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Hook prompt: the decision failed while streaming")
+            result = deny
+        finally:
+            if not task.done():
+                task.cancel()
+        yield json.dumps(result).encode()
+
+    return StreamingResponse(body(), media_type="application/json")
+
+
 @router.post("/v1/hooks/permission")
 async def hook_permission(req: HookPermissionRequest, authorization: str | None = Header(None)):
     """Permission gate for the Claude CLI PreToolUse hook, the satellite stdio
@@ -70,12 +160,17 @@ async def hook_permission(req: HookPermissionRequest, authorization: str | None 
 
     Thin transport wrapper: it only verifies the session, then delegates to
     ``decide_tool_permission`` — the single decision authority, reused in-process
-    by the local Codex app-server approval handler.
+    by the local Codex app-server approval handler. A decision that waits on a
+    person is streamed with keepalives (``_answer_with_keepalive``).
     """
     await verify_session_match_async(authorization, req.session_id)
-    return await decide_tool_permission(
-        req.session_id, req.tool_name, req.tool_input,
-        live_permission_mode=req.permission_mode,
+    return await _answer_with_keepalive(
+        decide_tool_permission(
+            req.session_id, req.tool_name, req.tool_input,
+            live_permission_mode=req.permission_mode,
+            wait_s=_prompt_wait_s(authorization, req.session_id),
+        ),
+        {"decision": "deny", "reason": "OtoDock could not decide this tool call"},
     )
 
 
@@ -100,8 +195,13 @@ async def hook_codex_question(
     from core.session.session_manager import engine_layer_for_session
     layer = engine_layer_for_session(req.session_id)
     names = layer.capabilities.behaviour.tools.get(tool_roles.QUESTION, ()) if layer else ()
-    answers = await ask_user_question(req.session_id, req.questions, tool_name=names[0] if names else "")
-    return {"answers": answers}
+
+    async def answer() -> dict:
+        return {"answers": await ask_user_question(
+            req.session_id, req.questions, tool_name=names[0] if names else "",
+            timeout=_prompt_wait_s(authorization, req.session_id))}
+
+    return await _answer_with_keepalive(answer(), {"answers": {}})
 
 
 @router.post("/v1/hooks/mcp-credentials")
@@ -132,7 +232,7 @@ async def hook_mcp_credentials(authorization: str | None = Header(None)):
         # Session closed / purged / proxy restarted mid-session → fail fast so
         # the spawn-time wrapper errors cleanly instead of hanging on its timeout.
         raise HTTPException(status_code=404, detail="No credentials for this session")
-    return {"env": bundle.env, "http_bearer": bundle.http_bearer}
+    return {"env": bundle.env}
 
 
 @router.post("/v1/hooks/session-files")
@@ -193,7 +293,7 @@ def _park_interactive_on_dialog(session_id: str, tool_name: str) -> None:
 
 async def decide_tool_permission(
     session_id: str, tool_name: str, tool_input: dict | None = None,
-    live_permission_mode: str = "",
+    live_permission_mode: str = "", *, wait_s: float = PROMPT_WAIT_S,
 ) -> dict:
     """The single permission-decision authority for every execution layer.
 
@@ -207,6 +307,8 @@ async def decide_tool_permission(
     ``live_permission_mode`` is the CLI-reported mode from the PreToolUse
     hook's stdin (reflects in-TUI Shift+Tab); it overrides the chat's stored
     mode for interactive sessions — see the override in the implementation.
+    ``wait_s`` bounds a prompt's wait on a person (``PROMPT_WAIT_S``, cut to
+    the caller's token life by the route).
 
     ``updated_input`` rides along on ALLOW and ASK when Pass-1 rewrote a
     native tool's path arg for a remote satellite (sandbox-virtual / ``~``
@@ -232,6 +334,7 @@ async def decide_tool_permission(
     _pass1_out: dict = {}
     result = await _decide_tool_permission(
         session_id, tool_name, tool_input, _pass1_out, live_permission_mode,
+        wait_s=wait_s,
     )
     if result.get("decision") in ("allow", "ask") and _pass1_out.get("updated_input"):
         return {**result, "updated_input": _pass1_out["updated_input"]}
@@ -254,7 +357,7 @@ _CLI_LIVE_MODE_MAP = {
 
 async def _decide_tool_permission(
     session_id: str, tool_name: str, tool_input: dict | None,
-    _pass1_out: dict, live_permission_mode: str = "",
+    _pass1_out: dict, live_permission_mode: str = "", *, wait_s: float = PROMPT_WAIT_S,
 ) -> dict:
     """Implementation of :func:`decide_tool_permission`. ``_pass1_out``
     carries Pass-1 side data (currently ``updated_input``) back to the
@@ -446,7 +549,8 @@ async def _decide_tool_permission(
                 "tool_input": tool_input or {},
             })
             logger.info(f"Hook permission: dashboard plan_review, request_id={request_id}")
-            approved = await wait_for_permission(request_id, session_id, timeout=604800.0)
+            approved = await _wait_on_person(
+                queue, request_id, wait_for_permission(request_id, session_id, timeout=wait_s))
             logger.info(f"Hook permission: plan_review resolved, approved={approved}")
             if approved:
                 current = get_session_mode(session_id)
@@ -754,7 +858,8 @@ async def _decide_tool_permission(
             prompt_data["meeting_agent"] = route.meeting_agent
         await queue.put(prompt_data)
         logger.info(f"Hook permission: {'meeting ' + route.meeting_agent + ' ' if route.meeting_agent else ''}dashboard blocking for {tool_name}, request_id={request_id}")
-        approved = await wait_for_permission(request_id, session_id, timeout=604800.0)
+        approved = await _wait_on_person(
+            queue, request_id, wait_for_permission(request_id, session_id, timeout=wait_s))
         logger.info(f"Hook permission: dashboard resolved {tool_name}, approved={approved}")
         if approved and tool_name.startswith("mcp__"):
             # Feed the session allow-memory (checked above before prompting).
@@ -779,7 +884,7 @@ async def _decide_tool_permission(
 
 
 async def ask_user_question(
-    session_id: str, questions: list, timeout: float = 604800.0, *,
+    session_id: str, questions: list, timeout: float = PROMPT_WAIT_S, *,
     tool_name: str = "",
 ) -> dict:
     """Surface a Codex ``request_user_input`` question set to the dashboard and
@@ -808,7 +913,8 @@ async def ask_user_question(
         "tool_input": {"questions": questions},
     })
     logger.info(f"Codex question: dashboard blocking, request_id={request_id}")
-    answers = await wait_for_question(request_id, session_id, timeout=timeout)
+    answers = await _wait_on_person(
+        queue, request_id, wait_for_question(request_id, session_id, timeout=timeout))
     logger.info(f"Codex question: resolved request_id={request_id} "
                 f"({len(answers)} answered)")
     return answers

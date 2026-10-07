@@ -13,6 +13,111 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.7.1] — 2026-10-07
+
+### Added
+- **Share an app with a person, an agent or a department** at a role you pick;
+  "Shared with you" in the notifications panel replaces the Agents page strip
+  (earlier app shares wait there to be accepted, one migration). An agent an app
+  is placed in can call what it offers, and an app can keep each viewer's data.
+- **Documents open in a pane beside the chat**, one tab per document the agent
+  delivers with every version delivered in that chat (Live first) and a card per
+  delivery; it opens itself when a turn delivers one, floating on a phone.
+- **Hosted MCP servers sign in with OAuth.** The install registers itself with
+  the vendor (Forget undoes it) or uses an admin's own app when the server takes
+  one; the token is added in transit and never written into a session's files.
+- Admins accept an MCP's move to a new catalog source on the MCP Servers page; a
+  source that changed quietly is flagged, and settings, credentials and
+  assignments stay. An MCP-authoring skill checks a package (editors and up).
+- A worker's result files land in the delegating agent's workspace, a result or
+  wake-up that stops to ask you in a chat nobody watches notifies you, and
+  admins list and delete removed people's archives (kept 180 days by default).
+
+### Changed
+- **Enter adds a line in the chat box.** Shift+Enter, Ctrl+Enter or Send sends, and
+  on a phone or tablet Send does, now also during a turn. A paste never sends, the
+  box no longer zooms an iPhone, and it shrinks to four lines when you leave it.
+- **Claude Code 2.1.289, Codex 0.160.0, satellite 0.5.138** in the images and on
+  paired machines at reconnect (npm 12 too); a satellite update ends that
+  machine's running turns. Headless Claude stops a background command at 30 min.
+- **Sonnet 5.5 and GPT-6.1 Sol replace Sonnet 5 and GPT-6 Sol**, and pinned ones
+  move at boot. Anthropic chat titles use Sonnet 5.5, about twice Haiku's cost.
+- Prompts wait up to a day (3 on the direct engine, paired machines too), tool calls
+  outlast a 2-minute restart, workers switch model, limited accounts wait for reset.
+- Idle terminals end on time (one waiting for you stays a day), the session cap
+  closes only what it must, and no burst, refresh or long history stalls a chat.
+- SSH tools reach editors and up only, and a Shared-only agent takes editors and
+  managers only (assignments kept and marked; the switch names who loses one).
+- Apps shared with you: Remove for me removes a share you accepted, placed apps
+  carry a teal border, a server app's unpin reads Stop app, Admin → Shares lists
+  every share, revoked or declined ones go in 30 days.
+- Webhooks accept up to 25 MB from GitHub and API-key senders (2 MB otherwise),
+  refusals show on the subscription, and vendor API calls refuse private hosts.
+- The Local Browser reaches local services on its site list, its run-code tool
+  follows the chat's mode, and its saved token serves allowed unattended runs.
+- A hung MCP install rolls back, Python tools prefer prebuilt packages, a reinstall
+  keeps saved data, and a remote task or meeting removes no MCP it leaves out.
+- A copy stops at 100,000 entries or 4 GB (configurable) and never takes a whole
+  top folder; moved tasks, triggers and notifications show where they came from.
+- A banner and the installer name the `TRUSTED_PROXY` an untrusted proxy needs.
+
+### Fixed
+- Saving a document from the chat keeps the edit when Collabora's background save
+  hangs (the upgrade recreates the container) or editing ends on a phone, a save
+  after another write asks first, and a phone's Fullscreen keeps the cursor.
+- **Documents on a remote machine.** The pane shows the stored file after the
+  agent's write even while another device has it open, a write that could not
+  reach the machine is not undone by the next read, and your edits are saved
+  10 s after the last keystroke, on minimize, hide and send, saved as you.
+- **Messages typed while the agent works wait in the chat** (one new table):
+  every tab and a teammate on a shared chat see them, they go out in order after
+  a chat switch, a closed tab, a restart or a machine's reconnect, and a failed
+  or stopped turn hands them back. A chat still answering opens in one paint.
+- **A turn that cannot finish ends with a card that says why** (a decline, the
+  usage limit, an engine error or exit, 10 minutes of silence with no tool
+  running, a lost machine), with Send again where it can help; check-backs, job
+  reviews and delegated results are their own turn, ending at the answer.
+- **Remote machines on a slow uplink or a blip.** Large files no longer drop the
+  connection, transfers pass 30 s, and turns and sent messages outlast a blip.
+- Meetings refuse an agent you hold below editor, keep a removed agent out and
+  end when the moderator leaves; bottom-level agents know their department.
+- After a restart a paired machine's chat keeps its session (idle Codex too),
+  tools and mode, sessions closed offline stay closed, results stored meanwhile
+  go to the person who asked, and the satellite survives a memory kill.
+- The Android app opens servers with an underscore, IPv6 or international name, no
+  longer reloads during sign-in, and can pick a zip to install.
+- A refused chat says why once, a demoted manager's accounts are not lent, first
+  boot gives the owner automations of accounts deleted before 1.7, and smaller
+  fixes cover HTML conversion, IPv6 sandboxes, big uploads, restore and backups.
+
+### Security
+- SSO verifies the ID token and refuses an unverified email already in use;
+  sign-in starts are capped per network address (60 in 5 minutes, reloads not
+  counted), and a success no longer clears that address's other failures.
+- A session token works only while its session runs and never for admin pages.
+  Signing out ends one sign-in; a password change, a lowered role or an admin's
+  sign-out everywhere ends them all and their push devices. Idle tabs re-check.
+- `CREDENTIAL_ENCRYPTION_KEY` works on Docker installs (old secrets still open),
+  a new `JWT_SECRET` under 32 characters is refused (one in use warns), tokens
+  leave page URLs and logs, and the server log is private.
+- Webhook, caller and visitor input is treated as data in prompts, MCP prompts
+  carry no credentials, meeting agents see only their own thinking, and Claude
+  Code plugins, Claude Mods and claude.ai Artifact tools stay out of sessions.
+- Writes from another site are refused even when signed in, disallowed scripts
+  are reported, anonymous calls to member-only pages get 401 before their body
+  is read, and an untrusted proxy's headers bypass no webhook or app limit.
+- New phone PINs take 6 digits (older ones still work), lockouts survive a
+  restart, plain http to the proxy or the phone service is refused online, and
+  a call's conversation is read-only on the dashboard, for managers too.
+- App hooks pause after failed signatures, an app's local step runs only its
+  approved script, conversions load no linked pictures, a sandbox mounts only
+  folders it checked, and plain-http machines get no update or uninstall.
+- A pushed document's editor token reaches only the person whose turn delivered it,
+  a file sent to another agent never writes through a planted link, and the
+  background-output read rule admits only the session's own output.
+- PyJWT 2.15.1, urllib3 2.8.0, multidict 6.9.1, Capacitor 8.5.2 and pnpm 11.28.2
+  fix advisories, as do Python 3.13.16, Node 24.21.0 and Postgres 16.15 (data kept).
+
 ## [1.7.0] — 2026-09-29
 
 ### Added
@@ -482,7 +587,8 @@ map, live voice conversations, and a long list of fixes.
 - Interactive terminals follow the CLI's own permission modes (Shift+Tab)
   instead of the platform's generic approval prompt; the platform still
   enforces file-access rules and prompts for the highest-risk actions.
-  Headless and "Don't ask" chats are unchanged — see UPGRADING.md.
+  Headless and "Don't ask" chats are unchanged — see
+  docs.otodock.io/security/permissions.
 - Core tools are granted when an agent is created or installed, and no
   longer silently re-added on every start — removing one now sticks.
   Templates can opt out entirely with `"core_mcps": "none"`.
@@ -853,7 +959,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.7.1...HEAD
+[1.7.1]: https://github.com/OtoDock/oto-dock/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/OtoDock/oto-dock/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/OtoDock/oto-dock/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/OtoDock/oto-dock/compare/v1.5.0...v1.6.0

@@ -71,7 +71,9 @@ async def test_session_not_found_flags_cli_dead_for_autoresume():
     assert info.cli_dead is True
     types = [e.type for e in events]
     assert types == [ERROR, DONE]
-    assert "Session not found" in events[0].data["message"]
+    from core.events import turn_ending
+    ending = turn_ending.from_dict(events[0].data["ending"])
+    assert ending.reason == turn_ending.LOST and "Session not found" in ending.detail
 
 
 @pytest.mark.asyncio

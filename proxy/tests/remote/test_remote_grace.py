@@ -142,11 +142,13 @@ async def test_remove_session_queue_drops_grace():
 
 
 class TestPumpDurableMarker:
-    """A grace-expiry ERROR carrying `durable_marker` is
-    PERSISTED by the pump (as a visible assistant block), not just forwarded
-    live — so a refresh after a genuinely-lost turn shows the ⚠ instead of a
-    silent truncation. The pump's `_run` BREAKS on ERROR, so the marker must be
-    saved on that path (it relies on the `finally`'s _save_turn_blocks)."""
+    """Every ERROR that ends a turn is PERSISTED by the pump as the chat's
+    ``turn_ended`` system row (the card a reload shows), not just forwarded
+    live, so a refresh after a lost turn shows its reason instead of a
+    silent truncation. The pump's `_run` BREAKS on ERROR, so the row is saved
+    on that path (it relies on the `finally`'s _save_turn_blocks). The remote
+    adapter maps the grace expiry's `durable_marker` to the ``lost`` ending
+    before the pump sees it."""
 
     @staticmethod
     def _mk_pump(chat_id, session_id, saved, monkeypatch):
@@ -171,25 +173,141 @@ class TestPumpDurableMarker:
         prod = _aio.create_task(_idle_producer())
         return sp, eq, sp.ChatStreamPump(chat_id, session_id, prod, eq, None)
 
-    @pytest.mark.asyncio
-    async def test_durable_marker_error_is_persisted(self, monkeypatch):
-        saved: list = []
-        sp, eq, pump = self._mk_pump("chat-x", "sess-x", saved, monkeypatch)
-        marker = "⚠ stream interrupted — output may be incomplete"
-        await eq.put(sp.CommonEvent(type=sp.ERROR,
-                                    data={"message": marker, "durable_marker": True}))
-        await pump._run()
-        assistant = [a for a, k in saved if len(a) >= 3 and a[1] == "assistant"]
-        assert any(marker in a[2] for a in assistant), saved
+    @staticmethod
+    def _ended_rows(saved) -> list[dict]:
+        import json as _json
+        out = []
+        for a, k in saved:
+            if len(a) >= 2 and a[1] == "event" and k.get("event_type") == "system":
+                block = _json.loads(k.get("event_data") or "{}")
+                if block.get("subtype") == "turn_ended":
+                    out.append(block)
+        return out
 
     @pytest.mark.asyncio
-    async def test_plain_error_not_persisted(self, monkeypatch):
-        """An ordinary transient ERROR (no durable_marker) is forwarded live
-        only — NOT persisted as an assistant block (today's behaviour)."""
+    async def test_a_plain_error_is_persisted_as_the_error_ending(self, monkeypatch):
         saved: list = []
         sp, eq, pump = self._mk_pump("chat-y", "sess-y", saved, monkeypatch)
         await eq.put(sp.CommonEvent(type=sp.ERROR,
                                     data={"message": "Remote session timeout"}))
         await pump._run()
-        assistant = [a for a, k in saved if len(a) >= 3 and a[1] == "assistant"]
-        assert assistant == [], saved
+        [block] = self._ended_rows(saved)
+        assert block["reason"] == "error" and block["detail"] == "Remote session timeout"
+        assert [a for a, k in saved if len(a) >= 3 and a[1] == "assistant"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_typed_ending_is_persisted_once_and_forwarded_typed(self, monkeypatch):
+        """A turn the engine stopped (a decline, a usage limit) persists its
+        card row (a reload shows it on both engines) and forwards the typed
+        reason; the runner and the delegator read it off the pump."""
+        from core.events import turn_ending
+        saved: list = []
+        sp, eq, pump = self._mk_pump("chat-z", "sess-z", saved, monkeypatch)
+        frames: list = []
+
+        async def forward(item):
+            frames.append(item)
+
+        monkeypatch.setattr(pump, "_forward", forward)
+        ending = turn_ending.TurnEnding(reason=turn_ending.LIMIT,
+                                        resets_at="2026-10-01T15:00:00+00:00")
+        await eq.put(sp.CommonEvent(type=sp.ERROR, data={
+            "message": ending.line(), "ending": ending.as_dict()}))
+        await pump._run()
+        [block] = self._ended_rows(saved)
+        assert block["reason"] == "limit" and block["message"] == ending.line()
+        err = [f for f in frames if f.get("pump_type") == sp.wire.PUMP_ERROR]
+        assert err == [{"pump_type": sp.wire.PUMP_ERROR, "message": ending.line(),
+                        "reason": "limit", "resets_at": "2026-10-01T15:00:00+00:00"}]
+        assert pump.last_ending == ending
+
+
+class TestWaitSessionReconnect:
+    """A turn start waits for a session whose machine is in its reconnect
+    grace instead of reading it as dead (the dead path would drop the live
+    session's record and state); a session not held answers at once."""
+
+    @staticmethod
+    def _held(*, cli_dead: bool = False):
+        from core.remote import remote_execution as re_mod
+        from core.remote.satellite_connection import SatelliteConnectionManager
+        cm = SatelliteConnectionManager()
+        layer = re_mod.RemoteExecutionLayer(cm)
+        info = re_mod.RemoteSessionInfo(
+            session_id="s", machine_id="m", agent_name="agent-x",
+            execution_path="claude-code-cli", event_queue=asyncio.Queue())
+        info.cli_dead = cli_dead
+        layer._sessions["s"] = info
+        cm._connections["m"] = _fake_conn({"s": info.event_queue})
+        return cm, layer
+
+    @staticmethod
+    def _reconnect_after(cm, delay: float):
+        async def _back():
+            await asyncio.sleep(delay)
+            # What register() does for the held sessions.
+            held = cm._grace_sessions.pop("m")
+            cm._grace_timers.pop("m").cancel()
+            cm._connections["m"] = _fake_conn({sid: q for sid, (q, _p) in held.items()})
+        return asyncio.ensure_future(_back())
+
+    @pytest.mark.asyncio
+    async def test_a_machine_back_inside_the_wait_leaves_the_session_alive(self):
+        cm, layer = self._held()
+        await cm.deregister("m")
+        assert not await layer.is_session_alive("s")
+        self._reconnect_after(cm, 0.3)
+
+        assert await layer.wait_session_reconnect("s", timeout=5) is True
+        assert await layer.is_session_alive("s")
+
+    @pytest.mark.asyncio
+    async def test_a_machine_still_away_at_the_timeout_reads_dead(self):
+        cm, layer = self._held()
+        await cm.deregister("m")
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+
+        assert await layer.wait_session_reconnect("s", timeout=0.4) is False
+        assert 0.35 <= loop.time() - t0 < 2
+        cm._grace_timers["m"].cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_session_not_held_answers_at_once(self):
+        from core.remote import remote_execution as re_mod
+        from core.remote.satellite_connection import SatelliteConnectionManager
+        layer = re_mod.RemoteExecutionLayer(SatelliteConnectionManager())
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        # No record at all, and a machine gone past its grace.
+        assert await layer.wait_session_reconnect("nobody", timeout=5) is False
+        layer._sessions["s"] = re_mod.RemoteSessionInfo(
+            session_id="s", machine_id="m", agent_name="agent-x",
+            execution_path="claude-code-cli", event_queue=asyncio.Queue())
+        assert await layer.wait_session_reconnect("s", timeout=5) is False
+        assert loop.time() - t0 < 0.2
+
+    @pytest.mark.asyncio
+    async def test_a_process_that_died_stays_dead_after_the_reconnect(self):
+        cm, layer = self._held(cli_dead=True)
+        await cm.deregister("m")
+        self._reconnect_after(cm, 0.1)
+
+        assert await layer.wait_session_reconnect("s", timeout=5) is False
+
+    @pytest.mark.asyncio
+    async def test_a_local_layer_never_waits(self):
+        from core.layers.cli.layer import CLIExecutionLayer
+        assert await CLIExecutionLayer().wait_session_reconnect("s") is False
+
+
+def test_the_session_records_on_one_machine():
+    from core.remote import remote_execution as re_mod
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    layer = re_mod.RemoteExecutionLayer(SatelliteConnectionManager())
+    for sid, machine in (("a", "m-1"), ("b", "m-2"), ("c", "m-1")):
+        layer._sessions[sid] = re_mod.RemoteSessionInfo(
+            session_id=sid, machine_id=machine, agent_name="agent-x",
+            execution_path="claude-code-cli", event_queue=asyncio.Queue())
+    assert layer.session_ids_on("m-1") == ["a", "c"]
+    assert layer.session_ids_on("m-3") == []

@@ -90,27 +90,21 @@ export function useChatMessages(args: {
     }
   }, [agents])
 
-  // Drop document_preview blocks for a dismissed file. `key` scopes the
-  // removal to ONE instance (a frozen "previous version" closing itself);
-  // without it every instance goes (the live block's close nukes the trail).
-  // Touching the streaming message must rebind currentMsgRef, or every later
-  // appendBlock/appendToLastTextBlock for the turn is silently dropped.
-  const removePreviewBlocks = useCallback((
-    fileId: string, key?: { snapshotId?: string; dbMessageId?: number },
-  ) => {
-    setMessages((prev) => prev.map((m) => {
-      const blocks = m.blocks.filter((b) => {
-        if (b.type !== 'document_preview' || b.fileId !== fileId) return true
-        if (!key) return false
-        if (key.snapshotId) return b.snapshotId !== key.snapshotId
-        if (key.dbMessageId != null) return b.dbMessageId !== key.dbMessageId
-        return false
-      })
-      if (blocks.length === m.blocks.length) return m
-      const updated = { ...m, blocks }
-      if (m === currentMsgRef.current) currentMsgRef.current = updated
-      return updated
-    }))
+  // A document push's card: appended to the streaming bubble, or in place
+  // of the card of the same file already there (a reconnect's live state
+  // may have drawn it before the turn's flush delivered the frame).
+  const upsertPreviewBlock = useCallback((block: Extract<MessageBlock, { type: 'document_preview' }>) => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1]
+      if (!last || last.role !== 'assistant' || last !== currentMsgRef.current) return prev
+      const at = last.blocks.findIndex((b) => b.type === 'document_preview' && b.fileId === block.fileId)
+      const blocks = at >= 0
+        ? last.blocks.map((b, i) => (i === at ? block : b))
+        : [...last.blocks, block]
+      const updated = { ...last, blocks }
+      currentMsgRef.current = updated
+      return [...prev.slice(0, -1), updated]
+    })
   }, [])
 
   // Drop every transient placeholder of `kind` from the streaming bubble
@@ -311,6 +305,6 @@ export function useChatMessages(args: {
     appendBlock, removePlaceholders, appendToLastTextBlock,
     updateToolBlock, updateToolBlockByName, resolvePermission,
     updateSubagentActive, updateCommandActive, ensureAssistantMsg,
-    removePreviewBlocks,
+    upsertPreviewBlock,
   }
 }

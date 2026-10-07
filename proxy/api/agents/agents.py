@@ -101,6 +101,9 @@ class UpdateAgentRequest(BaseModel):
     execution_target: str | None = None  # placement.LOCAL or a machine id
     default_scope: str | None = None  # "user" | "agent"
     collaborative: bool | None = None  # visibility-modes second axis
+    # Turning the agent Shared only removes its viewer and contributor rows:
+    # the subs a person confirmed, which must equal the live list (409 names it).
+    confirm_removals: list[str] | None = None
     # Per-agent default execution mode: "" (unset) | "interactive" | "-p".
     # Only valid when the agent's default model is a CLI execution layer.
     default_execution_mode: str | None = None
@@ -415,10 +418,18 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                     400, "Level does not belong to that department"
                 )
 
+    switch = await _shared_only_switch(
+        name, u, getattr(req, "collaborative", None), _req_default_scope,
+        getattr(req, "confirm_removals", None))
+
     fields = req.model_dump(exclude_none=True)
+    fields.pop("confirm_removals", None)
+    if switch is not None and switch["clear_default"]:
+        # The new-user default follows the rule with the mode, in the same write.
+        fields["default_for_new_users_role"] = ""
     # Keep the PRIMARY execution layer consistent with the default model whenever
     # EITHER is updated. A no-picker session/task uses (primary layer + default
-    # model), and a model only runs on its OWN layer (e.g. gpt-6-sol is codex-cli-
+    # model), and a model only runs on its OWN layer (e.g. gpt-6.1-sol is codex-cli-
     # only), so a mismatch makes delegated/no-picker runs hard-reject the model
     # (the personal-assistant delegate bug). resolve_execution_path reads the
     # scalar `execution_path`, so reconciling it here is what fixes those runs.
@@ -498,7 +509,76 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                     "agent %s → shared-only: cleared %d personal-machine remote "
                     "override(s)", name, removed,
                 )
+    if switch is not None:
+        result = dict(result)
+        result["shared_only_switch"] = await _finish_shared_only_switch(name, u, switch)
     return result
+
+
+async def _shared_only_switch(name: str, u: UserContext, collaborative: bool | None,
+                              default_scope: str | None,
+                              confirm_removals: list[str] | None) -> dict | None:
+    """When this PATCH turns the agent Shared only (the stored row, read
+    uncached, is not; the row with the request's axes is: one axis can do
+    it), what the switch takes away: the viewer and contributor rows a
+    person must confirm, and a below-editor new-user default. None when the
+    PATCH is not that switch. Refuses (nothing written) a switch that would
+    remove someone without the exact live list confirmed by a person; an
+    agent session or API key never reads the list."""
+    if collaborative is None and default_scope is None:
+        return None
+    from services.agents import shared_only_members as som
+    stored = await asyncio.to_thread(som.agent_row, name) or {}
+    merged = dict(stored)
+    if collaborative is not None:
+        merged["collaborative"] = collaborative
+    if default_scope is not None:
+        merged["default_scope"] = default_scope
+    if som.is_shared_only_row(stored) or not som.is_shared_only_row(merged):
+        return None
+    people = await asyncio.to_thread(som.below_editor_members, name)
+    default = stored.get("default_for_new_users_role") or ""
+    switch = {"subs": [p["sub"] for p in people],
+              "clear_default": bool(default) and not roles.allowed_on_shared_only(default)}
+    if not people:
+        return switch
+    if u.is_api_key:
+        n = len(people)
+        raise HTTPException(
+            403,
+            f"{n} {'person holds' if n == 1 else 'people hold'} the viewer or contributor "
+            "role on this agent and would lose that assignment: a manager confirms the "
+            "switch to Shared only in the agent's settings.")
+    if confirm_removals is None or set(confirm_removals) != set(switch["subs"]):
+        raise HTTPException(409, {
+            "code": "shared_only_removals",
+            "message": ("Shared only takes the editor role or above to chat: these "
+                        "people's viewer or contributor assignment is removed."),
+            "people": people,
+        })
+    return switch
+
+
+async def _finish_shared_only_switch(name: str, u: UserContext, switch: dict) -> dict:
+    """After the mode is written: remove the confirmed rows still below the
+    editor tier (read again now), report a row the confirmation did not name
+    (someone assigned during the switch: kept, marked in the panels)."""
+    from services.agents import shared_only_members as som
+    confirmed = set(switch["subs"])
+    try:
+        live = [p["sub"] for p in await asyncio.to_thread(som.below_editor_members, name)]
+        removed, failed = await som.remove_members(
+            name, [s for s in live if s in confirmed], u.sub)
+    except Exception:
+        # The mode is written: the answer reports the rows kept, never a 500.
+        logger.exception("agent %s → shared-only: the assignments were not removed", name)
+        live, removed, failed = [], [], sorted(confirmed)
+    not_removed = [s for s in live if s not in confirmed] + failed
+    if not_removed:
+        logger.warning("agent %s → shared-only: %d assignment(s) below the editor tier kept "
+                       "(not in the confirmation, or not removed)", name, len(not_removed))
+    return {"removed": removed, "not_removed": not_removed,
+            "default_cleared": switch["clear_default"]}
 
 
 @router.put("/v1/admin/agents/{name}/default-for-new-users")
@@ -529,6 +609,9 @@ async def admin_set_default_for_new_users(
                 "When enabled=True, role must be one of "
                 + ", ".join(repr(r) for r in roles.AGENT_ROLES),
             )
+        from services.agents import shared_only_members
+        if await asyncio.to_thread(shared_only_members.refused_assignments, {name: body.role}, {}):
+            raise HTTPException(400, shared_only_members.refusal_message([name]))
         new_role = body.role
     else:
         new_role = ""
@@ -651,36 +734,20 @@ async def list_agent_conversations(
     return {"conversations": conversations, "total": total}
 
 
-def can_open_chat(u: UserContext, chat: dict) -> bool:
-    """May this user open this chat BY ID — the rule the detail route and
-    the dashboard's ``resume_chat`` share. The REST rule
-    (``api/agents/chats.py::can_access_chat``: the owner, an admin, a
-    Shared-only agent's ``agent::`` pool for its assigned users, a task
-    run's chat by its run) plus phone conversations for the agent's
-    managers, which is who the conversations list serves. The chat's OWNER
-    decides, never the agent's current mode: a per-user chat from before an
-    agent turned Shared-only stays its owner's."""
-    from api.agents.chats import can_access_chat
-    from core.session.visibility import is_phone_chat_owner
-    if session_kind.of_chat(chat) is session_kind.PHONE \
-            or is_phone_chat_owner(chat.get("user_sub")):
-        return u.is_admin or u.can_manage_agent(chat.get("agent", ""))
-    return can_access_chat(u, chat)
-
-
 @router.get("/v1/chats/{chat_id}/detail")
 async def get_chat_detail(
     chat_id: str,
     user: UserContext = Depends(get_current_user),
 ):
-    """Get chat metadata with access control (``can_open_chat``): the
+    """Get chat metadata with access control (``can_access_chat``): the
     owner, an admin, an assigned user for a Shared-only agent's shared
     history or an agent-scope task run, a manager for a phone conversation.
     """
+    from api.agents.chats import can_access_chat
     u = require_auth(user)
     chat = await asyncio.to_thread(task_store.get_chat, chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-    if not await asyncio.to_thread(can_open_chat, u, chat):
+    if not await asyncio.to_thread(can_access_chat, u, chat):
         raise HTTPException(403, "Access denied")
     return chat

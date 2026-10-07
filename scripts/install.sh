@@ -42,6 +42,31 @@ _raw="https://raw.githubusercontent.com/OtoDock/oto-dock/${_ref}"
 say()  { echo "install.sh: $*"; }
 fail() { echo "install.sh: $*" >&2; exit 1; }
 
+# An https public URL means a reverse proxy in front, and with TRUSTED_PROXY
+# empty every visitor shares its address: one person's failed sign-ins lock
+# everyone out. The server says so at every boot and shows admins a banner;
+# the installer says it first. The shell environment wins over .env, as for
+# docker compose itself.
+env_value() { # env_value <KEY>: the shell's value, else the last .env line's, unquoted
+    local v="${!1:-}"
+    [ -n "$v" ] || v="$(grep -E "^$1=" .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    printf '%s' "$v"
+}
+trusted_proxy_hint() {
+    case "$(env_value DASHBOARD_PUBLIC_URL)" in
+        [Hh][Tt][Tt][Pp][Ss]://*) ;;
+        *) return 0 ;;
+    esac
+    [ -z "$(env_value TRUSTED_PROXY)" ] || return 0
+    say "DASHBOARD_PUBLIC_URL is https but TRUSTED_PROXY is empty: behind a reverse
+  proxy every visitor shares its address. In .env add the address it connects
+  from: for one on this host, PROXY_BIND_IP=127.0.0.1 and TRUSTED_PROXY set to
+  the otodock network's gateway (10.200.0.1 by default:
+  docker network inspect otodock -f '{{(index .IPAM.Config 0).Gateway}}');
+  for one on another machine, its IP. Then run: docker compose up -d"
+}
+
 # Fetch a file atomically: a failed download must not leave a partial file
 # behind (a half-written docker-compose.yml would look like an existing
 # install on the next run).
@@ -301,3 +326,4 @@ say "done. OtoDock is starting at:
   there, then connect your AI subscription or API key.
       First run:  https://docs.otodock.io/getting-started/first-run
       Logs:       docker compose logs -f otodock-proxy   (in $(pwd))"
+trusted_proxy_hint

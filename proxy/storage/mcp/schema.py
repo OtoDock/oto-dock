@@ -145,9 +145,10 @@ def init_mcp_autoupdate(conn) -> None:
     """Weekly MCP auto-update run log."""
     # --- Automatic MCP updates run log (services/mcp/mcp_autoupdate.py) ---
     # One row per MCP touched in a weekly run. `status`:
-    #   updated | no_change | skipped_in_use | failed.
-    # `run_id` groups a single run; `trigger` is 'auto' (weekly) — reserved for
-    # future manual full-runs. Pruned by the daily retention sweep.
+    #   updated | no_change | skipped_in_use | failed | held | needs_approval
+    # (the last two: a `.hold` marker, a catalog source change left to the
+    # admin). `run_id` groups a single run; `trigger` is 'auto' (weekly) or
+    # 'manual'. Pruned by the daily retention sweep.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mcp_auto_update_log (
             id TEXT PRIMARY KEY,
@@ -164,3 +165,49 @@ def init_mcp_autoupdate(conn) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mcp_autoupdate_ts ON mcp_auto_update_log(ts DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mcp_autoupdate_run ON mcp_auto_update_log(run_id)")
+
+    # --- The last update check and the pending source changes ---
+    # (services/mcp/mcp_updater.py, services/community/mcp_source_swap.py;
+    # storage/mcp/mcp_update_state_store.py). One row per MCP the last check
+    # found an update for (`info` is the detection entry as JSON), replaced
+    # whole by every check; the check time is the platform setting
+    # `mcp_update_last_checked_at`.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mcp_update_checks (
+            mcp_name TEXT PRIMARY KEY,
+            info TEXT NOT NULL,
+            checked_at TEXT NOT NULL
+        )
+    """)
+    # One row per MCP whose catalog source differs from the installed one:
+    # `status` pending (shown, awaiting the admin's Switch) | switching (the
+    # accept route holds the install lock) | switched (the result shown until
+    # dismissed). `from_*` is the installed identity, `to_*` the catalog's at
+    # check time, `to_manifest_hash` the catalog manifest the card described,
+    # `plan` the credential carry/rename/reconnect lists (JSON), `result` what
+    # a switch did or why it failed (JSON). `notified_at` marks the weekly
+    # job's one notification per pair.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mcp_source_changes (
+            mcp_name TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            from_kind TEXT NOT NULL,
+            from_identity TEXT NOT NULL,
+            from_url TEXT NOT NULL,
+            from_runtime TEXT NOT NULL DEFAULT '',
+            to_kind TEXT NOT NULL,
+            to_identity TEXT NOT NULL,
+            to_url TEXT NOT NULL,
+            to_runtime TEXT NOT NULL DEFAULT '',
+            to_version TEXT NOT NULL DEFAULT '',
+            to_manifest_hash TEXT NOT NULL DEFAULT '',
+            declared BOOLEAN NOT NULL DEFAULT FALSE,
+            plan TEXT NOT NULL DEFAULT '{}',
+            detected_at TEXT NOT NULL,
+            notified_at TEXT,
+            accepted_at TEXT,
+            accepted_by TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        )
+    """)

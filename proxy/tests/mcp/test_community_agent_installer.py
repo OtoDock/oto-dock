@@ -263,9 +263,8 @@ class TestTemplateAppsAndChecks:
         assert board.auto_create_for_new_users is True and board.roles is None
         # The hashes: the tree without app.json (blueprint.json stays, it
         # travels verbatim), the manifest, the consent sig.
-        files = [("blueprint.json", tdir / "user-apps/home/blueprint.json"),
-                 ("client/index.html", tdir / "user-apps/home/client/index.html")]
-        assert home.tree_sha == template_sig.tree_sha(files)
+        assert home.tree_sha == template_sig.tree_sha(
+            tdir / "user-apps/home", ["blueprint.json", "client/index.html"])
         assert home.app_json_sha == template_sig.sha256_text(template_sig.canonical(self.HOME))
         assert home.sig == template_sig.template_app_sig(self.HOME, home.blueprint, home.tree_sha)
         assert home.owner_approval is False
@@ -285,12 +284,62 @@ class TestTemplateAppsAndChecks:
         (root / "client").mkdir(parents=True)
         (root / "client" / "index.html").write_text("<p>x</p>")
         (root / "app.json").write_text('{"title": "a"}')
-        files = [("app.json", root / "app.json"), ("client/index.html", root / "client/index.html")]
-        first = template_sig.tree_sha(files)
+        rels = ["app.json", "client/index.html"]
+        first = template_sig.tree_sha(root, rels)
         (root / "app.json").write_text('{"title": "b"}')
-        assert template_sig.tree_sha(files) == first
+        assert template_sig.tree_sha(root, rels) == first
         (root / "client" / "index.html").write_text("<p>y</p>")
-        assert template_sig.tree_sha(files) != first
+        assert template_sig.tree_sha(root, rels) != first
+
+    def test_the_tree_hash_keeps_its_format_and_never_reads_through_a_swap(self, tmp_path, temp_db,
+                                                                           monkeypatch):
+        # The registry's generator hashes the same bytes the same way, so the
+        # hex of a fixed tree is pinned. A file swapped for a link (even one
+        # naming the same bytes) or a FIFO after the walk is refused, never
+        # read through.
+        import os
+        from services.apps import releases
+        from storage.agents import template_sig
+        from storage.agents.community_agent_template_store import (
+            TemplateValidationError, load_template_from_dir)
+        root = tmp_path / "pinned"
+        (root / "client").mkdir(parents=True)
+        (root / "server").mkdir()
+        (root / "app.json").write_text('{"title": "Pinned"}')
+        (root / "blueprint.json").write_text('{"format": 1}')
+        (root / "client" / "index.html").write_text("<p>pinned</p>")
+        (root / "server" / "index.ts").write_text("export {}\n")
+        rels = [rel for rel, _path in releases.walk_tree(root)]
+        assert template_sig.tree_sha(root, rels) == \
+            "ff0a1d86591ab4399df0479962fba577e57f38ee6f3f2807206d4148948fbcc7"
+        twin = tmp_path / "twin.html"
+        twin.write_text("<p>pinned</p>")
+        page = root / "client" / "index.html"
+        page.unlink()
+        page.symlink_to(twin)
+        with pytest.raises(OSError):
+            template_sig.tree_sha(root, rels)
+        page.unlink()
+        os.mkfifo(page)
+        with pytest.raises(OSError):
+            template_sig.tree_sha(root, rels)
+        # The loader: the walk judged the tree, then the page became a link.
+        tdir = _write_template(tmp_path, user_apps={"home": self.HOME},
+                               agent_json_extra={"collaborative": True})
+        twin.write_text("<p>app</p>")
+        real_walk = releases.walk_tree
+
+        def swapping(source):
+            files = real_walk(source)
+            target = Path(source) / "client" / "index.html"
+            if not target.is_symlink():
+                target.unlink()
+                target.symlink_to(twin)
+            return files
+
+        monkeypatch.setattr(releases, "walk_tree", swapping)
+        with pytest.raises(TemplateValidationError):
+            load_template_from_dir(tdir)
 
     def test_owner_approval_predicate(self, temp_db):
         from storage.agents.template_sig import needs_owner
@@ -1232,12 +1281,12 @@ class TestSeededCleanupInvariants:
 # On_user_added_to_agent hook (catalog-aware seeding)
 # ---------------------------------------------------------------------------
 
-def _install_with_user_items(tmp_path, *, default_for_new_users=None):
+def _install_with_user_items(tmp_path, *, default_for_new_users=None, agent_json_extra=None):
     """Helper: install a template that declares ALL three user-scope items.
 
     Returns the installed agent_slug. ADMIN_SUB is the installer/manager.
     """
-    agent_json_extras = {}
+    agent_json_extras = dict(agent_json_extra or {})
     if default_for_new_users is not None:
         agent_json_extras["default_for_new_users"] = default_for_new_users
 
@@ -1427,6 +1476,17 @@ class TestUserJoinHook:
         )
         agent = agent_store.get_agent(agent_slug)
         assert agent["default_for_new_users_role"] == "viewer"
+
+    def test_a_shared_only_template_keeps_no_below_editor_default(self, tmp_path, temp_db):
+        from storage.agents import agent_store
+        agent_slug = _install_with_user_items(
+            tmp_path,
+            default_for_new_users={"enabled": True, "role": "viewer"},
+            agent_json_extra={"collaborative": False, "default_scope": "agent"},
+        )
+        agent = agent_store.get_agent(agent_slug)
+        assert agent["collaborative"] is False and agent["default_scope"] == "agent"
+        assert agent["default_for_new_users_role"] == ""
 
     def test_install_default_for_new_users_disabled_keeps_empty(self, tmp_path, temp_db):
         from storage.agents import agent_store

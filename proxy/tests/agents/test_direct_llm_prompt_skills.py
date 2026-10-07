@@ -51,6 +51,22 @@ def test_cli_prompts_never_get_the_section(temp_db):
             assert "# Skills" not in p
 
 
+def test_the_persons_role_filters_the_skills_by_audience(temp_db):
+    """The prompt builder hands the person's role to both skill readers, so
+    a skill above their tier is neither inlined nor listed; a caller with no
+    person (a task) passes None and filters nothing."""
+    _seed_agent("skillcat")
+    with patch.object(mcp_registry, "get_skills_for_agent", return_value=[]) as inline, \
+            patch.object(mcp_registry, "get_skill_catalog_for_agent", return_value=[]) as cat:
+        app_config.build_agent_prompt(
+            "skillcat", username="alice", role="contributor", execution_path="direct-llm",
+            user_role="contributor",
+        )
+        app_config.build_agent_prompt("skillcat", execution_path="direct-llm")
+    assert [c.kwargs["user_role"] for c in inline.call_args_list] == ["contributor", None]
+    assert [c.kwargs["user_role"] for c in cat.call_args_list] == ["contributor", None]
+
+
 def test_empty_catalog_omits_the_section(temp_db):
     _seed_agent("skillcat")
     with patch.object(mcp_registry, "get_skill_catalog_for_agent", return_value=[]):

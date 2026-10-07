@@ -136,6 +136,16 @@ html, body {
 
 body { padding: 2px; }
 
+/* iOS Safari zooms the whole page into a focused field under 16px. :where()
+   keeps this at zero specificity, so an artifact's or app's own field size
+   still wins. */
+@media (pointer: coarse) {
+  :where(input:not([type=checkbox], [type=radio], [type=range], [type=button],
+    [type=submit], [type=reset], [type=file], [type=color]), textarea, select) {
+    font-size: max(16px, 1em);
+  }
+}
+
 h1, h2, h3, h4 { color: var(--p-text); font-weight: 600; line-height: 1.25; margin: 0 0 .5em; }
 h1 { font-size: 1.5rem; } h2 { font-size: 1.25rem; } h3 { font-size: 1.05rem; }
 p { margin: 0 0 .75em; }

@@ -19,7 +19,11 @@ the event, so the sweep is what reaches those).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import functools
 import logging
+from collections.abc import Iterable
 
 from auth import roles
 from services.agents import offboarding
@@ -66,7 +70,13 @@ async def clear_binding(row: dict, owner_sub: str) -> None:
         logger.exception("offboarding: the subscriptions of %s on %s were not cleaned",
                          mcp_name, agent)
         cleaned = 0
-    await run_db(credential_store.remove_service_agent_binding, mcp_name, agent)
+    removed = await run_db(functools.partial(
+        credential_store.remove_service_agent_binding, mcp_name, agent,
+        owner_sub=owner_sub, account_label=label))
+    if not removed:
+        logger.info("offboarding: the %s binding on %s names another account now; kept",
+                    mcp_name, agent)
+        return
     logger.info("offboarding: cleared the %s binding of %s on %s (%d subscription(s))",
                 mcp_name, owner_sub[:8], agent, cleaned)
 
@@ -93,15 +103,57 @@ async def _sweep_orphans() -> int:
     return gone
 
 
-async def on_offboard(event: offboarding.OffboardEvent) -> None:
-    if not _lost_manager_tier(event):
-        return
-    user, agent_roles = await run_db(_standing, event.sub)
-    rows = await run_db(credential_store.list_service_agent_bindings_for_owner, event.sub)
+async def clear_unmanaged_bindings(sub: str) -> int:
+    """Clear every binding ``sub`` lends to an agent they no longer manage,
+    their standing read now. Returns how many went."""
+    user, agent_roles = await run_db(_standing, sub)
+    rows = await run_db(credential_store.list_service_agent_bindings_for_owner, sub)
+    cleared = 0
     for row in rows:
         if _manages(user, agent_roles, row["agent_name"]):
             continue
-        await clear_binding(row, event.sub)
+        await clear_binding(row, sub)
+        cleared += 1
+    return cleared
+
+
+#: How long a demotion route waits for the inline clear (vendor calls); the
+#: rest finishes in the background and the subscriber is the safety net.
+DEMOTION_CLEAR_WAIT_S = 15.0
+# The inline clears still running, by person: the subscriber waits for one
+# instead of clearing the same rows beside it.
+_inflight: dict[str, asyncio.Task] = {}
+
+
+async def clear_at_demotion(sub: str, agent_losses: Iterable[offboarding.AgentLoss]) -> None:
+    """The demotion site's own clear: when a change took the manager tier
+    away on some agent, the person's bindings there go before the route
+    answers, not only when the offboarding chain reaches its subscriber."""
+    if not any(roles.can_manage(loss.old_role) and not roles.can_manage(loss.new_role)
+               for loss in agent_losses):
+        return
+    task = _inflight.get(sub)
+    if task is None or task.done():
+        task = asyncio.ensure_future(clear_unmanaged_bindings(sub))
+        _inflight[sub] = task
+        offboarding._keep(task)
+        task.add_done_callback(lambda t: _inflight.pop(sub, None) if _inflight.get(sub) is t else None)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), DEMOTION_CLEAR_WAIT_S)
+    except TimeoutError:
+        logger.info("offboarding: the bindings of %s are still clearing in the background", sub[:8])
+    except Exception:
+        logger.exception("offboarding: the bindings of %s were not cleared at the demotion", sub[:8])
+
+
+async def on_offboard(event: offboarding.OffboardEvent) -> None:
+    if not _lost_manager_tier(event):
+        return
+    running = _inflight.get(event.sub)
+    if running is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(running)
+    await clear_unmanaged_bindings(event.sub)
     swept = await _sweep_orphans()
     if swept:
         logger.info("offboarding: %d orphaned service subscription(s) swept after %s (%s)",

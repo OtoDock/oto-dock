@@ -85,7 +85,7 @@ def build_session_env(
 
     # Belt-and-braces disable of Claude Code's built-in auto-memory
     # subsystem. Paired with ``autoMemoryEnabled: false`` in the
-    # session ``settings.json`` (see ``core/sandbox/sandbox.py``) and the
+    # session ``settings.json`` (see ``core/layers/cli/config_dir.py``) and the
     # session-start memory-dir wipe in ``core/layers/cli/config_dir.ensure_persistent_claude_dir``.
     # Otodock memory-mcp is the single source of memory truth.
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
@@ -93,7 +93,7 @@ def build_session_env(
     # Pin/freeze the CLI version fleet-wide: disable Claude Code's auto-updater so
     # an install can't drift off the platform pin (the platform reconciles the
     # pinned version). Belt-and-braces with ``autoUpdates: false`` in settings.json
-    # (core/sandbox/sandbox.py). See VERSIONS.md.
+    # (core/layers/cli/config_dir.py). See VERSIONS.md.
     env["DISABLE_AUTOUPDATER"] = "1"
 
     # The platform is the only skill SOURCE: keep

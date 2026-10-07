@@ -19,19 +19,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_admin, require_human
+from auth.providers import UserContext, get_current_user, require_admin, require_human, require_user
 from services.community import community_catalog, community_installer
 from auth import roles
 
 logger = logging.getLogger("claude-proxy.community-api")
-router = APIRouter()
-
-
-def _require_admin(user: UserContext | None) -> UserContext:
-    """Admin-only entry point (install / approve / reject)."""
-    if not user or not user.is_admin:
-        raise HTTPException(403, "Admin only")
-    return user
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 def _require_creator_or_admin(user: UserContext | None) -> UserContext:
@@ -248,7 +241,7 @@ async def install_community_mcp(
     docker, rollback on failure) runs in the background and completes even if the
     page is closed; failures fire a durable notification.
     """
-    _require_admin(user)
+    require_admin(user)
     from core.credentials import catalog_install_registry
 
     # Confirm the MCP exists in the catalog (precise 404) and capture its
@@ -288,7 +281,7 @@ async def list_catalog_installs(
     poll reliably catches the done/failed state. Admin-global, like the existing
     ``/v1/admin/mcp-requests`` list.
     """
-    _require_admin(user)
+    require_admin(user)
     from core.credentials import catalog_install_registry
     return {"installs": [j.to_dict() for j in catalog_install_registry.snapshot()]}
 
@@ -413,7 +406,7 @@ async def install_community_skill(
     Same 202 + job semantics as the MCP install endpoint; progress rides the
     same job registry, polled via either installs listing.
     """
-    _require_admin(user)
+    require_admin(user)
     from core.credentials import catalog_install_registry
 
     registry = await community_catalog.fetch_skills_registry()
@@ -447,7 +440,7 @@ async def list_skill_catalog_installs(
 ) -> dict:
     """Alias of the shared install-jobs snapshot (jobs are keyed by name and
     names are unique across both catalogs)."""
-    _require_admin(user)
+    require_admin(user)
     from core.credentials import catalog_install_registry
     return {"installs": [j.to_dict() for j in catalog_install_registry.snapshot()]}
 
@@ -710,7 +703,7 @@ async def list_admin_mcp_requests(
     user: UserContext = Depends(get_current_user),
 ) -> dict:
     """All requests across all agents. Admin only."""
-    _require_admin(user)
+    require_admin(user)
     from storage.mcp import mcp_request_store
     if open_only:
         rows = await asyncio.to_thread(mcp_request_store.list_open_requests)
@@ -737,7 +730,7 @@ async def approve_mcp_request(
     ``body.instance_id`` (optional, explicit-mode MCPs only) attaches the
     requesting agent to that specific instance instead of the automatic pick.
     """
-    _require_admin(user)
+    require_admin(user)
     updated = await community_installer.approve_request(
         request_id, user.sub, admin_note=body.admin_note,
         instance_id=body.instance_id,
@@ -752,7 +745,7 @@ async def reject_mcp_request(
     user: UserContext = Depends(get_current_user),
 ) -> dict:
     """Reject a pending request with an optional explanatory note. Admin only."""
-    _require_admin(user)
+    require_admin(user)
     updated = await community_installer.reject_request(
         request_id, user.sub, admin_note=body.admin_note,
     )

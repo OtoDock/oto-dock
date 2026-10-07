@@ -60,6 +60,8 @@ export const EDITOR_TIER: readonly EffectiveRole[] = ['manager', 'editor', 'admi
 export const WORKSPACE_TIER: readonly EffectiveRole[] = ['manager', 'editor', 'contributor', 'admin']
 /** Creates agents; reaches the creator surfaces. */
 export const CREATOR_TIER: readonly PlatformRole[] = ['admin', 'creator']
+/** The per-agent roles a Shared-only agent's rows may hold (its sessions run as the agent). */
+export const SHARED_ONLY_ROLES: readonly AgentRole[] = ['manager', 'editor']
 
 /** A word outside the table ranks 0: it clears the viewer floor and no other. */
 export const ROLE_RANK: Record<string, number> = Object.fromEntries(EFFECTIVE_ROLES.map((r, i) => [r, i]))
@@ -80,6 +82,11 @@ export function isAdmin(subject: RoleBearer): boolean {
 /** Admin or creator: the platform roles that create agents and reach the creator surfaces. */
 export function isCreatorOrAbove(subject: RoleBearer): boolean {
   return (CREATOR_TIER as readonly string[]).includes(roleOf(subject))
+}
+
+/** Whether an assignment of `role` may be written on a Shared-only agent. */
+export function allowedOnSharedOnly(role: string | null | undefined): boolean {
+  return (SHARED_ONLY_ROLES as readonly string[]).includes(role || '')
 }
 
 /**

@@ -54,9 +54,9 @@ def _bearer_session(user_sub: str) -> dict[str, str]:
     """A session-scoped JWT (the config-MCP's credential) resolving back to
     a REAL user row — is_api_key=True, so the cookie-only admin bypass must
     not apply."""
-    from auth.session_token import create_session_token
+    from tests.conftest import live_session_token
     return {"Authorization":
-            f"Bearer {create_session_token('sess-1', SLUG, user_sub)}"}
+            f"Bearer {live_session_token('sess-1', SLUG, user_sub)}"}
 
 
 def _assign_manager(sub: str) -> None:

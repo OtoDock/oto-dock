@@ -202,21 +202,20 @@ async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], 
     absent so ``install_mcp`` falls back to creating it on uv's default Python.
     """
     spec = f"{target[0]}.{target[1]}"
-    env = {
-        **os.environ,
+    # The installer's own environment and time bound, as every install
+    # subprocess gets: no platform secret reaches uv.
+    env = mcp_installer._install_env({
         "UV_PYTHON_INSTALL_DIR": str(mcp_dir.parent.parent / ".uv-python"),
         "UV_LINK_MODE": "copy",
-    }
+    })
     try:
-        proc = await asyncio.create_subprocess_exec(
-            uv_bin, "venv", "--python", spec, str(venv_dir),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+        rc, out = await mcp_installer._run_bounded(
+            [uv_bin, "venv", "--python", spec, str(venv_dir)],
+            cwd=None, env=env, timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
         )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
+        if rc != 0:
             logger.warning(
-                "uv venv --python %s for %s failed: %s",
-                spec, mcp_dir.name, out.decode(errors="replace")[-300:],
+                "uv venv --python %s for %s failed: %s", spec, mcp_dir.name, out[-300:],
             )
     except Exception:
         logger.exception("uv venv --python %s for %s errored", spec, mcp_dir.name)
@@ -245,17 +244,17 @@ async def _reconcile_node_addons(mcp_dir: Path, name: str) -> str | None:
         name, recorded, current,
     )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "npm", "rebuild", cwd=str(mcp_dir),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        # The packages' lifecycle scripts run here: the installer's
+        # environment and time bound, as for every install subprocess. A
+        # timeout keeps the old marker, so the next boot tries again.
+        rc, out = await mcp_installer._run_bounded(
+            ["npm", "rebuild"], cwd=str(mcp_dir), env=mcp_installer._install_env(),
+            timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
         )
-        out, _ = await proc.communicate()
-        if proc.returncode == 0:
+        if rc == 0:
             _write_marker(mcp_dir, node_major=current)
             return "ok-node-rebuild"
-        logger.warning(
-            "npm rebuild for %s failed: %s", name, out.decode(errors="replace")[-300:],
-        )
+        logger.warning("npm rebuild for %s failed: %s", name, out[-300:])
         return "skipped-node-rebuild-fail"
     except Exception:
         logger.exception("npm rebuild for %s errored", name)

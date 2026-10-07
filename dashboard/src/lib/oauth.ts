@@ -18,7 +18,12 @@ interface DeepLinkWaiter {
   promise: Promise<string>
   resolve: (url: string) => void
   reject: (err: Error) => void
+  /** Start the timeout; a no-op once started or settled. */
+  arm: (timeoutMs: number) => void
 }
+
+/** How long a flow's link may take once the browser opened (the server's state TTL). */
+const DEEP_LINK_TIMEOUT_MS = 300_000
 
 // The waiter the next otodock://oauth/* link resolves.
 let pendingDeepLink: DeepLinkWaiter | null = null
@@ -37,14 +42,19 @@ export function deepLinkPending(): boolean {
   pendingDeepLink?.resolve(url)
 }
 
-function createWaiter(timeoutMs: number): DeepLinkWaiter {
+/** A waiter for the next link; untimed until armed when `timeoutMs` is null
+ * (it counts for deepLinkPending either way). */
+function createWaiter(timeoutMs: number | null): DeepLinkWaiter {
   let resolvePromise!: (url: string) => void
   let rejectPromise!: (err: Error) => void
   const promise = new Promise<string>((res, rej) => { resolvePromise = res; rejectPromise = rej })
   // Handled here so a decline settled before the caller awaits is never reported
   // as unhandled; the caller's own await still receives it.
   promise.catch(() => {})
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let settled = false
   const settle = () => {
+    settled = true
     clearTimeout(timer)
     if (pendingDeepLink === waiter) pendingDeepLink = null
   }
@@ -52,11 +62,14 @@ function createWaiter(timeoutMs: number): DeepLinkWaiter {
     promise,
     resolve: (url) => { settle(); resolvePromise(url) },
     reject: (err) => { settle(); rejectPromise(err) },
+    arm: (ms) => {
+      if (settled || timer !== undefined) return
+      timer = setTimeout(() => waiter.reject(new Error('OAuth timeout: no response from browser')), ms)
+    },
   }
-  const timer = setTimeout(
-    () => waiter.reject(new Error('OAuth timeout: no response from browser')), timeoutMs)
   pendingDeepLink?.reject(new Error('Superseded by a newer sign-in'))
   pendingDeepLink = waiter
+  if (timeoutMs !== null) waiter.arm(timeoutMs)
   return waiter
 }
 
@@ -66,7 +79,7 @@ function createWaiter(timeoutMs: number): DeepLinkWaiter {
  * Rejects after timeout (default 5 min, matching server state TTL), and at once
  * when the person declined the app's confirm for the flow just opened.
  */
-export function waitForDeepLink(timeoutMs = 300_000): Promise<string> {
+export function waitForDeepLink(timeoutMs = DEEP_LINK_TIMEOUT_MS): Promise<string> {
   const mine = handedOver
   handedOver = null
   return mine ? mine.promise : createWaiter(timeoutMs).promise
@@ -97,10 +110,20 @@ export async function openOAuthWindow(
       // Deep link mode: the app opens the system browser (after the person
       // confirms another site); the browser redirects to otodock://, which the
       // app routes back via onNewIntent → handleDeepLink. The waiter exists
-      // before the ask, so a build reload waits while the confirm is open.
-      const waiter = createWaiter(300_000)
+      // before the ask, so a build reload waits while the confirm is open,
+      // and its timeout starts only once the browser opened: the confirm may
+      // stay open for NATIVE_BROWSER_TIMEOUT_MS. Every way out of the ask
+      // either arms it or rejects it, so the reload is never held for good.
+      const waiter = createWaiter(null)
       handedOver = waiter
-      if (await openNativeBrowser(url, 'oauth')) return true
+      let opened = false
+      try {
+        opened = await openNativeBrowser(url, 'oauth')
+      } catch { /* no answer: a cancel */ }
+      if (opened) {
+        waiter.arm(DEEP_LINK_TIMEOUT_MS)
+        return true
+      }
       waiter.reject(new Error('Sign-in cancelled'))
       return false
     }

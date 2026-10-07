@@ -98,3 +98,94 @@ async def test_ready_status_always_forwards(temp_db):
     conn = _Conn()
     await conn._handle_server_notification(_status("sc-ready", "ready"))
     assert conn.sent == [_status("sc-ready", "ready")]
+
+
+@pytest.mark.asyncio
+async def test_a_delegate_result_keeps_its_typed_ending(temp_db):
+    """The dashboard-socket rung of a delegate result: the persisted row and
+    the frame carry the worker's typed ending, as the other rungs do."""
+    import json
+    temp_db.create_chat("sc-deleg", "user-admin", "a1")
+
+    class _Viewer(_Conn):
+        chat_id = "sc-deleg"
+        session_id = "sess-deleg"
+        layer = object()
+
+        async def _run_server_turn(self, *a, **k):
+            return object()
+
+    conn = _Viewer()
+    await conn._handle_server_notification({
+        "type": "task_result_prompt", "chat_id": "sc-deleg", "session_id": "sess-deleg",
+        "task_id": "t-1", "task_name": "lane", "result_prompt": "p", "delegate_agent": "w",
+        "output_text": "⚠ declined", "status": "failed",
+        "reason": "declined", "resets_at": "",
+    })
+    frame = next(f for f in conn.sent if f["type"] == "delegate_result")
+    assert frame["reason"] == "declined" and frame["resets_at"] == ""
+    rows = [m for m in temp_db.get_chat_messages("sc-deleg") if m.get("event_type") == "delegate_result"]
+    assert json.loads(rows[-1]["event_data"])["reason"] == "declined"
+
+
+@pytest.mark.asyncio
+async def test_a_delegate_result_whose_turn_cannot_start_is_stored_as_the_socket_person(temp_db):
+    """No turn ran for the result: the prompt is stored as the chat's wake
+    for the person this socket's turn runs as, at their role on the agent,
+    off the loop."""
+    from storage.identity import db_users
+    temp_db.create_chat("sc-park", "agent::a1", "a1")
+    db_users.add_user_agent("user-viewer", "a1", "editor", "user-admin")
+
+    class _Dead(_Conn):
+        chat_id = "sc-other"
+        session_id = "sess-other"
+        user_sub = "user-viewer"
+
+        async def _resolve_layer_for_chat_async(self, cid):
+            return object()
+
+        async def _run_server_turn(self, *a, **k):
+            return None
+
+    await _Dead()._handle_server_notification({
+        "type": "task_result_prompt", "chat_id": "sc-park", "session_id": "sess-park",
+        "task_id": "t-2", "task_name": "lane", "result_prompt": "the result",
+        "delegate_agent": "w", "output_text": "done", "status": "completed",
+    })
+    assert temp_db.claim_pending_wake_records("sc-park") == [
+        {"prompt": "the result", "person": "user-viewer", "role": "editor", "by": ""}]
+
+
+@pytest.mark.asyncio
+async def test_a_delegate_result_keeps_its_files_and_verdict(temp_db):
+    """The dashboard-socket rung rebuilds the row and the frame from the notify
+    item through one helper: the worker's files, the skipped ones and the
+    failing check's verdict survive it as the typed ending does."""
+    import json
+    temp_db.create_chat("sc-files", "user-admin", "a1")
+
+    class _Viewer(_Conn):
+        chat_id = "sc-files"
+        session_id = "sess-files"
+        layer = object()
+
+        async def _run_server_turn(self, *a, **k):
+            return object()
+
+    files = [{"path": "users/u/workspace/inbox/w/r.md", "bytes": 5}]
+    skipped = [{"path": "x", "reason": "symlink"}]
+    verdict = {"check": "answer", "round": 1, "summary": "no"}
+    conn = _Viewer()
+    await conn._handle_server_notification({
+        "type": "task_result_prompt", "chat_id": "sc-files", "session_id": "sess-files",
+        "task_id": "t-2", "task_name": "lane", "result_prompt": "p", "delegate_agent": "w",
+        "output_text": "done", "status": "completed",
+        "files": files, "files_skipped": skipped, "verdict": verdict,
+    })
+    frame = next(f for f in conn.sent if f["type"] == "delegate_result")
+    assert frame["files"] == files and frame["files_skipped"] == skipped
+    assert frame["verdict"] == verdict and "reason" not in frame
+    rows = [m for m in temp_db.get_chat_messages("sc-files") if m.get("event_type") == "delegate_result"]
+    data = json.loads(rows[-1]["event_data"])
+    assert data["files"] == files and data["verdict"] == verdict

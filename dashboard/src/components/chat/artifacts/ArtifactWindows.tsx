@@ -6,7 +6,7 @@ import type { ArtifactWindow } from '@/hooks/useArtifactWindows'
 /**
  * The floating (OPEN) artifact windows for an interactive CLI session.
  * Each display/file-tools artifact (gallery/chart,
- * video, audio, url, file, Collabora preview) opens as a draggable, minimizable
+ * video, audio, url, file, ui page) opens as a draggable, minimizable
  * glass panel over the terminal. Window data comes from `useArtifactWindows`;
  * this component owns only the view (positions + z-order + drag). Minimized
  * windows dock as icon-buttons in the page's top-left panel stack — that is the
@@ -29,16 +29,16 @@ interface Props {
 
 interface Pos { x: number; y: number }
 
-// px widths (clamped to the container on small screens). Documents (Collabora)
-// and ui artifacts need a larger window than a gallery / link card.
+// px widths (clamped to the container on small screens). A ui artifact needs
+// a larger window than a gallery / link card. (A document opens in the
+// chat's document pane, never here.)
 const WIN_W_DEFAULT = 384 // matches w-96
-const WIN_W_DOC = 640     // matches w-[40rem]
-const isDocWin = (w: ArtifactWindow) => w.block.type === 'document_preview'
+const WIN_W_FRAME = 640   // matches w-[40rem]
 // Iframe-hosting windows: the window is fixed-size with overflow-hidden and
 // the IFRAME is the single scroller — an overflow-auto body around an
 // auto-height iframe stacks two scrollbars.
-const isFrameWin = (w: ArtifactWindow) => isDocWin(w) || w.block.type === 'ui'
-const winWidthPx = (w: ArtifactWindow) => (isFrameWin(w) ? WIN_W_DOC : WIN_W_DEFAULT)
+const isFrameWin = (w: ArtifactWindow) => w.block.type === 'ui'
+const winWidthPx = (w: ArtifactWindow) => (isFrameWin(w) ? WIN_W_FRAME : WIN_W_DEFAULT)
 
 export default function ArtifactWindows({ windows, minimized, onClose, onMinimize, agent, onArtifactInteraction }: Props) {
   const overlayRef = useRef<HTMLDivElement | null>(null)
@@ -137,15 +137,15 @@ export default function ArtifactWindows({ windows, minimized, onClose, onMinimiz
   return (
     <div ref={overlayRef} className="pointer-events-none absolute inset-0 z-30 overflow-hidden">
       {/* Render ALL windows, hiding minimized ones with `hidden` instead of
-          unmounting — so a playing video/audio and a loaded Collabora iframe
-          keep running in the background while minimized (the dock shows their
+          unmounting — so a playing video/audio and a loaded ui page keep
+          running in the background while minimized (the dock shows their
           icons). display:none does not pause media playback. */}
       {windows.map((w) => {
         const pos = positions[w.id] || { x: 24, y: 16 }
         const z = Math.max(0, order.indexOf(w.id))
         const frame = isFrameWin(w)
         const hidden = minimized.has(w.id)
-        // Iframe windows (Collabora, ui artifacts) are larger + fixed-height so
+        // Iframe windows (ui artifacts) are larger + fixed-height so
         // the embedded iframe fills them; other artifacts size to content
         // (max-height capped).
         const sizeCls = frame

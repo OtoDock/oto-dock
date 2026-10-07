@@ -2,8 +2,9 @@
 
 stdio MCP server for visible parallel delegation: spawn worker sessions
 (background tasks or first-class chats), monitor sibling sessions, peek
-into delegated lanes, and send file copies to a target's inbox
-(send_files — the passive half of cross-agent handoff). Scheduling
+into delegated lanes, send file copies to a target's inbox (send_files,
+the passive half of cross-agent handoff), and, as a delegated worker,
+attach deliverables to the result (attach_result_files). Scheduling
 (recurring/one-time/trigger tasks) lives in the separate schedules-mcp.
 
 Environment variables (set in per-agent mcp-config.json):
@@ -89,6 +90,61 @@ def _send_files_failure(target_agent: str, e: httpx.HTTPStatusError) -> str:
     )
 
 
+def _attach_failure(e: httpx.HTTPStatusError) -> str:
+    """An attach refusal is one sentence and copies nothing; a 5xx may have
+    landed some files, so it must not read as a clean refusal."""
+    status = e.response.status_code
+    try:
+        detail = e.response.json().get("detail") or e.response.text
+    except Exception:
+        detail = e.response.text
+    if isinstance(detail, list):
+        # A validation answer: its messages, not the schema's dicts.
+        detail = "; ".join(str(d.get("msg", d)) if isinstance(d, dict) else str(d)
+                           for d in detail) or e.response.text
+    if status < 500:
+        return f"Nothing attached: {detail}"
+    return (
+        f"The platform could not finish the attach (HTTP {status}): files may "
+        f"still have landed. Name the paths in your report and do not attach "
+        f"them again. {detail}"
+    )
+
+
+def _attach_report(result: dict) -> str:
+    def _size(n: int) -> str:
+        if n < 1024:
+            return f"{n} B"
+        if n < 1024 * 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n / (1024 * 1024):.1f} MB"
+
+    files = result.get("files") or []
+    named = result.get("named") or []
+    skipped = result.get("skipped") or []
+    lines: list[str] = []
+    if files:
+        lines.append(
+            f"Attached {len(files)} file(s) ({_size(result.get('total_bytes') or 0)}) to "
+            f"the result for '{result.get('target_agent', '?')}':"
+        )
+        lines.extend(f"  {r['ws_path']} ({_size(int(r.get('bytes') or 0))})" for r in files)
+    if named:
+        lines.append(
+            "Already in the delegating chat's workspace (named, not copied): "
+            + ", ".join(r["ws_path"] for r in named)
+        )
+    if skipped:
+        lines.append("Not attached: " + ", ".join(
+            f"{r['path']} ({r['reason']})" for r in skipped))
+    lines.append(
+        f"The result delivered to the delegating agent names these files. "
+        f"This run: {result.get('attached', 0)} of {result.get('max_per_run', '?')} "
+        f"rows used."
+    )
+    return "\n".join(lines)
+
+
 async def _get(path: str, params: dict | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{PROXY_URL}{path}", params=params, headers=_headers())
@@ -170,10 +226,10 @@ async def list_tools() -> list[Tool]:
                     "output_dir": {
                         "type": "string",
                         "description": (
-                            "Relative path within the target agent's workspace/ directory "
-                            "where the worker should save output files (e.g. 'research/AAPL', "
-                            "'reports/monthly'). The worker will be instructed to write "
-                            "files there."
+                            "Relative folder inside the WORKER's own workspace where it "
+                            "should save output files (e.g. 'research/AAPL', "
+                            "'reports/monthly'). The worker is told to write there and "
+                            "to attach the files to its result, so they reach you."
                         ),
                     },
                     "project_id": {
@@ -198,7 +254,14 @@ async def list_tools() -> list[Tool]:
                             "pick by the capability tier tagged there, [t1] frontier "
                             "for judgement-heavy work down to [t4] fast for routine "
                             "work; the Model tiers list explains each). Omit to "
-                            "inherit the agent's default. Ignored with continue_id."
+                            "inherit the agent's default. With continue_id it moves "
+                            "the continued worker to this model: the worker resumes "
+                            "its conversation on it (background work it still ran "
+                            "ends), and the model must be an enabled one of the "
+                            "worker's own layer (on Codex, of the chat's model "
+                            "provider). Refused while the worker is mid-turn (wait "
+                            "for its result) or when its chat has a live terminal "
+                            "open; layer and mode stay ignored with continue_id."
                         ),
                     },
                     "layer": {
@@ -287,6 +350,54 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["target_agent", "paths"],
+            },
+        ),
+        Tool(
+            name="attach_result_files",
+            description=(
+                "Attach deliverables of THIS delegated run to your result. Use it "
+                "only when your prompt starts with [DELEGATED_WORK]; any other "
+                "session is refused with the reason. COPIES of the named files "
+                "from your workspace land in the DELEGATING agent's inbox folder "
+                "(a subfolder named after you; existing files are never "
+                "overwritten), and the result that reaches it names them beside "
+                "your report, with an Open button in its chat. Call it BEFORE your "
+                "final message and name the files in the report too. A file you "
+                "change after attaching it is not copied again unless you attach "
+                "it again. Directories copy recursively; symlinks, .partial files "
+                "and engine state folders are skipped; other dot-files are "
+                "allowed. When you and the delegating chat work in the same "
+                "workspace the files are named where they are and nothing is "
+                "copied. A delegating chat on a Shared-only agent receives the "
+                "files in that agent's shared workspace, which every member sees. "
+                "Caps: the per-call file count after expansion (the send_files "
+                "cap) and a per-run total; a call over a cap is refused whole: "
+                "split it or send an archive."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Files or directories to attach, relative to your "
+                            "workspace/ directory (e.g. 'report.md', "
+                            "'analysis/out'). Directories copy recursively. "
+                            "Files you wrote or changed in this turn are "
+                            "attachable right away, also on a remote machine."
+                        ),
+                    },
+                    "dest_dir": {
+                        "type": "string",
+                        "description": (
+                            "Optional subfolder inside your inbox slot on the "
+                            "delegating agent (e.g. 'round-2'): relative, no '..', "
+                            "no hidden segment."
+                        ),
+                    },
+                },
+                "required": ["paths"],
             },
         ),
         Tool(
@@ -410,9 +521,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         text=f"Cannot delegate to '{target_agent}'. Cross-agent delegation targets for this agent: {available}. Self-delegation to '{AGENT}' is always allowed.",
                     )]
 
-            # Validate and resolve output_dir. User-scoped workers → the user's
-            # isolated dir; agent-scoped → the shared workspace.
-            username = os.environ.get("OTO_USERNAME") or os.environ.get("PROXY_TASK_USERNAME") or ""
+            # The output_dir hint names a folder inside the WORKER's own
+            # workspace, whatever scope the proxy clamps the worker to; the
+            # worker's session resolves the tree.
             output_dir = arguments.get("output_dir")
             task_prompt = arguments["prompt"]
             if output_dir:
@@ -420,17 +531,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if err:
                     return [TextContent(type="text", text=f"Invalid output_dir '{output_dir}': {err}")]
                 clean_dir = str(Path(output_dir))
-                # Continues may omit the agent — the path hint then assumes
-                # the common same-agent case (the proxy knows the real one).
-                dir_agent = target_agent or AGENT
-                if PARENT_SCOPE == "user" and username:
-                    full_path = f"agents/{dir_agent}/users/{username}/workspace/{clean_dir}"
-                else:
-                    full_path = f"agents/{dir_agent}/workspace/{clean_dir}"
                 task_prompt = (
                     f"[TASK_OUTPUT_DIR]\n"
-                    f"Save any output files to: {full_path}/\n"
-                    f"Create the directory if it does not exist.\n"
+                    f"Save any output files under {clean_dir}/ inside your own "
+                    f"workspace folder (create it if it does not exist), and attach "
+                    f"them to your result with attach_result_files.\n"
                     f"[/TASK_OUTPUT_DIR]\n\n"
                     f"{task_prompt}"
                 )
@@ -447,7 +552,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 f"blocked. Do not send the caller a to-do list or questions to answer "
                 f"by delegation: it cannot delegate back to you and would have to "
                 f"re-open this lane just to reply. Put anything it must do on a single "
-                f"'Blocked on:' line.\n"
+                f"'Blocked on:' line. Attach the files you produced with "
+                f"attach_result_files(paths) before your final message and name "
+                f"them in the report: the delegating agent receives copies in its "
+                f"inbox.\n"
                 f"[/DELEGATED_WORK]\n\n"
                 f"{task_prompt}"
             )
@@ -551,6 +659,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "pointing at the inbox path if it should act on the files now."
             )
             return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "attach_result_files":
+            paths = arguments.get("paths") or []
+            if not paths:
+                return [TextContent(type="text", text="Error: a non-empty paths list is required.")]
+            dest_dir = arguments.get("dest_dir") or ""
+            if dest_dir:
+                err = _validate_output_dir(dest_dir)
+                if err:
+                    return [TextContent(type="text", text=f"Invalid dest_dir '{dest_dir}': {err}")]
+            try:
+                result = await _post("/v1/delegation/attach_result_files", {
+                    "paths": paths,
+                    "dest_dir": dest_dir,
+                    # A remote machine's files are read through first: well
+                    # past the 30 s default, as send_files.
+                }, timeout=300.0)
+            except httpx.HTTPStatusError as e:
+                return [TextContent(type="text", text=_attach_failure(e))]
+            except httpx.TimeoutException:
+                return [TextContent(type="text", text=(
+                    "The platform gave no answer in 300 s: files may still have "
+                    "landed. Name the paths in your report and do not attach them again."
+                ))]
+            return [TextContent(type="text", text=_attach_report(result))]
 
         elif name == "list_sessions":
             params = {"limit": arguments.get("limit", 30)}

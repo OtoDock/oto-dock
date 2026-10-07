@@ -19,6 +19,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
+import time
+
 import config as app_config
 from core import placement
 from core.events.common_events import CommonEvent, ERROR, METADATA, DONE, PLAN_MODE
@@ -40,6 +42,7 @@ from core.session.session_state import (
     set_session_codex_dir,
     resolve_permission,
     resolve_session_permissions,
+    mark_starting, clear_starting, session_is_held, START_MARK_TTL_S,
 )
 
 logger = logging.getLogger("codex-layer")
@@ -76,7 +79,7 @@ _CODEX_CAPABILITIES = LayerCapabilities(
     # "max" is real wire vocabulary from the GPT-5.6 family on (GPT-6 too);
     # older models clamp to xhigh in map_effort_to_codex. "ultra" (Codex-
     # native proactive multi-agent orchestration on top of max/xhigh
-    # reasoning) is per-MODEL — gpt-5.6 Sol/Terra and gpt-6-astra, never
+    # reasoning) is per-MODEL — the Sols, Terra and gpt-6-astra, never
     # Luna — so the registry flag is emitted per model row (offers_ultra
     # above says this engine can run it at all) and map_effort_to_codex
     # clamps it everywhere else (see helpers).
@@ -123,7 +126,8 @@ _CODEX_CAPABILITIES = LayerCapabilities(
         supports_remote_execution=True,
         supports_interactive_pty=True,        # the native Ratatui TUI under a PTY
         interactive_first_prompt_via_argv=True,    # `codex <PROMPT>` auto-runs after MCP warm
-        supports_reattach_after_restart=False,# next-turn resume by thread id, no live re-adopt
+        supports_reattach_after_restart=False,# no turn replay: a turn across a restart is lost
+        readopts_idle_session=True,           # an idle app-server is taken back by its thread
         binary="codex",
         pin_key="codex",                      # cli_pins wire key — frozen
         config_dir_name=".codex",             # CODEX_HOME under the session's scope root
@@ -157,12 +161,12 @@ _CODEX_CAPABILITIES = LayerCapabilities(
             "discovery": ("tool_search_call",),
             "todo": ("update_plan",),
             "question": ("request_user_input",),
-            "escalation": ("CodexEscalation",),
+            "escalation": ("CodexEscalation", "CodexTerminalInput"),
         },
         question_tool_holds_turn=True,        # request_user_input holds the turn on item/tool/requestUserInput; ask_user_question answers it
     ),
     model_policy=ModelPolicy(
-        default_model="gpt-6-sol",            # tier 2; Astra (tier 1) is offered, never defaulted
+        default_model="gpt-6.1-sol",          # tier 2; Astra (tier 1) is offered, never defaulted
         model_filter_policy="local_providers",# a personal ChatGPT account keeps the OpenAI builtins
         pricing_editable=False,
     ),
@@ -208,8 +212,6 @@ _CODEX_TOOLS_TABLE = "[tools]\nupdate_plan = { enabled = true }"
 
 _TOML_MCP_SECTION_RE = re.compile(r"^\[mcp_servers\.([a-zA-Z0-9_-]+)\]")
 _TOML_ENV_LINE_RE = re.compile(r'^(\s*env\s*=\s*\{)(.*)\}(\s*)$')
-_TOML_HTTP_HEADERS_RE = re.compile(r"^\[mcp_servers\.([a-zA-Z0-9_-]+)\.http_headers\]")
-_TOML_AUTH_LINE_RE = re.compile(r'^(\s*)"?Authorization"?\s*=\s*"Bearer\s+[^"]*"(\s*)$')
 
 
 def _inject_fetch_tokens_toml(
@@ -244,41 +246,6 @@ def _inject_fetch_tokens_toml(
                 f'{head}{inner.rstrip()}{sep}"OTO_MCP_FETCH_TOKEN" = "{esc}" }}{trail}{nl}'
             )
             continue
-        out_lines.append(line)
-    return "".join(out_lines)
-
-
-def _inject_real_bearers_toml(toml_content: str, bundles: dict) -> str:
-    """Swap the sentinel ``Authorization`` bearer in each proxy-terminable HTTP
-    MCP's ``http_headers`` sub-table for the REAL token from its bundle (local
-    Codex).
-
-    Local Codex has no tunnel ``_dispatch`` to swap at, so — on the TRUSTED proxy
-    host — the real bearer lands inline in this per-session ``config.toml``
-    (agent-read-denied; never the shared sessions/ file). Only fires for slugs
-    whose bundle carries an ``http_bearer`` (github/m365); vendor HTTP MCPs (real
-    bearer already inline) and stdio MCPs are untouched.
-    """
-    out_lines: list[str] = []
-    slug: str | None = None
-    for line in toml_content.splitlines(keepends=True):
-        nl = "\n" if line.endswith("\n") else ""
-        body = line[: -len(nl)] if nl else line
-        stripped = body.strip()
-        m = _TOML_MCP_SECTION_RE.match(stripped) or _TOML_HTTP_HEADERS_RE.match(stripped)
-        if m:
-            slug = m.group(1)
-            out_lines.append(line)
-            continue
-        am = _TOML_AUTH_LINE_RE.match(body)
-        if am and slug is not None:
-            bearer = getattr(bundles.get(slug), "http_bearer", None)
-            if bearer:
-                esc = bearer.replace("\\", "\\\\").replace('"', '\\"')
-                out_lines.append(
-                    f'{am.group(1)}"Authorization" = "Bearer {esc}"{am.group(2)}{nl}'
-                )
-                continue
         out_lines.append(line)
     return "".join(out_lines)
 
@@ -416,12 +383,19 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         derive their external claim from the live context. A failed spawn
         drops the registration again (see the CLI layer).
         """
-        register_session_state(session_id, config.permission_mode, config.security_context)
+        held = session_is_held(session_id)
+        mark_starting(session_id, START_MARK_TTL_S)
         try:
-            await self._start_session_impl(session_id, config)
-        except BaseException:
-            cleanup_session_permission_state(session_id)
-            raise
+            register_session_state(session_id, config.permission_mode, config.security_context,
+                                   token_minted_at=config.token_minted_at)
+            try:
+                await self._start_session_impl(session_id, config)
+            except BaseException:
+                if not held:
+                    cleanup_session_permission_state(session_id)
+                raise
+        finally:
+            clear_starting(session_id)
 
     async def _start_session_impl(self, session_id: str, config: AgentConfig) -> None:
         # Fail CLOSED: a local agent MUST run sandboxed + network-isolated. The
@@ -553,9 +527,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # CODEX_HOME as Codex sees it INSIDE the sandbox (config.toml paths).
         sandbox_codex_dir = env_overrides.get("CODEX_HOME", "/workspace/.codex")
 
-        # ssh-hosts (context-only MCP): provision the agent's authorized SSH
-        # keys into <.codex>/ssh so the prompt's `ssh -i "$OTO_SSH_KEY_DIR/…"`
-        # lines work from the Codex shell (mirrors the CLI layer). A session
+        # ssh-hosts: provision the agent's authorized SSH keys into
+        # <.codex>/ssh so the prompt's `ssh -i "$OTO_SSH_KEY_DIR/…"` lines
+        # work from the Codex shell (mirrors the CLI layer). A session
         # that takes no keys is left none from an earlier one (the helper's
         # rule).
         from core.sandbox.session_config_dir import provision_ssh_keys_for_sandbox
@@ -635,16 +609,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 mcp_toml_content = _inject_fetch_tokens_toml(
                     mcp_toml_content, bundle_keys, session_id,
                 )
-                # Swap the sentinel bearer for the real token on
-                # proxy-terminable github/m365 HTTP MCPs (local — no tunnel
-                # _dispatch — so it lands inline in this trusted, agent-read-denied
-                # config.toml). No-op when no HTTP MCP has a bundle bearer.
-                mcp_toml_content = _inject_real_bearers_toml(
-                    mcp_toml_content, config.mcp_secret_bundles or {},
-                )
             from core.sandbox.interceptor_wrap import wrap_toml_text
             mcp_toml_content = wrap_toml_text(
-                mcp_toml_content, interpreter="python3",
+                mcp_toml_content, interpreter="python3", interpreter_args=("-I",),
                 interceptor_path=f"{sandbox_codex_dir}/stdio_path_interceptor.py",
             )
 
@@ -743,12 +710,18 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             # xterm scrollback); the command-level FLOOR runs via .codex/hooks.json
             # (config has hooks=true) with --dangerously-bypass-hook-trust (the
             # platform vets the hook source). Sandbox/approval are derived from the
-            # permission mode (same mapping as the app-server).
+            # permission mode (same mapping as the app-server). --no-daemon: Codex
+            # 0.157 auto-starts a shared background server (its own Codex install,
+            # outside the pin) for eligible TUIs; the trust flag already keeps this
+            # TUI out of it, and --no-daemon turns the auto-start off with the
+            # "Running without the shared background server" line it printed at
+            # start (the flag exists on the previous pin 0.156.1 too).
             flags = [
                 "--no-alt-screen",
                 "-s", sandbox_mode,
                 "-a", approval,
                 "--dangerously-bypass-hook-trust",
+                "--no-daemon",
                 "-C", sandbox_cwd,
             ]
             if config.model:
@@ -810,14 +783,14 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 from services.engines.subscription_pool import (
                     bind_session, credential_scope_key,
                 )
-                bind_session(
+                await asyncio.wrap_future(bind_session(
                     session_id, config.subscription_id,
                     layer="codex-cli", user_sub=config.subscription_user_sub,
                     scope_key=credential_scope_key(
                         config.execution_target or placement.LOCAL,
                         config.sandbox_host_claude_dir,
                     ),
-                )
+                ))
                 if wrote_auth_json:
                     self._register_fanout_target(session_id, config)
             return
@@ -853,14 +826,14 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             from services.engines.subscription_pool import (
                 bind_session, credential_scope_key,
             )
-            bind_session(
+            await asyncio.wrap_future(bind_session(
                 session_id, config.subscription_id,
                 layer="codex-cli", user_sub=config.subscription_user_sub,
                 scope_key=credential_scope_key(
                     config.execution_target or placement.LOCAL,
                     config.sandbox_host_claude_dir,
                 ),
-            )
+            ))
             if wrote_auth_json:
                 self._register_fanout_target(session_id, config)
 
@@ -1057,6 +1030,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
 
         async for codex_event in session.send_message(
             message, inject_time=inject_time,
+            task=bool(kwargs.get("settle_after_result")),
         ):
             if in_plan and codex_event.type == "item/completed":
                 _item = (codex_event.data or {}).get("item") or {}
@@ -1096,6 +1070,17 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         release_subscription(session_id)
         from core.concurrency import release_chat_slot
         release_chat_slot(session_id)
+
+    def session_idle_seconds(self, session_id: str) -> float | None:
+        """Seconds since the daemon's last notification (or the last turn
+        start, steer or compaction): the resume reaper and the task watchdog
+        read it to probe a silent local turn, as they probe a remote one.
+        None for a session the registry does not hold."""
+        from .session import _codex_sessions
+        session = _codex_sessions.get(session_id)
+        if session is None:
+            return None
+        return time.monotonic() - session.last_activity
 
     async def abort(self, session_id: str) -> bool:
         # The app-server daemon, its warm MCP subprocesses and the stdio

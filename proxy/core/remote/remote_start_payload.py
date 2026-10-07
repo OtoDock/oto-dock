@@ -10,6 +10,7 @@ names an engine. Mixed into RemoteExecutionLayer; split out of
 remote_execution.py.
 """
 
+import asyncio
 import json
 import logging
 
@@ -55,6 +56,31 @@ def _load_hook_scripts() -> dict[str, str]:
             logger.warning("Hook script missing on proxy: %s", path)
     _HOOK_SCRIPTS_CACHE = scripts
     return scripts
+
+
+async def _gateway_facts(bundles: dict, gateway_mode: bool) -> dict[str, dict]:
+    """What the engine's config rewrite needs per credentialed HTTP MCP, by
+    mcpServers key: the upstream origin and path, the header, whether the
+    upstream is a sidecar the proxy reaches itself, and, for a vendor entry
+    on a machine below the gateway version, the header's value resolved
+    here off the loop (the inline shape; a refusal leaves the value empty
+    and the vendor answers the MCP). Secret-free in gateway mode."""
+    from core.credentials import mcp_gateway
+    facts: dict[str, dict] = {}
+    for key, bundle in (bundles or {}).items():
+        cred = getattr(bundle, "gateway", None)
+        if cred is None:
+            continue
+        f = {"upstream": cred.upstream, "path": cred.path, "header": cred.header,
+             "proxy_local": bool(cred.proxy_local), "value": ""}
+        if not cred.proxy_local and not gateway_mode:
+            res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
+            if isinstance(res, mcp_gateway.Refusal):
+                logger.warning("gateway: %s keeps no credential on this machine: %s", key, res.reason)
+            else:
+                f["value"] = res.value
+        facts[key] = f
+    return facts
 
 
 class RemoteStartPayloadMixin:
@@ -202,15 +228,13 @@ class RemoteStartPayloadMixin:
         # engine's MCP config rewrite, which makes the satellite wrap it with
         # the interceptor.
         secret_bundle_keys = set(config.mcp_secret_bundles or {})
-        # HTTP bearer-swap: the subset of bundle MCPs that carry an
-        # http_bearer (proxy-terminable github/m365). Their satellite config ships
-        # the per-session JWT as the Authorization bearer; the tunnel `_dispatch`
-        # swaps it for the real token server-side, so the real bearer never lands
-        # on the satellite disk.
-        bearer_swap_keys = {
-            k for k, b in (config.mcp_secret_bundles or {}).items()
-            if getattr(b, "http_bearer", None)
-        }
+        # The credential gateway: what the engine's rewrite needs per
+        # credentialed HTTP MCP. On a machine that runs the gateway a vendor
+        # entry dials the machine's loopback gateway and a sidecar entry the
+        # tunnel; below the gateway version a vendor entry keeps the inline
+        # shape, its value resolved here, off the loop.
+        gateway_mode = self._cm.satellite_supports_mcp_gateway(config.execution_target) is True
+        gateway = await _gateway_facts(config.mcp_secret_bundles or {}, gateway_mode)
 
         # The engine's part: its config dir, credential file, MCP config in
         # its format, resume handle, effort and sandbox mapping.
@@ -224,9 +248,11 @@ class RemoteStartPayloadMixin:
             env=env,
             proxy_api_key=env["PROXY_API_KEY"],
             secret_bundle_keys=secret_bundle_keys,
-            bearer_swap_keys=bearer_swap_keys,
+            gateway=gateway,
+            gateway_mode=gateway_mode,
             cm=self._cm,
         ))
+        plan.gateway_mode = gateway_mode
         # No engine's PRIVATE carrier (a credential blob, a local endpoint,
         # the model rows) ever rides the satellite env — the engine's own
         # builder consumed its own above; this strips every registered

@@ -210,6 +210,12 @@ def venv_exe(venv_dir: Path, name: str) -> Path:
     return venv_bin(venv_dir) / f"{name}{EXE_SUFFIX}"
 
 
+# The CLI's timeout on the permission gate and the Stop hook, and the
+# tunnel's default request timeout: an hour past the platform's own wait on a
+# person (its ``PROMPT_WAIT_S``, three days), so the platform answers first.
+HOOK_WAIT_S = 3 * 24 * 3600 + 3600
+
+
 def hook_command(hook_path: Path) -> str:
     """Build the ``settings.json::hooks.command`` string for CLAUDE hooks.
 
@@ -687,13 +693,13 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.130"
+SATELLITE_VERSION = "0.5.138"
 SHARED_LAYOUT_HASH = "2addd8b41902ccd73df4135667a276d215d83e635cc5d94587f764ba58d38ad9"
 SHARED_TERMINAL_QUERIES_HASH = "9d73a19b21e363dd688f4501d0376de7f5274db3cc79be863891461884bc595a"
-SHARED_STDIO_INTERCEPTOR_HASH = "7afe65d06ada641e89c9901c261417dbf3d0786f043ff415b7a580248b831449"
-SHARED_CODEX_APPROVALS_HASH = "1af4fbad6fd1e3483c2a420f85b7dfe7e91bb46b957950526270d8d7905a06e1"
+SHARED_STDIO_INTERCEPTOR_HASH = "249f4153f709bdad0dc0e9754fba2ccc1716dacf542214941bc7626a0a50f3fa"
+SHARED_CODEX_APPROVALS_HASH = "23845c21b11918b4590174e900226661f4a252c011b5cbee379f922157e908ee"
 SHARED_APP_SERVER_CLIENT_HASH = "36ccdaed5e23751c81e26df5f3ac9c15d9bf310ed471ac27579ddcbd0cff719d"
-SHARED_MCP_INSTALLER_HASH = "ce3d89b5e9b718da3a4190f0899ad12aad3caa6133547cf1b260f42503c53052"
+SHARED_MCP_INSTALLER_HASH = "bd8cd550a3edc4dd414ce269e97129c5b93fa7b2c215e64b4a98a229dd5da626"
 
 
 def _default_cli_bins() -> dict[str, str]:

@@ -62,14 +62,14 @@ _JOIN_CALLS = frozenset({"join_under", "resolve_under", "_verified_literal_path"
 # {path: (reason, {word: count})} — every site outside the homes, with why.
 KNOWN_LAYOUT_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "proxy/services/path_roles.py": ("the path_env ROLE names (`workspace`, `config`, …) the resolver dispatches on — a manifest vocabulary, not the folder", {"config": 1, "workspace": 2}),
+    "proxy/services/mcp/mcp_manifest_types.py": ("the skill `audience` values name the role tiers of auth/roles (`owner`, `editor`, `workspace`) — a manifest vocabulary, not the folder", {"workspace": 1}),
     "mcps/custom/agent-config-mcp/server.py": ("an MCP process reading the tree the API serves (config/context, the knowledge mirrors); it cannot import the leaf", {"context": 1, "knowledge": 3}),
     "mcps/custom/display-mcp/app_tools.py": ("an MCP process recovering the agent root from OTO_WORKSPACE_DIR by the layout's rule (the strip; put to the operator as OTO_AGENT_DIR)", {"users": 1, "workspace": 2}),
-    "mcps/custom/delegation-mcp/server.py": ("an MCP process composing the path HINT it writes into a task prompt — not a resolved path; it cannot import the leaf", {"users": 1, "workspace": 2}),
 }
 KNOWN_OS_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "proxy/services/infra/safe_fs.py": ("vendored into file-tools with no proxy import: probes its own kernel for openat2", {"linux": 1, "sys.platform": 1}),
     "mcps/custom/file-tools-mcp/safe_fs.py": ("the byte copy of services/infra/safe_fs.py the file-tools image runs (the copy test pins it)", {"linux": 1, "sys.platform": 1}),
-    "proxy/services/mcp/mcp_installer.py": ("vendored byte-for-byte into the satellite and self-contained by its docstring: its sys.platform reads and the package families (a manifest vocabulary) stay", {"win32": 3, "windows": 3, "darwin": 1, "linux": 1, "sys.platform": 3, "platform.system": 1}),
+    "proxy/services/mcp/mcp_installer.py": ("vendored byte-for-byte into the satellite and self-contained by its docstring: its sys.platform reads (the venv layout, `cmd /c`, and the bounded run's process-group spawn and tree kill) and the package families (a manifest vocabulary) stay", {"win32": 5, "windows": 3, "darwin": 1, "linux": 1, "sys.platform": 5, "platform.system": 1}),
     "mcps/custom/computer-mcp/environment.py": ("an MCP process probing its own host (os_kind / display_backend)", {"darwin": 4, "linux": 2, "windows": 1, "sys.platform": 1}),
     "mcps/custom/computer-mcp/executor.py": ("an MCP process probing its own host", {"darwin": 2, "windows": 1}),
     "mcps/custom/computer-mcp/screen.py": ("an MCP process probing its own host", {"windows": 1}),

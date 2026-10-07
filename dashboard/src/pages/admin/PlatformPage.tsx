@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { ScrollableTabs } from '../../components/ScrollableTabs'
 import GeneralTab from './GeneralTab'
 import ExecutionLayersTab from './ExecutionLayersTab'
@@ -24,8 +25,16 @@ const SETUP_TABS: { id: Tab; label: string }[] = [
   { id: 'system', label: 'System Settings' },
 ]
 
+function asTab(value: string | null): Tab | null {
+  return SETUP_TABS.find((t) => t.id === value)?.id ?? null
+}
+
 export default function PlatformPage() {
-  const [tab, setTab] = useState<Tab>('general')
+  // ?tab= opens a tab (the forwarding banner links to Security).
+  const [params] = useSearchParams()
+  const asked = asTab(params.get('tab'))
+  const [tab, setTab] = useState<Tab>(asked ?? 'general')
+  useEffect(() => { if (asked) setTab(asked) }, [asked])
 
   return (
     <div className="max-w-3xl">

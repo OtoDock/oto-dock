@@ -1,10 +1,12 @@
 import { useState } from 'react'
-import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useUpdateMcp, McpServer, McpUpdateInfo } from '../../api/mcps'
+import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useUpdateMcp, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, McpServer, McpUpdateInfo, McpSourceChange, McpSourceEnd } from '../../api/mcps'
 import { useAgents } from '../../api/agents'
-import { useSetInfraCredentials } from '../../api/credentials'
+import { useSetInfraCredentials, useCredentialSchema } from '../../api/credentials'
+import { useClientRegistrations, useForgetClientRegistration, ClientRegistration } from '../../api/oauth'
 import McpInstanceManager, { ApiKeyRelayInfo } from '../../components/admin/McpInstanceManager'
 import McpIcon from '../../components/McpIcon'
 import { useAuth } from '../../contexts/AuthContext'
+import { formatRelativeTime } from '../../lib/format'
 import { safeHref } from '../../lib/safeUrl'
 import { isContainerRuntime } from '../../lib/kinds/mcpRuntime'
 import { DOCKER_STATUS as DOCKER, ENABLE_DOCKER, type DockerStatus } from '../../lib/status/docker'
@@ -29,6 +31,245 @@ function InstanceManagerWrapper({ mcpName, apiKeyRelay }: { mcpName: string; api
   const { authConfig } = useAuth()
   return <McpInstanceManager mcpName={mcpName} agents={agents} apiKeyRelay={apiKeyRelay}
     airGapped={!!authConfig?.air_gapped} relayAvailable={!!authConfig?.relay_available} />
+}
+
+// A source as the card shows it: a link when it is a page (npm, PyPI, a
+// repository: an absolute http(s) URL), plain text for an image reference
+// or a host (safeHref alone would read those as paths of this origin).
+function SourceLink({ end }: { end: McpSourceEnd }) {
+  const href = /^https?:\/\//i.test(end.url || '') ? safeHref(end.url) : undefined
+  const text = end.url || '(no source)'
+  return href ? (
+    <a href={href} target="_blank" rel="noreferrer" className="font-mono text-brand hover:underline break-all"
+      onClick={e => e.stopPropagation()}>{text}</a>
+  ) : <span className="font-mono break-all">{text}</span>
+}
+
+function KeyList({ label, keys, tone }: { label: string; keys: string[]; tone?: 'warn' }) {
+  if (keys.length === 0) return null
+  return (
+    <p className={`text-[11px] ${tone === 'warn' ? 'text-amber-700 dark:text-amber-400' : 'text-p-text-secondary'}`}>
+      <span className="text-p-text-light">{label}:</span>{' '}
+      {keys.map(k => <code key={k} className="mr-1">{k}</code>)}
+    </p>
+  )
+}
+
+// The install's client registrations at the authorization server an MCP
+// server names: the live one, the older ones, and Forget (the row is
+// revoked, the next connect registers afresh). A server that also takes
+// the vendor's app tokens makes this the fallback sign-in, offered under
+// the app credentials: tools only, since a token issued for the MCP server
+// serves no webhook call.
+function RegisteredClientCard({ mcp, issuer, resourceHost, confidential, acceptsAppTokens, hostedActive, rows, onForget, forgetting }: {
+  mcp: McpServer; issuer: string; resourceHost: string; confidential: boolean; acceptsAppTokens: boolean
+  hostedActive: boolean; rows: ClientRegistration[]; onForget: (id: number) => void; forgetting: boolean
+}) {
+  const where = issuer ? (issuer.replace(/^https:\/\//, '')) : resourceHost
+  const live = rows.filter(r => !r.revoked_at)
+  const older = rows.filter(r => !!r.revoked_at)
+  return (
+    <div className="rounded-lg border border-p-border-light/60 bg-white dark:bg-gray-800/50 p-3">
+      <div className="flex items-center justify-between mb-1.5">
+        <p className="text-[11px] font-semibold text-p-text-light uppercase tracking-wide">
+          {acceptsAppTokens ? 'Sign in without an app' : `Signs in at ${where}`}
+        </p>
+        <span className="text-[10px] px-1.5 py-0.5 rounded-md font-medium bg-gray-100 dark:bg-gray-800 text-p-text-light">
+          {confidential ? 'Confidential client' : 'Public client'}
+        </span>
+      </div>
+      {acceptsAppTokens ? (
+        <p className="text-xs text-p-text-secondary mb-2">
+          {mcp.label}'s server also accepts this install's own registration as a client.
+          With hosted mode off and no app credentials, people sign in at {where} on the
+          vendor's page: tools only, no events.
+          {hostedActive && ' Hosted via OtoDock is on, so the relay signs people in.'}
+          {!hostedActive && mcp.app_credential_configured && ' App credentials are configured, so the admin app signs people in and keeps events.'}
+        </p>
+      ) : (
+        <p className="text-xs text-p-text-secondary mb-2">
+          {mcp.label}'s server names its own authorization server and takes its tokens
+          only. This install registers itself there as a client the first time someone
+          connects; people sign in on the vendor's page and no OAuth app is created.
+        </p>
+      )}
+      {live.length === 0 && older.length === 0 && (
+        <p className="text-[11px] text-p-text-light italic">No registration yet: the first connect creates one.</p>
+      )}
+      {live.map(r => (
+        <div key={r.id} className="text-[11px] text-p-text-secondary space-y-0.5 mb-2" data-testid="registration-live">
+          <p><span className="text-p-text-light">Client id:</span> <code>{r.client_id}</code>{r.has_secret ? ' (with a secret)' : ''}</p>
+          <p><span className="text-p-text-light">Callback:</span> <code className="break-all">{r.redirect_uri}</code></p>
+          <p>
+            <span className="text-p-text-light">Registered</span> {formatRelativeTime(r.created_at)}
+            {r.last_used_at && <>, <span className="text-p-text-light">used</span> {formatRelativeTime(r.last_used_at)}</>}
+          </p>
+          <button
+            onClick={() => { if (window.confirm(`Forget this install's registration at ${where}? ${r.has_secret ? 'Accounts connected through it will need a reconnect' : 'Connected accounts keep working'}; the next connect registers again.`)) onForget(r.id) }}
+            disabled={forgetting}
+            className="text-xs px-2.5 py-1 rounded-md border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-40"
+          >
+            Forget
+          </button>
+        </div>
+      ))}
+      {older.length > 0 && (
+        <p className="text-[10px] text-p-text-light italic">
+          {older.length} older registration{older.length === 1 ? '' : 's'} kept for the accounts that still use {older.length === 1 ? 'it' : 'them'}.
+        </p>
+      )}
+    </div>
+  )
+}
+
+// The pending change of a community MCP's catalog source: what moved,
+// whether the catalog entry declares it, what happens to the credentials,
+// and the Switch (proxy COMMUNITY-MARKETPLACE.md "Source changes").
+function SourceChangeCard({ mcp, change }: { mcp: McpServer; change: McpSourceChange }) {
+  const accept = useAcceptMcpSource()
+  const [log, setLog] = useState('')
+  const creds = change.plan?.credentials
+  const runtimeChanged = !!change.plan?.runtime && change.plan.runtime.from !== change.plan.runtime.to
+  const renames = Object.entries(creds?.rename ?? {})
+  const switching = change.status === 'switching' || accept.isPending
+  const confirmText =
+    `Switch "${mcp.label}" to its new source?\n\n${change.from.url}\n  →  ${change.to.url}\n\n` +
+    'The MCP keeps its name, settings, credentials and agent assignments. ' +
+    (change.declared ? '' : 'The catalog entry does not declare this change: verify the new source first. ') +
+    'Its runtime is reinstalled from the new source.'
+  return (
+    <div className={`rounded-lg border p-3 ${change.declared
+      ? 'border-brand/30 dark:border-brand/20 bg-brand/5 dark:bg-brand/10'
+      : 'border-amber-300/70 dark:border-amber-700/50 bg-amber-50/60 dark:bg-amber-900/10'}`}>
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div className="min-w-0">
+          <p className={`text-xs font-medium ${change.declared ? 'text-brand' : 'text-amber-700 dark:text-amber-400'}`}>
+            Source change
+          </p>
+          <p className="text-[11px] text-p-text-secondary">
+            <span className="text-p-text-light">Installed:</span> <SourceLink end={change.from} />
+            {change.from.runtime && <span className="text-p-text-light"> ({change.from.runtime})</span>}
+          </p>
+          <p className="text-[11px] text-p-text-secondary">
+            <span className="text-p-text-light">Catalog:</span> <SourceLink end={change.to} />
+            {change.to.runtime && <span className="text-p-text-light"> ({change.to.runtime})</span>}
+            {change.to.version && <span className="text-p-text-light"> v{change.to.version}</span>}
+          </p>
+        </div>
+        <button
+          onClick={() => {
+            if (!window.confirm(confirmText)) return
+            setLog('')
+            accept.mutate({ name: mcp.name, from: change.from.url, to: change.to.url, manifest_hash: change.to_manifest_hash }, {
+              onSuccess: (data) => setLog(data.install_log || 'Switched.'),
+              onError: (e: Error) => setLog(`Error: ${e.message}`),
+            })
+          }}
+          disabled={switching}
+          className={`shrink-0 text-xs px-3 py-1.5 rounded-md text-white disabled:opacity-40 transition-colors ${
+            change.declared ? 'bg-brand hover:bg-brand-hover' : 'bg-amber-600 hover:bg-amber-700'}`}
+        >
+          {switching ? 'Switching…' : 'Switch'}
+        </button>
+      </div>
+      <p className="text-[11px] text-p-text-secondary mb-1.5">
+        {change.declared
+          ? 'The catalog entry declares that it replaces the installed source.'
+          : 'The catalog entry does not say it replaces the installed source. Treat this as a possible compromise of the catalog entry and verify the new source before switching.'}
+        {' '}Automatic updates never apply a source change.
+      </p>
+      {runtimeChanged && (
+        <p className="text-[11px] text-p-text-secondary">
+          <span className="text-p-text-light">Runtime:</span> {change.plan!.runtime!.from} → {change.plan!.runtime!.to}
+        </p>
+      )}
+      {creds && (
+        <div className="mt-1.5 space-y-0.5">
+          <KeyList label="Credentials that carry" keys={creds.carry} />
+          {renames.length > 0 && (
+            <p className="text-[11px] text-p-text-secondary">
+              <span className="text-p-text-light">Renamed:</span>{' '}
+              {renames.map(([o, n]) => <span key={o} className="mr-1.5"><code>{o}</code> → <code>{n}</code></span>)}
+            </p>
+          )}
+          <KeyList label="Reconnect needed" keys={creds.reconnect} tone="warn" />
+          {creds.oauth === 'reconnect' && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-400">
+              The connected accounts need a reconnect: the new source uses another sign-in provider.
+            </p>
+          )}
+          {creds.oauth === 'carry' && (
+            <p className="text-[11px] text-p-text-secondary"><span className="text-p-text-light">Connected accounts:</span> carry over.</p>
+          )}
+        </div>
+      )}
+      {change.plan?.bearer_host_change && (
+        <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
+          The new host needs an entry in the bearer allowlist (Admin Setup → Security) before sessions can use it.
+        </p>
+      )}
+      {change.result?.error && (
+        <p className="mt-1.5 text-[11px] text-red-600 dark:text-red-400">
+          Last attempt failed{change.result.failed_at ? ` ${formatRelativeTime(change.result.failed_at)}` : ''}: {change.result.error}
+        </p>
+      )}
+      {log && (
+        <details open={log.startsWith('Error')} className="mt-1.5">
+          <summary className="text-[11px] text-p-text-light cursor-pointer">Switch log</summary>
+          <pre className="mt-1 text-[11px] text-p-text-light bg-gray-100 dark:bg-gray-900 rounded-sm p-2 overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">{log}</pre>
+        </details>
+      )}
+    </div>
+  )
+}
+
+// The record of a finished switch, shown until dismissed.
+function SwitchedCard({ mcp, change }: { mcp: McpServer; change: McpSourceChange }) {
+  const dismiss = useDismissMcpSourceChange()
+  const result = change.result || {}
+  const renames = Object.entries(result.renamed ?? {})
+  return (
+    <div className="rounded-lg border border-green-200 dark:border-green-800 bg-green-50/50 dark:bg-green-900/10 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-green-700 dark:text-green-400">
+            Switched to <SourceLink end={change.to} />
+            {result.switched_at && <span className="text-p-text-light font-normal"> {formatRelativeTime(result.switched_at)}</span>}
+          </p>
+          {renames.length > 0 && (
+            <p className="text-[11px] text-p-text-secondary">
+              <span className="text-p-text-light">Renamed:</span>{' '}
+              {renames.map(([o, n]) => <span key={o} className="mr-1.5"><code>{o}</code> → <code>{n}</code></span>)}
+            </p>
+          )}
+          <KeyList label="Kept under the old key" keys={result.kept ?? []} />
+          <KeyList label="Reconnect needed" keys={result.reconnect_needed ?? []} tone="warn" />
+          {result.oauth === 'reconnect' && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-400">The connected accounts need a reconnect.</p>
+          )}
+          {result.container_started === false && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-400">
+              The new container did not start; use the Docker controls to start it.
+            </p>
+          )}
+          {result.error && (
+            // The half of a switch after the install cannot be undone, so an
+            // error there is recorded on the switched row, never hidden.
+            <p className="text-[11px] text-red-600 dark:text-red-400">
+              Finished with an error: {result.error}
+            </p>
+          )}
+        </div>
+        <button
+          onClick={() => dismiss.mutate(mcp.name)}
+          disabled={dismiss.isPending}
+          className="shrink-0 text-xs px-3 py-1.5 rounded-md border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-40 transition-colors"
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
+  )
 }
 
 export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUpdateInfo }) {
@@ -58,6 +299,30 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
   // `hosted_oauth_active` gate. When inactive the self-managed app-cred form shows.
   const hostedOauthMode = mcp.hosted_oauth_mode || mcp.hosted?.oauth_app?.default_mode
   const hostedOauthActive = hostedOauthMode === 'hosted' && !authConfig?.air_gapped
+  // The MCP server names its own authorization server (the credential
+  // schema carries the manifest's declaration; the install's registrations
+  // there are an admin route, read only when the row is expanded).
+  const schema = useCredentialSchema(expanded && mcp.credential_type === 'per_user')
+  const authServer = schema.data?.[mcp.name]?.oauth_meta?.authorization_server
+  const registrations = useClientRegistrations(expanded && !!authServer)
+  const forgetRegistration = useForgetClientRegistration()
+  // A server that takes its own authorization server's tokens only: the
+  // registered client is the one sign-in, so the row hides the hosted
+  // choice and the app credentials.
+  const ownServerOnly = !!authServer && !authServer.accepts_app_tokens
+  const registeredClientCard = authServer && (
+    <RegisteredClientCard
+      mcp={mcp}
+      issuer={authServer.issuer}
+      resourceHost={authServer.resource_host}
+      confidential={authServer.confidential}
+      acceptsAppTokens={authServer.accepts_app_tokens}
+      hostedActive={hostedOauthActive}
+      rows={(registrations.data || []).filter(r => r.mcps.includes(mcp.name))}
+      onForget={(id) => forgetRegistration.mutate(id)}
+      forgetting={forgetRegistration.isPending}
+    />
+  )
   const [updateLog, setUpdateLog] = useState('')
   const [toolFilterRegex, setToolFilterRegex] = useState(mcp.tool_filter_regex || '')
   const [toolFilterSaved, setToolFilterSaved] = useState(false)
@@ -74,6 +339,14 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
   const hasConfig = mcp.config_fields.length > 0
   const hasSkills = mcp.skills.length > 0
   const dockerInfo = isDocker ? DOCKER_STATUS[mcp.docker_status || DOCKER.NOT_CHECKED] : null
+  // What the last check says about this MCP: a pending source change
+  // replaces the ordinary offer; a finished switch rides beside one; an
+  // install ahead of the catalog is a note, not an offer.
+  const change = updateInfo?.source_change
+  const pendingChange = change && change.status !== 'switched' ? change : undefined
+  const switchedChange = change && change.status === 'switched' ? change : undefined
+  const ahead = updateInfo?.reason === 'ahead' ? updateInfo : undefined
+  const ordinaryUpdate = updateInfo && isUpdateOffer(updateInfo) && updateInfo.reason !== 'source' ? updateInfo : undefined
 
   const handleToggle = () => {
     if (lockedOn) return
@@ -140,9 +413,16 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                 explicit assignment
               </span>
             )}
-            {updateInfo && (
+            {pendingChange && (
+              <span className={`text-[10px] px-1.5 py-0.5 rounded-md font-medium animate-pulse ${pendingChange.declared
+                ? 'bg-brand/10 dark:bg-brand/20 text-brand'
+                : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'}`}>
+                {pendingChange.status === 'switching' ? 'switching source…' : 'source changed'}
+              </span>
+            )}
+            {ordinaryUpdate && (
               <span className="text-[10px] px-1.5 py-0.5 rounded-md font-medium bg-brand/10 dark:bg-brand/20 text-brand animate-pulse">
-                {updateInfo.reason === 'manifest' ? 'integration update' : `${updateInfo.latest} available`}
+                {ordinaryUpdate.reason === 'manifest' ? 'integration update' : `${ordinaryUpdate.latest} available`}
               </span>
             )}
           </div>
@@ -233,17 +513,54 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                 </div>
               )}
 
+              {/* A pending source change replaces the ordinary offer */}
+              {pendingChange && <SourceChangeCard mcp={mcp} change={pendingChange} />}
+
+              {/* A finished switch, until dismissed */}
+              {switchedChange && <SwitchedCard mcp={mcp} change={switchedChange} />}
+
+              {/* Ahead of the catalog: a note and an explicit way back */}
+              {ahead && (
+                <div className="rounded-lg border border-p-border-light/60 bg-white dark:bg-gray-800/50 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-[11px] text-p-text-secondary">
+                      Installed {ahead.current} is ahead of the catalog's {ahead.latest}. Automatic updates leave it alone.
+                    </p>
+                    <button
+                      onClick={() => {
+                        if (!window.confirm(`Revert "${mcp.label}" to the catalog's ${ahead.latest}? Its settings, credentials and agent assignments are kept.`)) return
+                        setUpdateLog('')
+                        updateMcp.mutate(mcp.name, {
+                          onSuccess: (data: any) => setUpdateLog(data.install_log || 'Reverted.'),
+                          onError: (e: Error) => setUpdateLog(`Error: ${e.message}`),
+                        })
+                      }}
+                      disabled={updateMcp.isPending}
+                      className="shrink-0 text-xs px-3 py-1.5 rounded-md border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-40 transition-colors"
+                    >
+                      {updateMcp.isPending ? 'Reverting…' : `Revert to catalog ${ahead.latest}`}
+                    </button>
+                  </div>
+                  {updateLog && (
+                    <details open={updateLog.startsWith('Error')} className="mt-1.5">
+                      <summary className="text-[11px] text-p-text-light cursor-pointer">Install log</summary>
+                      <pre className="mt-1 text-[11px] text-p-text-light bg-gray-100 dark:bg-gray-900 rounded-sm p-2 overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">{updateLog}</pre>
+                    </details>
+                  )}
+                </div>
+              )}
+
               {/* Update available */}
-              {updateInfo && (
+              {ordinaryUpdate && (
                 <div className="rounded-lg border border-brand/30 dark:border-brand/20 bg-brand/5 dark:bg-brand/10 p-3">
                   <div className="flex items-center justify-between mb-2">
                     <div>
                       <p className="text-xs font-medium text-brand">Update Available</p>
                       <p className="text-[11px] text-p-text-secondary">
-                        {updateInfo.reason === 'manifest'
+                        {ordinaryUpdate.reason === 'manifest'
                           ? 'Integration update (manifest changed)'
-                          : <>{updateInfo.current} → {updateInfo.latest}</>}
-                        <span className="text-p-text-light ml-1">({updateInfo.registry})</span>
+                          : <>{ordinaryUpdate.current} → {ordinaryUpdate.latest}</>}
+                        <span className="text-p-text-light ml-1">({ordinaryUpdate.registry})</span>
                       </p>
                     </div>
                     <button
@@ -520,7 +837,7 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
 
               {/* Hosted OAuth toggle — relay-routed; OtoDock's
                   client_secret stays in the relay, never in this install. */}
-              {mcp.hosted?.oauth_app?.available && (
+              {mcp.hosted?.oauth_app?.available && !ownServerOnly && (
                 <div className="rounded-lg border border-p-border-light/60 bg-white dark:bg-gray-800/50 p-3">
                   <div className="flex items-center justify-between mb-1.5">
                     <p className="text-[11px] font-semibold text-p-text-light uppercase tracking-wide">
@@ -584,6 +901,15 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                 </div>
               )}
 
+              {/* The MCP server's own authorization server: the install
+                  registers itself there as a client; a person signs in on
+                  the vendor's page. The sign-in itself when the server takes
+                  its own tokens only (the hosted choice and the app
+                  credentials, which sign nobody in there, are hidden);
+                  under the app credentials, as the fallback, when it also
+                  accepts the vendor's app tokens. */}
+              {ownServerOnly && registeredClientCard}
+
               {/* App credentials (OAuth app — admin-managed). SELF-MANAGED
                   mode only: with hosted OAuth the relay owns the client
                   ID/secret AND receives the vendor's webhook events centrally
@@ -592,7 +918,7 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                   install-local app secret is needed and the panel hides. Any
                   previously-saved secrets stay stored (visible again when
                   switching to self-managed). */}
-              {mcp.app_credential && !hostedOauthActive && (() => {
+              {mcp.app_credential && !hostedOauthActive && !ownServerOnly && (() => {
                 const appCredFields = mcp.app_credential_fields || []
                 if (appCredFields.length === 0) return null
                 return (
@@ -657,6 +983,11 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                 </div>
                 )
               })()}
+
+              {/* The fallback sign-in of a server that also accepts the
+                  vendor's app tokens: below the app credentials it stands in
+                  for. */}
+              {authServer?.accepts_app_tokens && registeredClientCard}
 
             </div>
           </div>

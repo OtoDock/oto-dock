@@ -34,11 +34,11 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_user
 from auth import roles
 
 logger = logging.getLogger("claude-proxy.local-templates")
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # The parser reads every context file into memory with no cap of its own,
 # so these are load-bearing, not belt-and-braces.
@@ -125,7 +125,10 @@ def _resolve_template_dir(user: UserContext, raw_path: str) -> Path:
     return resolved
 
 
-def _snapshot_template_dir(src: Path) -> Path:
+def _snapshot_template_dir(
+    src: Path, *, skip_dirs: frozenset[str] = frozenset(),
+    skipped: list[str] | None = None, what: str = "template",
+) -> Path:
     """Copy ``src`` into a private temp dir, rejecting anything unexpected.
 
     Only regular files and real directories are copied — no symlinks, no
@@ -135,6 +138,11 @@ def _snapshot_template_dir(src: Path) -> Path:
     directory open (``os.fwalk``) and opens every file relative to it with
     ``O_NOFOLLOW``, judging what it opened (``fstat``), never a name it
     checked before. The caller deletes the snapshot.
+
+    ``skip_dirs`` adds directory names left out besides the dotfiles and
+    ``node_modules``; ``skipped`` collects the relative names of everything
+    left out, so a check that must refuse them (an MCP package's ``.env``
+    or ``venv``) sees them without the copy holding them.
     """
     dest = Path(tempfile.mkdtemp(prefix="oto-local-template-"))
     files = 0
@@ -146,18 +154,22 @@ def _snapshot_template_dir(src: Path) -> Path:
             # app's data/) — an author's `bun install` beside the app would
             # otherwise fill the file cap; reject symlinked dirs outright.
             for name in list(dirnames):
-                if name.startswith(".") or name == "node_modules" or (
+                if name.startswith(".") or name == "node_modules" or name in skip_dirs or (
                         name == "data" and _is_app_dir(rel_root)):
                     dirnames.remove(name)
+                    if skipped is not None:
+                        skipped.append(str(rel_root / name))
                 elif stat.S_ISLNK(os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_mode):
                     raise HTTPException(
                         400,
-                        f"Symlinks are not allowed in a template folder: "
+                        f"Symlinks are not allowed in a {what} folder: "
                         f"{rel_root / name}",
                     )
             (dest / rel_root).mkdir(parents=True, exist_ok=True)
             for name in filenames:
                 if name.startswith("."):
+                    if skipped is not None:
+                        skipped.append(str(rel_root / name))
                     continue
                 rel = rel_root / name
                 try:
@@ -166,7 +178,7 @@ def _snapshot_template_dir(src: Path) -> Path:
                     if e.errno == errno.ELOOP:
                         raise HTTPException(
                             400,
-                            f"Symlinks are not allowed in a template folder: {rel}",
+                            f"Symlinks are not allowed in a {what} folder: {rel}",
                         )
                     raise HTTPException(400, f"{rel} cannot be read")
                 try:
@@ -178,7 +190,7 @@ def _snapshot_template_dir(src: Path) -> Path:
                     files += 1
                     if files > _MAX_FILES:
                         raise HTTPException(
-                            400, f"Template folder has too many files (max {_MAX_FILES})",
+                            400, f"The {what} folder has too many files (max {_MAX_FILES})",
                         )
                     with os.fdopen(os.dup(fd), "rb") as fh:
                         data = fh.read(_MAX_FILE_BYTES + 1)
@@ -194,7 +206,7 @@ def _snapshot_template_dir(src: Path) -> Path:
                 if total > _MAX_TOTAL_BYTES:
                     raise HTTPException(
                         400,
-                        f"Template folder is too large "
+                        f"The {what} folder is too large "
                         f"(max {_MAX_TOTAL_BYTES // (1024 * 1024)} MB total)",
                     )
                 (dest / rel).write_bytes(data)
@@ -202,6 +214,64 @@ def _snapshot_template_dir(src: Path) -> Path:
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/mcps/local-package/validate — an MCP package an agent authored
+# ---------------------------------------------------------------------------
+
+# A built package's dependency tree is never part of what ships; left out of
+# the snapshot (and reported) instead of counting against the file cap.
+_PACKAGE_SKIP_DIRS = frozenset({"venv"})
+
+
+def _require_package_author(user: UserContext | None) -> UserContext:
+    """A session principal with a signed-in person at the editor tier of the
+    session's agent: the audience of the authoring skill (``mcps-mcp``
+    lists its check tool for the same tier). The path resolver below needs
+    the session either way."""
+    if not user:
+        raise HTTPException(403, "Authentication required")
+    if not user.session_id or not user.acting_sub or not user.agent:
+        raise HTTPException(
+            403,
+            "This endpoint is callable only from an agent session with a "
+            "signed-in user",
+        )
+    if not roles.can_edit(user.acting_role(user.agent)):
+        raise HTTPException(
+            403, "Authoring an MCP package takes the editor role or above on this agent",
+        )
+    return user
+
+
+@router.post("/v1/mcps/local-package/validate")
+async def validate_local_package(
+    body: LocalTemplateBody,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Check an MCP package folder the way the admin installer will, without
+    installing it (``community_installer.check_package``). The folder is
+    resolved through the session's own path policy and snapshotted (no
+    symlink, the byte caps), so nothing outside the session's tree is read.
+    Problems come back as ``ok: false`` plus ``errors`` and ``warnings``
+    (the agent self-corrects from them); 4xx is reserved for authorization
+    and path problems."""
+    from services.community import community_installer
+
+    u = _require_package_author(user)
+    src = _resolve_template_dir(u, body.path)
+    skipped: list[str] = []
+    snapshot = await asyncio.to_thread(
+        _snapshot_template_dir, src, skip_dirs=_PACKAGE_SKIP_DIRS, skipped=skipped,
+        what="package",
+    )
+    try:
+        return await asyncio.to_thread(
+            community_installer.check_package, snapshot, skipped=skipped,
+        )
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
 
 
 def _is_app_dir(rel_root: Path) -> bool:

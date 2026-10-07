@@ -1,6 +1,7 @@
 """Lane helpers for task runs: output collection, the limit notice, lane
-quiescence and settling, warm-session reuse, the post-run session action, the
-prior-pump reaper, and the pump stall watchdog.
+quiescence and settling, warm-session reuse, the close before a round that
+changed the worker's model, the post-run session action, the prior-pump
+reaper, and the pump stall watchdog.
 
 One piece of the task scheduler; ``services/scheduler/scheduler.py`` is the
 facade that assembles them and holds the registry API. Every ``core.*`` and
@@ -12,6 +13,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 
 
 import config
@@ -60,7 +62,8 @@ def _limit_notice(final_output: str) -> str | None:
     """Detect a provider usage-limit notice ending a run's output.
 
     The CLIs stream the limit notice as NORMAL result text ("You've hit your
-    session limit · resets 3pm", "Claude AI usage limit reached|<ts>"), so the
+    session limit · resets 3pm", "You've reached your Fable limit. …",
+    "You're out of usage credits. …", "Claude AI usage limit reached|<ts>"), so the
     turn ends cleanly and the run would be stamped `completed` with the notice
     as its output. Only the LAST non-empty line is eligible and it must START
     with a known notice shape — a run whose real output merely discusses usage
@@ -74,7 +77,8 @@ def _limit_notice(final_output: str) -> str | None:
         if not line:
             continue
         low = line.lower()
-        if ((low.startswith("you've hit your") and "limit" in low)
+        if ((low.startswith(("you've hit your", "you've reached your")) and "limit" in low)
+                or low.startswith("you're out of usage credits")
                 or low.startswith("claude ai usage limit reached")
                 or low.startswith("usage limit reached")):
             return line
@@ -139,6 +143,7 @@ async def _await_lane_quiescence(chat_id: str, *, ceiling_seconds: float = 1800.
     interrupted lane is quiet BECAUSE the user just stopped it — their
     redirect (and the worker's reply to it) is what the settle window is
     there to capture."""
+    from core.events import input_queue
     from core.events.stream_pump import _active_pumps
     from core.session import interactive_session
 
@@ -147,7 +152,9 @@ async def _await_lane_quiescence(chat_id: str, *, ceiling_seconds: float = 1800.
     quiet_since: float | None = None
     while True:
         pump = _active_pumps.get(chat_id)
-        busy = pump is not None and (not pump.is_done or bool(pump.message_queue))
+        # A message waiting in the chat's queue (or a turn starter about to
+        # take it) still goes out as the lane's next turn.
+        busy = (pump is not None and not pump.is_done) or input_queue.busy(chat_id)
         if not busy:
             live = interactive_session.find_live_for_chat(chat_id)
             busy = live is not None and (live._turn_open or bool(live._prompt_queue))
@@ -253,6 +260,34 @@ async def _try_reuse_warm_session(
     return True
 
 
+async def _close_for_model_change(session_id: str, run_id: str, *, slot_target: str) -> bool:
+    """Close a continued lane's live session before a round that changed the
+    worker's model (``TaskDefinition.respawn_for_model``), so the round's
+    spawn resumes the conversation on the new model: a live local process
+    would be reused as it is, and a warm remote one ridden.
+
+    Called after the round's last lane gate, so no turn of the lane is open;
+    the close runs under the holding layer's session lock, which a delivery
+    wake into the session holds while it sends. Background work the old
+    process still ran ends with it. The close releases the admission slot
+    under ``session_id``, which is also this round's: it is taken back
+    (blocking, as the round's own ``task_slot`` took it) so the new process
+    is counted. Returns True when a live session was closed."""
+    from core.session.session_manager import find_layer_for_session
+    holder = find_layer_for_session(session_id)
+    if holder is None:
+        return False
+    async with holder.session_lock(session_id):
+        await holder.close_session(session_id)
+    logger.info(
+        f"Task {run_id}: closed live session {session_id[:8]} — the worker's "
+        f"model changed, the round resumes it on the new one"
+    )
+    from core import concurrency
+    await concurrency.acquire(session_id, "task", target=slot_target, blocking=True)
+    return True
+
+
 def _post_run_session_action(chat_row: dict | None) -> tuple[str, bool]:
     """Map a finished lane turn's abort flags to (final_status, keep_warm).
 
@@ -316,8 +351,11 @@ class _TaskTurnStalled(RuntimeError):
 
 
 async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
-                           session_id: str) -> None:
-    """Await the task pump with a stall watchdog.
+                           session_id: str, *,
+                           on_parked: Callable[[], Awaitable[None]] | None = None) -> None:
+    """Await the task pump with a stall watchdog. ``on_parked`` is awaited
+    once, the first time the turn waits on a person (a permission card, a
+    question) while no viewer is attached to the pump.
 
     A headless turn had no wall-clock backstop: ``await pump._task`` waits for
     PRODUCER_DONE forever, and the wedge reap in ws/dashboard_chat.py only
@@ -327,6 +365,8 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
     stream, a silent-AND-dead process, or silence past the CLI turn ceiling.
     An alive process below the ceiling always gets its leash.
     """
+    from core.session import session_state
+    told = on_parked is None
     while True:
         try:
             await asyncio.wait_for(asyncio.shield(pump._task),
@@ -334,12 +374,23 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
             return
         except asyncio.TimeoutError:
             pass
+        if (not told and session_state.has_pending_prompt(session_id)
+                and not pump.has_viewers):
+            told = True
+            try:
+                await on_parked()
+            except Exception:
+                logger.warning("Task watchdog: the parked-prompt notice for chat %s failed",
+                               chat_id, exc_info=True)
         if pump.producer.done():
             continue  # turn tail persisting — the pump is about to exit
         severed = layer.remote_stream_severed(session_id)
         idle = layer.session_idle_seconds(session_id)
         stale = idle is not None and idle > _STALL_PROBE_SECS
-        hard_stale = idle is not None and idle > config.CLAUDE_TIMEOUT
+        # A prompt waiting on a person is silent by design; its own wait
+        # bounds it.
+        hard_stale = (idle is not None and idle > config.CLAUDE_TIMEOUT
+                      and not session_state.has_pending_prompt(session_id))
         proc_dead = False
         if stale and not severed and not hard_stale:
             proc_dead = await layer.probe_session_process_dead(session_id)
@@ -357,6 +408,13 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
             f"Task watchdog: reaping stalled turn run={run_id} chat={chat_id} "
             f"session={session_id[:8]} ({reason})"
         )
+        # The lost ending first: the run's record and a viewer get a
+        # reason, then the producer's cancellation follows it on the queue.
+        from core.events import turn_ending
+        from core.events.common_events import CommonEvent, ERROR
+        _ending = turn_ending.TurnEnding(reason=turn_ending.LOST, detail=reason)
+        pump.event_queue.put_nowait(CommonEvent(type=ERROR, data={
+            "message": _ending.line(), "ending": _ending.as_dict()}))
         pump.abort()
         if pump._task is not None:
             # Wait WITHOUT cancelling — the pump's finally persists the
@@ -373,3 +431,76 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
                 f"Task watchdog: prepare_resume failed run={run_id}"
             )
         raise _TaskTurnStalled(f"reaped by platform: {reason}")
+
+
+# A run owes its report from its start until its output is collected
+# (``delivery._finalize_and_deliver``): keyed by the run's chat and by its
+# session (a sibling chat can name the same session), counted because a
+# continue round can start while the previous run's collection still waits.
+_report_holds: dict[str, int] = {}
+
+
+def hold_report(*keys: str) -> None:
+    for key in keys:
+        if key:
+            _report_holds[key] = _report_holds.get(key, 0) + 1
+
+
+def release_report(*keys: str) -> None:
+    for key in keys:
+        n = _report_holds.get(key, 0) - 1
+        if n > 0:
+            _report_holds[key] = n
+        else:
+            _report_holds.pop(key, None)
+
+
+def report_pending(chat_id: str, session_id: str) -> bool:
+    return bool((chat_id and chat_id in _report_holds)
+                or (session_id and session_id in _report_holds))
+
+
+def drives_own_session(chat: dict | None, session_id: str) -> bool:
+    """Whether ``chat`` is a dashboard or task chat whose row names
+    ``session_id``: a turn on it can run as the chat's own (a phone chat,
+    and a session the chat no longer runs, a meeting participant's on the
+    meeting's chat among them, cannot)."""
+    from core.session import session_kind
+    from core.session.visibility import is_phone_chat_owner
+    if not chat or not session_id or chat.get("session_id") != session_id:
+        return False
+    if session_kind.of_chat(chat) not in (session_kind.DASHBOARD, session_kind.TASK):
+        return False
+    return not is_phone_chat_owner(chat.get("user_sub") or "")
+
+
+def takes_chat_contract(chat: dict | None, session_id: str) -> bool:
+    """Whether a turn the platform drives into ``chat`` on ``session_id`` runs
+    as the chat's own turns do (it ends at the engine's result; background
+    work it leaves running is the chat's monitors') rather than as a task run
+    (it returns only after its background work, so a report carries it): a
+    chat driving its own session, a worker's or a task run's included, while
+    no run on it owes a report. A phone chat, a session the chat no longer
+    runs (a meeting participant's among them), and any chat inside a report
+    window keep the task run's producer."""
+    return (drives_own_session(chat, session_id)
+            and not report_pending((chat or {}).get("id") or "", session_id))
+
+
+async def _chat_turn_produce(layer, session_id: str, prompt: str,
+                             event_queue: asyncio.Queue) -> None:
+    """The producer of a turn the platform drives into an ordinary chat: one
+    send on the chat's own contract (no settle, no review loop, no hold on
+    the chat's monitors), every event to the pump, a failure as the turn's
+    ERROR, PRODUCER_DONE last. The caller arms the monitors once the pump
+    has ended."""
+    from core.events.common_events import CommonEvent, ERROR, PRODUCER_DONE
+    try:
+        async with layer.session_lock(session_id):
+            async for event in layer.send_message(session_id, prompt):
+                await event_queue.put(event)
+    except Exception as e:
+        logger.error(f"Chat turn producer error: {e}", exc_info=True)
+        await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
+    finally:
+        await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))

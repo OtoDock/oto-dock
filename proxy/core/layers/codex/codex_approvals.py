@@ -151,6 +151,17 @@ def approval_to_tool(
     if method in _EXEC_APPROVALS:
         cmd = _exec_command(params)
         cwd = params.get("cwd") or ""
+        if params.get("kind") == "writeStdin":
+            # Codex 0.158 asks before typing into a terminal that runs with
+            # elevated permissions (``write_stdin_approval``, on by default).
+            # The request names the terminal's command and the reason, never
+            # the text about to be typed, so this is a person's call on the
+            # terminal, not a shell command for the command gate to re-judge.
+            return "CodexTerminalInput", {
+                "command": cmd, "cwd": cwd,
+                "reason": params.get("reason") or "",
+                "approval_id": params.get("approvalId") or "",
+            }
         # Windows-shell invocations (powershell/pwsh/cmd /c) route to the platform
         # PowerShell checker; everything else is a POSIX/bash command.
         if _is_windows_shell_wrapper(cmd):

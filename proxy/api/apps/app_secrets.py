@@ -12,12 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from api.apps.apps import _visible_row
-from auth.providers import UserContext, get_current_user, require_auth, require_human
+from auth.providers import UserContext, get_current_user, require_auth, require_human, require_user
 from services.apps import app_deploy, app_secrets
 from storage import db_app_secrets, db_apps
 
 logger = logging.getLogger("claude-proxy.apps")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class SecretValue(BaseModel):

@@ -40,6 +40,7 @@ from services.infra import safe_fs
 from services.media import media_pipeline
 from storage.agents import agent_store
 from storage import database as task_store
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.media")
 router = APIRouter()
@@ -159,7 +160,7 @@ async def _repull_satellite_media(token: str, info: dict) -> tuple[Path, str] | 
     served, mime, _ = await media_pipeline.ensure_playable_async(
         dest, media_kind=info.get("media_kind", ""), dest_dir=host_dir,
     )
-    task_store.update_media_token_path(token, str(served), mime=mime)
+    await run_db(task_store.update_media_token_path, token, str(served), mime=mime)
     return served, mime
 
 
@@ -215,10 +216,17 @@ async def serve_media(
     """
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
-    info = task_store.get_media_token(token)
-    # Denied == missing (404): don't hand an unauthorized holder an oracle for
-    # whether a leaked token is still live.
-    if not info or not can_serve_token(info, user):
+
+    def _job() -> dict | None:
+        info = task_store.get_media_token(token)
+        # Denied == missing (404): don't hand an unauthorized holder an oracle
+        # for whether a leaked token is still live.
+        if not info or not can_serve_token(info, user):
+            return None
+        return info
+
+    info = await run_db(_job)
+    if info is None:
         raise HTTPException(status_code=404, detail="media not found or expired")
     # display_ui artifact rows share this table but are served ONLY by
     # /v1/ui/{token} (opaque-origin sandbox CSP) — a text/html row rendering
@@ -274,11 +282,18 @@ async def mint_media_token(
     reading the file (`require_agent_access` + `_check_file_role`)."""
     u = require_auth(user)
     require_agent_access(u, req.agent)
-    if not agent_store.agent_exists(req.agent):
-        raise HTTPException(status_code=400, detail=f"Unknown agent: {req.agent}")
     from api.agents.agents import safe_agent_path
     agent_dir = config.get_agent_dir(req.agent)
-    file_path, _ = safe_agent_path(agent_dir, req.agent, req.path, u, writing=False)
+
+    def _job() -> Path | None:
+        if not agent_store.agent_exists(req.agent):
+            return None
+        file_path, _ = safe_agent_path(agent_dir, req.agent, req.path, u, writing=False)
+        return file_path
+
+    file_path = await run_db(_job)
+    if file_path is None:
+        raise HTTPException(status_code=400, detail=f"Unknown agent: {req.agent}")
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -291,7 +306,8 @@ async def mint_media_token(
     expires = (
         datetime.now(timezone.utc) + timedelta(seconds=_WORKSPACE_TOKEN_TTL)
     ).isoformat()
-    task_store.create_media_token(
+    await run_db(
+        task_store.create_media_token,
         token,
         str(served_path),
         mime=mime,

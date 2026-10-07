@@ -217,3 +217,29 @@ def test_symlinked_and_odd_folders_are_ignored(tree):
     with pytest.raises(d.CheckError):
         d.write_check(AGENT, "", _doc(name="linked", description="rewritten"), None, updated_by="x")
     assert json.loads((real / "check.json").read_text())["description"] == "Lint and a look"
+
+
+def test_a_judge_engine_the_agent_does_not_enable_is_refused(tree):
+    """F67: a check's judge runs only on an engine and model the judged
+    agent has enabled (the rule a delegated worker's override meets)."""
+    from storage.agents import agent_store
+    paths = agent_store.get_agent(AGENT).get("execution_path")
+    other = "codex-cli" if paths != "codex-cli" else "claude-code-cli"
+    with pytest.raises(d.CheckError, match="not enabled"):
+        d.write_check(AGENT, "alice", _doc(name="judged", judge={"rubric": "r", "engine": other}),
+                      None, updated_by="alice-sub")
+    ok = d.write_check(AGENT, "alice", _doc(name="judged", judge={"rubric": "r", "engine": paths}),
+                       None, updated_by="alice-sub")
+    assert ok.doc["judge"]["engine"] == paths
+    assert d.judge_envelope_problem(AGENT, {"rubric": "r"}) is None
+    assert "not enabled" in d.judge_envelope_problem(AGENT, {"engine": other})
+
+
+def test_a_judge_model_the_agent_does_not_offer_is_refused(tree, monkeypatch):
+    from storage.billing import subscription_store
+    monkeypatch.setattr(subscription_store, "list_models",
+                        lambda path: [{"model_id": "m-enabled", "enabled": True},
+                                      {"model_id": "m-off", "enabled": False}])
+    assert d.judge_envelope_problem(AGENT, {"model": "m-enabled"}) is None
+    assert "not available" in d.judge_envelope_problem(AGENT, {"model": "m-off"})
+    assert "not available" in d.judge_envelope_problem(AGENT, {"model": "any-model"})

@@ -10,8 +10,10 @@ and reach the other mixins through ``self``. Nothing here is standalone.
 import asyncio
 import base64
 import functools
+import json
 import logging
 import mimetypes
+import os
 import uuid
 from pathlib import Path
 import config
@@ -42,7 +44,6 @@ from core.session import interactive_session
 from ws.dashboard import (
     _CHAT_PAGE,
     _build_chat_restore,
-    _host_to_sandbox_path,
     _model_allowed_for_path,
     _save_base64_image,
     _task_continue_allowed,
@@ -54,6 +55,7 @@ from ws.dashboard_chat_text import (
 from core.session import session_kind, visibility as _vis
 from core.sandbox.session_config_dir import AgentStateRefused, refuse_agent_state_below_editor
 from core.events.common_events import TurnInput
+from services.infra import safe_fs
 from storage.agents import agent_store
 from auth import roles
 from auth.providers import acting_role_of
@@ -78,6 +80,9 @@ _PHOTO_WAIT_S = 30.0
 _photo_slots: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
 
+PHONE_CHAT_READ_ONLY = "A phone call's conversation is read-only: the call drives it."
+
+
 def _remember_chat(chat: dict) -> tuple[str, str]:
     if len(_chat_owner_cache) >= _CHAT_OWNER_CACHE_MAX:
         _chat_owner_cache.clear()
@@ -96,8 +101,11 @@ def _photo_slot() -> asyncio.Semaphore:
     return sem
 
 
-async def _save_photo_off_loop(fn, *args, **kwargs):
-    """Run one photo save (or read-back) in a thread under the slot."""
+async def _save_photo_off_loop(fn, *args, late: list | None = None, **kwargs):
+    """Run one photo save (or read-back) in a thread under the slot. A cancel
+    cannot stop the thread: the slot is held until it ends, and a result it
+    still returns goes to ``late`` (when given), so the caller's cleanup
+    sees the file it wrote."""
     sem = _photo_slot()
     try:
         async with asyncio.timeout(_PHOTO_WAIT_S):
@@ -107,10 +115,26 @@ async def _save_photo_off_loop(fn, *args, **kwargs):
             "The server is busy saving other photos right now; send the message again "
             "in a moment."
         )
+    job = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
     try:
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        return await asyncio.shield(job)
+    except asyncio.CancelledError:
+        await _until_done(job)
+        if late is not None and not job.cancelled() and job.exception() is None and job.result():
+            late.append(job.result())
+        raise
     finally:
         sem.release()
+
+
+async def _until_done(job: asyncio.Future) -> None:
+    """Wait for ``job`` to end, through further cancels (the thread behind it
+    runs to the end regardless)."""
+    while not job.done():
+        try:
+            await asyncio.wait({job})
+        except asyncio.CancelledError:
+            continue
 
 
 class AttachmentsRefused(Exception):
@@ -118,24 +142,65 @@ class AttachmentsRefused(Exception):
     scope puts them; the message is refused whole, with the reason."""
 
 
-def _reattach_saved_photo(full: Path | None, *, with_bytes: bool) -> dict | None:
+def _reattach_saved_photo(agent: str, agent_dir: Path, rel_path: str, expected_prefix: str,
+                          *, with_bytes: bool) -> dict | None:
     """A photo already saved in the chat's scope, in the shape
     ``_save_base64_image`` returns — so a re-attached photo flows through the
     same prompt/vision path as a fresh one. ``with_bytes`` reads it back for
     an engine that takes photos inline; the Read-tool engines only need the
-    path. None when the scope check refused the path."""
-    if full is None:
+    path. The scope check, the open and the read are this one worker-thread
+    job: the file is opened beneath the agents root with no link followed at
+    any component (``safe_fs``, the files API's own read), so the file
+    checked is the file read however long the photo waited for its slot.
+    None when the path is outside the scope, not an image, or refused."""
+    if not rel_path.startswith(expected_prefix):
         return None
-    media_type = mimetypes.guess_type(full.name)[0] or "image/jpeg"
+    media_type = mimetypes.guess_type(rel_path)[0] or "image/jpeg"
     if not media_type.startswith("image/"):
         return None
-    out = {"path": str(full), "base64": "", "media_type": media_type}
-    if with_bytes:
+    try:
+        fd, _st = safe_fs.open_regular_for_read(config.AGENTS_DIR, f"{agent}/{rel_path}")
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read() if with_bytes else b""
+    except OSError:
+        return None
+    return {
+        "path": str(agent_dir / rel_path),
+        "base64": base64.b64encode(data).decode("ascii") if with_bytes else "",
+        "media_type": media_type,
+    }
+
+
+def _scoped_files(agent_dir: Path, expected_prefix: str, files: list[dict]) -> list[dict]:
+    """The attached files whose path stays inside the chat's scope root once
+    resolved and names a regular file, checked in one worker-thread job.
+    Nothing is read here: the agent opens the file in its own sandbox."""
+    valid: list[dict] = []
+    expected_root = (agent_dir / expected_prefix).resolve()
+    for f in files:
+        fpath = f.get("path", "")
+        fname = f.get("name", "")
+        if not (fpath and fname and fpath.startswith(expected_prefix)):
+            continue
         try:
-            out["base64"] = base64.b64encode(full.read_bytes()).decode("ascii")
+            full = (agent_dir / fpath).resolve()
+            if full.is_relative_to(expected_root) and full.is_file():
+                valid.append({"path": fpath, "name": fname})
         except OSError:
-            return None
-    return out
+            continue
+    return valid
+
+
+def _discard_photos(agent: str, rels: list[str]) -> None:
+    """Remove the photos a refused message saved (agent-relative paths),
+    beneath the agents root with no link followed; one that cannot be
+    removed is logged and the rest still go."""
+    for rel in rels:
+        try:
+            safe_fs.unlink_beneath(config.AGENTS_DIR, f"{agent}/{rel}", missing_ok=True)
+        except OSError as exc:
+            logger.warning("refused message's photo not removed: %s/%s (%s)",
+                           agent, rel, type(exc).__name__)
 
 
 class ChatSupportMixin:
@@ -223,40 +288,65 @@ class ChatSupportMixin:
                 logger.debug("first-prompt title broadcast failed for %s",
                              cid, exc_info=True)
 
-    def _build_cancelled_context(self, cid: str) -> str:
+    def _build_cancelled_context(self, cid: str, *, new_text: str | None = None,
+                                 new_rows: int = 1) -> str:
         """Read the cancelled turn's messages from DB and format for injection.
 
-        The current user message was JUST saved before this is called.
-        Walk backwards to find the previous user message (the cancelled one)
-        and any partial assistant response after it.
+        The current user message was JUST saved before this is called (with
+        the person's waiting messages an idle send took: ``new_rows`` rows
+        in all), unless ``new_text`` names it (a queued batch whose rows land
+        after its turn starts). Walk backwards past them to find the previous
+        user message (the cancelled one) and any partial assistant response
+        after it.
         """
         messages = task_store.get_chat_messages(cid)
         if not messages:
             return ""
 
-        user_count = 0
+        skip = 0 if new_text is not None else max(1, new_rows)
+        user_count = 0 if new_text is None else 1
+        new_text = new_text or ""
         last_user_text = ""
         assistant_parts = []
+        # The turn ended on its own (the chat's ``turn_ended`` row), not by
+        # the person's Stop: the words say so.
+        ended = ""
 
         for msg in reversed(messages):
             if msg["role"] == "user" and msg["content"]:
-                user_count += 1
-                if user_count == 1:
-                    continue  # Skip the new message (just saved)
+                if skip:
+                    skip -= 1
+                    if not new_text:
+                        new_text = msg["content"]
+                    if not skip:
+                        user_count = 1
+                    continue  # Skip the new message(s) (just saved)
                 last_user_text = msg["content"]
                 break
             elif msg["role"] == "assistant" and msg["content"]:
                 if user_count >= 1:
                     assistant_parts.insert(0, msg["content"])
             elif msg["role"] == "event":
+                if user_count >= 1 and not ended and msg.get("event_type") == wire.SYSTEM:
+                    try:
+                        data = json.loads(msg.get("event_data") or "{}")
+                    except (TypeError, ValueError):
+                        data = {}
+                    if isinstance(data, dict) and data.get("subtype") == wire.SUBTYPE_TURN_ENDED:
+                        ended = str(data.get("reason") or "error")
                 continue
 
         if not last_user_text:
             return ""
+        if new_text.strip() == last_user_text.strip():
+            # The same message again (the card's Send again): the engine
+            # gets it once, with no copy of the turn it repeats.
+            return ""
 
+        head = (f"[Your previous turn ended early ({ended}) before it finished. "
+                if ended else "[Your previous response was cancelled by the user. ")
         parts = [
-            "[Your previous response was cancelled by the user. "
-            "The cancelled turn was not saved to your session context, "
+            head + "The cancelled turn was not saved to your session context, "
             "so here is what happened:]",
             f"User said: {last_user_text}",
         ]
@@ -356,8 +446,11 @@ class ChatSupportMixin:
         An image entry is either ``{data, name}`` (a fresh base64 photo, saved
         now) or ``{path, name}`` (a photo this chat's scope already holds —
         one the composer got back from a cancelled queued message): the path
-        entry passes the same scope check as a file and is used in place, so
-        a re-send never writes a second copy."""
+        entry is scope-checked and read in one worker-thread job and used in
+        place, so a re-send never writes a second copy. No attachment path
+        touches the filesystem on the event loop. A message refused part-way
+        (a photo over the size limit, the slot wait) keeps none of the photos
+        it saved."""
         image_meta: list[dict] = []
         attached_images: list[dict] = []  # for Direct LLM content blocks
         cli_text = text  # text sent to CLI (may include image paths for CLI/Codex)
@@ -365,23 +458,12 @@ class ChatSupportMixin:
         # user-scoped, `workspace/…` for agent-scoped — set by the upload
         # endpoint from `is_shared_only(agent)`). The prefix check alone would
         # let `..` segments escape and turn is_file() into a host-file
-        # existence oracle — the resolved path must stay inside the scope root.
+        # existence oracle: the path must stay inside the scope root, checked
+        # in a worker thread (`_reattach_saved_photo`, `_scoped_files`).
         if is_agent_scoped:
             expected_prefix = f"{layout.WORKSPACE}/"
         else:
             expected_prefix = f"{layout.user_rel(username)}/{layout.WORKSPACE}/"
-        expected_root = (agent_dir / expected_prefix).resolve()
-
-        def _scoped_file(rel_path: str) -> Path | None:
-            if not rel_path.startswith(expected_prefix):
-                return None
-            try:
-                full = (agent_dir / rel_path).resolve()
-                if not full.is_relative_to(expected_root) or not full.is_file():
-                    return None
-            except OSError:
-                return None
-            return full
 
         if images:
             # Dedicated subfolder for chat-attached photos so the workspace
@@ -397,34 +479,50 @@ class ChatSupportMixin:
                 img_dir = agent_dir / layout.WORKSPACE / "uploads" / "photos"
             else:
                 img_dir = layout.user_dir(agent_dir, username) / layout.WORKSPACE / "uploads" / "photos"
-            saved_images: list[dict] = []  # each: {"path", "base64", "media_type"}
-            for img in images:
-                data_url = img.get("data", "")
-                saved: dict | None = None
-                if data_url:
-                    # Ensure data URL format
-                    if not data_url.startswith("data:"):
-                        data_url = f"data:image/jpeg;base64,{data_url}"
-                    # In order, one after another: the paths ride the prompt
-                    # in the order the photos were attached.
-                    saved = await _save_photo_off_loop(
-                        _save_base64_image, data_url, save_dir=img_dir)
-                elif img.get("path"):
-                    saved = await _save_photo_off_loop(
-                        _reattach_saved_photo, _scoped_file(str(img["path"])),
-                        with_bytes=is_direct_llm)
-                if saved:
-                    saved_images.append(saved)
-                    image_meta.append({
-                        "name": img.get("name", "photo.jpg"),
-                        # agent-relative saved path — after a reload the
-                        # frontend renders the photo via
-                        # GET /v1/agents/<agent>/files/<path> (the base64
-                        # data URL only exists on the live send).
-                        "path": str(
-                            Path(saved["path"]).resolve().relative_to(
-                                agent_dir.resolve())),
-                    })
+            # each: ({"path", "base64", "media_type"}, agent-relative path)
+            saved_images: list[tuple[dict, str]] = []
+            # The photos this message wrote: a refusal or a cancel part-way
+            # removes them (a re-attached photo is an earlier message's file).
+            fresh: list[str] = []
+            late: list[dict] = []  # a save whose thread ended after a cancel
+            try:
+                for img in images:
+                    data_url = img.get("data", "")
+                    saved: dict | None = None
+                    if data_url:
+                        # Ensure data URL format
+                        if not data_url.startswith("data:"):
+                            data_url = f"data:image/jpeg;base64,{data_url}"
+                        # In order, one after another: the paths ride the prompt
+                        # in the order the photos were attached.
+                        saved = await _save_photo_off_loop(
+                            _save_base64_image, data_url, save_dir=img_dir, late=late)
+                    elif img.get("path"):
+                        saved = await _save_photo_off_loop(
+                            _reattach_saved_photo, agent, agent_dir, str(img["path"]),
+                            expected_prefix, with_bytes=is_direct_llm)
+                    if saved:
+                        # Both kinds of path are built from agent_dir, so the
+                        # agent-relative form needs no filesystem call.
+                        rel = Path(saved["path"]).relative_to(agent_dir).as_posix()
+                        if data_url:
+                            fresh.append(rel)
+                        saved_images.append((saved, rel))
+                        image_meta.append({
+                            "name": img.get("name", "photo.jpg"),
+                            # agent-relative saved path — after a reload the
+                            # frontend renders the photo via
+                            # GET /v1/agents/<agent>/files/<path> (the base64
+                            # data URL only exists on the live send).
+                            "path": rel,
+                        })
+            except BaseException:
+                fresh += [Path(s["path"]).relative_to(agent_dir).as_posix() for s in late]
+                if fresh:
+                    # Shielded: a second cancel must not drop the job before
+                    # its thread starts.
+                    await asyncio.shield(asyncio.to_thread(_discard_photos, agent, fresh))
+                raise
 
             if saved_images:
                 # Push freshly-saved photos to any active remote satellite
@@ -432,12 +530,10 @@ class ChatSupportMixin:
                 # this, the satellite-side CLI tries to Read the path before
                 # end-of-turn sync ever runs and sees ENOENT.
                 from api.media.uploads import _push_upload_to_active_remote_sessions
-                for s in saved_images:
+                for s, rel in saved_images:
                     try:
-                        host_path = Path(s["path"])
-                        rel_path = str(host_path.relative_to(agent_dir))
                         await _push_upload_to_active_remote_sessions(
-                            agent, rel_path, host_path,
+                            agent, rel, Path(s["path"]),
                         )
                     except Exception:
                         logger.exception("Photo push to satellite failed: %s", s["path"])
@@ -447,29 +543,25 @@ class ChatSupportMixin:
                     # native vision content blocks via `images` kwarg into
                     # `send_message` / `run_direct_stream`. Skip path-injection
                     # text entirely; the LLM sees the image in the message body.
-                    for s in saved_images:
+                    for s, _rel in saved_images:
                         attached_images.append({
                             "base64": s["base64"],
                             "media_type": s["media_type"],
                         })
                 else:
-                    # CLI / Codex: inject sandbox-virtual path so the agent's
+                    # CLI / Codex: inject the sandbox-virtual path (the
+                    # agent-relative path with a leading `/`) so the agent's
                     # built-in Read tool can open the file from disk.
                     cli_text += f"\n\nThe user has attached {len(saved_images)} image(s). Read and analyze them using the Read tool:\n"
-                    for s in saved_images:
-                        sandbox_path = _host_to_sandbox_path(s["path"], agent_dir)
-                        cli_text += f"- {sandbox_path}\n"
+                    for _s, rel in saved_images:
+                        cli_text += f"- /{rel}\n"
 
         # Validate and inject attached files as sandbox-virtual paths
         # (leading `/`).
         valid_files: list[dict] = []
         if files:
             from api.media.uploads import FILE_TYPE_LABELS
-            for f in files:
-                fpath = f.get("path", "")
-                fname = f.get("name", "")
-                if fpath and fname and _scoped_file(fpath) is not None:
-                    valid_files.append({"path": fpath, "name": fname})
+            valid_files = await asyncio.to_thread(_scoped_files, agent_dir, expected_prefix, files)
             if valid_files:
                 cli_text += f"\n\nThe user has attached {len(valid_files)} file(s):\n"
                 for vf in valid_files:
@@ -561,6 +653,10 @@ class ChatSupportMixin:
           it runs as the agent, so it takes the editor tier, the rule its
           session start applies (``refuse_agent_state_below_editor``) and
           every frame that reaches an already-warm session applies too.
+        - A phone call's conversation (the ``phone`` owner): refused for
+          everyone, admins included. Its session runs as the person the
+          route is tied to, or as the caller, and only the call drives it;
+          the agent's managers read it.
         - Every other chat: its owner's, nothing to gate here.
 
         ``chat`` is the row a caller already read; without it the owner is
@@ -596,11 +692,21 @@ class ChatSupportMixin:
                 return ""  # nothing to protect; the caller's write is a no-op
             entry = _remember_chat(chat)
         owner, agent = entry
+        if _vis.is_phone_chat_owner(owner):
+            if not quiet:
+                await self._send_error(PHONE_CHAT_READ_ONLY)
+            return PHONE_CHAT_READ_ONLY
         if not _vis.is_shared_chat_owner(owner):
             return ""
-        role = await run_db(acting_role_of, self.user_sub, agent, fallback_user=self.user)
+        _sub, _fb = self.user_sub, self.user
+
+        def _standing_job() -> tuple[str, bool]:
+            return (acting_role_of(_sub, agent, fallback_user=_fb),
+                    _vis.is_shared_only(agent))
+
+        role, shared_only = await run_db(_standing_job)
         try:
-            refuse_agent_state_below_editor(_vis.SCOPE_AGENT, role)
+            refuse_agent_state_below_editor(_vis.SCOPE_AGENT, role, shared_only=shared_only)
         except AgentStateRefused as e:
             if not quiet:
                 await self._send_error(str(e))
@@ -618,24 +724,50 @@ class ChatSupportMixin:
             return False
         return not await self._deny_task_continue(isess.chat_id)
 
-    async def _open_chat_by_id(self, cid: str) -> dict | None:
+    async def _open_chat_by_id(self, cid: str, *, echo: str = "") -> dict | None:
         """The row of a chat a frame names that this socket is NOT bound to,
-        or None (an error already sent) when it is refused. The gate is the
-        one ``resume_chat`` applies before binding (``can_open_chat``) plus
-        the task continue-gate: a frame must never reach a chat by id that
-        this user could not open and drive. A missing row answers ``{}``:
-        there is nothing to protect and the caller's write is a no-op."""
+        or None (the refusal already answered) when it is refused. The gate
+        is the one ``resume_chat`` applies before binding (``can_access_chat``)
+        plus the task continue-gate: a frame must never reach a chat by id
+        that this user could not open and drive. A missing row answers
+        ``{}``: there is nothing to protect and the caller's write is a no-op.
+
+        A picker frame passes ``echo`` (the setting it changes): a drive-gate
+        refusal on a chat this person MAY open then answers with the chat's
+        stored value (``_echo_pick``) instead of an error. A chat they may
+        not open always answers "Access denied" alone: its settings are not
+        theirs to read."""
         chat = await run_db(task_store.get_chat, cid)
         if not chat:
             return {}
         # Imported here: the agents API package imports this module's assembly.
-        from api.agents.agents import can_open_chat
-        if not await run_db(can_open_chat, self._viewer_context(), chat):
+        from api.agents.chats import can_access_chat
+        if not await run_db(can_access_chat, self._viewer_context(), chat):
             await self._send_error("Access denied")
             return None
-        if await self._deny_task_continue(cid, chat):
+        if echo:
+            if await self._deny_task_continue(cid, chat, quiet=True):
+                await self._echo_pick(cid, echo, chat)
+                return None
+        elif await self._deny_task_continue(cid, chat):
             return None
         return chat
+
+    async def _echo_pick(self, cid: str, setting: str, chat: dict | None = None) -> None:
+        """Answer a refused pick with the chat's stored value, so the picker
+        shows what the chat really runs with. Only after a drive-gate refusal
+        on a chat this person may open (``_open_chat_by_id``)."""
+        if chat is None:
+            chat = await run_db(task_store.get_chat, cid) or {}
+        if setting == "mode":
+            await self._send({"type": wire.MODE_CHANGED, "chat_id": cid,
+                              "mode": chat.get("permission_mode") or "default"})
+        elif setting == "model":
+            await self._send({"type": wire.MODEL_CHANGED, "chat_id": cid,
+                              "model": chat.get("model", "")})
+        else:
+            await self._send({"type": wire.EXECUTION_MODE_CHANGED, "chat_id": cid,
+                              "execution_mode": chat.get("execution_mode") or ""})
 
     async def _handle_mode_change(self, msg: dict):
         new_mode = msg.get("mode", "")
@@ -647,13 +779,14 @@ class ChatSupportMixin:
         # gets the row write only, never the bound session.
         cid = msg.get("chat_id") or ""
         bound = bool(cid) and cid == self.chat_id
-        if bound and await self._deny_task_continue(cid):
+        if bound and await self._deny_task_continue(cid, quiet=True):
+            await self._echo_pick(cid, "mode")
             return
         if cid and not bound:
             if new_mode not in PERMISSION_MODES:
                 await self._send_error(f"Invalid mode: {new_mode}")
                 return
-            if await self._open_chat_by_id(cid) is None:
+            if await self._open_chat_by_id(cid, echo="mode") is None:
                 return
             await chat_writer.submit(
                 cid,
@@ -677,9 +810,11 @@ class ChatSupportMixin:
             return
         if not bound:
             self.deferred_mode = new_mode
+            self.deferred_for = ""
         if not sid or not self.layer:
             # No session yet — defer until warmup creates one
             self.deferred_mode = new_mode
+            self.deferred_for = cid if bound else ""
             await self._send({"type": wire.MODE_CHANGED, "mode": new_mode})
             return
         # The hook keeps a stored mode over the terminal's own: switching a
@@ -702,7 +837,10 @@ class ChatSupportMixin:
             )
 
         if not await self.layer.is_session_alive(sid):
+            # The session is away (its machine reconnecting, or gone): the
+            # engine's side applies at the chat's next start.
             self.deferred_mode = new_mode
+            self.deferred_for = cid if bound else ""
             await self._send({"type": wire.MODE_CHANGED, "mode": new_mode})
             return
         await self._send({"type": wire.MODE_CHANGED, "mode": new_mode})
@@ -752,10 +890,11 @@ class ChatSupportMixin:
         bound = bool(cid) and cid == self.chat_id
         if not cid:
             self.deferred_model = new_model
+            self.deferred_for = ""
             await self._send({"type": wire.MODEL_CHANGED, "model": new_model})
             logger.info(f"WS dashboard model deferred: model={new_model} (new-chat state)")
             return
-        if not bound and await self._open_chat_by_id(cid) is None:
+        if not bound and await self._open_chat_by_id(cid, echo="model") is None:
             return
 
         # The persisted model drives every follow-up turn AND the pump's
@@ -763,7 +902,8 @@ class ChatSupportMixin:
         # gate (a task chat's continue tier, a pooled chat's editor tier),
         # and an in-flight run is never re-attributed mid-stream from a
         # picker click.
-        if bound and await self._deny_task_continue(cid):
+        if bound and await self._deny_task_continue(cid, quiet=True):
+            await self._echo_pick(cid, "model")
             return
         if session_kind.is_task_chat_id(cid):
             if await task_run_active_async(cid):
@@ -831,11 +971,13 @@ class ChatSupportMixin:
         if not self.session_id or not self.layer:
             # No session yet — store for when session is created via warmup
             self.deferred_model = new_model
+            self.deferred_for = cid
             logger.info(f"WS dashboard model deferred: model={new_model} (no session yet)")
             return
 
         if not await self.layer.is_session_alive(self.session_id):
             self.deferred_model = new_model
+            self.deferred_for = cid
             logger.info(f"WS dashboard model deferred: model={new_model} (session not found)")
             return
 
@@ -876,9 +1018,17 @@ class ChatSupportMixin:
             return
         cid = msg.get("chat_id")
         if cid:
-            if await self._open_chat_by_id(cid) is None:
+            if await self._open_chat_by_id(cid, echo="execution_mode") is None:
                 return
-            task_store.update_chat(cid, execution_mode=new_mode)
+            # A lane job, awaited before the ack: a warmup reading the row
+            # after the ack must see the new mode.
+            await chat_writer.submit(
+                cid, functools.partial(task_store.update_chat, cid, execution_mode=new_mode),
+                label="exec_mode_persist",
+            )
+            await self._send({"type": wire.EXECUTION_MODE_CHANGED, "execution_mode": new_mode,
+                              "chat_id": cid})
+            return
         await self._send({"type": wire.EXECUTION_MODE_CHANGED, "execution_mode": new_mode})
 
     async def _handle_switch_execution_mode(self, msg: dict):
@@ -901,7 +1051,7 @@ class ChatSupportMixin:
         # The frame names its chat; the connection's bound chat_id is the last
         # chat opened on the socket, never a substitute (see the persist handler).
         cid = msg.get("chat_id")
-        chat = await self._open_chat_by_id(cid) if cid else {}
+        chat = await self._open_chat_by_id(cid, echo="execution_mode") if cid else {}
         if chat is None:
             return
         if not cid or not chat:
@@ -913,6 +1063,7 @@ class ChatSupportMixin:
         live = interactive_session.get(old_sid) if old_sid else None
         if live is not None and live.alive and not live.may_drive(self.user_sub):
             await self._send_pty_read_only(live)
+            await self._echo_pick(cid, "execution_mode", chat)
             return
 
         # Persist the target so the re-warm resolves to it.
@@ -967,6 +1118,7 @@ class ChatSupportMixin:
             "model": chat.get("model", ""),
             "mode": chat.get("permission_mode", "default"),
         })
+        self._history_floors = None  # a page with no siblings: no base for a delta
 
         # Re-warm in the target mode — reuses the full warmup machinery; the now
         # dead old session falls through to the resume path → spawns the new mode

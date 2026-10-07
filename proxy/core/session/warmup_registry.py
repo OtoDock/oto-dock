@@ -22,6 +22,7 @@ Sweeper task in app.py removes entries with completed.is_set() or older than
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -112,10 +113,40 @@ async def emit(chat_id: str, event: dict) -> None:
         listeners = list(rec.listeners)
 
     for send_fn in listeners:
+        _chain_send(send_fn, event, chat_id)
+
+
+# One ordered chain per listener: its events go out in order, the emit never
+# waits on a send, and a listener whose socket is paused (its reader is
+# slow) delays only itself, never the other tabs or the server kick that
+# follows ``warmup_ready``. A listener's chain is dropped once it drains.
+_chains: dict[int, asyncio.Task] = {}
+
+
+def _chain_send(send_fn, event: dict, chat_id: str) -> None:
+    key = id(send_fn)
+    prev = _chains.get(key)
+
+    async def _run() -> None:
+        if prev is not None:
+            with contextlib.suppress(Exception):
+                await prev
         try:
             await send_fn(event)
         except Exception:
             logger.exception("listener send_fn raised for chat=%s", chat_id[:8])
+        finally:
+            if _chains.get(key) is task:
+                _chains.pop(key, None)
+
+    task = asyncio.get_running_loop().create_task(_run())
+    _chains[key] = task
+
+
+async def drain_listeners() -> None:
+    """Wait for every listener chain to finish its sends (tests)."""
+    while _chains:
+        await asyncio.gather(*list(_chains.values()), return_exceptions=True)
 
 
 async def unregister(chat_id: str) -> None:

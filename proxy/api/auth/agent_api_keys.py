@@ -25,10 +25,12 @@ from auth.providers import (
     UserContext,
     get_current_user,
     require_human,
+    require_user,
 )
 
 logger = logging.getLogger("claude-proxy.agent-api-keys")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class CreateAgentKeyRequest(BaseModel):

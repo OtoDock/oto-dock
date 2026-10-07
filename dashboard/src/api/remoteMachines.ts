@@ -87,6 +87,9 @@ export interface RemoteMachine {
   // never returned). Without one every session asks for a click in the
   // browser and unattended sessions cannot use it.
   browser_extension_token_set?: boolean
+  // Whether unattended sessions (scheduled tasks, triggers, calls, meetings)
+  // may use the saved token; off, only a session a person drives does.
+  browser_unattended?: boolean
   // Proxy-side concurrent-session override. null = use the
   // satellite's own reported recommendation. The satellite still hard-caps
   // at its physical max regardless of this value.
@@ -285,6 +288,26 @@ export const useSetBrowserToken = (scope: MachineScope) => {
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: 'Failed' }))
         throw new Error(err.detail || 'Failed to update the extension token')
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: machinesKey(scope) }),
+  })
+}
+
+export const useSetBrowserUnattended = (scope: MachineScope) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (
+      { machineId, enabled }: { machineId: string; enabled: boolean },
+    ) => {
+      const res = await apiFetch(`${machinePath(scope, machineId)}/browser-unattended`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Failed' }))
+        throw new Error(err.detail || 'Failed to update unattended use')
       }
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: machinesKey(scope) }),

@@ -637,6 +637,87 @@ class TestFileWrittenHookDispatch:
         assert r.json() == {"ok": True}
         assert captured["rel"] == "users/alice/workspace/foo.png"
 
+    def test_a_written_agent_tree_file_is_announced_on_both_branches(self, client, monkeypatch):
+        """Every open view of the file (another device's pane, a teammate's,
+        a workspace preview) learns of a file-tools write: a disk change,
+        whatever the push to the machine answered."""
+        from unittest.mock import AsyncMock
+        from services.notifications import notification_manager
+        bc = AsyncMock()
+        monkeypatch.setattr(notification_manager, "broadcast_file_updated", bc)
+        monkeypatch.setattr(
+            "api.hooks.lifecycle.get_session_security", lambda sid: _make_remote_ctx(),
+        )
+        monkeypatch.setattr("core.remote.remote_file_flow.is_host_cache_path", lambda p: False)
+        monkeypatch.setattr("core.remote.remote_file_flow.push_back", AsyncMock(return_value=False))
+        post = lambda path: client.post("/v1/hooks/file-written", json={  # noqa: E731
+            "session_id": "s1", "path": path,
+        }, headers={"Authorization": "Bearer test"})
+
+        monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: True)
+        assert post("my-agent/users/alice/workspace/r.docx").json() == {"ok": False}
+        bc.assert_awaited_once_with("my-agent", "users/alice/workspace/r.docx", source="disk")
+
+        bc.reset_mock()
+        monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: False)
+        assert post("my-agent/workspace/r.docx").json() == {"ok": True, "local": True}
+        bc.assert_awaited_once_with("my-agent", "workspace/r.docx", source="disk")
+
+        bc.reset_mock()
+        for path in ("other-agent/workspace/r.docx", "my-agent/../x/r.docx", "/workspace/r.docx"):
+            post(path)
+        bc.assert_not_awaited()
+
+    def test_a_write_that_changed_nothing_since_the_push_is_not_announced(
+        self, client, monkeypatch, tmp_path,
+    ):
+        """A preview_document of an untouched file posts file-written too:
+        the file still holds the bytes its newest push's document knows, so
+        no view (a dirty one least of all) is told it changed."""
+        import hashlib
+        from collections import OrderedDict
+        from unittest.mock import AsyncMock
+        import config
+        from api.hooks import preview
+        from api.media.wopi import encode_file_id
+        from services.notifications import notification_manager
+        monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+        monkeypatch.setattr(preview, "_pushed_generations", OrderedDict())
+        target = tmp_path / "my-agent" / "workspace" / "r.docx"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"pushed bytes")
+        preview.note_pushed_generation(encode_file_id("my-agent/workspace/r.docx"), 5,
+                                       hashlib.sha256(b"pushed bytes").hexdigest())
+        bc = AsyncMock()
+        monkeypatch.setattr(notification_manager, "broadcast_file_updated", bc)
+        monkeypatch.setattr(
+            "api.hooks.lifecycle.get_session_security", lambda sid: _make_remote_ctx(),
+        )
+        monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: False)
+        post = lambda: client.post("/v1/hooks/file-written", json={  # noqa: E731
+            "session_id": "s1", "path": "my-agent/workspace/r.docx",
+        }, headers={"Authorization": "Bearer test"})
+        post()
+        bc.assert_not_awaited()
+        target.write_bytes(b"the agent's new bytes")
+        post()
+        bc.assert_awaited_once_with("my-agent", "workspace/r.docx", source="disk")
+
+    def test_a_host_cache_write_announces_nothing(self, client, monkeypatch):
+        from unittest.mock import AsyncMock
+        from services.notifications import notification_manager
+        bc = AsyncMock()
+        monkeypatch.setattr(notification_manager, "broadcast_file_updated", bc)
+        monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: True)
+        monkeypatch.setattr("core.remote.remote_file_flow.is_host_cache_path", lambda p: True)
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.push_back_host_path", AsyncMock(return_value=True),
+        )
+        client.post("/v1/hooks/file-written", json={
+            "session_id": "s1", "path": "/proxy/agents/.remote-host-cache/s1/abc/f.docx",
+        }, headers={"Authorization": "Bearer test"})
+        bc.assert_not_awaited()
+
     def test_foreign_slug_is_never_stripped(self, client, monkeypatch):
         """Only the session's OWN agent slug folds off — a foreign slug is
         passed through untouched (and fails push_back's canonical gate)."""
@@ -976,10 +1057,12 @@ class TestHostCachePreviewEditMint:
         monkeypatch.setattr(
             routing, "resolve_hook_chat_id", AsyncMock(return_value=None),
         )
-        preview._wopi_url_cache.clear()
+        preview._wopi_token_cache.clear()
+        from collections import OrderedDict
+        monkeypatch.setattr(preview, "_pushed_generations", OrderedDict())
         minted = {}
 
-        def _fake_mint(rel, sub, name, permissions, agent):
+        def _fake_mint(rel, sub, name, permissions, agent, chat_id=""):
             minted["permissions"] = permissions
             return "tok", 3600
 
@@ -988,7 +1071,24 @@ class TestHostCachePreviewEditMint:
             "session_id": req_session, "file_path": "C:/Users/u/Desktop/x.docx",
         }, headers={"Authorization": "Bearer test"})
         assert r.status_code == 200, r.text
+        assert "tok" not in r.text
         return minted["permissions"]
+
+    def test_the_token_never_rides_the_url(self, client, monkeypatch, tmp_path, temp_db):
+        """F57: the live event carries the token beside a tokenless URL and
+        the hook's own answer carries none."""
+        from api.hooks import preview
+        pushed = []
+
+        class _Q:
+            async def put(self, item):
+                pushed.append(item)
+
+        monkeypatch.setattr(preview, "get_permission_queue", lambda sid: _Q())
+        self._mint(client, monkeypatch, tmp_path, role="editor")
+        evt = pushed[-1]
+        assert evt["access_token"] == "tok" and evt["access_token_ttl"] == 3600
+        assert "access_token" not in evt["wopi_url"]
 
     def test_editor_gets_edit_on_own_session_cache(
         self, client, monkeypatch, tmp_path, temp_db,
@@ -1008,6 +1108,23 @@ class TestHostCachePreviewEditMint:
             client, monkeypatch, tmp_path, role="manager",
             cache_session="sess-OTHER", req_session="sess-1",
         ) == "view"
+
+    def test_download_token_is_minted_off_the_loop(
+        self, client, monkeypatch, tmp_path, temp_db,
+    ):
+        import asyncio
+        from storage import database as task_store
+        real = task_store.create_media_token
+
+        def _guarded(*a, **kw):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return real(*a, **kw)
+            raise AssertionError("create_media_token ran on the event loop")
+
+        monkeypatch.setattr(task_store, "create_media_token", _guarded)
+        assert self._mint(client, monkeypatch, tmp_path, role="editor") == "edit"
 
 
 # ---------------------------------------------------------------------------

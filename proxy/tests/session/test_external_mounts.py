@@ -144,7 +144,8 @@ class TestConfigDirs:
         assert {"Bash", "Monitor", "PowerShell"} <= set(deny)
         # The web tools are deliberately not denied (2026-09-08).
         assert not {"WebFetch", "WebSearch"} & set(deny)
-        assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].startswith("/caller/.claude/")
+        assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == (
+            'python3 -I "/caller/.claude/permission_gate.py"')
         codex_dir = ensure_persistent_agent_dir(
             "support", execution_path="codex-cli", external_home=home,
         )

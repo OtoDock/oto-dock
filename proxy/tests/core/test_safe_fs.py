@@ -300,6 +300,30 @@ def test_a_long_multibyte_name_still_gets_a_temp(tree):
     assert (root / "a" / name).read_bytes() == b"x"
 
 
+@pytest.mark.parametrize("name", ["report.pdf", "x" * 240, "\u6587" * 80],
+                         ids=["short", "long", "multibyte"])
+def test_is_partial_of_follows_the_temp_name_rule(tree, name):
+    root, _ = tree
+    assert safe_fs.is_partial_of(safe_fs._temp_name(name), name)
+    # The temp as the directory listing reports it: a name cut inside a
+    # multibyte character comes back surrogate-escaped.
+    with safe_fs.atomic_writer(root, f"a/{name}") as fh:
+        fh.write(b"x")
+        [tmp] = [e for e in os.listdir(root / "a") if e.endswith(".partial")]
+        assert safe_fs.is_partial_of(tmp, name)
+    assert not safe_fs.is_partial_of(name, name)
+
+
+def test_is_partial_of_wants_the_exact_shape():
+    assert safe_fs.is_partial_of(".a.pdf.0123456789ab.partial", "a.pdf")
+    for entry in (".a.pdf.bak.0123456789ab.partial", ".a.pdf.0123456789a.partial",
+                  ".a.pdf.0123456789abc.partial", ".a.pdf.0123456789AB.partial",
+                  ".a.pdf.0123456789xy.partial", "a.pdf.0123456789ab.partial",
+                  ".a.pdf.0123456789ab.partia"):
+        assert not safe_fs.is_partial_of(entry, "a.pdf"), entry
+    assert safe_fs.is_partial_of(".a.pdf.bak.0123456789ab.partial", "a.pdf.bak")
+
+
 def test_atomic_write_exclusive_and_mkdirs(tree):
     root, _ = tree
     with pytest.raises(FileExistsError):
@@ -435,6 +459,47 @@ def test_copytree_ignore_and_no_copy_into_itself(tree):
         # The same tree through another root: the copy never copies itself.
         safe_fs.copytree_beneath(root, "a", a_handle, "b/inner")
     assert not (root / "a" / "b" / "inner" / "b" / "inner").exists()
+
+
+def test_copytree_with_a_budget(tree):
+    root, _ = tree
+    (root / "a" / "b" / "g.txt").write_bytes(b"12345678")
+    budget = safe_fs.CopyBudget(max_entries=10, max_bytes=100)
+    safe_fs.copytree_beneath(root, "a", root, "ok", budget=budget)
+    assert (root / "ok" / "b" / "g.txt").read_bytes() == b"12345678"
+    # Two directories and two files.
+    assert (budget.entries_left, budget.bytes_left) == (6, 86)
+    # Past the bytes or the entries left: the copy raises, the directory it
+    # made goes and what it spent is given back; the next copy runs against
+    # what is left.
+    for budget, error in ((safe_fs.CopyBudget(max_bytes=10), safe_fs.FileTooLarge),
+                          (safe_fs.CopyBudget(max_entries=3), safe_fs.TooManyEntries)):
+        with pytest.raises(error):
+            safe_fs.copytree_beneath(root, "a", root, "over", budget=budget)
+        assert not (root / "over").exists()
+        assert _no_partials(root)
+        assert (budget.entries_left, budget.bytes_left) in ((None, 10), (3, None))
+        safe_fs.copytree_beneath(root, "a/b", root, "one", budget=budget,
+                                 ignore=lambda rel, names: {"g.txt"})
+        assert (root / "one" / "f.txt").read_bytes() == b"inside"
+        safe_fs.rmtree_beneath(root, "one")
+    # No budget, or no cap in it: no limit.
+    safe_fs.copytree_beneath(root, "a", root, "free", budget=safe_fs.CopyBudget())
+    assert (root / "free" / "b" / "g.txt").exists()
+
+
+def test_a_copy_budget_counts_every_directory_and_link_it_makes(tree):
+    root, _ = tree
+    for d in ("e1", "e2", "e3"):
+        (root / "d" / d).mkdir(parents=True)
+    (root / "d" / "l").symlink_to("e1")
+    with pytest.raises(safe_fs.TooManyEntries):
+        safe_fs.copytree_beneath(root, "d", root, "out", symlinks="copy",
+                                 budget=safe_fs.CopyBudget(max_entries=4))
+    assert not (root / "out").exists()
+    budget = safe_fs.CopyBudget(max_entries=5)
+    safe_fs.copytree_beneath(root, "d", root, "out", symlinks="copy", budget=budget)
+    assert budget.entries_left == 0 and os.readlink(root / "out" / "l") == "e1"
 
 
 def test_rename_replace_and_no_replace(tree):

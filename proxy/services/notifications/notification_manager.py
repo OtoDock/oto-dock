@@ -42,6 +42,7 @@ from auth.providers import acting_role_of
 from services.notifications import push_sender
 from ws import chat_phase
 from ws import wire_events as wire
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.notifications")
 
@@ -88,6 +89,135 @@ _FOCUS_SURFACES = frozenset({"chat", "home", "app"})
 _FOCUS_ID_MAX = 64
 # Catalog subscriptions one connection may hold (apps × feeds on one tab).
 CATALOG_SUBS_MAX = 64
+
+
+NOTIFY_QUEUE_MAX = 1024
+
+# What a full notify queue sheds, least valuable first. A frame of these
+# kinds is superseded by the next of its key, a reconnect's snapshot or the
+# next poll of the list it refreshes.
+_NOTIFY_EVICT_ORDER = (
+    wire.CHAT_STATUS, wire.CHAT_READ,
+    wire.INSTALL_PROGRESS, wire.INSTALL_HEARTBEAT, wire.TRANSFER_PROGRESS,
+    wire.WARMUP_HEARTBEAT, wire.SATELLITE_UPDATE_SYNC,
+    wire.FILE_UPDATED, wire.CHAT_ROWS, wire.GOAL_UPDATE,
+)
+# Never evicted: the internal kinds carry turns and prompts, a notification
+# is the inbox's alert, the end-of-turn ping has no second channel, and a
+# terminal lifecycle frame is replayed only by a reconnect.
+_NOTIFY_KEEP = frozenset({
+    wire.NOTIFY_SERVER_KICK, wire.NOTIFY_BG_NUDGE, wire.NOTIFY_BG_COMMAND_NUDGE,
+    wire.NOTIFY_LIVENESS_CLEAR, wire.NOTIFY_CHAT_UI_FRAME, wire.NOTIFY_TASK_RESULT_PROMPT,
+    wire.NOTIFY_CONTINUATION_PROMPT, wire.NOTIFY_LOCATION_REQUEST,
+    wire.NOTIFICATION, wire.NOTIFICATION_SILENT, wire.NOTIFICATION_COUNT, wire.SHARE_INBOX,
+    wire.TURN_COMPLETE, wire.BG_AGENT_DONE,
+    wire.INSTALL_DONE, wire.INSTALL_FAILED, wire.MCP_INSTALL_FAILED,
+    wire.TRANSFER_DONE, wire.TRANSFER_STATE, wire.TRANSFER_MACHINE_STATE,
+    wire.SATELLITE_UPDATED, wire.SATELLITE_UPDATE_FAILED,
+})
+# The broadcast copies the drain discards (the acting socket holds its own
+# copy, ws/dashboard_server_events._DIRECT_COPY_ONLY): never queued.
+_NOTIFY_REFUSED = frozenset({wire.TITLE_UPDATED, wire.ENGINE_SWITCHED})
+_NOTIFY_STATUS = frozenset({wire.CHAT_STATUS, wire.CHAT_READ})
+_NOTIFY_DROP_LOG_S = 60.0
+
+
+def _notify_coalesce_key(frame: dict) -> tuple | None:
+    """The key under which a queued frame is replaced by a newer one of the
+    same kind, or None for a frame that is never coalesced."""
+    t = frame.get("type")
+    if t in _NOTIFY_STATUS or t == wire.WARMUP_HEARTBEAT:
+        return (t, frame.get("chat_id"))
+    if t in (wire.INSTALL_PROGRESS, wire.INSTALL_HEARTBEAT):
+        return (t, frame.get("machine_id"), frame.get("agent"))
+    if t == wire.TRANSFER_PROGRESS:
+        return (t, frame.get("transfer_id") or frame.get("id"))
+    if t == wire.SATELLITE_UPDATE_SYNC:
+        return (t,)
+    return None
+
+
+class NotifyQueue(asyncio.Queue):
+    """The per-connection notify queue, bounded.
+
+    Drained only between the viewed chat's turns, so a long turn beside a
+    chatty broadcast source could grow it without limit. Three rules keep
+    it small before anything is lost: a status, read-receipt, progress or
+    heartbeat frame replaces the queued one of its key (in place, so order
+    holds); the two broadcast copies the drain discards are refused; and
+    past ``NOTIFY_QUEUE_MAX`` the oldest frame of the least valuable kind
+    present is evicted (``_NOTIFY_EVICT_ORDER``), never one of
+    ``_NOTIFY_KEEP``. When only kept frames wait, a new evictable frame is
+    dropped and a new kept frame is queued past the bound. ``put`` never
+    blocks. An evicted status frame marks the queue ``stale``: the
+    connection's drain then purges the queued status frames and sends a
+    fresh ``chat_status_snapshot`` so the client's dots converge.
+    """
+
+    def __init__(self, bound: int = NOTIFY_QUEUE_MAX) -> None:
+        super().__init__()
+        self.bound = bound
+        self.stale = False
+        self.dropped = 0
+        self._dropped_since_log = 0
+        self._logged_at = 0.0
+
+    def put_nowait(self, item: dict) -> None:
+        kind = item.get("type") if isinstance(item, dict) else None
+        if kind in _NOTIFY_REFUSED:
+            return
+        key = _notify_coalesce_key(item) if kind else None
+        if key is not None:
+            for i, queued in enumerate(self._queue):
+                if _notify_coalesce_key(queued) == key:
+                    self._queue[i] = item
+                    return
+        if self.qsize() >= self.bound and kind not in _NOTIFY_KEEP:
+            victim = self._victim()
+            if victim is None:
+                self._drop(item)
+                return
+            evicted = self._queue[victim]
+            del self._queue[victim]
+            self._drop(evicted)
+        super().put_nowait(item)
+
+    async def put(self, item: dict) -> None:
+        self.put_nowait(item)
+
+    def _victim(self) -> int | None:
+        for kind in _NOTIFY_EVICT_ORDER:
+            for i, queued in enumerate(self._queue):
+                if queued.get("type") == kind:
+                    return i
+        for i, queued in enumerate(self._queue):
+            if queued.get("type") not in _NOTIFY_KEEP:
+                return i
+        return None
+
+    def _drop(self, frame: dict) -> None:
+        self.dropped += 1
+        self._dropped_since_log += 1
+        if frame.get("type") in _NOTIFY_STATUS:
+            self.stale = True
+        now = time.monotonic()
+        if now - self._logged_at >= _NOTIFY_DROP_LOG_S:
+            logger.warning(
+                "notify queue full (%d): dropped %d frame(s) in the last minute, the newest a %s",
+                self.bound, self._dropped_since_log, frame.get("type"),
+            )
+            self._logged_at = now
+            self._dropped_since_log = 0
+
+    def purge_status(self) -> int:
+        """Drop every queued status frame (a snapshot replaces them) and
+        clear ``stale``. Returns how many went."""
+        kept = [f for f in self._queue if f.get("type") not in _NOTIFY_STATUS]
+        gone = len(self._queue) - len(kept)
+        self._queue.clear()
+        self._queue.extend(kept)
+        self.stale = False
+        return gone
 
 
 class LiveQueue:
@@ -361,7 +491,11 @@ def get_connection(user_sub: str, connection_id: str) -> ConnectionInfo | None:
 # change invalidates the entries it touches, so the TTL bounds only the
 # changes that raise neither (an identity provider's role change at login, a
 # row written outside the routes).
-# A refresh that started before a drop is discarded by the entry's generation.
+# Every read takes the entry's generation before it reads the store, so a
+# read that started before a drop or an invalidation is discarded when it
+# lands. An agent with no entry yet is a placeholder until its first read
+# lands: a fan-out on the loop is answered with nobody meanwhile, every other
+# read reads the store.
 
 _AUDIENCE_TTL_S = 30.0
 
@@ -374,49 +508,68 @@ class _AudienceEntry:
     generation: int = 0     # bumped by every drop and invalidation
     stale: bool = False
     refreshing: bool = False
+    placeholder: bool = False   # no list read yet: it answers fan-outs only
 
 
 _audience: dict[str, _AudienceEntry] = {}
 _audience_tasks: set[asyncio.Task] = set()
 
 
-def agent_audience(agent: str) -> list[str]:
+def agent_audience(agent: str, *, fan_out: bool = False) -> list[str]:
     """Every user who sees ``agent``'s shared-only and task chats, from the
-    cache, as a fresh list. Callable from any thread: the first read of an
-    agent per process runs on the caller's thread, later reads never touch
-    the store from the loop."""
+    cache, as a fresh list. Callable from any thread. A miss (an agent with
+    no entry yet) reads the store on the caller's thread, except a
+    ``fan_out`` read on the loop: a caller that only delivers frames is
+    answered with nobody at once while one executor job fills the entry, and
+    the next frame reaches the audience. A check that refuses on the answer
+    never passes ``fan_out``."""
     if not agent:
         return []
     getter = notification_store.get_agent_user_subs
     entry = _audience.get(agent)
-    now = time.monotonic()
-    if entry is not None and entry.getter is getter:
-        if not entry.stale and now - entry.fetched_at < _AUDIENCE_TTL_S:
-            return list(entry.subs)
-        return list(_refresh_audience(agent, entry, getter))
-    subs = tuple(getter(agent))
-    _audience[agent] = _AudienceEntry(subs, now, getter)
-    return list(subs)
+    if entry is None or entry.getter is not getter:
+        entry = _audience[agent] = _placeholder(getter)
+    elif not entry.stale and time.monotonic() - entry.fetched_at < _AUDIENCE_TTL_S:
+        return list(entry.subs)
+    return list(_refresh_audience(agent, entry, getter, fan_out=fan_out))
 
 
-def _refresh_audience(agent: str, entry: _AudienceEntry, getter) -> tuple[str, ...]:
-    """A stale entry: on the loop thread, serve it and refresh it in one
-    executor job (one in flight per agent); on any other thread, read it
-    right there and serve the result."""
+def _placeholder(getter) -> _AudienceEntry:
+    return _AudienceEntry((), 0.0, getter, stale=True, placeholder=True)
+
+
+def _refresh_audience(agent: str, entry: _AudienceEntry, getter, *,
+                      fan_out: bool) -> tuple[str, ...]:
+    """A stale or placeholder entry. On the loop thread a stale entry is
+    served and refreshed in one executor job (one in flight per agent), and
+    a placeholder is served so to a fan-out only. On any other thread, and
+    for a placeholder an exact caller reads, the store is read right there.
+    The generation is taken before the read: an invalidation that lands
+    during it keeps the entry stale."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
-    if loop is None:
-        subs = tuple(getter(agent))
-        _store_audience(agent, entry.generation, subs, getter)
+    if loop is None or (entry.placeholder and not fan_out):
+        generation = entry.generation
+        try:
+            subs = tuple(getter(agent))
+        except Exception:
+            if entry.placeholder and _audience.get(agent) is entry:
+                _audience.pop(agent, None)
+            raise
+        _store_audience(agent, generation, subs, getter)
         return subs
+    _start_audience_refresh(loop, agent, entry, getter)
+    return entry.subs
+
+
+def _start_audience_refresh(loop, agent: str, entry: _AudienceEntry, getter) -> None:
     if not entry.refreshing:
         entry.refreshing = True
         task = loop.create_task(_refresh_audience_job(agent, entry.generation, getter))
         _audience_tasks.add(task)
         task.add_done_callback(_audience_tasks.discard)
-    return entry.subs
 
 
 async def _refresh_audience_job(agent: str, generation: int, getter) -> None:
@@ -447,12 +600,30 @@ def _store_audience(agent: str, generation: int, subs: tuple[str, ...], getter) 
 
 
 def invalidate_audience(agent: str = "") -> None:
-    """Mark one agent's entry, or every entry, for a refresh on its next read."""
+    """Mark one agent's entry, or every entry, for a refresh on its next
+    read. An agent with no entry yet gets one filled when this runs on the
+    loop (its creation, a community install), so its first turn edge finds
+    its audience."""
     entries = [_audience.get(agent)] if agent else list(_audience.values())
     for entry in entries:
         if entry is not None:
             entry.stale = True
             entry.generation += 1
+    if agent and entries[0] is None:
+        _fill_new_audience(agent)
+
+
+def _fill_new_audience(agent: str) -> None:
+    """One executor job fills a missing entry; off the loop the first read
+    fills it instead."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    getter = notification_store.get_agent_user_subs
+    entry = _audience.setdefault(agent, _placeholder(getter))
+    if entry.placeholder:
+        _start_audience_refresh(loop, agent, entry, getter)
 
 
 def _drop_from_audience(sub: str, agents) -> None:
@@ -462,7 +633,8 @@ def _drop_from_audience(sub: str, agents) -> None:
             continue
         _audience[agent] = _AudienceEntry(
             tuple(s for s in entry.subs if s != sub), entry.fetched_at,
-            entry.getter, entry.generation + 1, stale=True)
+            entry.getter, entry.generation + 1, stale=True,
+            placeholder=entry.placeholder)
 
 
 async def _on_offboard(event) -> None:
@@ -518,8 +690,10 @@ def _schedule_audience_warmup() -> None:
 
 
 def reset_audience_cache() -> None:
-    """Forget every entry (tests)."""
+    """Forget every entry and every tracked refresh (tests: a later test
+    never waits on a job left on a loop that ended)."""
     _audience.clear()
+    _audience_tasks.clear()
 
 
 def chat_status_targets(owner_sub: str, agent: str) -> list[str]:
@@ -528,11 +702,12 @@ def chat_status_targets(owner_sub: str, agent: str) -> list[str]:
     agent (admins included). Synthetic owners are the shared-only chat owner
     (``agent::<slug>``) AND the scheduler's agent-scope task-chat owner
     (``task::<slug>``) — the latter fans out so scheduled-run pulses reach the
-    sidebar's task mode. The synthetic paths read the audience cache."""
+    sidebar's task mode. The synthetic paths read the audience cache as a
+    fan-out (every caller delivers frames)."""
     from core.session.visibility import is_shared_chat_owner, is_task_chat_owner
     if is_shared_chat_owner(owner_sub) or is_task_chat_owner(owner_sub):
         try:
-            return agent_audience(agent) if agent else []
+            return agent_audience(agent, fan_out=True) if agent else []
         except Exception:
             return []
     return [owner_sub] if owner_sub else []
@@ -777,30 +952,41 @@ async def fire_notification(
     then routes to WS / native push per the mutually-exclusive policy in ``_deliver_to_user``.
     ``href`` is a dashboard path the row opens instead of the agent/chat deep link.
     """
-    user_subs = await asyncio.to_thread(resolve_targets, scope, target)
+    user_subs = await run_db(resolve_targets, scope, target)
     if not user_subs:
         logger.warning(
             f"No targets resolved for notification: scope={scope}, target={target}"
         )
         return []
 
-    deliveries = []
-    for user_sub in user_subs:
-        delivery = await asyncio.to_thread(
-            notification_store.create_delivery,
-            user_sub=user_sub,
-            title=title,
-            body=body,
-            severity=severity,
-            scope=scope,
-            source=source,
-            notification_id=notification_id,
-            agent_slug=agent_slug,
-            chat_id=chat_id,
-            href=href,
-        )
-        deliveries.append(delivery)
-        await _deliver_to_user(user_sub, delivery)
+    def _create_rows() -> list[tuple[str, dict]]:
+        # One job for every inbox row, each its own transaction as before:
+        # a recipient deleted since the targets were resolved costs their
+        # row alone, never the others'.
+        out: list[tuple[str, dict]] = []
+        for user_sub in user_subs:
+            try:
+                out.append((user_sub, notification_store.create_delivery(
+                    user_sub=user_sub, title=title, body=body, severity=severity,
+                    scope=scope, source=source, notification_id=notification_id,
+                    agent_slug=agent_slug, chat_id=chat_id, href=href,
+                )))
+            except Exception:
+                logger.exception("notification delivery row for %s failed", user_sub[:8])
+        return out
+
+    created = await run_db(_create_rows)
+    deliveries = [d for _, d in created]
+    slot = _fan_out_slot()
+
+    async def _one(user_sub: str, delivery: dict) -> None:
+        async with slot:
+            try:
+                await _deliver_to_user(user_sub, delivery)
+            except Exception:
+                logger.exception("notification delivery to %s failed", user_sub[:8])
+
+    await asyncio.gather(*(_one(u, d) for u, d in created), return_exceptions=True)
 
     # Update fired count if this came from a stored notification definition
     # (immediate-fire from create, scheduled fire, or manual /fire endpoint).
@@ -834,12 +1020,57 @@ async def fire_notification(
 def _install_id() -> str:
     """This proxy's stable install id (the relay identity), tagged into every push
     so the Android app can route a notification to the matching installation. Empty
-    string if unavailable — old apps ignore it and route to the active install."""
+    string if unavailable — old apps ignore it and route to the active install.
+    A store read: ``_install_id_async`` serves it from a per-process cache."""
     try:
         from services.billing.relay_client import get_install_id
         return get_install_id()
     except Exception:
         return ""
+
+
+_install_id_value = ""
+_install_id_flights: dict[int, asyncio.Future] = {}
+
+
+async def _install_id_async() -> str:
+    """``_install_id()`` read once per process on ``run_db`` (the id never
+    changes once minted; an empty answer is retried next time), the first
+    callers of a loop sharing one read."""
+    global _install_id_value
+    if _install_id_value:
+        return _install_id_value
+    loop = asyncio.get_running_loop()
+    flight = _install_id_flights.get(id(loop))
+    if flight is None:
+        # The read is its own task and every caller, the first included,
+        # awaits it shielded: a cancelled caller cancels nobody's read.
+        async def _read() -> str:
+            global _install_id_value
+            value = await run_db(_install_id)
+            _install_id_value = value
+            return value
+
+        flight = _install_id_flights[id(loop)] = loop.create_task(_read())
+        flight.add_done_callback(lambda f: (_install_id_flights.pop(id(loop), None),
+                                            f.cancelled() or f.exception()))
+    return await asyncio.shield(flight)
+
+
+# The fan-outs' concurrency: recipients delivered at once, per loop (a
+# semaphore binds to the loop it first waits on). The pushes inside a
+# delivery take ``push_sender._push_slot()``, never this one.
+_FAN_OUT_CONCURRENCY = 8
+_fan_out_slots: dict[int, asyncio.Semaphore] = {}
+
+
+def _fan_out_slot() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    slot = _fan_out_slots.get(id(loop))
+    if slot is None:
+        _fan_out_slots.clear()
+        slot = _fan_out_slots[id(loop)] = asyncio.Semaphore(_FAN_OUT_CONCURRENCY)
+    return slot
 
 
 async def fire_ephemeral(
@@ -968,21 +1199,25 @@ async def fire_ephemeral(
                                  else f"/chat/{_agent}/{chat_id}")
             except Exception:
                 pass  # link is best-effort — the push itself still matters
-        subscriptions = await asyncio.to_thread(ns.get_push_subscriptions, user_sub)
-        _tokens = 0
-        _ok = 0
-        for sub in subscriptions:
-            if sub["platform"] == "android":
-                _tokens += 1
-                if await push_sender.send_fcm(sub["subscription_data"], {
-                    "title": title,
-                    "body": body,
-                    "severity": "info",
-                    "ephemeral": True,
-                    "click_url": click_url,
-                    "install_id": _install_id(),
-                }):
-                    _ok += 1
+        subscriptions = await run_db(ns.get_push_subscriptions, user_sub)
+        android = [s for s in subscriptions if s["platform"] == "android"]
+        _tokens = len(android)
+        payload = {
+            "title": title,
+            "body": body,
+            "severity": "info",
+            "ephemeral": True,
+            "click_url": click_url,
+            "install_id": await _install_id_async(),
+        }
+        slot = push_sender._push_slot()
+
+        async def _push(sub: dict) -> bool:
+            async with slot:
+                return await push_sender.send_fcm(sub["subscription_data"], payload)
+
+        _ok = sum(1 for r in await asyncio.gather(*(_push(s) for s in android),
+                                                   return_exceptions=True) if r is True)
         _route(f"native push — android tokens={_tokens} sent={_ok}"
                + ("" if _tokens else " (no Android push registration for this user)"))
     except Exception as e:
@@ -1017,6 +1252,24 @@ async def _safe_put(queue: asyncio.Queue, message: dict) -> bool:
         return False
 
 
+_FILE_UPDATED_WINDOW_S = 0.25
+_FILE_UPDATED_MAX_FRAMES = 64
+
+
+@dataclass
+class _FileBatch:
+    """One agent's pending ``file_updated`` calls: per path, the merged
+    source (``disk`` when any call said so), the OR of the pin flags and the
+    users every call excluded (the intersection: an agent's write must
+    reach the person who saved the same file)."""
+    paths: dict[str, dict] = field(default_factory=dict)
+    handle: asyncio.TimerHandle | None = None
+
+
+_file_batches: dict[str, _FileBatch] = {}
+_file_flushes: set[asyncio.Task] = set()
+
+
 async def broadcast_file_updated(
     agent_slug: str, rel_path: str, *, source: str = "disk",
     exclude_user_sub: str = "", pin: bool = False,
@@ -1033,68 +1286,134 @@ async def broadcast_file_updated(
     session doesn't know about). The CLIENT decides whether to reload based on
     ``source`` + its own dirty state, and ignores the event for files it doesn't
     have open. ``exclude_user_sub`` skips the writer (no point refreshing their
-    own save). Best-effort; never raises."""
+    own save). Best-effort; never raises.
+
+    Calls are coalesced per agent: the first opens a window of
+    ``_FILE_UPDATED_WINDOW_S``, the ones that follow join it, and the flush
+    resolves the audience once for the whole batch (a sync burst of N files
+    costs one audience read, not N). The call returns once it is queued;
+    ``flush_file_updates`` runs a pending window now."""
     if not agent_slug or not rel_path:
         return
     try:
+        batch = _file_batches.get(agent_slug)
+        if batch is None:
+            batch = _file_batches[agent_slug] = _FileBatch()
+            batch.handle = asyncio.get_running_loop().call_later(
+                _FILE_UPDATED_WINDOW_S, _flush_file_batch, agent_slug)
+        excluded = {exclude_user_sub} if exclude_user_sub else set()
+        entry = batch.paths.get(rel_path)
+        if entry is None:
+            batch.paths[rel_path] = {"source": source, "pin": bool(pin), "exclude": excluded}
+        else:
+            entry["source"] = "disk" if "disk" in (entry["source"], source) else source
+            entry["pin"] = entry["pin"] or bool(pin)
+            entry["exclude"] &= excluded
+    except Exception:
+        logger.debug("broadcast_file_updated failed for %s/%s", agent_slug, rel_path, exc_info=True)
+
+
+def _flush_file_batch(agent_slug: str) -> None:
+    batch = _file_batches.pop(agent_slug, None)
+    if batch is None:
+        return
+    if batch.handle is not None:
+        batch.handle.cancel()
+    task = asyncio.get_running_loop().create_task(_send_file_updates(agent_slug, batch.paths))
+    _file_flushes.add(task)
+    task.add_done_callback(_file_flushes.discard)
+
+
+async def flush_file_updates() -> None:
+    """Flush every pending window now and wait for the sends (tests, the
+    shutdown)."""
+    for agent_slug in list(_file_batches):
+        _flush_file_batch(agent_slug)
+    while _file_flushes:
+        await asyncio.gather(*list(_file_flushes), return_exceptions=True)
+
+
+async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
+    """One batch's frames: the audience and each active user's role and
+    username read in one job, then one ``file_updated`` per path to each
+    user's active sockets (a batch past ``_FILE_UPDATED_MAX_FRAMES`` sends
+    that many per path and one agent-level frame with an empty ``rel_path``,
+    which every tree view refreshes on and no per-path consumer matches),
+    and each path handed to the catalog once."""
+    try:
+        import base64
+
         from core.remote.file_sync import should_sync_to_target
         from storage import database as task_store
 
-        user_subs = await asyncio.to_thread(resolve_targets, "agent", agent_slug)
-        # base64url of the AGENTS_DIR-relative path == api.media.wopi.encode_file_id,
-        # so the client can match this event to an open Collabora preview by its
-        # file_id without a path round-trip.
-        import base64
-        file_id = base64.urlsafe_b64encode(
-            f"{agent_slug}/{rel_path}".encode()
-        ).decode().rstrip("=")
-        msg = {
-            "type": wire.FILE_UPDATED,
-            "agent_slug": agent_slug,
-            "rel_path": rel_path,
-            "file_id": file_id,
-            "source": source,
-        }
-        if pin:
-            # Dock pin membership changed for this path (file pinned or
-            # unpinned) — clients refresh the pins list, not just content.
-            msg["pin"] = True
+        def _audience() -> tuple[list[str], dict[str, tuple[str, str]]]:
+            subs = resolve_targets("agent", agent_slug) or []
+            active = [u for u in subs if any(c.active for c in _user_connections.get(u, []))]
+            return subs, {u: (acting_role_of(u, agent_slug),
+                              task_store.get_username_by_sub(u) or "") for u in active}
 
-        def _role_and_name(user_sub: str) -> tuple[str, str]:
-            return acting_role_of(user_sub, agent_slug), (task_store.get_username_by_sub(user_sub) or "")
+        _, by_user = await run_db(_audience)
 
-        told: list[str] = []
-        for user_sub in user_subs or []:
-            if exclude_user_sub and user_sub == exclude_user_sub:
-                continue
-            active = [c for c in _user_connections.get(user_sub, []) if c.active]
-            if not active:
-                continue
-            # Per-user isolation: never tell a user about a path they can't see
-            # (another user's users/{u}/ file, or config/ for a non-owner) —
-            # the same predicate the workspace fan-out applies.
-            role, username = await asyncio.to_thread(_role_and_name, user_sub)
-            if not should_sync_to_target(rel_path, username, role):
-                continue
-            for c in active:
-                await _safe_put(c.queue, msg)
-            told.append(user_sub)
-        # The catalog's ``file_changes`` feed, ONE delta per change: frames to
-        # the users told above (on the live queue, so an open app hears it
-        # mid-turn), and the agent's app servers and handlers take it once,
-        # whether or not anyone is watching.
-        try:
-            from api.apps import catalog
-            catalog.file_changed(told, agent_slug, rel_path,
-                                 file_id=file_id if source == "collabora" else "",
-                                 source=source)
-        except Exception as e:
-            logger.debug("catalog file_changes delta: %s", e)
+        def _file_id(rel_path: str) -> str:
+            # base64url of the AGENTS_DIR-relative path == api.media.wopi.encode_file_id,
+            # so the client can match this event to an open Collabora preview by its
+            # file_id without a path round-trip.
+            return base64.urlsafe_b64encode(f"{agent_slug}/{rel_path}".encode()).decode().rstrip("=")
+
+        from api.apps import catalog
+        reached: set[str] = set()
+        # The pins and the Collabora saves first (a pins list and an open
+        # preview match their path; a tree view matches any frame), then
+        # the disk writes in order: the cap falls on the writes alone.
+        ordered = sorted(paths.items(),
+                         key=lambda kv: not (kv[1]["pin"] or kv[1]["source"] != "disk"))
+        for n, (rel_path, entry) in enumerate(ordered):
+            msg = {
+                "type": wire.FILE_UPDATED,
+                "agent_slug": agent_slug,
+                "rel_path": rel_path,
+                "file_id": _file_id(rel_path),
+                "source": entry["source"],
+            }
+            if entry["pin"]:
+                # Dock pin membership changed for this path (file pinned or
+                # unpinned) — clients refresh the pins list, not just content.
+                msg["pin"] = True
+            told: list[str] = []
+            for user_sub, (role, username) in by_user.items():
+                if user_sub in entry["exclude"]:
+                    continue
+                # Per-user isolation: never tell a user about a path they can't see
+                # (another user's users/{u}/ file, or config/ for a non-owner) —
+                # the same predicate the workspace fan-out applies.
+                if not should_sync_to_target(rel_path, username, role):
+                    continue
+                told.append(user_sub)
+                if n < _FILE_UPDATED_MAX_FRAMES:
+                    for c in _user_connections.get(user_sub, []):
+                        if c.active:
+                            await _safe_put(c.queue, msg)
+                else:
+                    reached.add(user_sub)
+            # The catalog's ``file_changes`` feed, ONE delta per change: frames to
+            # the users told above (on the live queue, so an open app hears it
+            # mid-turn), and the agent's app servers and handlers take it once,
+            # whether or not anyone is watching.
+            try:
+                catalog.file_changed(told, agent_slug, rel_path,
+                                     file_id=msg["file_id"] if entry["source"] == "collabora" else "",
+                                     source=entry["source"])
+            except Exception as e:
+                logger.debug("catalog file_changes delta: %s", e)
+        if reached:
+            summary = {"type": wire.FILE_UPDATED, "agent_slug": agent_slug,
+                       "rel_path": "", "file_id": "", "source": "disk"}
+            for user_sub in reached:
+                for c in _user_connections.get(user_sub, []):
+                    if c.active:
+                        await _safe_put(c.queue, summary)
     except Exception:
-        logger.debug(
-            "broadcast_file_updated failed for %s/%s",
-            agent_slug, rel_path, exc_info=True,
-        )
+        logger.debug("file_updated batch for %s failed", agent_slug, exc_info=True)
 
 
 async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
@@ -1160,7 +1479,7 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
             "delivery_id": delivery["id"],
             "severity": delivery["severity"],
             "click_url": click_url,
-            "install_id": _install_id(),
+            "install_id": await _install_id_async(),
         })
         push_attempted = True
         logger.debug(

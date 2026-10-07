@@ -15,6 +15,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import time
+
 import pytest
 
 from core.layers.cli.remote import ClaudeRemoteState
@@ -39,6 +41,7 @@ def _layer(*, execution_path="codex-cli", supported=True, ack=None,
             session_id="sess-1", execution_path=execution_path,
             machine_id="machine-1", agent_name="agent-1",
             engine_state=engine_state, last_activity=0.0,
+            last_event_at=time.monotonic(), task_turn=False, turn_active=False,
         ),
     }
     send = AsyncMock(return_value=ack or {})
@@ -167,6 +170,39 @@ class TestRemoteClaudeSteer:
         assert cm.satellite_supports_steer_turn("future")
         assert not cm.satellite_supports_steer_turn("old")
         assert not cm.satellite_supports_steer_turn("absent")
+
+
+    @pytest.mark.asyncio
+    async def test_a_satellite_that_reads_will_retry_keeps_the_turn_through_a_retry(self):
+        """0.5.131 keeps a Codex turn running through an error Codex retries;
+        on an older satellite the turn ends on it, so the proxy's translator
+        keeps the ERROR there instead of ending the turn silently."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from core.layers.codex.remote import CodexRemoteAdapter
+        from core.remote.remote_session_info import RemoteSessionInfo
+        from core.remote.satellite_connection import (
+            SatelliteConnection, SatelliteConnectionManager,
+        )
+        cm = SatelliteConnectionManager()
+        for mid, ver in [("new", "0.5.131"), ("old", "0.5.130")]:
+            cm._connections[mid] = SatelliteConnection(
+                machine_id=mid, ws=None, satellite_version=ver,
+            )
+        assert cm.satellite_supports_codex_retry_read("new")
+        assert not cm.satellite_supports_codex_retry_read("old")
+        adapter = CodexRemoteAdapter.__new__(CodexRemoteAdapter)
+
+        async def no_router(info):
+            return None
+
+        adapter._route_notifications = no_router
+        for mid, ends in (("new", False), ("old", True)):
+            info = RemoteSessionInfo(session_id=f"s-{mid}", machine_id=mid, agent_name="a",
+                                     execution_path="codex-cli", event_queue=asyncio.Queue())
+            adapter.init_session(info, MagicMock(model="gpt-5.5"), cm)
+            assert info.engine_state.translator.retried_errors_end_turn is ends
+            await info.engine_state.router_task
 
 
 class TestRemoteCompact:

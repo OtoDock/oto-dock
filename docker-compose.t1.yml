@@ -6,7 +6,7 @@
 #
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:16.14-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
     container_name: otodock-postgres
     restart: unless-stopped
     # Secrets live in PLATFORM_ROOT/config.env (proxy/setup.sh auto-generates a

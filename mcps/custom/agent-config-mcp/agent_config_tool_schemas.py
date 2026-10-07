@@ -136,7 +136,9 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "agents (tasks / notifications / memories default to the user), "
             "`agent` for operational agents where most work is shared across "
             "all users of this agent. (For the full mode, prefer "
-            "`set_visibility_mode`.)"
+            "`set_visibility_mode`.) If this makes the agent Shared only while "
+            "people hold the viewer or contributor role, it is refused: a manager "
+            "confirms that switch in the agent's settings."
         ),
         "inputSchema": {
             "type": "object",
@@ -172,7 +174,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "`shared_personal` (one shared space + personal files too), "
             "`personal_only` (fully private per person, NO shared space), "
             "`shared_only` (ONE shared workspace + ONE shared chat history for "
-            "everyone, no personal space). Changing modes never deletes folders."
+            "everyone, no personal space). Changing modes never deletes folders. "
+            "Shared only takes the editor role or above to chat, so switching to it "
+            "while people hold the viewer or contributor role is refused here: a "
+            "manager confirms, in the agent's settings, the people whose assignment "
+            "is removed."
         ),
         "inputSchema": {
             "type": "object",

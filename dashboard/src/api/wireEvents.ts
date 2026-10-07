@@ -42,6 +42,7 @@ export const WIRE = {
   PERMISSION_PROMPT: 'permission_prompt',
   PLAN_REVIEW: 'plan_review',
   QUESTION: 'question',
+  PROMPT_RETIRED: 'prompt_retired',
   LOCATION_REQUEST: 'location_request',
   PLAN_MODE: 'plan_mode',
   SYSTEM: 'system',
@@ -91,6 +92,7 @@ export const WIRE = {
   WARMUP_FAILED: 'warmup_failed',
   PRE_WARMUP_READY: 'pre_warmup_ready',
   CHAT_HISTORY: 'chat_history',
+  CHAT_HISTORY_DELTA: 'chat_history_delta',
   CHAT_STATUS: 'chat_status',
   CHAT_STATUS_SNAPSHOT: 'chat_status_snapshot',
   CHAT_READ: 'chat_read',
@@ -118,6 +120,7 @@ export const WIRE = {
   OPEN_APP: 'open_app',
   APP_DEPLOYED: 'app_deployed',
   CATALOG: 'catalog',
+  SHARE_INBOX: 'share_inbox',
   INSTALL_STARTED: 'install_started',
   INSTALL_MCP_PLAN: 'install_mcp_plan',
   INSTALL_PROGRESS: 'install_progress',
@@ -193,6 +196,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   permission_prompt: { perChat: true, persisted: 'permission_prompt' },
   plan_review: { perChat: true, persisted: 'plan_review' },
   question: { perChat: true, persisted: 'question' },
+  prompt_retired: { perChat: true, persisted: null },
   location_request: { perChat: true, persisted: null },
   plan_mode: { perChat: true, persisted: 'plan_mode' },
   system: { perChat: true, persisted: 'system' },
@@ -222,11 +226,14 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   artifact_ack: { perChat: false, persisted: null },
   app_action: { perChat: false, persisted: 'app_action' },
   app_action_ack: { perChat: false, persisted: null },
-  queued: { perChat: true, persisted: null },
-  queue_removed: { perChat: true, persisted: null },
-  queue_sent: { perChat: true, persisted: null },
-  queue_cleared: { perChat: true, persisted: null },
-  queue_snapshot: { perChat: true, persisted: null },
+  // The chat's queue frames are chat-routed: they reach every socket of the
+  // chat's audience and name the chat whose queue they describe. A steer
+  // stays in its stream.
+  queued: { perChat: false, persisted: null },
+  queue_removed: { perChat: false, persisted: null },
+  queue_sent: { perChat: false, persisted: null },
+  queue_cleared: { perChat: false, persisted: null },
+  queue_snapshot: { perChat: false, persisted: null },
   steered: { perChat: true, persisted: null },
   mode_changed: { perChat: true, persisted: null },
   model_changed: { perChat: true, persisted: null },
@@ -239,6 +246,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   warmup_failed: { perChat: false, persisted: null },
   pre_warmup_ready: { perChat: false, persisted: null },
   chat_history: { perChat: false, persisted: null },
+  chat_history_delta: { perChat: true, persisted: null },
   chat_status: { perChat: false, persisted: null },
   chat_status_snapshot: { perChat: false, persisted: null },
   chat_read: { perChat: false, persisted: null },
@@ -264,6 +272,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   open_app: { perChat: false, persisted: null },
   app_deployed: { perChat: false, persisted: null },
   catalog: { perChat: false, persisted: null },
+  share_inbox: { perChat: false, persisted: null },
   install_started: { perChat: false, persisted: null },
   install_mcp_plan: { perChat: false, persisted: null },
   install_progress: { perChat: false, persisted: null },
@@ -300,13 +309,15 @@ export function isWireType(t: unknown): t is WireType {
 /** `system.subtype`: the ones the proxy mints or persists (the meeting
  *  orchestrator's seven, the reseed card, the undelivered-input card, the
  *  self-wake marker, the install progress, the tailers' compaction
- *  separator) and, marked, the ones the DASHBOARD synthesises from other
+ *  separator, the not-sent line of a turn whose machine is reconnecting)
+ *  and, marked, the ones the DASHBOARD synthesises from other
  *  frames (`warmup_failed.reason`, the two nudge rows, the live compaction).
  *  The CLI passes raw subtypes through as well; the renderer ignores what
  *  it does not know. */
 export const SYSTEM_SUBTYPE = {
   SESSION_RESEEDED: 'session_reseeded',
   UNDELIVERED_INPUT: 'undelivered_input',
+  TURN_ENDED: 'turn_ended',
   BG_WAKE: 'bg_wake',
   CONTEXT_COMPRESSED: 'context_compressed',
   MEETING_STARTED: 'meeting_started',
@@ -316,13 +327,24 @@ export const SYSTEM_SUBTYPE = {
   MEETING_AGENT_FAILED: 'meeting_agent_failed',
   MEETING_AGENT_LEFT: 'meeting_agent_left',
   MEETING_FAILED: 'meeting_failed',
+  MACHINE_RECONNECTING: 'machine_reconnecting',
   // Dashboard-synthesised (never sent by the proxy).
   NO_SUBSCRIPTION: 'no_subscription',
   POOL_CAP: 'pool_cap',
   TARGET_UNAVAILABLE: 'target_unavailable',
   SESSION_ERROR: 'session_error',
+  BELOW_EDITOR: 'below_editor',
   BG_AGENTS_COMPLETED: 'bg_agents_completed',
   BG_COMMANDS_COMPLETED: 'bg_commands_completed',
+} as const
+
+/** `undelivered_input.reason` (the proxy's `UNDELIVERED_*`): why a message
+ *  from the chat's queue was not sent (a refused delivery, a failed turn, a
+ *  Stop). The terminal's abandoned cold flush carries none. */
+export const UNDELIVERED_REASON = {
+  QUEUED: 'queued',
+  TURN_FAILED: 'turn_failed',
+  STOPPED: 'stopped',
 } as const
 
 /** The kind of a held prompt (`live_state.pending_permission.event_type`,
@@ -344,6 +366,7 @@ export const WARMUP_FAILED_REASON = {
   POOL_CAP: 'pool_cap',
   TARGET_UNAVAILABLE: 'target_unavailable',
   SESSION_ERROR: 'session_error',
+  BELOW_EDITOR: 'below_editor',
 } as const
 
 /** The inbound messages (dashboard → proxy); the proxy's `INBOUND` table
@@ -413,11 +436,33 @@ export interface WorkflowEndFrame extends PerChat { type: typeof WIRE.WORKFLOW_E
 /** `chat_id` on the persisted row is the WORKER chat; on the live frame the
  *  stream loop's tag overwrites it (a payload collision, deferred). */
 export interface DelegateSpawnFrame extends PerChat { type: typeof WIRE.DELEGATE_SPAWN; task_id?: string; task_name: string; agent: string; surface?: string; prompt_preview: string; prompt?: string }
-export interface DelegateResultFrame extends PerChat { type: typeof WIRE.DELEGATE_RESULT; task_id?: string; task_name: string; agent?: string; output_text?: string; status?: string }
+/** A deliverable the worker attached, as it landed in this chat's agent tree. */
+export interface DelegateResultFile { path: string; bytes: number }
+/** A deliverable that did not land, with the proxy's reason. */
+export interface DelegateResultSkipped { path: string; reason: string }
+// reason / resets_at: a worker turn's typed ending, any reason; the
+// block keeps its status icon and reads neither. verdict: a failed run's
+// newest failing check verdict, when one landed since the run started.
+export interface DelegateResultFrame extends PerChat {
+  type: typeof WIRE.DELEGATE_RESULT
+  task_id?: string
+  task_name: string
+  agent?: string
+  output_text?: string
+  status?: string
+  reason?: TurnEndingReason
+  resets_at?: string
+  verdict?: Record<string, unknown>
+  files?: DelegateResultFile[]
+  files_skipped?: DelegateResultSkipped[]
+}
 export interface CheckVerdictFrame extends PerChat { type: typeof WIRE.CHECK_VERDICT; check?: string; status?: string; summary?: string; findings?: any[]; round?: number; rounds?: number; ran_on?: string; [k: string]: unknown }
 export interface PermissionPromptFrame extends PerChat { type: typeof WIRE.PERMISSION_PROMPT; request_id: string; tool_name: string; tool_input: any; description?: string; meeting_agent?: string }
 export interface PlanReviewFrame extends PerChat { type: typeof WIRE.PLAN_REVIEW; request_id: string; plan: string; tool_input: any; filename?: string }
 export interface QuestionFrame extends PerChat { type: typeof WIRE.QUESTION; tool_name: string; tool_input: any; request_id?: string }
+/** A permission, plan review or held question card whose wait ended with no
+ *  answer (its caller went away, it ran out, a Stop or a close released it). */
+export interface PromptRetiredFrame extends PerChat { type: typeof WIRE.PROMPT_RETIRED; request_id: string }
 export interface LocationRequestFrame extends PerChat { type: typeof WIRE.LOCATION_REQUEST; request_id: string }
 export interface PlanModeFrame extends PerChat { type: typeof WIRE.PLAN_MODE; action: string; plan?: string; filename?: string; tool_input?: any }
 export interface SystemFrame extends PerChat { type: typeof WIRE.SYSTEM; subtype: string; message?: string; agent?: string; agent_display_name?: string; agent_color?: string; round?: number; participants?: any[]; max_rounds?: number; max_turns?: number; meeting_id?: string; machine_name?: string; reason?: string; mcp?: string; pct?: number; phase?: string }
@@ -436,7 +481,17 @@ export interface ThreadGoal {
 export interface GoalUpdateFrame extends PerChat { type: typeof WIRE.GOAL_UPDATE; goal: ThreadGoal | null }
 export interface ContextCompactFrame extends PerChat { type: typeof WIRE.CONTEXT_COMPACT; phase: string; trigger?: string; pre_tokens?: number; post_tokens?: number; context_max?: number; messages_summarized?: number }
 export interface DoneFrame extends PerChat { type: typeof WIRE.DONE }
-export interface ErrorFrame extends PerChat { type: typeof WIRE.ERROR; message: string }
+/** A turn's typed ending rides the pump's error frame as `reason`
+ *  (`core/events/turn_ending.REASONS`); a `done` follows it once the turn's
+ *  rows landed. A bare error (one refused message) carries no `chat_id`. */
+export type TurnEndingReason = 'declined' | 'limit' | 'error' | 'exited' | 'silent' | 'lost'
+export const RESEND_REASONS: ReadonlySet<string> = new Set(['error', 'exited', 'silent', 'lost'])
+export interface ErrorFrame extends PerChat {
+  type: typeof WIRE.ERROR
+  message: string
+  reason?: TurnEndingReason
+  resets_at?: string
+}
 export interface AbortedFrame extends PerChat { type: typeof WIRE.ABORTED; session_id?: string }
 export interface LiveStateFrame extends PerChat {
   type: typeof WIRE.LIVE_STATE
@@ -471,7 +526,7 @@ export interface VideoFrame extends PerChat, MediaFields { type: typeof WIRE.VID
 export interface AudioFrame extends PerChat, MediaFields { type: typeof WIRE.AUDIO }
 export interface MediaProcessingFrame extends PerChat { type: typeof WIRE.MEDIA_PROCESSING; media_kind?: string; caption?: string }
 export interface MediaFailedFrame extends PerChat { type: typeof WIRE.MEDIA_FAILED; error?: string }
-export interface DocumentPreviewFrame extends PerChat { type: typeof WIRE.DOCUMENT_PREVIEW; wopi_url: string; filename: string; file_id: string; download_url: string; snapshot_id?: string; generation?: number }
+export interface DocumentPreviewFrame extends PerChat { type: typeof WIRE.DOCUMENT_PREVIEW; wopi_url: string; access_token?: string; access_token_ttl?: number; filename: string; file_id: string; download_url: string; snapshot_id?: string; generation?: number; version?: number }
 export interface UiFrame extends PerChat { type: typeof WIRE.UI; token: string; ui_url: string; title?: string; height?: number | null; path?: string }
 export interface ArtifactInteractionFrame extends PerChat { type: typeof WIRE.ARTIFACT_INTERACTION; token: string; title?: string; payload?: unknown }
 export interface ArtifactAckFrame { type: typeof WIRE.ARTIFACT_ACK; token: string; status: string; reason?: string }
@@ -484,22 +539,64 @@ export interface QueueAttachments {
   images?: Array<{ name: string; path?: string }>
   files?: Array<{ path: string; name: string }>
 }
-export interface QueuedFrame extends PerChat, QueueAttachments { type: typeof WIRE.QUEUED; index: number; text: string }
-export interface QueueRemovedFrame extends PerChat, QueueAttachments { type: typeof WIRE.QUEUE_REMOVED; index: number; text: string }
-export interface QueueSentFrame extends PerChat, QueueAttachments { type: typeof WIRE.QUEUE_SENT; text: string }
-export interface QueueClearedFrame extends PerChat { type: typeof WIRE.QUEUE_CLEARED; text: string }
-export interface QueueSnapshotFrame extends PerChat { type: typeof WIRE.QUEUE_SNAPSHOT; messages: Array<{ text: string } & QueueAttachments> }
-/** A delegated steer carries the delegating agent's identity in `event_data`
- * (the same meta the row stores), so the bubble wears its badge. */
+/** One waiting message of a chat's queue: its id (client-minted), its text,
+ *  who typed it (a shared chat shows a teammate's chips), and the chat its
+ *  author viewed when not the queue's own (a task chat viewed through a
+ *  sibling run's pump: the chip is filed there). */
+export interface QueueChip extends QueueAttachments {
+  queue_id: string
+  text: string
+  author_sub: string
+  view_chat_id?: string
+  /** What the message waits for besides a free turn (`QUEUE_WAITING`). */
+  waiting?: string
+}
+/** `QueueChip.waiting` (the proxy's `input_queue.WAITING_*`): the chat's
+ *  machine is reconnecting, the message goes out when it is back. */
+export const QUEUE_WAITING = {
+  RECONNECT: 'reconnect',
+} as const
+/** On the author's sockets only: the message handed back to the composer. */
+export interface QueueReturned extends QueueAttachments { returned?: boolean; text?: string }
+export interface QueuedFrame extends PerChat, QueueChip { type: typeof WIRE.QUEUED; index: number }
+export interface QueueRemovedFrame extends PerChat, QueueReturned {
+  type: typeof WIRE.QUEUE_REMOVED
+  queue_id: string
+  index: number
+}
+/** The turn took the queued messages: their rows' ids, one per message (a
+ *  1.7.0 proxy sends neither id list). */
+export interface QueueSentFrame extends PerChat, QueueAttachments {
+  type: typeof WIRE.QUEUE_SENT
+  queue_ids?: string[]
+  message_ids?: number[]
+  text: string
+}
+/** `reason`: cancel, stopped, turn_failed, drive_refused or revoked; the
+ *  chips of `queue_ids` go (every chip when it lists none). */
+export interface QueueClearedFrame extends PerChat, QueueReturned {
+  type: typeof WIRE.QUEUE_CLEARED
+  queue_ids?: string[]
+  reason?: string
+}
+export interface QueueSnapshotFrame extends PerChat { type: typeof WIRE.QUEUE_SNAPSHOT; messages: QueueChip[] }
+/** A message the running turn took. `message_id` is its row (its place in
+ *  the chat: the bubble renders at once); a delegated steer carries the
+ *  delegating agent's identity in `event_data` (the same meta the row
+ *  stores), so the bubble wears its badge. */
 export interface SteeredFrame extends PerChat, QueueAttachments {
   type: typeof WIRE.STEERED
   text: string
+  queue_id?: string
+  message_id?: number | null
   event_data?: { agent_slug?: string; agent_display_name?: string; agent_color?: string; badge?: string }
 }
 export interface ModeChangedFrame extends PerChat { type: typeof WIRE.MODE_CHANGED; mode: string }
 export interface ModelChangedFrame extends PerChat { type: typeof WIRE.MODEL_CHANGED; model: string }
-/** Sent as the persist-only ack of `execution_mode_change`; not acted on. */
-export interface ExecutionModeChangedFrame { type: typeof WIRE.EXECUTION_MODE_CHANGED; execution_mode: string }
+/** The ack of `execution_mode_change` and the echo of a refused terminal
+ *  pick: the chat's stored mode. Applied to the viewed chat only (`chat_id`);
+ *  absent for a new chat's pick. */
+export interface ExecutionModeChangedFrame { type: typeof WIRE.EXECUTION_MODE_CHANGED; execution_mode: string; chat_id?: string }
 export interface PlanStatusFrame { type: typeof WIRE.PLAN_STATUS; filename: string; status: string }
 export interface ServerTurnStartFrame extends PerChat { type: typeof WIRE.SERVER_TURN_START }
 export interface WarmupStartedFrame { type: typeof WIRE.WARMUP_STARTED; chat_id: string; agent: string; execution_path?: string; execution_target?: string; new_chat?: boolean }
@@ -552,6 +649,25 @@ export interface ChatHistoryFrame {
   model?: string
   mode?: string
   process_alive?: boolean
+  /** On a chat that runs as the agent which this person may not drive: the
+   *  server's refusal, shown on the locked mode, model and terminal pickers. */
+  drive_refusal?: string
+  /** The live turn's attach follows: hold these rows and paint them with
+   *  its `live_state` in one go (a 1.7.0 proxy never sends it). */
+  live_pending?: boolean
+}
+/** A history re-send of the viewed chat, for a client that declared
+ *  `history_deltas`: a `resume_chat` with `delta`, or one of the server's
+ *  re-sends (a task or meeting chat's turn end, a task chat's next run, the
+ *  idle poll's attach, a promised pump gone before its attach). The history
+ *  frame's fields with `messages` holding the rows above the floors of the
+ *  last history this connection got for the chat (the chat and its sibling
+ *  runs, ascending by id; a row can come again, so the receiver dedupes by id).
+ *  Never the first frame of a view. */
+export interface ChatHistoryDeltaFrame extends Omit<ChatHistoryFrame, 'type'> {
+  type: typeof WIRE.CHAT_HISTORY_DELTA
+  chat_id: string
+  since_id: number
 }
 export interface ChatStatusFrame { type: typeof WIRE.CHAT_STATUS; chat_id: string; status: string }
 export interface ChatStatusSnapshotFrame { type: typeof WIRE.CHAT_STATUS_SNAPSHOT; chat_ids: string[] }
@@ -572,6 +688,9 @@ export interface PtyStatusFrame extends PerChat { type: typeof WIRE.PTY_STATUS; 
 export interface NotificationFrame { type: typeof WIRE.NOTIFICATION; delivery: any }
 export interface NotificationSilentFrame { type: typeof WIRE.NOTIFICATION_SILENT; delivery: any }
 export interface NotificationCountFrame { type: typeof WIRE.NOTIFICATION_COUNT; count: number }
+/** The viewer's "Shared with you" section changed: `pending` decisions wait,
+ *  and the Apps panels of `agents` gained or lost a placed app (SHARING.md). */
+export interface ShareInboxFrame { type: typeof WIRE.SHARE_INBOX; pending?: number; agents?: string[] }
 export interface FileUpdatedFrame { type: typeof WIRE.FILE_UPDATED; agent_slug: string; rel_path: string; file_id?: string; source?: string; pin?: any }
 export interface AppPushFrame { type: typeof WIRE.APP_PUSH; app_id: string; payload: unknown; ts: number }
 export interface AppStateFrame { type: typeof WIRE.APP_STATE; app_id: string; doc: Record<string, unknown>; rev: number }
@@ -580,6 +699,9 @@ export interface OpenAppFrame {
   app_id: string
   title: string
   agent: string
+  /** The agent whose session asked, when it is not the app's own (an app a
+   *  share placed in it); absent from an older proxy. */
+  opened_by?: string
   scope_chat_id: string
   scope_project_id: string
   /** Set by the page that showed the app, so the shell's toast (which
@@ -620,7 +742,7 @@ export type WireFrame =
   | BgAgentsCompleteFrame | BgCommandsCompleteFrame | FgAgentsCompleteFrame
   | WorkflowStartFrame | WorkflowProgressFrame | WorkflowEndFrame
   | DelegateSpawnFrame | DelegateResultFrame | CheckVerdictFrame
-  | PermissionPromptFrame | PlanReviewFrame | QuestionFrame | LocationRequestFrame | PlanModeFrame
+  | PermissionPromptFrame | PlanReviewFrame | QuestionFrame | PromptRetiredFrame | LocationRequestFrame | PlanModeFrame
   | SystemFrame | MetadataFrame | McpCostFrame | TodoUpdateFrame | GoalUpdateFrame | ContextCompactFrame
   | DoneFrame | ErrorFrame | AbortedFrame | LiveStateFrame | LimitWarningFrame | LimitReachedFrame
   | ImagesFrame | ImageGeneratingFrame | ImageGenFailedFrame | UrlFrame | FileFrame | VideoFrame | AudioFrame
@@ -629,10 +751,10 @@ export type WireFrame =
   | QueuedFrame | QueueRemovedFrame | QueueSentFrame | QueueClearedFrame | QueueSnapshotFrame | SteeredFrame
   | ModeChangedFrame | ModelChangedFrame | ExecutionModeChangedFrame | PlanStatusFrame | ServerTurnStartFrame
   | WarmupStartedFrame | WarmupHeartbeatFrame | WarmupReadyFrame | WarmupFailedFrame | PreWarmupReadyFrame
-  | ChatHistoryFrame | ChatStatusFrame | ChatStatusSnapshotFrame | ChatReadFrame | ChatRowsFrame | ChatMetaFrame
+  | ChatHistoryFrame | ChatHistoryDeltaFrame | ChatStatusFrame | ChatStatusSnapshotFrame | ChatReadFrame | ChatRowsFrame | ChatMetaFrame
   | ChatMovedFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TitleUpdatedFrame | TurnCompleteFrame
   | PtyOutputFrame | PtyExitFrame | PtyPermissionFrame | PtyArtifactFrame | PtyStatusFrame
-  | NotificationFrame | NotificationSilentFrame | NotificationCountFrame | FileUpdatedFrame
+  | NotificationFrame | NotificationSilentFrame | NotificationCountFrame | ShareInboxFrame | FileUpdatedFrame
   | AppPushFrame | AppStateFrame | OpenAppFrame | AppDeployedFrame | CatalogFrame
   | InstallStartedFrame | InstallMcpPlanFrame | InstallProgressFrame | InstallHeartbeatFrame
   | InstallVerifyingFrame | InstallDoneFrame | InstallFailedFrame | McpInstallFailedFrame

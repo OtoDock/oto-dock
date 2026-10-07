@@ -20,7 +20,7 @@ def _cm_with(version: str, mid: str = "m1") -> SatelliteConnectionManager:
 
 def _pending(cm, mid="m1", cid="c1"):
     fut = asyncio.get_event_loop().create_future()
-    cm._pending_acks[cid] = (mid, fut)
+    cm._pending_acks[cid] = (mid, fut, None)
     return fut
 
 
@@ -149,12 +149,10 @@ def test_the_request_asks_for_pages_only_from_a_satellite_that_pages():
 
 
 @pytest.mark.asyncio
-async def test_the_other_manifest_senders_ask_a_paging_satellite_for_pages(monkeypatch):
-    """The file listing and the plans walk send the same paged request as
-    the merge, through the manager's own command path (the joined pages
-    resolve that wait)."""
+async def test_the_file_listing_asks_a_paging_satellite_for_pages(monkeypatch):
+    """The file listing sends the same paged request as the merge, through
+    the manager's own command path (the joined pages resolve that wait)."""
     from types import SimpleNamespace
-    from api.sessions import sessions as sessions_api
     from core.remote import remote_file_flow as rff
 
     cm = _cm_with("0.5.130")
@@ -170,12 +168,9 @@ async def test_the_other_manifest_senders_ask_a_paging_satellite_for_pages(monke
     monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
     info = SimpleNamespace(machine_id="m1", agent_name="a")
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: info)
-    monkeypatch.setattr(sessions_api, "_get_remote_session_info", lambda sid: info)
     monkeypatch.setattr("core.session.session_state._session_security", {})
 
     assert await rff.list_remote_files("s1", "workspace/notes") == ["workspace/notes/a.txt"]
-    plans = await sessions_api._list_remote_plans("s1")
-    assert plans == [{"filename": "p.md", "modified": 5.0, "size": 7}]
-    assert [m for _mid, m in sent] == [rws.manifest_request(cm, "m1", "a")] * 2
+    assert [m for _mid, m in sent] == [rws.manifest_request(cm, "m1", "a")]
     assert all(mid == "m1" for mid, _m in sent)
     assert cm._pending_acks == {}

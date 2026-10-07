@@ -12,6 +12,7 @@ import {
   usePhoneSettings, useSavePhoneSettings, useRouteMcpPreview,
   useExternalData, useSaveExternalData, useForgetExternalData,
   type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
+  PIN_DIGITS, isRoutePin, PHONE_INBOUND, PHONE_OUTBOUND,
 } from '../../api/phone'
 import { formatBytes } from './PlatformPage.shared'
 import CallLogModal from '../../components/phone/CallLogModal'
@@ -134,7 +135,7 @@ function ServersSection() {
 // ---------------------------------------------------------------------------
 
 const EMPTY_ROUTE: PhoneRouteCreate = {
-  direction: 'inbound', name: '', agent: '', language: 'en', llm_mode: 'proxy',
+  direction: PHONE_INBOUND, name: '', agent: '', language: 'en', llm_mode: 'proxy',
   phone_server_id: null, stt_provider_id: null, tts_provider_id: null,
   greeting: '', phone_context_override: '',
   backchannel_mode: 'on', thinking_filler_mode: 'on',
@@ -158,7 +159,7 @@ export type PinIntent = { dirty: boolean; enabled: boolean; value: string }
 // Whether a saved form ends as a user-mode inbound route with no PIN: the
 // state the server refuses without an explicit acknowledgement.
 function endsWithoutPin(form: { identity_mode: string; direction: string }, pin: PinIntent, hasPin: boolean) {
-  return form.identity_mode === 'user' && form.direction === 'inbound'
+  return form.identity_mode === 'user' && form.direction === PHONE_INBOUND
     && !(pin.enabled && (pin.value !== '' || hasPin))
 }
 
@@ -233,8 +234,8 @@ function RouteModal({
   const [pinValue, setPinValue] = useState('')
   const pinDirty = pinEnabled !== hasPin || pinValue !== ''
   const pinValid =
-    form.direction !== 'inbound' || !pinEnabled
-    || /^\d{4,6}$/.test(pinValue) || (hasPin && pinValue === '')
+    form.direction !== PHONE_INBOUND || !pinEnabled
+    || isRoutePin(pinValue) || (hasPin && pinValue === '')
   const { data: agentTriggers } = useTriggers({ agent: form.agent, scope: 'agent' })
   const createTrigger = useCreateTrigger()
   const [showCreateTrigger, setShowCreateTrigger] = useState(false)
@@ -300,7 +301,7 @@ function RouteModal({
             <div>
               <label className="block text-xs font-medium text-p-text mb-1">Direction</label>
               <div className="flex gap-2">
-                {(['inbound', 'outbound'] as const).map(d => (
+                {([PHONE_INBOUND, PHONE_OUTBOUND] as const).map(d => (
                   <button key={d} onClick={() => set('direction', d)}
                     className={`flex-1 px-3 py-1.5 text-sm rounded-lg border transition-colors ${
                       form.direction === d ? 'border-brand bg-brand/10 text-brand font-medium' : 'border-p-border-light text-p-text-secondary hover:border-gray-300'
@@ -366,7 +367,7 @@ function RouteModal({
                   {userChoices.map(u => <option key={u.sub} value={u.sub}>{u.name || u.email || u.sub}{u.role ? ` (${u.role})` : ''}</option>)}
                 </select>
                 <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-                  {form.direction === 'inbound'
+                  {form.direction === PHONE_INBOUND
                     ? 'Require a PIN below — without one, anyone who dials this number acts as that user.'
                     : 'Whoever answers an outbound call on this route acts as that user.'}
                 </p>
@@ -398,7 +399,7 @@ function RouteModal({
             </div>
           </div>
 
-          {form.direction === 'inbound' && (
+          {form.direction === PHONE_INBOUND && (
             <>
               <div>
                 <label className="block text-xs font-medium text-p-text mb-1">DID (inbound number)</label>
@@ -430,16 +431,16 @@ function RouteModal({
                 {pinEnabled && (
                   <div>
                     <input
-                      type="password" inputMode="numeric" autoComplete="off" maxLength={6}
+                      type="password" inputMode="numeric" autoComplete="off" maxLength={PIN_DIGITS}
                       value={pinValue}
                       onChange={e => setPinValue(e.target.value.replace(/\D/g, ''))}
                       className="w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono tracking-widest"
-                      placeholder={hasPin ? '••••••' : '4–6 digits'}
+                      placeholder={hasPin ? '••••••' : `${PIN_DIGITS} digits`}
                     />
                     <p className="text-xs text-p-text-light mt-1">
                       {hasPin
                         ? 'Leave empty to keep the current PIN, or type a new one to replace it.'
-                        : 'Enter 4–6 digits. Callers press pound (#) after the code.'}
+                        : `Enter ${PIN_DIGITS} digits. Callers press pound (#) after the code.`}
                     </p>
                   </div>
                 )}
@@ -469,7 +470,7 @@ function RouteModal({
             </>
           )}
 
-          {form.direction === 'outbound' && (
+          {form.direction === PHONE_OUTBOUND && (
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-medium text-p-text mb-1">Caller ID</label>
@@ -626,7 +627,7 @@ function RoutesSection() {
     const hadPin = !!pin_configured
     // The PIN card hides on an outbound form but keeps its state: a value
     // rides the save only for an inbound route, and only a valid one.
-    const settingPin = rest.direction === 'inbound' && pin.dirty && pin.enabled && /^\d{4,6}$/.test(pin.value)
+    const settingPin = rest.direction === PHONE_INBOUND && pin.dirty && pin.enabled && isRoutePin(pin.value)
     if (settingPin) rest.pin = pin.value
     if (acknowledged) rest.acknowledge_no_pin = true
     const removingPin = pin.dirty && !pin.enabled && hadPin
@@ -685,7 +686,7 @@ function RoutesSection() {
                 <tr key={r.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/30">
                   <td className="px-3 py-2 text-p-text">{r.name || r.id.slice(0, 8)}</td>
                   <td className="px-3 py-2">
-                    <Badge variant={r.direction === 'inbound' ? 'blue' : 'amber'}>{r.direction}</Badge>
+                    <Badge variant={r.direction === PHONE_INBOUND ? 'blue' : 'amber'}>{r.direction}</Badge>
                     {r.pin_configured && (
                       <svg className="inline-block w-3 h-3 ml-1.5 text-p-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-label="PIN protected">
                         <title>PIN protected</title>

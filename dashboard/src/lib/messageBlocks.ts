@@ -1,4 +1,5 @@
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
+import type { PendingFile, PendingImage } from '../store/types'
 import { cleanUserMessageText } from './transcriptCleanup'
 import { LIVE_BLOCK, PERSISTED, SYSTEM_SUBTYPE, WIRE } from '../api/wireEvents'
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from './status/run'
@@ -36,6 +37,52 @@ export function latestCostBilled(dbMessages: any[]): boolean {
   return true
 }
 
+/**
+ * The blocks of a delegate result's own bubble: the worker's report text and
+ * the files it attached (`files` / `files_skipped` on the event, agent-relative
+ * paths in THIS chat's tree). Empty when the result carries neither, so no
+ * bubble is minted for it: a length test, never truthiness (an empty list
+ * must not mint an empty card). Shared by the history replay and the live
+ * frame, so the two render one shape and the live dedup can compare blocks.
+ */
+export function delegateResultBlocks(evt: {
+  output_text?: string
+  files?: Array<{ path: string; bytes: number }>
+  files_skipped?: Array<{ path: string; reason: string }>
+}): MessageBlock[] {
+  const text = evt.output_text || ''
+  const files = Array.isArray(evt.files) ? evt.files : []
+  const skipped = Array.isArray(evt.files_skipped) ? evt.files_skipped : []
+  const blocks: MessageBlock[] = []
+  if (text) blocks.push({ type: 'text', content: text })
+  if (files.length || skipped.length) blocks.push({ type: 'delegate_files', files, skipped })
+  return blocks
+}
+
+/**
+ * What makes one delegate result's bubble distinct from another's: its text
+ * and its files (each `path` and `bytes`), its skipped entries (each `path`
+ * and `reason`), and nothing else. One delivery can reach a socket as two
+ * frames; the live path renders a bubble once per signature.
+ */
+export function delegateResultSignature(blocks: MessageBlock[]): string {
+  const text = blocks.find((b): b is Extract<MessageBlock, { type: 'text' }> => b.type === 'text')?.content || ''
+  const files = blocks.find((b): b is Extract<MessageBlock, { type: 'delegate_files' }> => b.type === 'delegate_files')
+  return JSON.stringify([
+    text,
+    (files?.files || []).map((f) => [f.path, f.bytes]),
+    (files?.skipped || []).map((s) => [s.path, s.reason]),
+  ])
+}
+
+/** The badge a delegate result's bubble wears, by the run's result word. */
+export function delegateResultBadge(status: string | undefined): string {
+  return status === DELEGATE_RESULT.CANCELLED ? 'delegate canceled'
+    : status === DELEGATE_RESULT.FAILED ? 'delegate failed'
+    : status === DELEGATE_RESULT.USER_INTERRUPTED ? 'delegate interrupted'
+    : 'delegate response'
+}
+
 /** Convert a live_state inline_block to a MessageBlock for reconnect rendering. */
 export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
   switch (ib.type) {
@@ -65,7 +112,7 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
     case WIRE.MEDIA_PROCESSING:
       return { type: 'media_processing', mediaKind: ib.media_kind === 'audio' ? 'audio' : 'video', caption: ib.caption || undefined }
     case WIRE.DOCUMENT_PREVIEW:
-      return { type: 'document_preview', wopiUrl: ib.wopi_url, filename: ib.filename, fileId: ib.file_id, downloadUrl: ib.download_url, snapshotId: ib.snapshot_id || undefined, generation: ib.generation || undefined }
+      return { type: 'document_preview', filename: ib.filename, fileId: ib.file_id, downloadUrl: ib.download_url, snapshotId: ib.snapshot_id || undefined, generation: ib.generation || undefined, version: ib.version || undefined }
     case WIRE.UI:
       return { type: 'ui', token: ib.token || '', uiUrl: ib.ui_url || '', title: ib.title || undefined, height: typeof ib.height === 'number' ? ib.height : undefined, path: ib.path || undefined }
     case WIRE.ARTIFACT_INTERACTION:
@@ -81,7 +128,7 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
     case WIRE.PLAN_MODE:
       return { type: 'plan', action: ib.action || 'enter', toolInput: ib.tool_input }
     case WIRE.SYSTEM:
-      return { type: 'system', subtype: ib.subtype || '', message: ib.message, agentName: ib.agent_display_name || ib.agent, agentColor: ib.agent_color }
+      return { type: 'system', subtype: ib.subtype || '', message: ib.message, reason: ib.reason, agentName: ib.agent_display_name || ib.agent, agentColor: ib.agent_color }
     case WIRE.CHECK_VERDICT:
       // The pump keeps the verdict card event in the live state as-is.
       return eventToBlock(ib)
@@ -116,7 +163,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
     case WIRE.AUDIO:
       return { type: 'audio', srcKind: evt.src_kind === 'token' ? 'token' : 'url', url: evt.url || undefined, mediaUrl: evt.media_url || undefined, token: evt.token || undefined, mime: evt.mime || undefined, caption: evt.caption || undefined, title: evt.title || undefined }
     case WIRE.DOCUMENT_PREVIEW:
-      return { type: 'document_preview', wopiUrl: evt.wopi_url, filename: evt.filename, fileId: evt.file_id, downloadUrl: evt.download_url, dbMessageId, snapshotId: evt.snapshot_id || undefined, generation: evt.generation || undefined }
+      return { type: 'document_preview', filename: evt.filename, fileId: evt.file_id, downloadUrl: evt.download_url, dbMessageId, snapshotId: evt.snapshot_id || undefined, generation: evt.generation || undefined, version: evt.version || undefined }
     case WIRE.UI:
       return { type: 'ui', token: evt.token || '', uiUrl: evt.ui_url || '', title: evt.title || undefined, height: typeof evt.height === 'number' ? evt.height : undefined, path: evt.path || undefined }
     case WIRE.ARTIFACT_INTERACTION:
@@ -212,7 +259,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         action: evt.action || 'reject',  // No action saved = was never resolved = cancelled
       }
     case WIRE.SYSTEM:
-      return { type: 'system', subtype: evt.subtype || '', message: evt.message, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
+      return { type: 'system', subtype: evt.subtype || '', message: evt.message, reason: evt.reason, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
     case WIRE.METADATA:
       return { type: 'metadata', costUsd: evt.cost_usd ?? 0, durationMs: evt.duration_ms ?? evt.duration_api_ms ?? 0, costBilled: costBilledOf(evt) }
     case PERSISTED.BG_NUDGE:
@@ -345,8 +392,10 @@ export function dbMessagesToDisplay(
       }
       newTurnNext = false
     } else if (m.role === 'event' && m.event_data) {
-      // delegate_result / bg_nudge / artifact_interaction / app_action signal a new LLM turn
-      if (m.event_type === WIRE.DELEGATE_RESULT || m.event_type === PERSISTED.BG_NUDGE || m.event_type === PERSISTED.BG_COMMAND_NUDGE || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION) {
+      // delegate_result / bg_nudge / artifact_interaction / app_action /
+      // schedule_wake signal a new LLM turn (a wake's marker opens the bubble
+      // its answer lands in)
+      if (m.event_type === WIRE.DELEGATE_RESULT || m.event_type === PERSISTED.BG_NUDGE || m.event_type === PERSISTED.BG_COMMAND_NUDGE || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION || m.event_type === PERSISTED.SCHEDULE_WAKE) {
         newTurnNext = true
       }
       // Meeting turn start: force new message with agent identity
@@ -368,6 +417,8 @@ export function dbMessagesToDisplay(
         const evt = JSON.parse(m.event_data)
         // Skip dismissed events
         if (evt.dismissed) continue
+        // A wake row's data carries no type (its column names it).
+        if (!evt.type && m.event_type === PERSISTED.SCHEDULE_WAKE) evt.type = PERSISTED.SCHEDULE_WAKE
         const block = eventToBlock(evt, m.id)
         // Find or create the host assistant message — only when the event
         // actually renders an inline block (or opens a meeting identity
@@ -410,27 +461,28 @@ export function dbMessagesToDisplay(
           }
           if (block) lastAssistant.blocks.push(block)
         }
-        // Delegate result with output: insert as separate agent message.
-        // output_text is non-empty for failed/canceled terminals too (the
-        // backend synthesizes a ⚠ marker), so this never mints an empty bubble.
-        if (m.event_type === WIRE.DELEGATE_RESULT && evt.output_text) {
-          const delegateAgent = agents?.find(a => a.name === evt.agent)
-          displayMsgs.push({
-            id: `db-delresult-${m.id}`,
-            role: 'assistant',
-            blocks: [{ type: 'text', content: evt.output_text }],
-            createdAt: m.created_at,
-            agentSlug: evt.agent || '',
-            agentDisplayName: delegateAgent?.display_name,
-            agentColor: delegateAgent?.color || '',
-            badge: evt.status === DELEGATE_RESULT.CANCELLED ? 'delegate canceled'
-              : evt.status === DELEGATE_RESULT.FAILED ? 'delegate failed'
-              : evt.status === DELEGATE_RESULT.USER_INTERRUPTED ? 'delegate interrupted'
-              : 'delegate response',
-          })
-          // The response bubble belongs to the DELEGATE agent — whatever
-          // follows (the delegating agent's synthesis echo) starts fresh.
-          newTurnNext = true
+        // Delegate result with output or attached files: insert as a separate
+        // agent message. output_text is non-empty for failed/canceled
+        // terminals too (the backend synthesizes a ⚠ marker); a files-only
+        // result shows the list alone; neither mints nothing.
+        if (m.event_type === WIRE.DELEGATE_RESULT) {
+          const blocks = delegateResultBlocks(evt)
+          if (blocks.length) {
+            const delegateAgent = agents?.find(a => a.name === evt.agent)
+            displayMsgs.push({
+              id: `db-delresult-${m.id}`,
+              role: 'assistant',
+              blocks,
+              createdAt: m.created_at,
+              agentSlug: evt.agent || '',
+              agentDisplayName: delegateAgent?.display_name,
+              agentColor: delegateAgent?.color || '',
+              badge: delegateResultBadge(evt.status),
+            })
+            // The response bubble belongs to the DELEGATE agent — whatever
+            // follows (the delegating agent's synthesis echo) starts fresh.
+            newTurnNext = true
+          }
         }
       } catch {
         // skip
@@ -518,8 +570,7 @@ export function dbMessagesToDisplay(
   // Post-process: intra-message document_preview dedupe — within ONE message
   // keep only the LAST block per fileId (interactive chats persist every
   // intra-turn push; the pump path already dedupes per turn). Cross-message
-  // instances are KEPT: previewChainModes renders them as the live preview,
-  // the view-only "previous version", or a chip.
+  // instances are KEPT: each is a card of its own version.
   for (const dm of displayMsgs) {
     const lastIdxByFile = new Map<string, number>()
     dm.blocks.forEach((b, bi) => {
@@ -532,46 +583,6 @@ export function dbMessagesToDisplay(
     }
   }
   return displayMsgs
-}
-
-export type PreviewChainMode = 'live' | 'frozen' | 'chip'
-
-/**
- * Render-time live → frozen → chip chain per fileId over the combined loaded
- * block list: a file's LAST preview occurrence is the live block, the one
- * before it the view-only "previous version" (frozen to its own push-time
- * snapshot), anything older a chip. Keys are `${msgIdx}:${blockIdx}`.
- *
- * Computed at render (like supersededUiBlocks) so live streaming, history
- * reload, and scroll-back pagination all agree — never positionally ("all but
- * last message") and never only at rebuild. That is what fixes the deferred
- * collapse landing on the live block after an interleaved text turn, and the
- * loadOlder duplicate-live-block hole (an older page can only add frozen/chip
- * entries — the true latest instance is always already loaded).
- */
-export function previewChainModes(
-  messages: DisplayMessage[],
-): Map<string, PreviewChainMode> {
-  const perFile = new Map<string, string[]>()
-  messages.forEach((msg, mi) =>
-    msg.blocks.forEach((b, bi) => {
-      if (b.type === 'document_preview') {
-        const keys = perFile.get(b.fileId) ?? []
-        keys.push(`${mi}:${bi}`)
-        perFile.set(b.fileId, keys)
-      }
-    }),
-  )
-  const out = new Map<string, PreviewChainMode>()
-  for (const keys of perFile.values()) {
-    keys.forEach((key, i) => {
-      out.set(
-        key,
-        i === keys.length - 1 ? 'live' : i === keys.length - 2 ? 'frozen' : 'chip',
-      )
-    })
-  }
-  return out
 }
 
 /** Data a bgcommand pill borrows from the Bash tool block it spawned from. */
@@ -666,4 +677,50 @@ export function uiTitlesByPath(messages: DisplayMessage[]): Map<string, string> 
     }
   }
   return titles
+}
+
+/** Send again's prompt for the card in message `messageId`: that turn's
+ *  messages, an earlier card's included (every message when it is not found). */
+export function sendAgainPrompt(messages: DisplayMessage[], messageId: string) {
+  const at = messages.findIndex((m) => m.id === messageId)
+  return lastTurnPrompt(at >= 0 ? messages.slice(0, at + 1) : messages)
+}
+
+/** What the turn-ended card's Send again sends: the person's messages of
+ *  the turn that ended (every user bubble since the last answer text or
+ *  the previous turn-ended card: a combined batch, a steer), their texts
+ *  joined as the batch was, with their attachments by their saved paths.
+ *  Null when there is nothing. */
+export function lastTurnPrompt(messages: DisplayMessage[]):
+    { text: string; images: PendingImage[]; files: PendingFile[] } | null {
+  const textOf = (m: DisplayMessage) =>
+    m.blocks.flatMap((b) => (b.type === WIRE.TEXT ? [b.content] : [])).join('\n')
+  const endedShort = (m: DisplayMessage) =>
+    m.blocks.some((b) => b.type === WIRE.SYSTEM && b.subtype === SYSTEM_SUBTYPE.TURN_ENDED)
+  const turn: DisplayMessage[] = []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'user') turn.unshift(m)
+    else if (turn.length && (textOf(m) || endedShort(m))) break
+  }
+  const text = turn.map(textOf).filter(Boolean).join('\n\n')
+  const images: PendingImage[] = []
+  const files: PendingFile[] = []
+  for (const b of turn.flatMap((m) => m.blocks)) {
+    if (b.type === 'image_attachments') {
+      b.images.forEach((src: string, i: number) => {
+        const path = b.paths?.[i]
+        if (path) images.push({ id: `again-img-${path}`, path, name: src })
+        // A fresh photo of a live bubble has no saved path yet: its data
+        // URL goes again as a new photo.
+        else if (src.startsWith('data:')) images.push({ id: `again-img-${i}`, base64: src, name: `photo-${i + 1}` })
+      })
+    } else if (b.type === 'file_attachments') {
+      for (const f of b.files) {
+        if (f.path) files.push({ id: `again-file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path })
+      }
+    }
+  }
+  if (!text && !images.length && !files.length) return null
+  return { text, images, files }
 }

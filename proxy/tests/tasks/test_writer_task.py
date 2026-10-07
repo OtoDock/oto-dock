@@ -87,7 +87,7 @@ async def test_writer_failure_triggers_deregister():
     # Add a pending ack so we can verify it gets rejected on deregister
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
-    cm._pending_acks["cmd-1"] = ("m1", fut)
+    cm._pending_acks["cmd-1"] = ("m1", fut, None)
 
     await conn.enqueue_send({"type": "test"})
 

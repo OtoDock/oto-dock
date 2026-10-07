@@ -43,6 +43,7 @@ from typing import Any, Callable
 from auth import roles
 from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 from core import host_os
+from services.infra import external_data
 
 logger = logging.getLogger("claude-proxy")
 
@@ -88,6 +89,12 @@ async def get_dynamic_contexts(
     user_role = kwargs.get("user_role", "") or ""
     session_ctx = kwargs.get("session_ctx") or {}
     trigger_payload = kwargs.get("trigger_payload") or None
+    # The delegation provider's department line reads the department row
+    # (and the agent cache, cold after an invalidation): resolved here, off
+    # the loop, and handed to the provider, which then reads nothing.
+    if "department" not in kwargs and any(
+            _providers.get(n) is _delegation_mcp_context for n in assigned_mcp_names):
+        kwargs["department"] = await asyncio.to_thread(_department_data, agent_name)
 
     for mcp_name in assigned_mcp_names:
         # 1. Python provider (iterative / computed context)
@@ -233,10 +240,11 @@ def _build_token_map(
 ) -> dict[str, str]:
     """Build the ``${ns.key} → value`` map for one (mcp, session).
 
-    Both scopes resolve ``account.*`` + ``credential.*`` via
-    ``credential_resolver.pick_account`` — user scope reads the user's
-    bound account, agent scope reads the per-agent binding (a user's own
-    account a manager designated as the agent's service identity).
+    Both scopes resolve ``account.*`` via ``credential_resolver.pick_account``
+    — user scope reads the user's bound account, agent scope reads the
+    per-agent binding (a user's own account a manager designated as the
+    agent's service identity). No credential value enters the map: a block
+    renders into the system prompt, where a secret must never land.
     ``user.*`` is only populated in user scope.
 
     Always populates ``agent.*`` (from ``agent_store``) and
@@ -274,7 +282,7 @@ def _build_token_map(
     # ----- trigger.* (normalised flat fields from payload) -----
     tokens.update(_build_trigger_tokens(trigger_payload))
 
-    # ----- account.*, credential.*, user.* (scope-branched) -----
+    # ----- account.*, user.* (scope-branched) -----
     # Look up provider_id once; needed for `account.extra.*` token-file read.
     from services.mcp import mcp_registry as _mcp_registry
     _manifest = _mcp_registry.get_manifest(mcp_name)
@@ -297,18 +305,6 @@ def _build_token_map(
             display_email = (match or {}).get("display_email") or ""
             tokens["account.email"] = display_email or account_label
 
-            try:
-                creds = credential_store.get_user_credentials(
-                    user_sub, mcp_name, account_label,
-                )
-                for k, v in creds.items():
-                    tokens[f"credential.{k}"] = str(v or "")
-            except Exception as e:
-                logger.warning(
-                    "Failed to load user credentials for token map "
-                    "(mcp=%s user=%s account=%s): %s",
-                    mcp_name, user_sub[:8], account_label, e,
-                )
 
             # account.extra.* — vendor metadata persisted in the token file
             # (Slack team_id, Microsoft tenant_id, Zoom account_id, etc.).
@@ -361,8 +357,6 @@ def _build_token_map(
                 or account_label
             )
             tokens["account.email"] = email
-            for k, v in svc.items():
-                tokens[f"credential.{k}"] = str(v or "")
 
             _populate_account_extras(
                 tokens, mcp_name, _provider_id, account_label,
@@ -437,6 +431,8 @@ def _substitute_tokens(
     template: str,
     tokens: dict[str, str],
     trigger_payload: dict | None = None,
+    *,
+    fence: bool = True,
 ) -> str:
     """Replace every ``${ns.key}`` in ``template`` with ``tokens[ns.key]``.
 
@@ -446,15 +442,33 @@ def _substitute_tokens(
     ``${trigger.body.<dot.path>}`` tokens fall through to a
     direct walk of ``trigger_payload['body']`` so manifests can read raw
     webhook fields without an entry in the flat token map.
+
+    The rendered text is a prompt: every ``trigger.*`` value (what a
+    caller or a webhook sender supplied) is fenced, and so is every
+    ``result.*`` value when a trigger fired the session (the builder's
+    tool ran on the sender's values), and the block says what the fence
+    means (``services/infra/external_data.py``). ``fence=False`` is for
+    tool arguments (``substitute_in_json``), never a prompt.
     """
+    outside = ("trigger.", "result.") if trigger_payload is not None else ("trigger.",)
+    fenced = False
+
     def replace(match: re.Match) -> str:
+        nonlocal fenced
         key = match.group(1)
         if key in tokens:
-            return tokens[key]
-        if key.startswith("trigger.body.") and trigger_payload is not None:
-            return _walk_body_path(trigger_payload, key[len("trigger.body."):])
-        return ""
-    return _TOKEN_RE.sub(replace, template)
+            value = tokens[key]
+        elif key.startswith("trigger.body.") and trigger_payload is not None:
+            value = _walk_body_path(trigger_payload, key[len("trigger.body."):])
+        else:
+            return ""
+        if fence and value and key.startswith(outside):
+            fenced = True
+            return external_data.fence(value)
+        return value
+
+    out = _TOKEN_RE.sub(replace, template)
+    return external_data.with_note(out) if fenced else out
 
 
 def substitute_in_json(
@@ -469,7 +483,7 @@ def substitute_in_json(
     template substitution.
     """
     if isinstance(value, str):
-        return _substitute_tokens(value, tokens, trigger_payload)
+        return _substitute_tokens(value, tokens, trigger_payload, fence=False)
     if isinstance(value, dict):
         return {
             k: substitute_in_json(v, tokens, trigger_payload)
@@ -801,8 +815,25 @@ def _fmt_roster_layers(layers: list[dict]) -> str:
     return " · ".join(rendered)
 
 
+def _department_data(agent_name: str) -> dict | None:
+    """The agent's department row, for ``_department_line``, and a warm
+    agent cache (sync store reads: call off the loop). None when the agent
+    is in no department."""
+    from storage.agents import agent_store, db_departments
+    self_data = agent_store.get_agent(agent_name) or {}
+    dept_id = self_data.get("department_id") or ""
+    if not dept_id or not self_data.get("department_level_id"):
+        return None
+    agent_store.get_all_agents()
+    return db_departments.get_department(dept_id)
+
+
+_DEPARTMENT_UNRESOLVED = object()
+
+
 def _department_line(
     agent_name: str, self_data: dict, delegation_targets: list[str],
+    department=_DEPARTMENT_UNRESOLVED,
 ) -> str:
     """One compact department-membership line for the roster, or ''.
 
@@ -821,7 +852,10 @@ def _department_line(
     try:
         from storage.agents import agent_store
         from storage.agents import db_departments
-        dept = db_departments.get_department(dept_id)
+        # ``department`` is the row ``get_dynamic_contexts`` pre-resolved
+        # off the loop; a direct caller without it reads here.
+        dept = (db_departments.get_department(dept_id)
+                if department is _DEPARTMENT_UNRESOLVED else department)
         if not dept:
             return ""
         levels = dept["levels"]
@@ -834,7 +868,7 @@ def _department_line(
         below: list[str] = []
         above_ids = {lv["id"] for lv in levels if lv["rank"] < level["rank"]}
         below_ids = {lv["id"] for lv in levels if lv["rank"] > level["rank"]}
-        for a in agent_store.get_all_agents():
+        for a in (agent_store.get_all_agents() if targets else ()):
             slug = a["slug"]
             if slug == agent_name or slug not in targets:
                 continue
@@ -913,10 +947,15 @@ def _delegation_mcp_context(
     if block:
         sibling_block = block
 
-    if not delegation_targets:
-        return sibling_block or None
-
     from storage.agents import agent_store
+
+    if not delegation_targets:
+        # No roster to list (a bottom level under a downward mode, or a
+        # person's narrowed view): the department line still tells the agent
+        # its place.
+        dept_line = _department_line(agent_name, agent_store.get_agent(agent_name) or {}, [],
+                                     department=kwargs.get("department", _DEPARTMENT_UNRESOLVED))
+        return "\n".join(p for p in (dept_line.strip(), sibling_block) if p) or None
 
     roster: dict[str, list[dict]] = kwargs.get("delegation_roster") or {}
 
@@ -955,7 +994,8 @@ def _delegation_mcp_context(
     # would refuse — with the department's mode off, dept-mates simply
     # don't appear. Buckets are capped inside _department_line (a subtree
     # mesh can be the whole department under mode 'both').
-    dept_line = _department_line(agent_name, self_data or {}, delegation_targets)
+    dept_line = _department_line(agent_name, self_data or {}, delegation_targets,
+                                 department=kwargs.get("department", _DEPARTMENT_UNRESOLVED))
     if dept_line:
         lines.append(dept_line)
 
@@ -1145,8 +1185,9 @@ def _ssh_hosts_context(
 ) -> str | None:
     """Inject the authorized SSH host list for the ssh-hosts MCP.
 
-    ssh-hosts is context-only: agents use plain ``ssh``/``scp``/``rsync``
-    from bash against admin-configured hosts. Each authorizing instance
+    Agents use plain ``ssh``/``scp``/``rsync`` from bash against
+    admin-configured hosts (the MCP's one tool, ``list_ssh_hosts``, only
+    re-reads this list mid-session). Each authorizing instance
     renders as a ready-to-run command line; the referenced private keys are
     materialized per session at ``$OTO_SSH_KEY_DIR`` — locally by
     ``session_config_dir.materialize_ssh_keys_for_sandbox``, on admin-paired

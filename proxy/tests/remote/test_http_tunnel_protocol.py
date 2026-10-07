@@ -655,8 +655,9 @@ async def test_the_stop_hook_outlives_the_stream_clamp():
                  "/v1/hooks/codex-question", "/v1/hooks/tool-result"):
         await _run(path)
     assert reads["/v1/hooks/stop"] == float(tun._STREAM_MAX_AGE_S)
-    assert reads["/v1/hooks/permission"] == float(tun._STREAM_MAX_AGE_S)
-    assert reads["/v1/hooks/codex-question"] == float(tun._STREAM_MAX_AGE_S)
+    # A prompt waits on a person up to three days; its stream an hour more.
+    assert reads["/v1/hooks/permission"] == float(tun._PROMPT_STREAM_MAX_S)
+    assert reads["/v1/hooks/codex-question"] == float(tun._PROMPT_STREAM_MAX_S)
     assert reads["/v1/hooks/tool-result"] == float(tun._MAX_STREAM_TIMEOUT_S)
 
 
@@ -794,7 +795,6 @@ async def test_hooks_do_not_wait_behind_held_mcp_streams(monkeypatch):
     await up.start()
     monkeypatch.setattr(tun, "_resolve_upstream_url",
                         lambda p: f"http://127.0.0.1:{up.port}{p.split('?', 1)[0]}")
-    monkeypatch.setattr(tun, "_swap_brokered_bearer", lambda p, h: None)
     disp = SatelliteHttpTunnelDispatcher()
     conn = FakeConnection()
     mgr = FakeManager(conn)
@@ -844,11 +844,11 @@ async def test_a_tunneled_request_from_a_gone_holder_is_refused(monkeypatch):
     brokered MCPs and on the callback MCPs alike; a living person's and an
     agent-scope token pass; the answer is cached for the TTL and the cache
     is bounded."""
-    from auth import providers as auth_providers
-    from auth.session_token import create_session_token
+    from auth import providers as auth_providers, token_holder
+    from tests.conftest import live_session_token
     from core.remote import satellite_http_tunnel as tun
 
-    tun._holder_answers.clear()
+    token_holder.reset_for_tests()
     monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
     judged: list[str] = []
     real_judge = auth_providers.session_token_holder_ok
@@ -879,32 +879,34 @@ async def test_a_tunneled_request_from_a_gone_holder_is_refused(monkeypatch):
             await asyncio.sleep(0.01)
         return conn.sent[-1]
 
-    ghost = create_session_token("sid-ghost", "pa", user_sub="user-nobody")
+    ghost = live_session_token("sid-ghost", "pa", user_sub="user-nobody")
     for path in ("/mcp/github/mcp", "/mcp/file-tools/mcp/"):
         frame = await _ask(ghost, path)
         assert frame["status"] == 401 and frame["error"] == "session-holder-gone"
     fake_client.send.assert_not_called()
     assert judged == ["user-nobody"]            # the second ask hit the cache
 
-    alive = create_session_token("sid-alive", "pa", user_sub="user-admin")
+    alive = live_session_token("sid-alive", "pa", user_sub="user-admin")
     frame = await _ask(alive, "/mcp/github/mcp")
     assert frame["error"] == "upstream-ConnectError"   # reached the client
-    service = create_session_token("sid-svc", "pa")
+    service = live_session_token("sid-svc", "pa")
     frame = await _ask(service, "/mcp/github/mcp")
     assert frame["error"] == "upstream-ConnectError"
     assert judged == ["user-nobody", "user-admin"]     # no person, no judgement
     assert fake_client.send.await_count == 2
 
-    # An answer expires with the TTL, and the cache never outgrows its bound.
-    monkeypatch.setattr(tun, "_HOLDER_TTL_S", 0.0)
-    monkeypatch.setattr(tun, "_HOLDER_ANSWERS_MAX", 1)
-    tun._holder_answers.clear()
+    # A pass expires with the TTL, a refusal stands for the token's life (the
+    # routes' rule, one cache), and the cache never outgrows its bound.
+    monkeypatch.setattr(token_holder, "HOLDER_TTL_S", 0.0)
+    monkeypatch.setattr(token_holder, "ANSWERS_MAX", 1)
+    token_holder.reset_for_tests()
     await _ask(ghost, "/mcp/github/mcp")
     await _ask(ghost, "/mcp/github/mcp")
     await _ask(alive, "/mcp/github/mcp")
+    await _ask(alive, "/mcp/github/mcp")
     assert judged == ["user-nobody", "user-admin",
-                      "user-nobody", "user-nobody", "user-admin"]
-    assert len(tun._holder_answers) <= 1
+                      "user-nobody", "user-admin", "user-admin"]
+    assert len(token_holder._answers) <= 1
 
 
 @pytest.mark.asyncio
@@ -912,10 +914,11 @@ async def test_the_holder_check_reads_the_bearer_as_the_routes_do(monkeypatch):
     """The routes accept the scheme in any case, so the tunnel reads it so
     too; a request with two Authorization headers (keys differing in case)
     is refused, since which one a server reads is its own choice."""
-    from auth.session_token import create_session_token
+    from auth import token_holder
+    from tests.conftest import live_session_token
     from core.remote import satellite_http_tunnel as tun
 
-    tun._holder_answers.clear()
+    token_holder.reset_for_tests()
     monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
     disp = SatelliteHttpTunnelDispatcher()
     conn = FakeConnection()
@@ -937,7 +940,7 @@ async def test_the_holder_check_reads_the_bearer_as_the_routes_do(monkeypatch):
             await asyncio.sleep(0.01)
         return conn.sent[-1]
 
-    ghost = create_session_token("sid-ghost", "pa", user_sub="user-nobody")
+    ghost = live_session_token("sid-ghost", "pa", user_sub="user-nobody")
     for value in (f"bearer {ghost}", f"BEARER {ghost}", f"Bearer  {ghost}"):
         frame = await _ask({"authorization": value})
         assert frame["status"] == 401 and frame["error"] == "session-holder-gone", value
@@ -946,17 +949,280 @@ async def test_the_holder_check_reads_the_bearer_as_the_routes_do(monkeypatch):
     fake_client.send.assert_not_called()
 
 
-def test_the_swap_miss_log_set_stays_bounded():
-    """One line per (session, mcp) pair, and the set never outgrows its cap:
-    every callback-MCP session adds a pair for the life of the process."""
-    from core.remote import satellite_http_tunnel as tun
+class _RecordingUpstream:
+    """A loopback HTTP server that records each request's head and answers
+    a JSON-RPC result (a sidecar behind the gateway's forward)."""
 
-    tun._swap_miss_logged.clear()
+    def __init__(self):
+        self.server = None
+        self.port = None
+        self.heads: list[bytes] = []
+
+    async def _handle(self, reader, writer):
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            self.heads.append(head)
+            clen = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    clen = int(line.split(b":", 1)[1])
+            if clen:
+                await reader.readexactly(clen)
+            body = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                         b"Mcp-Session-Id: s-1\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+            await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            writer.close()
+
+    async def start(self):
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def stop(self):
+        self.server.close()
+
+
+async def _first_frame(conn, stream_id: str) -> dict:
+    for _ in range(300):
+        for f in conn.sent:
+            if f.get("stream_id") == stream_id and f["type"] == "http_response":
+                return f
+        await asyncio.sleep(0.01)
+    raise AssertionError("no response frame")
+
+
+@pytest.mark.asyncio
+async def test_a_credentialed_sidecar_request_is_forwarded_through_the_gateway(monkeypatch):
+    """A tunneled ``/mcp/<name>/`` request of a session that holds a gateway
+    credential for that sidecar reaches it with the credential added and the
+    session token kept on the platform; one without a credential takes the
+    direct hop as before."""
+    import base64
+    import uuid
+    from core.credentials import mcp_broker, mcp_gateway
+    from core.credentials.mcp_gateway import GatewayCredential
+    from core.remote import satellite_http_tunnel as tun
+    from storage.identity import bearer_allowlist
+    from tests.conftest import live_session_token
+
+    up = _RecordingUpstream()
+    await up.start()
+    sid = str(uuid.uuid4())
+    provider = f"gw-{uuid.uuid4().hex[:6]}"
+    bearer_allowlist.add_allowed(provider, "localhost", "test")
+    mcp_broker.provision(sid, {"github-mcp": mcp_broker.SecretBundle(gateway=GatewayCredential(
+        upstream=f"http://127.0.0.1:{up.port}", path="/mcp", allowlist_key=provider,
+        value="ghp_real", proxy_local=True))})
+    monkeypatch.setattr(tun, "_resolve_upstream_url",
+                        lambda p: f"http://127.0.0.1:{up.port}{p.split('?', 1)[0]}")
+    monkeypatch.setattr("auth.token_holder.holder_ok", _ok)
+    token = live_session_token(sid, "agent", "user-1")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    body = base64.b64encode(b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}').decode()
     try:
-        assert tun._first_swap_miss(("s0", "file-tools")) is True
-        assert tun._first_swap_miss(("s0", "file-tools")) is False
-        for i in range(tun._SWAP_MISS_LOG_CAP + 5):
-            tun._first_swap_miss((f"s{i}", "file-tools"))
-        assert len(tun._swap_miss_logged) <= tun._SWAP_MISS_LOG_CAP
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "gh", "method": "POST", "path": "/mcp/github-mcp/mcp/?session_id=forged",
+            "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                        "Mcp-Session-Id": "s-1"},
+            "body_b64": body, "body_eof": True, "timeout_s": 30,
+        })
+        first = await _first_frame(conn, "gh")
+        assert first["status"] == 200 and first.get("error") is None
+        assert first["headers"].get("mcp-session-id") == "s-1"
+        head = up.heads[-1].decode()
+        assert "Authorization: Bearer ghp_real" in head
+        assert token not in head and "forged" not in head and f"session_id={sid}" in head
+        assert head.startswith("POST /mcp?")
+        # the direct hop for a sidecar the session holds no credential for
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "ft", "method": "POST", "path": "/mcp/file-tools/mcp/?session_id=x",
+            "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            "body_b64": body, "body_eof": True, "timeout_s": 30,
+        })
+        first = await _first_frame(conn, "ft")
+        assert first["status"] == 200
+        assert f"Authorization: Bearer {token}" in up.heads[-1].decode()
     finally:
-        tun._swap_miss_logged.clear()
+        mcp_broker.purge_session(sid)
+        mcp_gateway.forget_memos()
+        await disp.shutdown()
+        await up.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_vendor_credential_never_leaves_the_platform_through_the_tunnel(monkeypatch):
+    """A machine session's vendor credential is pushed to the machine's own
+    gateway; a ``/mcp/<name>/`` request for it answers a JSON-RPC refusal
+    and no upstream is dialled."""
+    import base64
+    import uuid
+    from core.credentials import mcp_broker, mcp_gateway
+    from core.credentials.mcp_gateway import GatewayCredential
+    from core.remote import satellite_http_tunnel as tun
+    from tests.conftest import live_session_token
+
+    up = _RecordingUpstream()
+    await up.start()
+    sid = str(uuid.uuid4())
+    mcp_broker.provision(sid, {"vendor": mcp_broker.SecretBundle(gateway=GatewayCredential(
+        upstream="https://mcp.example.com", path="/mcp", allowlist_key="x", value="xoxb"))})
+    monkeypatch.setattr(tun, "_resolve_upstream_url",
+                        lambda p: f"http://127.0.0.1:{up.port}{p.split('?', 1)[0]}")
+    monkeypatch.setattr("auth.token_holder.holder_ok", _ok)
+    token = live_session_token(sid, "agent", "user-1")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    body = base64.b64encode(b'{"jsonrpc":"2.0","id":3,"method":"tools/list"}').decode()
+    try:
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "v", "method": "POST", "path": "/mcp/vendor/mcp/",
+            "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            "body_b64": body, "body_eof": True, "timeout_s": 30,
+        })
+        first = await _first_frame(conn, "v")
+        assert first["status"] == 200
+        doc = json.loads(base64.b64decode(first["body_b64"]))
+        assert doc["id"] == 3 and "machine's own gateway" in doc["error"]["message"]
+        assert up.heads == []
+    finally:
+        mcp_broker.purge_session(sid)
+        mcp_gateway.forget_memos()
+        await disp.shutdown()
+        await up.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_credentialed_sidecar_with_no_credential_is_refused_not_hopped(monkeypatch):
+    """A store miss (a session adopted with no gateway descriptor) for a
+    sidecar whose manifest takes a credential answers the JSON-RPC refusal:
+    the session token is never handed to the sidecar as its token and the
+    upstream is never dialled. A sidecar that takes no credential keeps the
+    direct hop, its session token forwarded as before."""
+    import base64
+    import uuid
+    from types import SimpleNamespace
+    from core.remote import satellite_http_tunnel as tun
+    from tests.conftest import live_session_token
+
+    credentialed = SimpleNamespace(credentials=SimpleNamespace(
+        oauth={"bearer_required": True, "provider_id": "github"}, api_key_header=None))
+    keyed = SimpleNamespace(credentials=SimpleNamespace(
+        oauth=None, api_key_header={"name": "X-Key", "value_from": "K", "proposed_hosts": ["h"]}))
+    plain = SimpleNamespace(credentials=SimpleNamespace(oauth=None, api_key_header=None))
+    manifests = {"github-mcp": credentialed, "keyed-mcp": keyed, "file-tools": plain}
+    monkeypatch.setattr("services.mcp.mcp_registry.get_manifest_by_config_key", manifests.get)
+    up = _RecordingUpstream()
+    await up.start()
+    sid = str(uuid.uuid4())
+    monkeypatch.setattr(tun, "_resolve_upstream_url",
+                        lambda p: f"http://127.0.0.1:{up.port}{p.split('?', 1)[0]}")
+    monkeypatch.setattr("auth.token_holder.holder_ok", _ok)
+    token = live_session_token(sid, "agent", "user-1")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    body = base64.b64encode(b'{"jsonrpc":"2.0","id":9,"method":"tools/list"}').decode()
+    try:
+        for stream_id, name in (("gh", "github-mcp"), ("kk", "keyed-mcp")):
+            await disp.handle_request_frame(mgr, "m1", {
+                "stream_id": stream_id, "method": "POST", "path": f"/mcp/{name}/mcp/",
+                "headers": {"Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json"},
+                "body_b64": body, "body_eof": True, "timeout_s": 30,
+            })
+            first = await _first_frame(conn, stream_id)
+            assert first["status"] == 200
+            doc = json.loads(base64.b64decode(first["body_b64"]))
+            assert doc["id"] == 9 and "No credential" in doc["error"]["message"]
+        assert up.heads == []
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "ft", "method": "POST", "path": "/mcp/file-tools/mcp/",
+            "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            "body_b64": body, "body_eof": True, "timeout_s": 30,
+        })
+        first = await _first_frame(conn, "ft")
+        assert first["status"] == 200
+        assert f"Authorization: Bearer {token}" in up.heads[-1].decode()
+    finally:
+        await disp.shutdown()
+        await up.stop()
+
+
+async def _ok(payload):
+    return True
+
+
+def test_the_two_tunnel_allowlists_are_the_same_list():
+    """The proxy's and the satellite's allowlists are mirrored by hand: this
+    compares them whole, pattern by pattern, so an entry added on one side
+    fails here instead of on a machine."""
+    import sys
+    from tests._paths import REPO_ROOT
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from core.remote import satellite_http_tunnel as tun
+    from satellite.transport import http_tunnel as sat
+    proxy_patterns = [r.pattern for r in tun._ALLOWLIST_REGEXES]
+    satellite_patterns = [r.pattern for r in sat._ALLOWLIST_REGEXES]
+    assert proxy_patterns == satellite_patterns
+    assert "/v1/mcp-gateway" not in "".join(proxy_patterns)
+
+
+@pytest.mark.asyncio
+async def test_a_tunneled_mcp_request_of_a_closed_or_earlier_life_is_refused(monkeypatch):
+    """The tunnel's MCP path judges the session before the holder check and
+    the bearer swap: a token of a session nothing holds, and one minted
+    before its session's floor, answer 401 ``session-not-live`` and the
+    upstream is never contacted; the current life's token passes."""
+    import time as _time
+    from auth import token_holder
+    from auth.session_token import create_session_token
+    from core.layers.direct.session import _direct_sessions
+    from core.remote import satellite_http_tunnel as tun
+    from core.session import session_state
+
+    token_holder.reset_for_tests()
+    monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    fake_client = MagicMock()
+    fake_client.build_request = MagicMock(return_value="REQ")
+    fake_client.send = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: fake_client)
+
+    async def _ask(token: str) -> dict:
+        n = len(conn.sent)
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": str(uuid.uuid4()), "method": "POST", "path": "/mcp/file-tools/mcp/",
+            "headers": {"Authorization": f"Bearer {token}"}, "body_b64": "",
+            "body_eof": True, "timeout_s": 30,
+        })
+        for _ in range(50):
+            if len(conn.sent) > n:
+                break
+            await asyncio.sleep(0.01)
+        return conn.sent[-1]
+
+    now = int(_time.time())
+    held = str(uuid.uuid4())
+    session_state.mark_starting(held, 60)
+    session_state.register_session_state(held, "default", None, token_minted_at=now)
+    _direct_sessions[held] = object()
+    try:
+        for token in (create_session_token(str(uuid.uuid4()), "pa", "user-admin"),
+                      create_session_token(held, "pa", "user-admin", issued_at=now - 100)):
+            frame = await _ask(token)
+            assert frame["status"] == 401 and frame["error"] == "session-not-live"
+        fake_client.send.assert_not_called()
+        frame = await _ask(create_session_token(held, "pa", "user-admin", issued_at=now))
+        assert frame["error"] == "upstream-ConnectError"      # reached the client
+    finally:
+        _direct_sessions.pop(held, None)
+        session_state.cleanup_session_permission_state(held)

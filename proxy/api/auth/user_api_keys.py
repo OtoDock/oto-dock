@@ -11,21 +11,25 @@ admin/userApiKeys page):
   DELETE /v1/user-api-keys/{key_id}
 """
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from storage.identity import api_key_store
+from storage.pg import run_db
 from services.infra import api_key_manager
 from auth.providers import (
     UserContext,
     get_current_user,
     require_auth,
+    require_user,
 )
 
 logger = logging.getLogger("claude-proxy.user-api-keys")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class CreateUserKeyRequest(BaseModel):
@@ -43,8 +47,10 @@ async def create_user_key(
         # User keys are owned by humans. Server-to-server callers shouldn't
         # mint user keys directly — go through admin if needed.
         raise HTTPException(403, "User API keys must be created by a logged-in user")
+    # A cost-12 bcrypt hash: on a plain worker thread, not the run_db lane.
     try:
-        row, raw = api_key_manager.create_user_key(
+        row, raw = await asyncio.to_thread(
+            api_key_manager.create_user_key,
             user_sub=u.sub,
             name=req.name,
             permissions=req.permissions,
@@ -70,7 +76,8 @@ async def list_user_keys(
     u = require_auth(user)
     if u.is_api_key:
         raise HTTPException(403, "Listing user API keys requires session auth")
-    rows = api_key_store.list_user_api_keys(
+    rows = await run_db(
+        api_key_store.list_user_api_keys,
         user_sub=u.sub, include_revoked=include_revoked,
     )
     return {
@@ -97,15 +104,22 @@ async def revoke_user_key(
     u = require_auth(user)
     if u.is_api_key:
         raise HTTPException(403, "Revoking user API keys requires session auth")
-    row = api_key_store.get_user_api_key(key_id)
-    if not row:
-        raise HTTPException(404, "Key not found")
-    if row.get("user_sub") != u.sub:
+
+    def _job() -> str:
+        row = api_key_store.get_user_api_key(key_id)
         # Strict ownership — admin can't revoke other users' keys via this
         # endpoint (would need a separate admin endpoint).
+        if not row or row.get("user_sub") != u.sub:
+            return "missing"
+        if row.get("revoked_at"):
+            return "already_revoked"
+        api_key_manager.revoke_user_key(key_id)
+        return "revoked"
+
+    outcome = await run_db(_job)
+    if outcome == "missing":
         raise HTTPException(404, "Key not found")
-    if row.get("revoked_at"):
+    if outcome == "already_revoked":
         return {"status": "already_revoked", "id": key_id}
-    api_key_manager.revoke_user_key(key_id)
     logger.info(f"Revoked user_api_key {key_id[:8]} for user {u.sub[:8]}")
     return {"status": "revoked", "id": key_id}

@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { WIRE, FRAMES, PER_CHAT_FRAMES, OUT, isWireType } from '@/api/wireEvents'
 import { _resetCatalogSubsForTests, subscribeCatalog } from '@/lib/appLive'
+import { useChatStore } from '@/store/chatStore'
 
 class FakeWebSocket {
   static OPEN = 1
@@ -120,6 +121,31 @@ describe('the receiver', () => {
       .toContainEqual({ type: 'catalog_subscribe', agent: 'dev', feed: 'tasks' })
     newPage.unmount()
     _resetCatalogSubsForTests()
+  })
+
+  it('clears the queued messages of the chat a queue_cleared names, viewed or not', () => {
+    const st = useChatStore.getState()
+    st.setQueuedMessages('chat-A', [{ text: 'mine' }])
+    st.setQueuedMessages('chat-B', [{ text: 'left behind' }])
+    const { ws } = connect('chat-A')
+    act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.QUEUE_CLEARED, text: 'left behind', chat_id: 'chat-B' }) }) })
+    expect(useChatStore.getState().byChat['chat-B'].queuedMessages).toEqual([])
+    expect(useChatStore.getState().byChat['chat-A'].queuedMessages).toEqual([{ text: 'mine' }])
+    // An untagged one (an acknowledgement the page already applied) names no chat.
+    act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.QUEUE_CLEARED, text: 'mine' }) }) })
+    expect(useChatStore.getState().byChat['chat-A'].queuedMessages).toEqual([{ text: 'mine' }])
+    st.clear('chat-A')
+    st.clear('chat-B')
+  })
+
+  it("hands a retired prompt to the viewed chat's stream and gates another chat's", () => {
+    const onPromptRetired = vi.fn()
+    const { ws } = connect('chat-A', { onPromptRetired })
+    act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.PROMPT_RETIRED, request_id: 'r-1', chat_id: 'chat-B' }) }) })
+    act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.PROMPT_RETIRED, request_id: 'r-2', chat_id: 'chat-A' }) }) })
+    expect(onPromptRetired).toHaveBeenCalledTimes(1)
+    expect(onPromptRetired.mock.calls[0][0]).toMatchObject({ request_id: 'r-2' })
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('hands a cancelled attachment-only queued message back to the composer', () => {

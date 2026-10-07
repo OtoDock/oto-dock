@@ -4,11 +4,12 @@ Sandboxes cannot see each other by design: the platform tree is the
 authority on both sides, and this module is the ONLY cross-agent file
 path. The gates mirror ``spawn_authz.authorize_spawn`` step for step
 (same order, same error voice) with the roster edge as the consent — no
-per-transfer approval. The copy mechanics mirror ``api/media/uploads.py``:
-containment on resolved paths, per-file cap ``config.MAX_UPLOAD_SIZE_BYTES``,
-``.partial`` + ``os.replace`` atomicity (``.partial`` is sync/fan-out
-invisible by construction), conflict renames — mailbox semantics, an
-existing inbox file is never overwritten.
+per-transfer approval. The copy runs beneath a handle on each agent's
+folder (``services/infra/safe_fs``, the path the worker result files
+take): every component opened without following, per-file cap
+``config.MAX_UPLOAD_SIZE_BYTES``, an exclusive temporary renamed in place
+(``.partial`` is sync/fan-out invisible by construction), conflict
+renames — mailbox semantics, an existing inbox file is never overwritten.
 
 send_files is the PASSIVE half of the delegation pair: it never spawns a
 turn on the target (autonomy stays with explicit ``delegate``); the
@@ -29,15 +30,16 @@ import asyncio
 import errno
 import logging
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from fastapi import HTTPException
 
 import config
 from auth.providers import UserContext
 from core.session.visibility import available_scopes_for
+from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, join_under, normalize_rel_path, resolve_under
 from storage.agents import agent_store
 from storage.files import db_file_transfers
@@ -315,16 +317,74 @@ class TransferResult:
     skipped: list[str]       # symlinks etc. — reported, never silent
 
 
-def _resolve_conflict(target: Path) -> Path:
-    """Append _1, _2, … if the target exists (mailbox: never overwrite)."""
-    if not target.exists():
-        return target
-    stem, ext, parent = target.stem, target.suffix, target.parent
-    for i in range(1, 100):
-        candidate = parent / f"{stem}_{i}{ext}"
-        if not candidate.exists():
+def free_name(dst_fd: int, parent_rel: str, name: str) -> str | None:
+    """The first free name among ``name``, ``stem_1.ext`` … ``stem_99.ext``
+    (an inbox file is never overwritten); None when every one is taken.
+    A probe, not a reservation: the write itself is exclusive. A symlink
+    met on the way is the caller's refusal (``SafeFsError``)."""
+    stem, suffix = Path(name).stem, Path(name).suffix
+    for i in range(0, 100):
+        candidate = name if i == 0 else f"{stem}_{i}{suffix}"
+        rel = f"{parent_rel}/{candidate}" if parent_rel else candidate
+        try:
+            safe_fs.lstat_beneath(dst_fd, rel)
+        except FileNotFoundError:
             return candidate
-    raise HTTPException(status_code=409, detail=f"Too many inbox files named '{target.name}'.")
+        except safe_fs.SafeFsError:
+            raise
+        except OSError:
+            return None
+    return None
+
+
+def _open_source(src_fd: int, src_rel: str, shown: Path, *, size_cap: int, cap_mb: int) -> int:
+    """A read descriptor for the source file beneath the sender's folder:
+    a regular file reached through no symlink, under the cap now."""
+    try:
+        fd, _ = safe_fs.open_regular_for_read(src_fd, src_rel, max_size=size_cap)
+    except safe_fs.FileTooLarge:
+        raise HTTPException(
+            status_code=413,
+            detail=f"'{shown.name}' is over the per-file cap of {cap_mb} MB.",
+        ) from None
+    except safe_fs.SafeFsError:
+        raise HTTPException(
+            status_code=400, detail=f"Path '{shown}' escapes your workspace.",
+        ) from None
+    return fd
+
+
+def _land(fin: BinaryIO, dst_fd: int, parent_rel: str, name: str, *, size_cap: int) -> str:
+    """Write ``fin`` beneath the target's folder at the first free name
+    under ``parent_rel`` and return the landed rel path. A symlink met on
+    the way, at any component, refuses the file: the target tree is
+    written directly by sandboxed sessions, and nothing here is checked by
+    path and then used by path."""
+    try:
+        safe_fs.mkdirs_beneath(dst_fd, parent_rel)
+        for _attempt in range(4):
+            free = free_name(dst_fd, parent_rel, name)
+            if free is None:
+                break
+            dst_rel = f"{parent_rel}/{free}"
+            try:
+                with safe_fs.atomic_writer(dst_fd, dst_rel, exclusive=True) as fout:
+                    fin.seek(0)
+                    safe_fs.copy_fd(fin, fout, max_size=size_cap)
+            except FileExistsError:
+                continue  # a race on the name: the next free one
+            return dst_rel
+    except safe_fs.FileTooLarge:
+        raise HTTPException(
+            status_code=413, detail=f"'{name}' grew over the per-file cap while it was copied.",
+        ) from None
+    except safe_fs.SafeFsError:
+        raise HTTPException(
+            status_code=400,
+            detail="Destination path escapes the target workspace "
+                   "(symlinked component) — transfer refused.",
+        ) from None
+    raise HTTPException(status_code=409, detail=f"Too many inbox files named '{name}'.")
 
 
 def perform_send_files(
@@ -419,76 +479,60 @@ def perform_send_files(
             )
         total_bytes += st.st_size
 
-    # Copy: `.partial` + fsync + atomic rename per file. A quota/disk stop
-    # mid-batch leaves the already-landed files in place (mailbox — partial
-    # delivery is real delivery) and says exactly where it stopped.
-    tgt_agent_dir = config.get_agent_dir(authz.target_agent).resolve()
-    # The containment anchor must NOT itself resolve through workspace-level
-    # symlinks (resolving authz.dest_root would follow a planted link and
-    # move the goalposts with it): rebuild it from the RESOLVED agent root —
-    # platform-owned, outside the sandbox's write reach — plus the literal
-    # scope path.
-    dest_root_resolved = tgt_agent_dir / authz.dest_root.relative_to(
-        config.get_agent_dir(authz.target_agent),
-    )
+    # Copy: one exclusive write per file, both sides reached beneath a
+    # handle on the agent's folder (platform-owned, outside any sandbox's
+    # write reach) with every component opened without following, the
+    # temporary renamed NOREPLACE within the same directory handle. Both
+    # trees are written directly by sandboxed sessions, so any component
+    # may become a symlink at any instant: no path is checked and then
+    # used by name, a link met on either side refuses that file. A
+    # quota/disk stop mid-batch leaves the already-landed files in place
+    # (mailbox — partial delivery is real delivery) and says exactly where
+    # it stopped.
+    src_agent_dir = config.get_agent_dir(authz.source_agent).resolve()
+    inbox_rel = dest_base.relative_to(config.get_agent_dir(authz.target_agent)).as_posix()
     landed: list[str] = []
-    for src, rel_dest in picked:
-        dest = _resolve_conflict(dest_base / rel_dest)
-        tmp = dest.with_name(dest.name + ".partial")
-        try:
-            # Both trees are written directly by sandboxed sessions (their
-            # own bind mounts), so a path component may have become a
-            # symlink since authorization. Re-anchor the write on the
-            # RESOLVED parent and require it inside the transfer root —
-            # the same resolved-containment bar as api/media/uploads.py —
-            # so a symlinked inbox can't redirect this proxy-privileged
-            # copy outside the target workspace. Resolved BEFORE mkdir
-            # (resolve() handles the non-existent tail lexically), so not
-            # even empty directories land outside.
-            real_parent = dest.parent.resolve()
-            if real_parent != dest_root_resolved and \
-                    not real_parent.is_relative_to(dest_root_resolved):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Destination path escapes the target workspace "
-                           "(symlinked component) — transfer refused.",
-                )
-            dest = real_parent / dest.name
-            tmp = dest.with_name(dest.name + ".partial")
-            real_parent.mkdir(parents=True, exist_ok=True)
-            # Mirror-image guard for the source: open without following a
-            # final-component symlink, then verify the file actually opened
-            # still lives inside the sender's workspace (a directory
-            # component swapped mid-race would otherwise leak whatever the
-            # proxy can read into the target inbox).
-            src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
-            with open(src_fd, "rb") as fin, open(tmp, "wb") as fout:
-                real_src = Path(os.path.realpath(f"/proc/self/fd/{fin.fileno()}"))
-                if real_src != src_root and \
-                        not real_src.is_relative_to(src_root):
+    try:
+        src_root_cm = safe_fs.open_root(config.AGENTS_DIR, authz.source_agent)
+        src_fd = src_root_cm.__enter__()
+    except OSError:
+        raise HTTPException(
+            status_code=404,
+            detail="Your workspace directory does not exist yet — nothing to send.",
+        ) from None
+    try:
+        with safe_fs.open_root(config.AGENTS_DIR, authz.target_agent) as dst_fd:
+            for src, rel_dest in picked:
+                try:
+                    src_rel = src.relative_to(src_agent_dir).as_posix()
+                except ValueError:
                     raise HTTPException(
-                        status_code=400,
-                        detail=f"Path '{rel_dest}' escapes your workspace.",
-                    )
-                shutil.copyfileobj(fin, fout, 1024 * 1024)
-                fout.flush()
-                os.fsync(fout.fileno())
-            os.replace(tmp, dest)
-        except HTTPException:
-            tmp.unlink(missing_ok=True)
-            raise
-        except OSError as e:
-            tmp.unlink(missing_ok=True)
-            if e.errno in (errno.EDQUOT, errno.ENOSPC):
-                raise HTTPException(
-                    status_code=507,
-                    detail=f"Not enough storage in '{authz.target_agent}'s "
-                           f"{authz.dest_scope} bucket — stopped after "
-                           f"{len(landed)} of {len(picked)} file(s).",
-                )
-            logger.error("send_files copy failed: %s → %s: %s", src, dest, e)
-            raise HTTPException(status_code=500, detail="File copy failed.")
-        landed.append(str(dest.relative_to(tgt_agent_dir)))
+                        status_code=400, detail=f"Path '{rel_dest}' escapes your workspace.",
+                    ) from None
+                parent_rel = inbox_rel
+                if rel_dest.parent != Path("."):
+                    parent_rel = f"{inbox_rel}/{rel_dest.parent.as_posix()}"
+                try:
+                    fd = _open_source(src_fd, src_rel, rel_dest, size_cap=size_cap, cap_mb=cap_mb)
+                    with os.fdopen(fd, "rb") as fin:
+                        dst_rel = _land(fin, dst_fd, parent_rel, rel_dest.name, size_cap=size_cap)
+                except OSError as e:
+                    if e.errno in (errno.EDQUOT, errno.ENOSPC):
+                        raise HTTPException(
+                            status_code=507,
+                            detail=f"Not enough storage in '{authz.target_agent}'s "
+                                   f"{authz.dest_scope} bucket — stopped after "
+                                   f"{len(landed)} of {len(picked)} file(s).",
+                        ) from None
+                    logger.error("send_files copy failed: %s → %s/%s: %s",
+                                 src_rel, parent_rel, rel_dest.name, e)
+                    raise HTTPException(status_code=500, detail="File copy failed.") from None
+                landed.append(dst_rel)
+    except OSError as e:
+        logger.error("send_files: '%s' tree could not be opened: %s", authz.target_agent, e)
+        raise HTTPException(status_code=500, detail="File copy failed.") from None
+    finally:
+        src_root_cm.__exit__(None, None, None)
 
     transfer_id = db_file_transfers.record_transfer(
         source_agent=authz.source_agent,
@@ -516,9 +560,47 @@ def perform_send_files(
     )
 
 
+def schedule_inbox_fanout(
+    target_agent: str, rel_paths: list[str], *, origin_user_sub: str,
+) -> None:
+    """Background satellite push per landed inbox file, best-effort, never
+    blocking the caller (uploads precedent: a target agent living on a
+    remote machine must see the inbox too). ``include_idle`` so a connected
+    satellite holding the agent receives it even with no live session. Each
+    push is tracked with the in-flight uploads, so the headless and steer
+    dispatch barrier of a remote turn waits on it (the PTY rung has none;
+    the warmup sync reconciles)."""
+    try:
+        from core.remote import upload_inflight
+        from services.remote import workspace_fanout
+    except Exception:
+        return
+    agent_dir = config.get_agent_dir(target_agent)
+    for rel in rel_paths:
+        if not workspace_fanout.has_fanout_candidates(
+            target_agent, rel, include_idle=True,
+        ):
+            continue
+
+        async def _push(rel: str = rel) -> None:
+            try:
+                await workspace_fanout.fan_out_write(
+                    target_agent, rel, agent_dir / rel,
+                    include_idle=True, origin_user_sub=origin_user_sub,
+                )
+            except Exception:
+                logger.exception("inbox fan-out failed: %s", rel)
+
+        upload_inflight.track(target_agent, _push())
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Remote sources — read-through before the copy (2026-09-05)
 # ───────────────────────────────────────────────────────────────────────────
+
+
+# The prefetch's whole budget, under the delegation MCP's 300 s wait.
+_PREFETCH_BUDGET_S = 240.0
 
 
 async def prefetch_remote_sources(
@@ -572,22 +654,43 @@ async def prefetch_remote_sources(
     manifest_failed = False
     budget: int | None = None
     pulled: list[str] = []
+    fallback: list[str] = []
+    # The delegation MCP waits 300 s for the call: a pull still running past
+    # this is abandoned and the platform's copy goes instead (reported).
+    deadline = asyncio.get_running_loop().time() + _PREFETCH_BUDGET_S
 
     async def _pull(remote_rel: str) -> Path | None:
+        remaining = _left()
         try:
-            got = await remote_file_flow.pull_through(session_id, remote_rel)
-            if got is not None:
-                pulled.append(remote_rel)
+            if remaining <= 0:
+                raise TimeoutError
+            got = await asyncio.wait_for(
+                remote_file_flow.pull_through(session_id, remote_rel, fallback=fallback),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            got = config.get_agent_dir(authz.source_agent) / remote_rel
+            if not got.is_file():
+                return None
+            fallback.append(remote_rel)
             return got
         except Exception:
             logger.warning(
                 "send_files prefetch: pull failed for %s", remote_rel, exc_info=True,
             )
             return None
+        if got is not None and remote_rel not in fallback:
+            pulled.append(remote_rel)
+        return got
+
+    def _left() -> float:
+        return deadline - asyncio.get_running_loop().time()
 
     async def _probe(remote_rel: str) -> dict | None:
         try:
-            return await remote_file_flow.stat_probe(session_id, remote_rel)
+            return await asyncio.wait_for(
+                remote_file_flow.stat_probe(session_id, remote_rel), max(_left(), 0.1),
+            )
         except Exception:
             logger.warning(
                 "send_files prefetch: probe failed for %s", remote_rel, exc_info=True,
@@ -598,7 +701,9 @@ async def prefetch_remote_sources(
         nonlocal manifest, manifest_failed, budget
         if manifest is None and not manifest_failed:
             try:
-                manifest = await remote_file_flow.list_remote_files(session_id, prefix)
+                manifest = await asyncio.wait_for(
+                    remote_file_flow.list_remote_files(session_id, prefix), max(_left(), 0.1),
+                )
             except Exception:
                 logger.warning("send_files prefetch: manifest failed", exc_info=True)
                 manifest = None
@@ -622,6 +727,12 @@ async def prefetch_remote_sources(
         except HTTPException:
             continue  # perform raises the same 400 — nothing reaches the satellite
         remote_rel = prefix if rel == "." else f"{prefix}/{rel}"
+        if _left() <= 0:
+            # Past the budget nothing more asks the machine: a file the
+            # platform holds goes as it is there, the rest is perform's.
+            if (authz.source_root / rel).is_file():
+                fallback.append(remote_rel)
+            continue
         # A platform-side directory can't be a satellite file — straight to
         # the manifest. Anything else: probe, then pull when it is (or may
         # be) a file over there.
@@ -643,10 +754,17 @@ async def prefetch_remote_sources(
             if budget is not None:
                 budget -= 1
             await _pull(entry)
+    if fallback:
+        machine = await remote_source_label(session_id)
+        for rel in fallback:
+            logger.warning(
+                "send_files prefetch: %s could not be read from %s, the platform's "
+                "copy was sent", rel, machine,
+            )
     logger.info(
         "send_files prefetch: session=%s agent=%s paths=%d read through=%d "
-        "manifest=%s unavailable=%s",
-        session_id[:8], authz.source_agent, len(paths), len(pulled),
+        "fallback=%s manifest=%s unavailable=%s",
+        session_id[:8], authz.source_agent, len(paths), len(pulled), fallback or "-",
         "failed" if manifest_failed else ("yes" if manifest is not None else "no"),
         unavailable or "-",
     )

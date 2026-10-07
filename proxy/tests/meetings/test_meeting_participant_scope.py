@@ -85,3 +85,54 @@ def test_collaborative_participant_in_user_meeting_stays_user_scope(temp_db):
         user_sub=creator, scope_override=identity.scope,
     )
     assert vis.mount_scope == "user"
+
+
+def _meeting(scope: str, created_by: str) -> dict:
+    return {"id": "mtg-x", "scope": scope, "created_by": created_by, "moderator": "caller",
+            "agents": ["caller"]}
+
+
+def test_a_participant_below_the_editor_tier_is_refused_at_build(temp_db):
+    """The build refuses before any seat: a Shared-only participant in a
+    user-scope meeting its creator holds below editor, and an agent-scope
+    meeting whose creator lost the editor tier after convening it."""
+    import asyncio
+
+    import pytest
+
+    from core.sandbox.session_config_dir import AgentStateRefused
+    from services.meetings.meeting_context import build_meeting_agent_config
+    agent_store.create_agent("caller", "Caller", default_scope="agent", collaborative=False)
+    agent_store.create_agent("team", "Team", collaborative=True)
+    creator = "sub-pm"
+    _mk_user(creator, "Pat")
+    task_store.set_user_agents(creator, ["caller", "team"], "sub-admin",
+                               agent_roles={"caller": "contributor", "team": "viewer"})
+    with pytest.raises(AgentStateRefused, match="set to Shared only") as e:
+        asyncio.run(build_meeting_agent_config("caller", _meeting("user", creator), "sid-1"))
+    assert "run as contributor" in str(e.value)
+    with pytest.raises(AgentStateRefused, match="runs as the agent itself") as e:
+        asyncio.run(build_meeting_agent_config("team", _meeting("agent", creator), "sid-2"))
+    assert "run as viewer" in str(e.value)
+
+
+def test_an_agent_scope_meeting_of_an_editor_builds_past_the_check(temp_db, monkeypatch):
+    import asyncio
+
+    import pytest
+
+    agent_store.create_agent("team", "Team", collaborative=True)
+    creator = "sub-ed"
+    _mk_user(creator, "Eddie")
+    task_store.set_user_agents(creator, ["team"], "sub-admin", agent_roles={"team": "editor"})
+
+    class _Past(Exception):
+        pass
+
+    def _reached(*a, **k):
+        raise _Past()
+    # The first read after the refusal check: reaching it means the check passed.
+    monkeypatch.setattr(agent_store, "get_delegation_targets", _reached)
+    from services.meetings.meeting_context import build_meeting_agent_config
+    with pytest.raises(_Past):
+        asyncio.run(build_meeting_agent_config("team", _meeting("agent", creator), "sid-3"))

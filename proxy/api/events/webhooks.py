@@ -19,40 +19,25 @@ Access) the platform sits behind. Same requirement as
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 
 from fastapi import APIRouter, Request, Response
 from starlette.requests import ClientDisconnect
 
-import config
-from auth import rate_limiter
+from api.events import webhook_body
+from auth import rate_limiter, webhook_providers
 from auth.lan_check import client_address
 from services.webhooks import webhook_dispatcher
 
 logger = logging.getLogger("claude-proxy.api.webhooks")
 router = APIRouter()
 
-# The unauthenticated body read: capped at MAX_WEBHOOK_BODY_BYTES (the
-# HTTP middleware's body cap is the outer bound), a gap limit
-# between two chunks and a limit for the whole body, and a bound on bodies
-# read at once, per client address and in all.
-_CHUNK_GAP_S = 10.0
-_BODY_S = 30.0
-_READS_PER_CLIENT = 4
-_READS_TOTAL = 256
-_reads = {"total": 0}
-_reads_by_client: dict[str, int] = {}
 # The refusals counted against the client address in ``webhook_receive_ip``:
 # the ones a request earns before any subscription is found. A 404 or 410 (a
 # deleted or disabled subscription a vendor keeps posting to) never counts,
 # nor does a delivered event: the relay forwards every vendor from one address.
 _COUNTED_REFUSALS = frozenset({400, 401, 408, 413})
-
-
-class _BodyTooLarge(Exception):
-    pass
 
 
 def _refusal(status: int, error: str, *, retry_after: int | None = None) -> Response:
@@ -63,73 +48,69 @@ def _refusal(status: int, error: str, *, retry_after: int | None = None) -> Resp
                     media_type="application/json", headers=headers)
 
 
-async def _read_body(request: Request) -> bytes:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _BODY_S
-    cap = config.MAX_WEBHOOK_BODY_BYTES
-    chunks: list[bytes] = []
-    total = 0
-    stream = request.stream().__aiter__()
-    while True:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            raise TimeoutError
-        try:
-            chunk = await asyncio.wait_for(stream.__anext__(), timeout=min(_CHUNK_GAP_S, remaining))
-        except StopAsyncIteration:
-            break
-        total += len(chunk)
-        if cap and total > cap:
-            raise _BodyTooLarge
-        chunks.append(chunk)
-    return b"".join(chunks)
+def _response(status: int, body, headers) -> Response:
+    return Response(
+        content=body if isinstance(body, bytes) else (
+            json.dumps(body) if isinstance(body, (dict, list)) else str(body)).encode("utf-8"),
+        status_code=status, headers=headers or {},
+    )
 
 
-def _release_read(key: str) -> None:
-    _reads["total"] -= 1
-    left = _reads_by_client.get(key, 1) - 1
-    if left > 0:
-        _reads_by_client[key] = left
-    else:
-        _reads_by_client.pop(key, None)
+# An early answer reads a body this small first, so its sender sees the
+# status rather than a reset connection; a larger one is left unread and
+# the answer closes the connection (the HTTP middleware).
+_DRAIN_MAX = 64 * 1024
 
 
-async def _receive(request: Request, dispatch) -> Response:
+async def _drain_small(request: Request, source: str) -> None:
+    declared = request.headers.get("content-length")
+    try:
+        if declared is not None and int(declared) <= _DRAIN_MAX:
+            await webhook_body.read(request, cap=_DRAIN_MAX, source=source)
+    except Exception:
+        pass
+
+
+async def _receive(request: Request, dispatch, *, source: str, prepare=None) -> Response:
     """The receive steps every vendor and relay POST takes before the
     dispatcher: the per-address throttle (a distinct client only: behind an
     edge whose address every client shares, one bucket would let one sender
-    block every vendor), the read bounds, the capped read; the dispatcher's
-    answer passes through unchanged. The read bounds count bodies being
-    read: the slot is given back when the read ends, before the dispatch,
-    which the dispatcher's own pre-auth gate bounds."""
+    block every vendor), ``prepare`` (run before the body is read: an early
+    answer, or the cap the sender may use and what to do when it is
+    exceeded), the capped read (``webhook_body``: its deadlines and the
+    in-flight bounds); the dispatcher's answer passes through unchanged."""
     addr = client_address(request)
-    key = f"ip:{addr.client}"
+    key = f"ip:{addr.bucket_key}"
     if not addr.shared:
         ok, retry_after = rate_limiter.check_rate_limit("webhook_receive_ip", key)
         if not ok:
             return _refusal(429, "too_many_requests", retry_after=retry_after)
-    if (_reads["total"] >= _READS_TOTAL
-            or (not addr.shared and _reads_by_client.get(key, 0) >= _READS_PER_CLIENT)):
-        return _refusal(503, "busy", retry_after=5)
-    _reads["total"] += 1
-    _reads_by_client[key] = _reads_by_client.get(key, 0) + 1
+    cap, on_too_large = webhook_body.unknown_cap(), None
+    if prepare is not None:
+        early, cap, on_too_large = await prepare()
+        if early is not None:
+            await _drain_small(request, source)
+            return _response(*early)
+    if cap > webhook_body.unknown_cap():
+        webhook_body.lift(request, cap)
     try:
-        raw_body = await _read_body(request)
-    except (_BodyTooLarge, ClientDisconnect):
+        raw_body = await webhook_body.read(request, cap=cap, source=source)
+    except webhook_body.TooLarge:
         status, response = 413, _refusal(413, "body_too_large")
+        if on_too_large is not None:
+            await on_too_large(cap)
+    except ClientDisconnect:
+        # The sender went away, or the middleware's cap cut the read.
+        status, response = 413, _refusal(413, "body_too_large")
+        if on_too_large is not None and request.scope.get("otodock.body_cut"):
+            await on_too_large(cap)
+    except webhook_body.Busy:
+        status, response = 503, _refusal(503, "busy", retry_after=5)
     except TimeoutError:
         status, response = 408, _refusal(408, "body_timeout")
     else:
-        status = 0
-    finally:
-        _release_read(key)
-    if not status:
         status, body, headers = await dispatch(raw_body)
-        response = Response(
-            content=body if isinstance(body, bytes) else (
-                json.dumps(body) if isinstance(body, (dict, list)) else str(body)).encode("utf-8"),
-            status_code=status, headers=headers or {},
-        )
+        response = _response(status, body, headers)
     if status in _COUNTED_REFUSALS and not addr.shared:
         rate_limiter.record_attempt("webhook_receive_ip", key)
     return response
@@ -165,7 +146,7 @@ async def receive_relay_webhook(provider_id: str, request: Request) -> Response:
             )
             return 500, {"error": "internal_error"}, {"content-type": "application/json"}
 
-    return await _receive(request, dispatch)
+    return await _receive(request, dispatch, source=f"relay/{provider_id}")
 
 
 @router.api_route(
@@ -201,6 +182,7 @@ async def receive_webhook(
                 headers=headers,
                 query_params=query_params,
                 http_method=request.method,
+                context=loaded.get("context"),
             )
         except Exception:
             logger.exception(
@@ -209,4 +191,25 @@ async def receive_webhook(
             )
             return 500, {"error": "internal_error"}, {"content-type": "application/json"}
 
-    return await _receive(request, dispatch)
+    loaded: dict = {}
+
+    async def prepare():
+        context, early = await webhook_dispatcher.load_receive_context(
+            provider_id, subscription_id)
+        if early is not None:
+            return early, 0, None
+        loaded["context"] = context
+        cap = webhook_body.unknown_cap()
+        # A signature is over the body: the larger read is allowed for a
+        # provider whose events run large and whose manifest declares one,
+        # and the dispatcher verifies it before anything else reads the body.
+        if (provider_id in webhook_providers.LARGE_BODY_PROVIDERS
+                and context.webhooks_block.get("signature")):
+            cap = webhook_body.signed_cap()
+
+        async def too_large(c: int) -> None:
+            await webhook_dispatcher.note_body_refusal(context.row, c)
+        return None, cap, too_large
+
+    return await _receive(request, dispatch, source=f"{provider_id}/{subscription_id}",
+                          prepare=prepare)

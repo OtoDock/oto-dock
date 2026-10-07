@@ -181,8 +181,8 @@ describe('AppSettingsPanel', () => {
     expect(stripe.textContent).toContain(`${window.location.origin}/v1/apps/app-1/inbound/stripe`)
     // The secrets' states arrive with the listing.
     await waitFor(() => expect(stripe.textContent).toContain('verified with the secret STRIPE_WEBHOOK_SECRET (not set — the address is off until it is)'))
-    expect(stripe.textContent).toContain('wakes payment')
-    expect(screen.getByTestId('inbound-section').textContent).toContain('Paste the address into the vendor’s webhook settings; its signing secret goes above.')
+    expect(stripe.textContent).toContain('(not set — the address is off until it is), and wakes payment')
+    expect(screen.getByTestId('inbound-section').textContent).toContain('Paste the address into the vendor’s webhook settings. Its signing secret goes above.')
     const gh = screen.getByTestId('inbound-row-gh')
     expect(gh.textContent).toContain('GitHub-signed events')
     expect(gh.textContent).toContain('GH_SECRET (set)')

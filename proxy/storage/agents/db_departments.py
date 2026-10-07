@@ -273,6 +273,13 @@ def delete_department(department_id: str) -> list[str]:
             "WHERE department_id = %s",
             (department_id,),
         )
+        # Its shares end with it (SHARING.md): the id has no FK and would
+        # dangle, naming a department nobody can see.
+        conn.execute(
+            "UPDATE shares SET revoked_at = %s WHERE grantee_department = %s "
+            "AND revoked_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), department_id),
+        )
         conn.execute("DELETE FROM departments WHERE id = %s", (department_id,))
         conn.commit()
     if members:

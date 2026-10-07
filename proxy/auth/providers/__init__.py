@@ -8,7 +8,10 @@ Provides:
   - Permission helpers for role-based endpoint gating
 """
 
+import contextlib
 import logging
+import math
+import secrets
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +31,13 @@ logger = logging.getLogger("claude-proxy.auth")
 # ({"expiry": monotonic timestamp, "redirect_uri": str | None})
 _oauth_states: dict[str, dict] = {}
 _STATE_TTL = 300  # 5 minutes
+_STATE_MAX = 10_000
+# Live states per client (``create_oauth_state(client=)``): one address, or
+# one IPv6 /64, cannot fill the store alone. A browser holds at most four
+# (its state-binding ring), so the cap leaves room for a few at one address.
+_STATE_MAX_PER_CLIENT = 8
+# client -> its live state ids, oldest first.
+_client_states: dict[str, list[str]] = {}
 
 # Synthetic ``sub`` prefix for a session-JWT caller that carried NO real
 # user_sub (agent-scope / phone / trigger / meeting service session with no
@@ -248,31 +258,107 @@ class UserContext:
 # --- CSRF state ---
 
 
+class StateStoreFull(Exception):
+    """A new sign-in state refused: the store holds ``_STATE_MAX`` live
+    states. ``retry_after`` is the seconds until the oldest one lapses."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"the sign-in state store is full; retry in {retry_after} s")
+        self.retry_after = retry_after
+
+
+class ClientStatesFull(Exception):
+    """A new sign-in state refused: the client holds
+    ``_STATE_MAX_PER_CLIENT`` live states. ``retry_after`` is the seconds
+    until its oldest one lapses."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(f"the client holds its cap of sign-in states; retry in {retry_after} s")
+        self.retry_after = retry_after
+
+
+def _forget(state: str, meta: dict) -> None:
+    """Drop a state that left the store from its client's list."""
+    ids = _client_states.get(meta.get("client") or "")
+    if ids is None:
+        return
+    with contextlib.suppress(ValueError):
+        ids.remove(state)
+    if not ids:
+        _client_states.pop(meta["client"], None)
+
+
 def create_oauth_state(redirect_uri: str | None = None, *, purpose: str = "login",
-                       sub: str = "", return_to: str = "") -> str:
+                       sub: str = "", return_to: str = "", nonce: str = "",
+                       code_verifier: str = "", client: str = "",
+                       client_capped: bool = True) -> str:
     """Generate a random state parameter and store it with a TTL.
 
     ``purpose`` is what the callback may do with the state: ``login`` issues
     a session; ``confirm`` (SHARING.md "The confirm") mints a one-shot
     confirm token for ``sub`` and sends the page back to ``return_to``. A
     state never serves the other purpose; ``created_at`` (wall clock) is the
-    instant a confirm's ``auth_time`` is judged against."""
-    import secrets
+    instant a confirm's ``auth_time`` is judged against. ``nonce`` and
+    ``code_verifier`` stay here, server-side: the ID token must carry the
+    first, and the code exchange sends the second (PKCE).
+
+    Anyone may start a sign-in, so the store is bounded: a ``client`` (the
+    starting address, an IPv6 address by its /64) holding
+    ``_STATE_MAX_PER_CLIENT`` live states is refused (``ClientStatesFull``)
+    unless ``client_capped`` is off (an address every client shares); at
+    ``_STATE_MAX`` live states in all a new one is refused
+    (``StateStoreFull``). No sign-in in flight loses its state."""
+    now = time.monotonic()
+    # Every state lives _STATE_TTL, so insertion order is expiry order: the
+    # lapsed ones are at the front.
+    while _oauth_states:
+        oldest = next(iter(_oauth_states))
+        if _oauth_states[oldest]["expiry"] >= now:
+            break
+        _forget(oldest, _oauth_states.pop(oldest))
+    if client and client_capped:
+        ids = [s for s in _client_states.get(client, ()) if s in _oauth_states]
+        if ids:
+            _client_states[client] = ids
+        else:
+            _client_states.pop(client, None)
+        if len(ids) >= _STATE_MAX_PER_CLIENT:
+            raise ClientStatesFull(max(1, math.ceil(_oauth_states[ids[0]]["expiry"] - now)))
+    if len(_oauth_states) >= _STATE_MAX:
+        oldest_expiry = next(iter(_oauth_states.values()))["expiry"]
+        raise StateStoreFull(max(1, math.ceil(oldest_expiry - now)))
     state = secrets.token_urlsafe(32)
     _oauth_states[state] = {
-        "expiry": time.monotonic() + _STATE_TTL,
+        "expiry": now + _STATE_TTL,
         "redirect_uri": redirect_uri,
         "purpose": purpose,
         "sub": sub,
         "return_to": return_to,
         "created_at": time.time(),
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "client": client,
     }
-    # Purge expired states
-    now = time.monotonic()
-    expired = [k for k, v in _oauth_states.items() if v["expiry"] < now]
-    for k in expired:
-        _oauth_states.pop(k, None)
+    if client:
+        _client_states.setdefault(client, []).append(state)
     return state
+
+
+def peek_oauth_state(state: str) -> dict | None:
+    """A live state's metadata, left in the store (None when unknown or
+    lapsed); the dict is the stored one."""
+    meta = _oauth_states.get(state)
+    if meta is None or time.monotonic() > meta["expiry"]:
+        return None
+    return meta
+
+
+def discard_oauth_state(state: str, client: str) -> None:
+    """Drop a live state the same ``client`` started (a state pushed out of
+    its browser's binding ring, which can no longer complete there)."""
+    meta = _oauth_states.get(state)
+    if meta is not None and client and meta.get("client") == client:
+        _forget(state, _oauth_states.pop(state))
 
 
 def validate_oauth_state(state: str) -> dict | None:
@@ -280,6 +366,7 @@ def validate_oauth_state(state: str) -> dict | None:
     meta = _oauth_states.pop(state, None)
     if meta is None:
         return None
+    _forget(state, meta)
     if time.monotonic() > meta["expiry"]:
         return None
     return meta
@@ -294,11 +381,19 @@ def validate_oauth_state(state: str) -> dict | None:
 
 def create_session_jwt(sub: str, email: str, name: str, role: str,
                        auth_provider: str = "local", *,
-                       expiry_hours: int | None = None) -> str:
+                       expiry_hours: int | None = None,
+                       jti: str | None = None,
+                       issued_at: int | None = None) -> str:
     """Create an HS256 JWT for the dashboard session cookie.
     ``expiry_hours`` saves a caller that already read the setting a second
-    read (``config.get_jwt_expiry_hours``)."""
+    read (``config.get_jwt_expiry_hours``). ``jti`` is the id of the
+    SIGN-IN: a login mints a fresh one, the sliding refresh re-mints with
+    the presented cookie's, so a logout revokes the whole lineage of one
+    sign-in and no other (``auth/session_revocation.py``). ``issued_at``
+    is the instant the sliding refresh last judged the cookie current: a
+    token epoch that moved after it refuses the re-minted cookie too."""
     hours = expiry_hours if expiry_hours is not None else config.get_jwt_expiry_hours()
+    now = int(time.time()) if issued_at is None else int(issued_at)
     payload = {
         # Discriminator: marks this as a dashboard session cookie. Required by
         # validate_session_jwt so that OTHER JWTs signed with the same
@@ -310,8 +405,9 @@ def create_session_jwt(sub: str, email: str, name: str, role: str,
         "name": name,
         "role": role,
         "auth_provider": auth_provider,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + hours * 3600,
+        "iat": now,
+        "exp": now + hours * 3600,
+        "jti": jti or secrets.token_urlsafe(16),
     }
     return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
 
@@ -374,19 +470,51 @@ def _iso_ts(value) -> float | None:
         return None
 
 
+def _after_token_epoch(user: dict, iat: int) -> bool:
+    """``iat`` is at or after the person's token epoch (``users.token_epoch_at``,
+    moved by a password set and by an admin's "sign out everywhere"; never
+    bumped = no epoch). No grace beyond the epoch's own second: ``iat`` is
+    whole seconds, so the cookie the password change re-issues right after
+    its write lands in that second or a later one, while a sign-in made
+    seconds before an admin's "sign out everywhere" ends with the rest."""
+    epoch = _iso_ts(user.get("token_epoch_at"))
+    return epoch is None or iat >= int(epoch)
+
+
 def session_token_is_current(user: dict, payload: dict) -> bool:
     """The credential timeline for an agent session token: refused when
-    minted before the user's last password change or before the users row
-    existed (a person deleted and re-created under the same sub). A token
-    minted before tokens carried ``iat`` is tolerated: it expires within its
-    24 h. The same 5 s grace as the cookie."""
+    minted before the user's last password change, before their token epoch
+    or before the users row existed (a person deleted and re-created under
+    the same sub). A token minted before tokens carried ``iat`` is
+    tolerated: it expires within its 24 h. The password and creation rules
+    keep the cookie's 5 s grace; the epoch has none beyond its own second
+    (``_after_token_epoch``)."""
     iat = payload.get("iat")
     if not isinstance(iat, int):
         return True
     created = _iso_ts(user.get("created_at"))
     if created is not None and iat < created - 5:
         return False
+    if not _after_token_epoch(user, iat):
+        return False
     return session_iat_after_password_change(user, payload)
+
+
+def session_cookie_current(user: dict, payload: dict) -> bool:
+    """The credential timeline for a dashboard session cookie: the password
+    rule (``session_iat_after_password_change``), the token epoch, and the
+    users row's creation (a person deleted and re-created under the same
+    sub, an identity provider's especially, does not revive an old
+    cookie). A cookie carries ``iat`` since the first release."""
+    if not session_iat_after_password_change(user, payload):
+        return False
+    iat = payload.get("iat")
+    if not isinstance(iat, int):
+        return False
+    created = _iso_ts(user.get("created_at"))
+    if created is not None and iat < created - 5:
+        return False
+    return _after_token_epoch(user, iat)
 
 
 def session_token_holder_ok(payload: dict) -> bool:
@@ -526,6 +654,10 @@ def validate_session_jwt(token: str) -> dict | None:
     if payload.get("purpose") != "session":
         logger.debug("JWT rejected: not a session cookie (purpose=%r)", payload.get("purpose"))
         return None
+    from auth import session_revocation
+    if session_revocation.is_revoked(session_revocation.session_cookie_id(payload)):
+        logger.debug("JWT rejected: the sign-in was revoked")
+        return None
     return payload
 
 
@@ -641,6 +773,12 @@ async def _resolve_principal(req: Request) -> UserContext | None:
             from auth.session_token import validate_session_token
             session_payload = validate_session_token(token)
             if session_payload:
+                # The session must be live and the token of its current
+                # life (the HTTP middleware refused it already; a WebSocket
+                # scope has no middleware). In memory, before any read.
+                from core.session.session_state import session_token_refusal
+                if session_token_refusal(session_payload):
+                    return None
                 # If the token was minted with a real user_sub, resolve it
                 # back to the actual users row so API-call attribution
                 # (e.g. mcp_assignment_requests.requested_by) records the
@@ -699,16 +837,19 @@ async def _resolve_principal(req: Request) -> UserContext | None:
         payload = validate_session_jwt(session_cookie)
         if payload:
             sub = payload["sub"]
+            checked_at = int(time.time())
             user, agent_roles, default_agent, gate = await run_db_fast(_load_cookie_user, sub)
-            if user and not session_iat_after_password_change(user, payload):
-                # Cookie predates the last password change → dead. (logout-all,
-                # admin reset, and self-service reset all invalidate here.)
+            if user and not session_cookie_current(user, payload):
+                # The cookie predates the last password change, the token
+                # epoch or the row itself: dead.
                 return None
             if user:
                 # The sliding refresh re-mints this exact cookie without a
-                # second read (``middleware``): it passed the check above.
+                # second read (``middleware``): it passed the check above,
+                # which the re-mint dates itself to.
                 if isinstance(req, HTTPConnection):
                     req.state.otodock_session_cookie = session_cookie
+                    req.state.otodock_session_cookie_checked_at = checked_at
                 # auth_provider: prefer DB value, then JWT claim, else "local"
                 auth_prov = user.get("auth_provider") or payload.get("auth_provider", "local")
                 return UserContext(
@@ -763,6 +904,18 @@ def require_auth(user: UserContext | None) -> UserContext:
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
     return user
+
+
+async def require_user(user: UserContext | None = Depends(get_current_user)) -> UserContext:
+    """A router's dependency when none of its routes takes an anonymous
+    caller: 401 for a request with no credential, decided before FastAPI
+    validates the body, so an anonymous caller never learns a route's body
+    from a 422 (a body that is not JSON at all is still refused 422 first:
+    FastAPI reads it before any dependency, and that error names no field).
+    Any principal passes; each route judges the role itself. Taken through
+    ``Depends`` so the request's one principal lookup is shared with the
+    route's own and an override of ``get_current_user`` applies."""
+    return require_auth(user)
 
 
 def require_admin(user: UserContext | None) -> UserContext:

@@ -65,3 +65,28 @@ def test_health_carries_the_build(tmp_path, monkeypatch):
     body = r.json()
     assert body["status"] == "ok"
     assert body["build"] == "1111222233334444"
+
+
+def test_the_dashboard_pages_answer_head(tmp_path, monkeypatch):
+    """HEAD on a dashboard page, a file of the build or a legacy /dashboard
+    URL answers what the GET answers, with no body; an API or retired docs
+    path stays a 404, never the page."""
+    from app import app
+
+    _write(tmp_path, STAMPED.format(id="5555666677778888"), 5)
+    icon = b"\x00\x00\x01\x00not really an icon"
+    (tmp_path / "favicon.ico").write_bytes(icon)
+    monkeypatch.setattr(config, "DASHBOARD_ENABLED", True)
+    monkeypatch.setattr(config, "DASHBOARD_DIST", tmp_path)
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
+    client = TestClient(app)
+    for path in ("/", "/chat/abc", "/dashboard/chat/abc", "/favicon.ico"):
+        get, head = client.get(path), client.head(path)
+        assert head.status_code == get.status_code == 200, path
+        assert head.content == b"", path
+        for name in ("content-type", "content-length", "cache-control"):
+            assert head.headers.get(name) == get.headers.get(name), (path, name)
+    assert client.head("/favicon.ico").headers["content-length"] == str(len(icon))
+    for path in ("/v1/does-not-exist", "/docs", "/ui-kit/missing.js"):
+        assert client.head(path).status_code == 404, path
+    assert client.post("/").status_code == 405

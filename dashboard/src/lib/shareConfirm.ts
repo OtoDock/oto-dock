@@ -28,17 +28,21 @@ const TTL_MS = 5 * 60 * 1000
 const PENDING = 'otodock-share-pending:'
 const CONFIRM = 'otodock-confirm:'
 
-function read<T>(key: string): T | null {
+// The pending choices live in localStorage (they must survive the round
+// trip to the provider); the confirm token, a credential, lives in this
+// tab's sessionStorage only: the callback lands in the same tab, and in the
+// app the deep link reloads the same WebView.
+function read<T>(key: string, store: Storage = localStorage): T | null {
   try {
-    const raw = localStorage.getItem(key)
+    const raw = store.getItem(key)
     return raw ? (JSON.parse(raw) as T) : null
   } catch { return null }
 }
-function write(key: string, value: unknown): void {
-  try { localStorage.setItem(key, JSON.stringify(value)) } catch { /* private mode */ }
+function write(key: string, value: unknown, store: Storage = localStorage): void {
+  try { store.setItem(key, JSON.stringify(value)) } catch { /* private mode */ }
 }
-function drop(key: string): void {
-  try { localStorage.removeItem(key) } catch { /* private mode */ }
+function drop(key: string, store: Storage = localStorage): void {
+  try { store.removeItem(key) } catch { /* private mode */ }
 }
 
 export function savePending(sub: string, entry: Omit<PendingShare, 'at'>): void {
@@ -65,23 +69,25 @@ export function takePending(sub: string, appId: string): PendingShare | null {
 }
 
 export function saveConfirm(sub: string, token: string): void {
-  write(CONFIRM + sub, { token, at: Date.now() })
+  write(CONFIRM + sub, { token, at: Date.now() }, sessionStorage)
 }
 
 /** The confirm token, taken; null when there is none or it is stale. */
 export function takeConfirm(sub: string): string | null {
-  const e = read<{ token: string; at: number }>(CONFIRM + sub)
-  drop(CONFIRM + sub)
+  const e = read<{ token: string; at: number }>(CONFIRM + sub, sessionStorage)
+  drop(CONFIRM + sub, sessionStorage)
   if (!e || typeof e.at !== 'number' || Date.now() - e.at > TTL_MS || !e.token) return null
   return e.token
 }
 
 /** Every account's entries: the sign-out sweep. */
 export function clearShareConfirm(): void {
-  try {
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const k = localStorage.key(i) || ''
-      if (k.startsWith(PENDING) || k.startsWith(CONFIRM)) localStorage.removeItem(k)
-    }
-  } catch { /* private mode */ }
+  for (const store of [localStorage, sessionStorage]) {
+    try {
+      for (let i = store.length - 1; i >= 0; i--) {
+        const k = store.key(i) || ''
+        if (k.startsWith(PENDING) || k.startsWith(CONFIRM)) store.removeItem(k)
+      }
+    } catch { /* private mode */ }
+  }
 }

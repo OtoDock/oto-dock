@@ -96,6 +96,6 @@ async def restart_after_change(row: dict) -> int:
     request relaunches them with the new env (the rollback pattern — nobody
     starts a server no one asked for). Returns how many were stopped."""
     from services.apps import app_supervisor
-    stopped = await app_supervisor.stop(row["id"], "live")
-    stopped += await app_supervisor.stop(row["id"], "preview")
+    stopped = await app_supervisor.stop(row["id"], app_supervisor.LIVE)
+    stopped += await app_supervisor.stop(row["id"], app_supervisor.PREVIEW)
     return stopped

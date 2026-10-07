@@ -73,3 +73,35 @@ describe('ChatStatusBar task-run locks', () => {
     expect(screen.getByText("Don't Ask")).toBeTruthy()
   })
 })
+
+describe('ChatStatusBar on a chat that runs as the agent, below the editor tier', () => {
+  const reason = 'This agent is set to Shared only, so its chats and tasks run as the agent itself, which takes the editor role or above (this one would run as contributor).'
+
+  it('locks the mode, model and terminal pickers and names why', () => {
+    const onModeChange = vi.fn()
+    const onModelChange = vi.fn()
+    const onInteractiveToggle = vi.fn()
+    renderBar({
+      mode: 'default', modeLocked: true, modelLocked: true,
+      interactiveAvailable: true, interactiveOn: false, interactiveDisabled: true,
+      lockReason: reason, onModeChange, onModelChange, onInteractiveToggle,
+      modelOptions: [
+        { value: 'claude-fable-5', label: 'Fable 5' },
+        { value: 'claude-sonnet-5', label: 'Sonnet 5' },
+      ],
+    })
+    // The triggers keep their "Mode:" / "Model:" prefix and carry the reason.
+    const modeTrigger = screen.getByTitle(`Mode: Default · ${reason}`)
+    fireEvent.click(modeTrigger)
+    expect(screen.queryByText('Accept Edits')).toBeNull()
+
+    fireEvent.click(screen.getByTitle(`Model: Sonnet 5 · ${reason}`))
+    expect(screen.queryByText('Fable 5')).toBeNull()
+    const toggle = screen.getByRole('switch')
+    expect(toggle.getAttribute('title')).toBe(reason)
+    fireEvent.click(toggle)
+    expect(onInteractiveToggle).not.toHaveBeenCalled()
+    expect(onModeChange).not.toHaveBeenCalled()
+    expect(onModelChange).not.toHaveBeenCalled()
+  })
+})

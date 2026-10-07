@@ -26,20 +26,13 @@ def _seed_agent(slug: str, *, collaborative: bool = True, default_scope: str = "
 
 
 def _headers(agent: str, claim: str) -> dict:
-    from auth.session_token import create_session_token
-    token = create_session_token(str(uuid.uuid4()), agent, external=claim)
+    from tests.conftest import live_session_token
+    token = live_session_token(str(uuid.uuid4()), agent, external=claim)
     return {"Authorization": f"Bearer {token}", "X-Agent-Name": agent}
 
 
 def _op(client, agent, claim, **body):
     return client.post("/v1/internal/memory/op", json=body, headers=_headers(agent, claim))
-
-
-@pytest.fixture(autouse=True)
-def _live(monkeypatch):
-    # The confinement middleware needs a live session for an `ext` token.
-    from core.session import session_manager
-    monkeypatch.setattr(session_manager, "is_session_registered", lambda sid: True)
 
 
 def test_caller_scope_only(client):

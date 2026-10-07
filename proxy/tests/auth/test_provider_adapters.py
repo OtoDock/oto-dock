@@ -151,7 +151,7 @@ def test_anthropic_non_reasoning_model_drops_thinking(monkeypatch):
 
 
 def test_anthropic_reasoning_model_keeps_thinking(monkeypatch):
-    kw = _capture_stream_kwargs(monkeypatch, "claude-sonnet-5", "high")
+    kw = _capture_stream_kwargs(monkeypatch, "claude-sonnet-5-5", "high")
     assert kw.get("thinking") == {"type": "adaptive"}
     assert kw.get("output_config") == {"effort": "high"}
 

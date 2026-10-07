@@ -785,6 +785,14 @@ def validate_app_json(doc: dict, agent: str, shared: bool,
     actions_json, err = _mf.validate_actions(doc.get("actions") or [], agent, shared)
     if actions_json is None:
         raise DeployError(f"app.json: {err}")
+    # A folder app's server owns its data directory, where the per-viewer
+    # documents would sit: it keeps per-viewer data in its own database.
+    from api.apps.catalog import VIEWER_DATA_METHODS
+    per_viewer = sorted({a.get("method") for a in json.loads(actions_json)
+                         if a.get("type") == "platform" and a.get("method") in VIEWER_DATA_METHODS})
+    if per_viewer:
+        raise DeployError(f"app.json: {', '.join(per_viewer)} are for single-file apps; "
+                          "a folder app keeps per-viewer data in its own database")
     files = validate_files(doc.get("files"), shared)
     egress = validate_egress(doc.get("egress"))
     try:
@@ -833,10 +841,27 @@ def validate_app_json(doc: dict, agent: str, shared: bool,
 # ── the folder on a satellite ───────────────────────────────────────────────
 
 
+def working_manifest(row: dict, tree_dir: Path) -> Manifest | None:
+    """The manifest a deploy of ``tree_dir`` (a copy of the row's working
+    tree) would write: its app.json read without following a link and
+    validated as the deploy validates it, the steps' scripts hashed; None
+    when it would not deploy. Blocking (the step check spawns a parser)."""
+    try:
+        return validate_app_json(read_app_json(tree_dir), row["agent"], not row.get("username"),
+                                 tree_dir)
+    except DeployError:
+        return None
+
+
 async def pull_folder(session_id: str, rel_dir: str) -> int:
     """Bring a satellite session's working folder to the platform tree,
     file by file, within the caps; files the satellite no longer has are
-    removed platform-side. Returns the number of files pulled."""
+    removed platform-side. Returns the number of files pulled.
+
+    A listing with no app file (the folder is missing on the machine, never
+    synced down, or holds only what a pull skips) refuses: the manifest
+    cannot tell a missing folder from an emptied one, and dropping the
+    platform copy on either would lose the app."""
     from core.remote import remote_file_flow
     listing = await remote_file_flow.list_remote_files(session_id, rel_dir)
     if listing is None:
@@ -848,6 +873,9 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
         if any(p.startswith(".") for p in parts) or "node_modules" in parts or parts[0] == "data":
             continue
         wanted.append((rel, inner))
+    if not wanted:
+        raise DeployError(f"the folder {rel_dir} is missing or empty on your machine; "
+                          "nothing was changed")
     if len(wanted) > PULL_MAX_FILES:
         raise DeployError(f"the folder has more than {PULL_MAX_FILES} files — trim it "
                           "(node_modules and data are never counted)")
@@ -1048,7 +1076,7 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
     await asyncio.to_thread(snapshot_db, db, releases.db_before_path(row, n))
     if start and app_sandbox.server_entry(new_dir) and task_store.app_actions_approved(row):
         try:
-            await app_supervisor.start(row, "live", release_dir=new_dir)
+            await app_supervisor.start(row, app_supervisor.LIVE, release_dir=new_dir)
         except (app_sandbox.AppStartError, app_supervisor.AppUnavailable) as e:
             await asyncio.to_thread(shutil.rmtree, new_dir, True)
             await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_IDLE,
@@ -1188,7 +1216,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
             # never parks for approval either; the release copy goes with it.
             from services.apps import app_render
             report = await app_render.render_tree(row, releases.app_release_dir(row) / str(n),
-                                                  approved=approved)
+                                                  approved=approved, seed=app_render.seeds_live_data(row, m))
             if report.status == "hard":
                 await asyncio.to_thread(shutil.rmtree, releases.app_release_dir(row) / str(n), True)
                 await _restore_live_manifest(row)
@@ -1330,7 +1358,7 @@ async def rollback_folder(row: dict) -> dict:
     prev = releases.previous_number(row)
     if prev is None:
         raise DeployError("no previous release")
-    await app_supervisor.stop(row["id"], "live")
+    await app_supervisor.stop(row["id"], app_supervisor.LIVE)
     db = releases.app_data_dir(row) / "app.db"
     stamp = time.strftime("%Y%m%dT%H%M%S")
     snapshotted = await asyncio.to_thread(snapshot_db, db, releases.rollback_snapshot_path(row, stamp))
@@ -1366,16 +1394,20 @@ async def rollback_folder(row: dict) -> dict:
 
 
 async def cut_preview(row: dict, source_dir: Path) -> str:
-    """Copy the working tree to the preview slot with its own data seeded
-    from the live database; returns the preview's tree hash."""
+    """Copy the working tree to the preview slot with its own data, seeded
+    from the live database only when the copied code would go live on it
+    without a person's review anyway (``app_render.seeds_live_data`` on the
+    copy's own manifest: the preview starts on the row's approval alone,
+    so it can run code nobody reviewed); returns the preview's tree hash."""
+    from services.apps import app_render
     confine_to_scope(row["agent"], row.get("username") or "", source_dir)
-    await app_supervisor.stop(row["id"], "preview")
+    await app_supervisor.stop(row["id"], app_supervisor.PREVIEW)
     pd = releases.preview_dir(row)
 
     def _copy() -> str:
         releases.copy_tree(source_dir, pd, replace=True)
         live_db = releases.app_data_dir(row) / "app.db"
-        if live_db.is_file():
+        if app_render.seeds_live_data(row, working_manifest(row, pd)) and live_db.is_file():
             snapshot_db(live_db, pd / "data" / "app.db")
         return releases.tree_sha(pd)
 

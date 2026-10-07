@@ -55,6 +55,11 @@ def _backstop() -> int:
     return config.MAX_REQUEST_BODY_BYTES
 
 
+def _mcp_gateway_cap() -> int:
+    from core.credentials.mcp_gateway import MAX_BODY_BYTES
+    return MAX_BODY_BYTES
+
+
 def _file_save_cap() -> int:
     # The editor saves, as JSON, a file it opened inline, so the body is
     # bounded by INLINE_TEXT_MAX_BYTES; escaping a control character takes
@@ -85,6 +90,11 @@ _ROUTE_CAPS = (
     # Collabora's insert-file upload, held in memory and forwarded
     ("POST", re.compile(r"^/collabora/.+"), lambda: 100 * _MB),
     ("PUT", re.compile(r"^/v1/agents/[^/]+/files/.+$"), _file_save_cap),
+    # a browser's CSP violation report, with or without the session cookie
+    ("POST", re.compile(r"^/v1/csp-report$"), lambda: 64 * _KB),
+    # an MCP client's request through the credential gateway, under the
+    # gateway's own cap (``api/mcp/gateway.py``)
+    ("POST", re.compile(r"^/v1/mcp-gateway/[^/]+/"), _mcp_gateway_cap),
 )
 # Routes authenticated by their own app or link tokens: the unauthenticated
 # tier does not apply. These read the body themselves after their token
@@ -183,12 +193,30 @@ def _service_key_refusal(request: Request) -> Response | None:
                         status_code=403)
 
 
-def _external_session_refusal(request: Request) -> Response | None:
-    """A session token carrying an ``ext`` claim (every phone-minted token)
-    is accepted only while its session is live in a layer registry, so a
-    token lifted from a call dies at hangup; one with no real user (an
-    external caller) reaches only ``auth/external_endpoints.py``'s
-    allowlist."""
+# The (sid, reason) pairs already logged, so a dead token retried by a hook
+# ladder or an MCP client logs once.
+_REFUSED_LOGGED: set[tuple[str, str]] = set()
+_REFUSED_LOGGED_CAP = 512
+
+
+def _log_session_refusal(request: Request, sid: str, reason: str) -> None:
+    key = (sid, reason)
+    if key in _REFUSED_LOGGED:
+        return
+    if len(_REFUSED_LOGGED) >= _REFUSED_LOGGED_CAP:
+        _REFUSED_LOGGED.clear()
+    _REFUSED_LOGGED.add(key)
+    logger.info("Session token refused (%s): %s %s sid=%s",
+                reason, request.method, request.url.path, sid[:8])
+
+
+def _session_refusal(request: Request) -> Response | None:
+    """A session token as the bearer is accepted only while its session is
+    live, and never when it was minted for an earlier life of the same
+    session id (``session_state.session_token_refusal``, decision 8):
+    401 before any database read, on both listeners. A token carrying an
+    ``ext`` claim and no real user (an external caller) then reaches only
+    ``auth/external_endpoints.py``'s allowlist."""
     from auth.external_endpoints import (
         EXTERNAL_BLOCKED_DETAIL,
         SESSION_DEAD_DETAIL,
@@ -196,15 +224,15 @@ def _external_session_refusal(request: Request) -> Response | None:
         session_token_claims,
     )
     claims = session_token_claims(request)
-    if not claims or not claims.get("ext"):
+    if not claims:
         return None
-    from core.session.session_manager import is_session_registered
+    from core.session.session_state import session_token_refusal
     sid = claims.get("sid") or ""
-    if not is_session_registered(sid):
-        logger.info("External session token rejected (session not live): %s %s sid=%s",
-                    request.method, request.url.path, sid[:8])
+    reason = session_token_refusal(claims)
+    if reason:
+        _log_session_refusal(request, sid if isinstance(sid, str) else "", reason)
         return JSONResponse({"detail": SESSION_DEAD_DETAIL}, status_code=401)
-    if not claims.get("user_sub") and not is_external_endpoint_allowed(
+    if claims.get("ext") and not claims.get("user_sub") and not is_external_endpoint_allowed(
             request.method, routed_path(request)):
         logger.warning("External session blocked from endpoint: %s %s sid=%s",
                        request.method, request.url.path, sid[:8])
@@ -249,12 +277,28 @@ def db_unavailable(exc: BaseException) -> bool:
     return state is None or state.startswith("08") or state in _DB_DOWN_SQLSTATES
 
 
+# The dashboard's script policy, report-only while its reports are read
+# (``/v1/csp-report``): the built shell has no inline script, the only
+# script from elsewhere is Turnstile's on the login page, and the wake-word
+# engine compiles WebAssembly.
+SHELL_SCRIPT_POLICY = (
+    "script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com; "
+    "object-src 'none'; base-uri 'self'; report-uri /v1/csp-report"
+)
+# HTML served under these is not the dashboard's shell: the API (the OAuth
+# and account pop-ups carry inline scripts), the link pages and the editor
+# keep their own policies or none.
+_NOT_SHELL = ("/v1/", "/s/", "/collabora/", "/wopi/", "/ui-kit/", "/setup.html")
+
+
 def _security_headers(headers: MutableHeaders, path: str) -> None:
     """``nosniff`` + ``Referrer-Policy`` on everything; HSTS only when the
     deployment is HTTPS (``COOKIE_SECURE``). Framing is denied everywhere
     except ``/collabora/*`` (the dashboard embeds the editor in an iframe).
-    ``setdefault``: a handler's own choice (a file response's nosniff)
-    wins."""
+    The dashboard's shell (an HTML document with no policy of its own)
+    carries the script policy, report-only. ``setdefault``: a handler's own
+    choice (a file response's nosniff) wins."""
+    own_policy = "content-security-policy" in headers
     headers.setdefault("X-Content-Type-Options", "nosniff")
     headers.setdefault("Referrer-Policy", "same-origin")
     if config.COOKIE_SECURE:
@@ -262,6 +306,74 @@ def _security_headers(headers: MutableHeaders, path: str) -> None:
     if not path.startswith("/collabora/"):
         headers.setdefault("X-Frame-Options", "DENY")
         headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    if (not own_policy and not path.startswith(_NOT_SHELL)
+            and headers.get("content-type", "").startswith("text/html")):
+        headers.setdefault("Content-Security-Policy-Report-Only", SHELL_SCRIPT_POLICY)
+
+
+# --- the origin check on cookie writes ---------------------------------------
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# WOPI is Collabora's server calling with its token; the link pages hold
+# their own same-origin check; a CSP report needs no session.
+_ORIGIN_EXEMPT = ("/wopi/", "/s/", "/v1/csp-report")
+_DEFAULT_PORTS = {"http": "80", "https": "443", "ws": "80", "wss": "443"}
+
+
+def _host_key(netloc: str, scheme: str = "") -> str:
+    """``host[:port]`` lowercased with a default port dropped (the scheme's,
+    or either for a ``Host`` header, which carries none)."""
+    netloc = netloc.strip().lower()
+    host, sep, port = netloc.rpartition(":")
+    if sep and port.isdigit():
+        default = _DEFAULT_PORTS.get(scheme)
+        if port == default or (not scheme and port in ("80", "443")):
+            return host
+    return netloc
+
+
+def _origin_matches(request: Request, origin: str) -> bool:
+    """The rule the dashboard socket applies (``ws/dashboard``), with ports:
+    the origin's host is the request's own ``Host``, the public URL's, or
+    the ``X-Forwarded-Host`` a trusted hop sent."""
+    from urllib.parse import urlsplit
+
+    from auth.lan_check import trusted_forwarded_host
+    if not origin or origin == "null":
+        return False
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    want = _host_key(parts.netloc, parts.scheme)
+    candidates = [request.headers.get("host", ""), trusted_forwarded_host(request.scope)]
+    if config.DASHBOARD_PUBLIC_URL:
+        pub = urlsplit(config.DASHBOARD_PUBLIC_URL)
+        candidates.append(_host_key(pub.netloc, pub.scheme))
+    return any(c and _host_key(c) == want for c in candidates)
+
+
+def _origin_refusal(request: Request) -> Response | None:
+    """A state-changing request the dashboard session cookie authenticates
+    (no bearer beside it) that names an origin other than this install's
+    is refused: SameSite=Lax alone let a same-site page write. No Origin
+    (a non-browser client) passes; bearer callers never meet this. Only a
+    ``Bearer`` credential counts: a browser sends an edge's cached Basic or
+    Negotiate header by itself, and the cookie still authenticates."""
+    if request.method not in _UNSAFE_METHODS or not request.cookies.get("session"):
+        return None
+    if request.headers.get("authorization", "")[:7].lower() == "bearer ":
+        return None
+    if routed_path(request).startswith(_ORIGIN_EXEMPT):
+        return None
+    origin = request.headers.get("origin")
+    if origin is None or _origin_matches(request, origin):
+        return None
+    logger.warning("Cross-site request refused: %s %s from origin %s",
+                   request.method, request.url.path, origin[:120])
+    return JSONResponse({"detail": "Cross-site request refused"}, status_code=403)
 
 
 # The session lifetime setting, read strictly (a failure raises, where
@@ -312,9 +424,10 @@ async def _refresh_session_cookie(scope, headers: MutableHeaders, cookie: str) -
     if any(v.startswith("session=") for v in headers.getlist("set-cookie")):
         return
     from auth.providers import (
-        apply_session_cookie, create_session_jwt, session_iat_after_password_change,
+        apply_session_cookie, create_session_jwt, session_cookie_current,
         validate_session_jwt,
     )
+    from auth.session_revocation import session_cookie_id
     payload = validate_session_jwt(cookie)
     if not payload:
         return
@@ -322,20 +435,27 @@ async def _refresh_session_cookie(scope, headers: MutableHeaders, cookie: str) -
     if (isinstance(iat, int) and isinstance(exp, int) and exp > iat
             and (now - iat) < (exp - iat) / 2):
         return
-    # The route resolved this exact cookie: it passed the password-change
-    # check there, no second read.
-    if (scope.get("state") or {}).get("otodock_session_cookie") != cookie:
+    # The route resolved this exact cookie: it passed the credential
+    # timeline there, no second read. The re-mint carries the instant of that
+    # check as its ``iat``, so a token epoch moved while the request ran (a
+    # "sign out everywhere", a password change) refuses the new cookie too.
+    state = scope.get("state") or {}
+    checked_at = state.get("otodock_session_cookie_checked_at")
+    if state.get("otodock_session_cookie") != cookie or not isinstance(checked_at, int):
         from storage import database as task_store
         from storage.pg import run_db_fast
+        checked_at = int(time.time())
         user = await asyncio.wait_for(run_db_fast(task_store.get_user, payload.get("sub", "")),
                                       _REFRESH_READ_TIMEOUT_S)
-        if not user or not session_iat_after_password_change(user, payload):
+        if not user or not session_cookie_current(user, payload):
             return
     hours = await _expiry_hours()
+    # The same sign-in id: a logout revokes the whole lineage of one sign-in.
     token = create_session_jwt(
         payload["sub"], payload.get("email", ""), payload.get("name", ""),
         payload.get("role", "member"),
         auth_provider=payload.get("auth_provider", "local"), expiry_hours=hours,
+        jti=session_cookie_id(payload), issued_at=checked_at,
     )
     carrier = Response()
     apply_session_cookie(carrier, token, expiry_hours=hours)
@@ -376,7 +496,7 @@ def _times_body(path: str) -> bool:
 class _Exchange:
     """One request's state across the wrapped ``receive`` and ``send``."""
 
-    __slots__ = ("scope", "send", "cookie", "started", "status", "answered", "cut")
+    __slots__ = ("scope", "send", "cookie", "started", "status", "answered", "cut", "body_open")
 
     def __init__(self, scope, send, cookie: str):
         self.scope = scope
@@ -386,6 +506,10 @@ class _Exchange:
         self.status = 0
         self.answered = False   # the middleware answered itself: the app's messages are dropped
         self.cut = False        # the body cap or the body deadline cut the request
+        # The request carries a body the app has not read to its end: an
+        # answer that starts now closes the connection, or uvicorn would
+        # go on reading the rest with no deadline.
+        self.body_open = False
 
     async def forward(self, message, *, own: bool = False) -> None:
         if message["type"] == "http.response.start":
@@ -393,6 +517,8 @@ class _Exchange:
             self.status = message["status"]
             headers = MutableHeaders(scope=message)
             _security_headers(headers, self.scope.get("path") or "")
+            if self.body_open and "connection" not in headers:
+                headers["connection"] = "close"
             if self.cookie and not own:
                 try:
                     await _refresh_session_cookie(self.scope, headers, self.cookie)
@@ -424,16 +550,24 @@ class _BodyCap:
     """The request's body cap: the path's tier, provisionally narrowed to
     the unauthenticated tier until a credential is proven (checked at most
     once, and only when the body would pass the narrow cap or a body read
-    outlasts the body deadline)."""
+    outlasts the body deadline).
 
-    __slots__ = ("cap", "full", "check", "credential", "received")
+    A webhook route instead lifts its own cap once it has checked its
+    sender (``lift`` reads what the route set, ``api/events/webhook_body``):
+    a declared length is judged against the most any webhook route may
+    lift to (``ceiling``), and the streamed bytes against what this one
+    lifted to by the time they arrive."""
 
-    def __init__(self, cap: int, full: int, check):
+    __slots__ = ("cap", "full", "check", "credential", "received", "lift", "ceiling")
+
+    def __init__(self, cap: int, full: int, check, *, lift=None, ceiling: int = 0):
         self.cap = cap
         self.full = full
         self.check = check
         self.credential = ""
         self.received = 0
+        self.lift = lift
+        self.ceiling = ceiling
 
     def proven(self) -> bool:
         """Whether the request carries a valid credential; a proven one
@@ -447,9 +581,18 @@ class _BodyCap:
     def exceeded(self, size: int) -> bool:
         if size <= self.cap:
             return False
+        if self.lift is not None:
+            self.cap = max(self.cap, self.lift())
+            return size > self.cap
         if self.cap < self.full:
             self.proven()
         return size > self.cap
+
+    def declared_exceeded(self, size: int) -> bool:
+        """The early judgement of a declared length, before the route ran."""
+        if self.lift is not None:
+            return size > self.ceiling
+        return self.exceeded(size)
 
     def refusal(self) -> tuple[int, bytes]:
         # A presented credential that does not verify (an expired cookie on
@@ -518,7 +661,7 @@ class PlatformHttpMiddleware:
 
     async def _handle(self, scope, receive, x: _Exchange, headers: Headers, cookies: dict):
         request = Request(scope)
-        for judge in (_render_refusal, _external_session_refusal, _service_key_refusal):
+        for judge in (_render_refusal, _session_refusal, _service_key_refusal, _origin_refusal):
             refusal = judge(request)
             if refusal is not None:
                 x.answered = True
@@ -528,9 +671,15 @@ class PlatformHttpMiddleware:
         routed = scope_routed_path(scope)
         full, narrowable = body_cap(scope.get("method", ""), routed)
         unauth = config.MAX_UNAUTH_BODY_BYTES
+        lift, ceiling = None, 0
+        if routed.startswith("/v1/webhooks/"):
+            from api.events import webhook_body
+            ceiling = min(_backstop(), max(full, webhook_body.ceiling()))
+            lift = lambda: min(ceiling, scope.get(webhook_body.SCOPE_KEY) or 0)  # noqa: E731
         cap = _BodyCap(
             min(unauth, full) if narrowable and unauth > 0 else full, full,
             lambda: credential_state(request, cookies, routed),
+            lift=lift, ceiling=ceiling,
         )
 
         declared = headers.get("content-length")
@@ -539,9 +688,12 @@ class PlatformHttpMiddleware:
                 size = int(declared)
             except ValueError:
                 size = -1
-            if cap.exceeded(size):
+            if cap.declared_exceeded(size):
                 await x.answer(*cap.refusal(), close=True)
                 return
+            x.body_open = size != 0
+        else:
+            x.body_open = "chunked" in (headers.get("transfer-encoding") or "").lower()
 
         deadline = _BodyDeadline(_times_body(routed))
 
@@ -568,10 +720,12 @@ class PlatformHttpMiddleware:
                 # The body is complete: a later read waits for the
                 # disconnect, which is never timed.
                 deadline.timed = False
+                x.body_open = False
             if message["type"] == "http.request":
                 cap.received += len(message.get("body", b""))
                 if cap.exceeded(cap.received):
                     x.cut = True
+                    scope["otodock.body_cut"] = True
                     if not x.started:
                         await x.answer(*cap.refusal(), close=True)
                     return {"type": "http.disconnect"}

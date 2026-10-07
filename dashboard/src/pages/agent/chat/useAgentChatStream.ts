@@ -25,6 +25,7 @@ import type { RefObject } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 import { useChatStream } from '../../../hooks/useChatStream'
 import type { WireImage } from '../../../hooks/useDashboardWs'
+import { WIRE } from '../../../api/wireEvents'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import type { useChatNotifications } from '../../../hooks/useChatNotifications'
 import type { useAgents } from '../../../api/agents'
@@ -50,7 +51,7 @@ export function useAgentChatStream({
   agents, urlChatId, agentDefaultModel, agentExecutionPath, agentName, navigate, isFavoriteAgent, preWarmPath,
   warmingUp, setWarmingUp, chatNotif, sessionInteractiveRef, duplexActiveRef,
   setChatActiveLayer, setProcessAlive, setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError,
-  pendingFindQuery, setFindInput, setFindQuery, setFindBarOpen,
+  pendingFindQuery, setFindInput, setFindQuery, setFindBarOpen, setDriveRefusal,
 }: {
   agents: ReturnType<typeof useAgents>['data']
   urlChatId: string | undefined
@@ -74,6 +75,9 @@ export function useAgentChatStream({
   setFindInput: FindBar['setFindInput']
   setFindQuery: FindBar['setFindQuery']
   setFindBarOpen: FindBar['setFindBarOpen']
+  /** The drive gate's sentence for the chat that just loaded ("" when this
+   *  person may drive it): the page locks its pickers with it. */
+  setDriveRefusal: (refusal: { chatId: string; text: string } | null) => void
 }) {
   // Assigned by the page every render (see the header); never read before
   // the first render completes, so the placeholder is never observed.
@@ -308,11 +312,18 @@ export function useAgentChatStream({
       // Task chats store permission_mode 'auto' (the scheduler's posture) —
       // restore it so the status bar reflects the run's real mode (rendered
       // as Don't Ask) instead of this page's 'default' seed.
-      if (data.mode && isTaskChatId(data.chat_id)) setMode(data.mode)
+      // A chat whose pickers are locked below the editor tier shows the
+      // chat's stored mode too (the person cannot pick one to correct it).
+      if (data.mode && (isTaskChatId(data.chat_id) || data.drive_refusal)) setMode(data.mode)
       // Restore the per-chat interactive toggle from the stored execution_mode.
       // The live flag stays false until a warmup_ready{interactive} arrives — a
       // dead interactive chat shows its DB history with the toggle reflected on.
       latest.current.interactive.restoreFromMeta(data.execution_mode)
+      setDriveRefusal(data.drive_refusal && data.chat_id
+        ? { chatId: data.chat_id, text: data.drive_refusal } : null)
+    },
+    onExecutionModeChanged: (executionMode) => {
+      latest.current.interactive.applyStoredExecMode(executionMode)
     },
     onChatHistoryLoaded: (_data) => {
       // Open find bar if deferred from URL ?q= param (after messages are loaded)
@@ -389,6 +400,14 @@ export function useAgentChatStream({
     return () => ws.disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // "Shared with you" (SHARING.md): the frame reaches the notifications
+  // hook through the socket's generic registry, the way any frame with no
+  // option of its own does; the ref keeps the newest handler.
+  const shareInboxRef = useRef(chatNotif.onShareInbox)
+  shareInboxRef.current = chatNotif.onShareInbox
+  const wsSubscribe = ws.subscribe
+  useEffect(() => wsSubscribe(WIRE.SHARE_INBOX, (msg) => shareInboxRef.current(msg)), [wsSubscribe])
 
   // Eager pre-warmup: start MCP init when landing on the FAVORITE agent's
   // new-chat page. Non-favorite agents warm lazily on first interaction

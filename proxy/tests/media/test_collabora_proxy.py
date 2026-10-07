@@ -132,6 +132,40 @@ def test_http_strips_hop_by_hop_request_headers(app_with_router, subpath_mode, a
     assert forwarded.get("x-custom") == "passthrough"
 
 
+def test_upstream_cookie_drops_the_platforms_and_keeps_the_rest():
+    from api.media.collabora_proxy import _upstream_cookie
+
+    raw = ("session=eyJ.sign.in; share_session_ab12=x; otodock_render=r; "
+           "__Host-pk_handoff=n; pk_handoff=n; gateway=keep; other=1")
+    assert _upstream_cookie(raw) == "gateway=keep; other=1"
+    assert _upstream_cookie("session=eyJ.sign.in") is None
+    assert _upstream_cookie("") is None
+    assert _upstream_cookie(None) is None
+
+
+def test_http_forwards_no_platform_cookie(app_with_router, subpath_mode, authed):
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = b""
+    mock_resp.headers = {}
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.request = AsyncMock(return_value=mock_resp)
+
+    with patch("api.media.collabora_proxy.httpx.AsyncClient", return_value=mock_client):
+        with TestClient(app_with_router) as client:
+            client.get("/collabora/foo", headers={"Cookie": "session=eyJ.a.b; gateway=keep"})
+            client.get("/collabora/foo", headers={"Cookie": "session=eyJ.a.b"})
+
+    first, second = (
+        {k.lower(): v for k, v in c.kwargs["headers"].items()}
+        for c in mock_client.request.call_args_list
+    )
+    assert first.get("cookie") == "gateway=keep"
+    assert "cookie" not in second
+
+
 def test_http_strips_content_encoding_from_response(app_with_router, subpath_mode, authed):
     """Regression: httpx auto-decompresses the upstream body, so forwarding
     the upstream's `Content-Encoding: gzip` header would make the browser
@@ -313,3 +347,39 @@ def test_ws_upstream_kwargs_carry_origin_and_subprotocol():
     assert kwargs["additional_headers"] == headers
     assert kwargs["origin"] == "https://example.com"
     assert kwargs["subprotocols"] == ["cool"]
+
+
+# ---------------------------------------------------------------------------
+# A save before a view leaves Editing
+# ---------------------------------------------------------------------------
+
+def test_a_view_leaving_editing_is_saved_first():
+    from api.media.collabora_proxy import _EditingWatch
+
+    watch = _EditingWatch()
+    assert watch.upstream_frames("setviewreadonly value=false") == ["setviewreadonly value=false"]
+    assert watch.upstream_frames("setviewreadonly value=true") == [
+        "save dontTerminateEdit=1 dontSaveIfUnmodified=1",
+        "setviewreadonly value=true",
+    ]
+
+
+def test_a_view_that_starts_in_viewing_has_nothing_to_save():
+    from api.media.collabora_proxy import _EditingWatch
+
+    watch = _EditingWatch()
+    assert watch.upstream_frames("setviewreadonly value=true") == ["setviewreadonly value=true"]
+    # Editing, then Viewing twice: the second switch follows no edit.
+    watch.upstream_frames("setviewreadonly value=false")
+    assert len(watch.upstream_frames("setviewreadonly value=true")) == 2
+    assert watch.upstream_frames("setviewreadonly value=true") == ["setviewreadonly value=true"]
+
+
+def test_other_frames_pass_through_unchanged():
+    from api.media.collabora_proxy import _EditingWatch
+
+    watch = _EditingWatch()
+    watch.upstream_frames("setviewreadonly value=false")
+    for text in ("key type=input char=97 key=0", "save dontTerminateEdit=1 dontSaveIfUnmodified=1", ""):
+        assert watch.upstream_frames(text) == [text]
+    assert watch.editing

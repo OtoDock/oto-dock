@@ -5,6 +5,7 @@ venvs/addons that lag THIS host's interpreter/node after an update. ``install_mc
 + ``_uv_venv_pinned`` are mocked; the decision/marker logic is the unit under test.
 """
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -135,6 +136,7 @@ async def test_reconcile_empty_when_nothing_present(tmp_path):
 async def test_uv_venv_pinned_runs_under_the_installers_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("OTO_SATELLITE_PRIVATE", "1")
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("UV_PYTHON_INSTALL_MIRROR", "https://mirror.example/python")
     fake = AsyncMock()
     fake.communicate = AsyncMock(return_value=(b"", None))
     fake.returncode = 0
@@ -144,6 +146,7 @@ async def test_uv_venv_pinned_runs_under_the_installers_environment(tmp_path, mo
     assert "OTO_SATELLITE_PRIVATE" not in env
     assert env["UV_NO_CONFIG"] == "1" and env["UV_LINK_MODE"] == "copy"
     assert env["UV_PYTHON_INSTALL_DIR"].endswith(".uv-python")
+    assert env["UV_PYTHON_INSTALL_MIRROR"] == "https://mirror.example/python"
 
 
 @pytest.mark.asyncio
@@ -179,3 +182,65 @@ async def test_reconcile_never_builds_a_catalog_python_folder(tmp_path):
     assert results == {"custom-py": "ok-py-reconcile", "community-py": "skipped-community-python"}
     inst.assert_awaited_once()
     assert (mcps / "community" / "community-py" / "venv").exists()
+
+
+# ── the npm rebuild and the pinned venv run as every install subprocess does ─
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+
+
+def _node_mcp_due_for_rebuild(tmp_path: Path) -> tuple[Path, Path]:
+    mcps = tmp_path / "mcps"
+    (mcps / "custom").mkdir(parents=True)
+    mcp = _make_mcp(mcps, "custom", "node-mcp", {"name": "node-mcp", "server": {"runtime": "node"}})
+    (mcp / "node_modules").mkdir()
+    (mcp / mis._RUNTIME_MARKER).write_text(json.dumps({"node_major": 22}))
+    return mcps, mcp
+
+
+@pytest.mark.asyncio
+async def test_npm_rebuild_runs_under_the_installers_environment(tmp_path, monkeypatch):
+    """``npm rebuild`` runs the packages' lifecycle scripts: they see the
+    installer's allowlisted environment, never the satellite's own."""
+    monkeypatch.setenv("OTO_SATELLITE_PRIVATE", "1")
+    mcps, _ = _node_mcp_due_for_rebuild(tmp_path)
+    fake = AsyncMock()
+    fake.communicate = AsyncMock(return_value=(b"ok", None))
+    fake.returncode = 0
+    with patch.object(mis, "_node_major", return_value=24), \
+         patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake) as spawn:
+        results = await mis.reconcile_mcp_runtimes(mcps, None)
+    assert results == {"node-mcp": "ok-node-rebuild"}
+    env = spawn.await_args.kwargs["env"]
+    assert env is not None and "OTO_SATELLITE_PRIVATE" not in env
+    assert env["UV_NO_CONFIG"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+async def test_a_hung_npm_rebuild_is_killed_and_retried_next_start(tmp_path, monkeypatch):
+    from satellite._vendored import mcp_installer
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pids = tmp_path / "npm.pids"
+    npm = bin_dir / "npm"
+    npm.write_text(f'#!/bin/sh\necho $$ >> "{pids}"\nsleep 20 & echo $! >> "{pids}"\nsleep 20\n')
+    npm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setattr(mcp_installer, "DEFAULT_INSTALL_TIMEOUT", 1)
+    mcps, mcp = _node_mcp_due_for_rebuild(tmp_path)
+    with patch.object(mis, "_node_major", return_value=24):
+        results = await asyncio.wait_for(mis.reconcile_mcp_runtimes(mcps, None), 10)
+    assert results == {"node-mcp": "skipped-node-rebuild-fail"}
+    assert json.loads((mcp / mis._RUNTIME_MARKER).read_text())["node_major"] == 22
+    for _ in range(40):
+        if not any(_alive(int(p)) for p in pids.read_text().split()):
+            break
+        await asyncio.sleep(0.05)
+    assert not [p for p in pids.read_text().split() if _alive(int(p))]

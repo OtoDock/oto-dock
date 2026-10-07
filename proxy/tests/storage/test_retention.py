@@ -516,3 +516,207 @@ def test_verdict_deletion_runs_in_batches(temp_db, monkeypatch):
     assert len(deletes) == 3  # 2 + 2 + 1, the short batch ends the loop
     assert [r["id"] for r in db_checks.list_verdicts("a1")] == [fresh]
     assert not any(r["id"] in aged for r in db_checks.list_verdicts("a1"))
+
+
+# ---------------------------------------------------------------------------
+# The .offboarded/ archive: its own setting, the sweep, list and purge
+# ---------------------------------------------------------------------------
+
+def _retired(username: str, *, archived_days: float | None, retired_days: float = 400) -> None:
+    from storage.pg import get_conn
+    now = datetime.now(timezone.utc)
+    archived = "" if archived_days is None else (now - timedelta(days=archived_days)).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO retired_usernames (username, sub, retired_at, archived_at) "
+            "VALUES (%s,%s,%s,%s)",
+            (username, f"sub-{username}", (now - timedelta(days=retired_days)).isoformat(), archived))
+        conn.commit()
+
+
+def _archive(username: str, *agents: str) -> Path:
+    base = Path(config.AGENTS_DIR) / ".offboarded" / username
+    for agent in agents or ("a1",):
+        d = base / agent / "workspace"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "notes.txt").write_text("z" * 100)
+    return base
+
+
+def test_the_archive_setting_helpers(temp_db):
+    db = temp_db
+    assert retention.offboarded_enabled() is True        # unset → ON
+    assert retention.offboarded_days() == 180
+    db.set_platform_setting("offboarded_retention_days", "0")
+    assert retention.offboarded_days() == 0               # keeps for ever
+    # An unreadable value (a forced setting, an older write) keeps every
+    # archive: "-1" meant as "for ever" must never become 180 days.
+    for garbage in ("-4", "99999", "soon"):
+        db.set_platform_setting("offboarded_retention_days", garbage)
+        assert retention.offboarded_days() == 0
+    db.set_platform_setting("offboarded_retention_enabled", "0")
+    assert retention.offboarded_enabled() is False
+
+
+def test_the_sweep_deletes_old_archives_only(temp_db):
+    db = temp_db
+    old, young, undated, odd = _archive("old-pat", "a1", "a2"), _archive("young"), \
+        _archive("undated"), _archive("Odd.Name")
+    _retired("old-pat", archived_days=200)
+    _retired("young", archived_days=10)
+    _retired("undated", archived_days=None)
+    target = Path(config.AGENTS_DIR) / "a1" / "workspace"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "keep.txt").write_text("k")
+    link = Path(config.AGENTS_DIR) / ".offboarded" / "linked"
+    link.symlink_to(Path(config.AGENTS_DIR) / "a1")
+    _retired("linked", archived_days=400)
+    stats = {"offboarded_deleted": 0, "offboarded_bytes": 0, "errors": 0}
+    retention._pass_offboarded_archives(stats, dry_run=True)
+    assert stats["offboarded_deleted"] == 1 and stats["offboarded_bytes"] >= 200 and old.exists()
+    stats = {"offboarded_deleted": 0, "offboarded_bytes": 0, "errors": 0}
+    retention._pass_offboarded_archives(stats, dry_run=False)
+    assert stats["offboarded_deleted"] == 1 and not old.exists()
+    assert young.exists() and undated.exists() and odd.exists() and link.is_symlink()
+    assert (target / "keep.txt").read_text() == "k"  # a link is never followed
+    # 0 keeps for ever; the toggle off keeps too.
+    _retired("older", archived_days=900)
+    older = _archive("older")
+    db.set_platform_setting("offboarded_retention_days", "0")
+    retention._pass_offboarded_archives({"offboarded_deleted": 0, "offboarded_bytes": 0,
+                                         "errors": 0}, dry_run=False)
+    db.set_platform_setting("offboarded_retention_days", "30")
+    db.set_platform_setting("offboarded_retention_enabled", "0")
+    retention._pass_offboarded_archives({"offboarded_deleted": 0, "offboarded_bytes": 0,
+                                         "errors": 0}, dry_run=False)
+    assert older.exists()
+
+
+def test_a_linked_archive_root_is_an_error_not_a_walk(temp_db, tmp_path):
+    outside = tmp_path / "elsewhere" / "victim"
+    outside.mkdir(parents=True)
+    root = Path(config.AGENTS_DIR) / ".offboarded"
+    root.symlink_to(tmp_path / "elsewhere")
+    try:
+        _retired("victim", archived_days=900)
+        stats = {"offboarded_deleted": 0, "offboarded_bytes": 0, "errors": 0}
+        retention._pass_offboarded_archives(stats, dry_run=False)
+        assert stats["errors"] == 1 and stats["offboarded_deleted"] == 0 and outside.exists()
+    finally:
+        root.unlink()
+
+
+def _admin_client(api_key=False):
+    from fastapi.testclient import TestClient
+    from app import app
+    from auth.providers import UserContext, get_current_user
+
+    async def _admin():
+        return UserContext(sub="user-admin", email="admin@t.com", name="Ada", role="admin",
+                           is_api_key=api_key)
+    app.dependency_overrides[get_current_user] = _admin
+    return app, TestClient(app)
+
+
+def test_the_admin_lists_and_purges_an_archive(temp_db):
+    from auth.providers import get_current_user
+    _archive("old-pat", "a1", "a2")
+    _retired("old-pat", archived_days=200)
+    _archive("fresh")
+    _retired("fresh", archived_days=None, retired_days=0)   # still being written
+    _archive("restored")                                      # no retired row at all
+    app, client = _admin_client()
+    try:
+        listed = client.get("/v1/admin/offboarded").json()
+        by_name = {a["username"]: a for a in listed["archives"]}
+        assert set(by_name) == {"old-pat", "fresh", "restored"}
+        assert by_name["old-pat"]["agents"] == ["a1", "a2"] and by_name["old-pat"]["bytes"] >= 200
+        assert by_name["old-pat"]["purge_after"] and by_name["restored"]["purge_after"] == ""
+        assert listed["retention"] == {"enabled": True, "days": 180}
+        assert client.delete("/v1/admin/offboarded/fresh").status_code == 409
+        assert client.delete("/v1/admin/offboarded/Nope.Name").status_code == 400
+        assert client.delete("/v1/admin/offboarded/nobody").status_code == 404
+        resp = client.delete("/v1/admin/offboarded/old-pat")
+        assert resp.status_code == 200 and resp.json()["bytes"] >= 200
+        assert not (Path(config.AGENTS_DIR) / ".offboarded" / "old-pat").exists()
+        assert client.delete("/v1/admin/offboarded/restored").status_code == 200
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    # A session token or API key never reaches it.
+    app, client = _admin_client(api_key=True)
+    try:
+        assert client.get("/v1/admin/offboarded").status_code == 403
+        assert client.delete("/v1/admin/offboarded/fresh").status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_the_platform_settings_carry_the_archive_setting(temp_db):
+    from auth.providers import get_current_user
+    app, client = _admin_client()
+    try:
+        got = client.get("/v1/admin/platform-settings").json()
+        assert got["offboarded_retention_enabled"] is True
+        assert got["offboarded_retention_days"] == "180"
+        assert client.put("/v1/admin/platform-settings",
+                          json={"offboarded_retention_days": "0"}).status_code == 200
+        assert client.put("/v1/admin/platform-settings",
+                          json={"offboarded_retention_enabled": False}).status_code == 200
+        for bad in ("-1", "4000", "soon"):
+            assert client.put("/v1/admin/platform-settings",
+                              json={"offboarded_retention_days": bad}).status_code == 400
+        got = client.get("/v1/admin/platform-settings").json()
+        assert got["offboarded_retention_days"] == "0" and got["offboarded_retention_enabled"] is False
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_an_unreadable_or_read_only_tree_is_listed_and_purged(temp_db):
+    """A tree the agent left read-only (a module cache) or unreadable stays
+    listable and purgeable: the list names it, the purge makes the owner's
+    own directories writable and deletes it."""
+    import os as _os
+    from auth.providers import get_current_user
+    base = _archive("locked", "a1")
+    _retired("locked", archived_days=5)
+    ro = base / "a1" / "workspace" / "go" / "pkg" / "mod"
+    ro.mkdir(parents=True)
+    (ro / "f.go").write_text("x")
+    _os.chmod(ro, 0o555)
+    closed = base / "a1" / "closed"
+    closed.mkdir()
+    (closed / "g").write_text("y")
+    _os.chmod(closed, 0o000)
+    _archive("fine")
+    _retired("fine", archived_days=5)
+    app, client = _admin_client()
+    try:
+        listed = {a["username"]: a for a in client.get("/v1/admin/offboarded").json()["archives"]}
+        assert set(listed) == {"locked", "fine"}
+        assert listed["fine"]["bytes"] >= 100 and listed["locked"]["bytes"] >= 100
+        resp = client.delete("/v1/admin/offboarded/locked")
+        assert resp.status_code == 200, resp.text
+        assert not base.exists()
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        if closed.exists():
+            _os.chmod(closed, 0o700)
+        if ro.exists():
+            _os.chmod(ro, 0o755)
+
+
+def test_a_refused_archive_setting_writes_nothing_else(temp_db):
+    from auth.providers import get_current_user
+    db = temp_db
+    db.set_platform_setting("company_name", "Before")
+    app, client = _admin_client()
+    try:
+        resp = client.put("/v1/admin/platform-settings",
+                          json={"company_name": "After", "offboarded_retention_days": "-1"})
+        assert resp.status_code == 400
+        assert db.get_platform_setting("company_name") == "Before"
+        # The page shows the value the sweep uses.
+        db.set_platform_setting("offboarded_retention_days", "soon")
+        assert client.get("/v1/admin/platform-settings").json()["offboarded_retention_days"] == "0"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

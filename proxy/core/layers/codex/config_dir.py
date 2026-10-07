@@ -58,10 +58,10 @@ def build_hooks(sandbox_codex_dir: str) -> dict:
 
     return {
         "hooks": {
-            "PreToolUse": _hook(f"python3 {gate}", scd.LONG_HOOK_TIMEOUT_S),
-            "PostToolUse": _hook(f"python3 {forwarder}", 10),
-            "SubagentStop": _hook(f"python3 {subagent}", 10),
-            "Stop": _hook(f"python3 {stop}", scd.STOP_HOOK_TIMEOUT_S),
+            "PreToolUse": _hook(f'python3 -I "{gate}"', scd.LONG_HOOK_TIMEOUT_S),
+            "PostToolUse": _hook(f'python3 -I "{forwarder}"', 10),
+            "SubagentStop": _hook(f'python3 -I "{subagent}"', 10),
+            "Stop": _hook(f'python3 -I "{stop}"', scd.STOP_HOOK_TIMEOUT_S),
         },
     }
 
@@ -87,7 +87,7 @@ def ensure_persistent_codex_dir(
 
     # Fail-soft; see skills_materializer for the full protocol.
     from core.sandbox.skills_materializer import materialize_skills_for_sandbox
-    materialize_skills_for_sandbox(agent_name, codex_dir)
+    materialize_skills_for_sandbox(agent_name, codex_dir, username=username)
 
     os.chmod(codex_dir, 0o700)
 

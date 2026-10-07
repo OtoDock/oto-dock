@@ -132,3 +132,132 @@ async def test_the_admin_delete_route_unregisters_through_the_lender_before_the_
     assert _rows(A) == [] and _rows(B) == []
     assert credential_store.list_service_agent_bindings_for_owner(w.pat) == []
     assert db.get_user(w.pat) is None
+
+
+def _as_admin(w):
+    from app import app
+    from auth.providers import UserContext, get_current_user
+
+    async def _admin():
+        return UserContext(sub=w.admin, email="admin@t.com", name="Ada", role="admin",
+                           agent_roles={})
+    app.dependency_overrides[get_current_user] = _admin
+    return app
+
+
+@pytest.mark.asyncio
+async def test_a_demotion_through_the_users_route_clears_the_binding_before_it_answers(
+        world, monkeypatch):
+    """The demotion site clears the binding itself: with the offboarding
+    chain held back, the route's answer already finds it gone."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    from auth.providers import get_current_user
+    w = world
+
+    async def _held(*a, **k):
+        return None
+    monkeypatch.setattr(offboarding, "dispatch_losses", _held)
+    app = _as_admin(w)
+    try:
+        resp = await asyncio.to_thread(lambda: TestClient(app).put(
+            f"/v1/admin/users/{w.pat}/agents",
+            json={"agents": [A, B], "agent_roles": {A: "editor", B: "manager"}}))
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    assert resp.status_code == 200, resp.text
+    assert credential_store.list_service_agent_bindings_for_owner(w.pat) == [
+        {"mcp_name": MCP, "agent_name": B, "account_label": "acct"}]
+    assert _rows(A) == [] and w.deleted == [(A, w.pat)]
+
+
+@pytest.mark.asyncio
+async def test_a_platform_role_drop_clears_the_bindings_it_takes_away(world, monkeypatch):
+    """An admin lends through admin standing alone; dropping to member
+    leaves no manager tier on an agent without a manager row."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    from auth.providers import get_current_user
+    w = world
+    boss = db.create_local_user("boss@t.com", "Boss", "Boss", "admin", "x")
+    db.set_user_agents(boss, [A], w.admin, agent_roles={A: "viewer"})
+    credential_store.set_user_credentials(boss, MCP, {"k": "v"}, account_label="boss")
+    credential_store.remove_service_agent_binding(MCP, A)
+    assert credential_store.set_service_agent_binding(
+        MCP, A, account_label="boss", owner_sub=boss, set_by=boss)
+
+    async def _held(*a, **k):
+        return None
+    monkeypatch.setattr(offboarding, "dispatch_losses", _held)
+    app = _as_admin(w)
+    try:
+        resp = await asyncio.to_thread(lambda: TestClient(app).put(
+            f"/v1/admin/users/{boss}/role", json={"role": "member"}))
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    assert resp.status_code == 200, resp.text
+    assert credential_store.list_service_agent_bindings_for_owner(boss) == []
+
+
+@pytest.mark.asyncio
+async def test_the_subscriber_waits_for_a_demotion_clear_still_running(world, monkeypatch):
+    """A demotion's inline clear that outlives the route's wait keeps
+    running; the subscriber waits for it instead of clearing the same rows
+    again beside it."""
+    import asyncio
+    w = world
+    db.set_user_agents(w.pat, [A, B], w.admin, agent_roles={A: "editor", B: "manager"})
+    calls: list[str] = []
+    release = asyncio.Event()
+    real = bindings.clear_binding
+
+    async def _slow(row, owner):
+        calls.append(row["agent_name"])
+        await release.wait()
+        await real(row, owner)
+    monkeypatch.setattr(bindings, "clear_binding", _slow)
+    monkeypatch.setattr(bindings, "DEMOTION_CLEAR_WAIT_S", 0.01)
+    loss = AgentLoss(A, "manager", "editor")
+    await bindings.clear_at_demotion(w.pat, [loss])        # returns after its wait
+    subscriber = asyncio.ensure_future(bindings.on_offboard(_event(w, offboarding.DEMOTED, loss)))
+    await asyncio.sleep(0.05)
+    release.set()
+    await subscriber
+    assert calls == [A]
+    assert credential_store.list_service_agent_bindings_for_owner(w.pat) == [
+        {"mcp_name": MCP, "agent_name": B, "account_label": "acct"}]
+
+
+@pytest.mark.asyncio
+async def test_a_rebind_while_the_clear_runs_is_kept(world, monkeypatch):
+    """The vendor cleanup takes seconds; a manager who binds the agent to
+    their own account meanwhile keeps that binding: the clear deletes only
+    the lender's row."""
+    w = world
+    mo = db.create_local_user("mo2@t.com", "Mo Manager", "Mo", "member", "x")
+    db.set_user_agents(mo, [A], w.admin, agent_roles={A: "manager"})
+    credential_store.set_user_credentials(mo, MCP, {"k": "v"}, account_label="mos")
+    real = subscription_manager.cleanup_account_subscriptions
+
+    async def _rebinding(**kw):
+        assert credential_store.set_service_agent_binding(
+            MCP, A, account_label="mos", owner_sub=mo, set_by=mo)
+        return await real(**kw)
+
+    monkeypatch.setattr(subscription_manager, "cleanup_account_subscriptions", _rebinding)
+    row = {"mcp_name": MCP, "agent_name": A, "account_label": "acct"}
+    await bindings.clear_binding(row, w.pat)
+    assert credential_store.list_service_agent_bindings_for_owner(mo) == [
+        {"mcp_name": MCP, "agent_name": A, "account_label": "mos"}]
+
+
+def test_the_conditional_delete_names_the_lender_and_the_account(world):
+    w = world
+    assert credential_store.remove_service_agent_binding(
+        MCP, A, owner_sub="someone-else", account_label="acct") is False
+    assert credential_store.remove_service_agent_binding(
+        MCP, A, owner_sub=w.pat, account_label="other") is False
+    assert credential_store.remove_service_agent_binding(
+        MCP, A, owner_sub=w.pat, account_label="acct") is True
+    assert credential_store.remove_service_agent_binding(MCP, B) is True
+    assert credential_store.list_service_agent_bindings_for_owner(w.pat) == []

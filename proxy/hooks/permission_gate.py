@@ -13,30 +13,60 @@ Environment variables (set by core/sandbox/env_builder.py in the CLI's subproces
   OTO_SESSION_ID - session UUID for this conversation
 """
 
+import http.client
 import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 # Transport failures fail CLOSED. The alternative — silently allowing the
 # tool a human was being asked to approve — turns every proxy restart or
-# tunnel drop into an auto-approval. The short retry ladder rides out a
-# proxy reboot; the satellite loopback tunnel answers fast with synthetic
-# 502/503 once its WS is down, so a dead platform never hangs the CLI here.
-_RETRY_DELAYS = (2.0, 4.0)
+# tunnel drop into an auto-approval. While the platform cannot be reached (a
+# restart, a dropped tunnel: the satellite's loopback tunnel answers 502/503
+# at once while its socket is down) the call is held and retried for up to
+# _HOLD_S, then denied; any answer from the platform ends the hold at once.
+_HOLD_S = 120.0
+_BACKOFF = (2.0, 4.0, 8.0, 15.0)  # then 15 s steps until the hold ends
+# A refused session token right after a restart: the satellite reports its
+# sessions a moment after it reconnects. A short ladder, then a deny.
+_AUTH_LADDER = (2.0, 4.0, 8.0)
+# A decision that waits on a person is streamed with whitespace keepalives
+# every 30 s, so a few intervals of silence mean the stream is gone.
+_SOCKET_TIMEOUT_S = 150
 
 
 def _request_decision(req):
-    """POST to the proxy, retrying transient failures. None = unreachable."""
-    for attempt in range(len(_RETRY_DELAYS) + 1):
+    """POST to the proxy. The decision dict; a deny for a definitive refusal;
+    None when the platform stayed unreachable for the whole hold, counted
+    from the first failure (a prompt may wait days before its stream drops)."""
+    deadline = None
+    unreachable = auth = 0
+    while True:
         try:
-            with urllib.request.urlopen(req, timeout=604800) as resp:
-                return json.loads(resp.read())
-        except Exception:
-            if attempt < len(_RETRY_DELAYS):
-                time.sleep(_RETRY_DELAYS[attempt])
-    return None
+            with urllib.request.urlopen(req, timeout=_SOCKET_TIMEOUT_S) as resp:
+                text = resp.read().decode("utf-8", "replace").strip()
+            if text:
+                return json.loads(text)
+            # A 2xx whose body ended before its JSON: the stream dropped.
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and auth < len(_AUTH_LADDER):
+                time.sleep(_AUTH_LADDER[auth])
+                auth += 1
+                continue
+            if e.code not in (502, 503, 504):
+                return {"decision": "deny",
+                        "reason": f"OtoDock refused this tool call (HTTP {e.code})"}
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+            pass  # unreachable, or a streamed answer cut before its JSON
+        wait = _BACKOFF[min(unreachable, len(_BACKOFF) - 1)]
+        if deadline is None:
+            deadline = time.monotonic() + _HOLD_S
+        if time.monotonic() + wait > deadline:
+            return None
+        time.sleep(wait)
+        unreachable += 1
 
 
 def _path_note(tool_input, updated_input):

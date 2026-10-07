@@ -1,9 +1,9 @@
 import { useParams } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
-import { canManageAgent, roleBadge } from '../../lib/permissions'
+import { allowedOnSharedOnly, canManageAgent, isAdmin, roleBadge } from '../../lib/permissions'
 import { useAgentInfo, useAgentUsers } from '../../api/agents'
 import { useRuns } from '../../api/runs'
-import { MODE_LABEL, MODE_SUMMARY, modeOfAgent } from '../../lib/visibility'
+import { MODE_LABEL, MODE_SUMMARY, isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import GroupedRunsTable from '../../components/GroupedRunsTable'
 
 export default function AgentOverview() {
@@ -65,7 +65,7 @@ export default function AgentOverview() {
       )}
 
       {/* Users — managers/admins only. Who's attached to this agent + their role. */}
-      {canManage && <AgentUsersCard name={name!} />}
+      {canManage && <AgentUsersCard name={name!} sharedOnly={!!info && isSharedOnly(modeOfAgent(info))} />}
 
       {/* Recent Activity */}
       <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
@@ -77,7 +77,7 @@ export default function AgentOverview() {
   )
 }
 
-function AgentUsersCard({ name }: { name: string }) {
+function AgentUsersCard({ name, sharedOnly }: { name: string; sharedOnly: boolean }) {
   const { data: users, isLoading } = useAgentUsers(name)
   return (
     <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
@@ -99,6 +99,14 @@ function AgentUsersCard({ name }: { name: string }) {
                 <p className="text-sm text-p-text truncate">{u.name}</p>
                 {u.email && <p className="text-xs text-p-text-light truncate">{u.email}</p>}
               </div>
+              {/* An older install may hold a lower row on a Shared-only
+                  agent: it opens no chat there, and an admin raises or removes it. */}
+              {sharedOnly && !allowedOnSharedOnly(u.role) && !isAdmin(u.platform_role) && (
+                <span className="text-[10px] text-amber-600 shrink-0"
+                      title="Shared only takes the editor role or above: this assignment opens no chat. An admin raises it or removes it (Admin, Users).">
+                  no chat access
+                </span>
+              )}
               <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${roleBadge(u.role)}`}>
                 {u.role}
               </span>

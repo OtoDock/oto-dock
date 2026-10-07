@@ -7,6 +7,7 @@ one. Single-use is structural: accepting — or an admin password reset — give
 the account a password, which permanently invalidates every outstanding token.
 """
 
+import asyncio
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -20,6 +21,7 @@ import config
 from app import app
 from auth.password import verify_password
 from auth.providers import UserContext, get_current_user, validate_session_jwt
+from auth import rate_limiter
 from auth.rate_limiter import clear_rate_limit
 from storage import database as db
 
@@ -229,7 +231,7 @@ def test_forgot_password_never_sends_broken_relative_links(monkeypatch):
 
     _create_invited(password=_STRONG_PW)
     clear_rate_limit("forgot", "testclient")
-    clear_rate_limit("forgot", "email:invitee@t.com")
+    clear_rate_limit("forgot", rate_limiter.forgot_email_key("invitee@t.com"))
 
     sent: list = []
     sent_evt = threading.Event()
@@ -248,7 +250,7 @@ def test_forgot_password_never_sends_broken_relative_links(monkeypatch):
     assert sent == []
 
     clear_rate_limit("forgot", "testclient")
-    clear_rate_limit("forgot", "email:invitee@t.com")
+    clear_rate_limit("forgot", rate_limiter.forgot_email_key("invitee@t.com"))
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://dash.example.com")
     # The send is fire-and-forget (a background task, so registered and
     # unregistered addresses answer equally fast — no timing oracle). It can
@@ -281,3 +283,34 @@ def test_admin_list_users_strips_secrets_and_flags_pending(monkeypatch):
         assert "totp_recovery_enc" not in u
     assert users["invitee@t.com"]["invite_pending"] is True
     assert users["active@t.com"]["invite_pending"] is False
+
+
+def _off_loop(fn):
+    """``fn``, refusing to run on a thread with a running event loop (a
+    worker thread has none)."""
+    def guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*a, **kw)
+        raise AssertionError(f"{fn.__name__} ran on the event loop")
+    return guarded
+
+
+def test_admin_create_and_list_read_off_the_loop(monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
+    for name in ("list_users", "get_user", "get_user_agents", "get_user_agent_roles",
+                 "get_user_default_agent"):
+        monkeypatch.setattr(db, name, _off_loop(getattr(db, name)))
+    created = _create_invited()
+    assert created["user"]["email"] == "invitee@t.com"
+    assert created["user"]["agents"] == [] and created["user"]["default_agent"] == ""
+    emails = {u["email"] for u in client.get("/v1/admin/users").json()["users"]}
+    assert "invitee@t.com" in emails
+    sub = created["user"]["sub"]
+    resp = client.put(f"/v1/admin/users/{sub}/agents", json={"agents": []})
+    assert resp.status_code == 200, resp.text
+    resp = client.put(f"/v1/admin/users/{sub}/role", json={"role": "creator"})
+    assert resp.status_code == 200, resp.text
+    assert client.put("/v1/admin/users/no-such-sub/role",
+                      json={"role": "creator"}).status_code == 404

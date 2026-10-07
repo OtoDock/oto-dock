@@ -22,12 +22,12 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # vendor's window label ("Fable") and a spawn's model id (claude-fable-5-1).
 FAMILIES = ("fable", "opus", "sonnet", "haiku")
 
-# The vendor's ``rateLimitType`` on a rejected stream event → our reached key.
+# The vendor's ``rateLimitType`` on a rejected stream event for an overall
+# window → our reached key; a model family's weekly window
+# (``seven_day_<family>``) is ``scoped:<family>`` (``event_reached_key``).
 _EVENT_TYPE_TO_KEY = {
     "five_hour": "five_hour",
     "seven_day": "seven_day",
-    "seven_day_opus": "scoped:opus",
-    "seven_day_sonnet": "scoped:sonnet",
 }
 
 
@@ -37,6 +37,20 @@ def model_family(model: str) -> str:
     for fam in FAMILIES:
         if fam in m:
             return fam
+    return ""
+
+
+def event_reached_key(rate_limit_type: str) -> str:
+    """The reached key of a rejected stream event's ``rateLimitType``: an
+    overall window's own key, ``scoped:<family>`` for a model family's
+    weekly window; "" for a type that names neither."""
+    kind = str(rate_limit_type or "")
+    if kind in _EVENT_TYPE_TO_KEY:
+        return _EVENT_TYPE_TO_KEY[kind]
+    if kind.startswith("seven_day_"):
+        family = model_family(kind[len("seven_day_"):])
+        if family:
+            return f"scoped:{family}"
     return ""
 
 
@@ -198,7 +212,7 @@ def from_event(info: dict, specs: dict[str, WindowSpec]) -> Windows | None:
     if not w.windows:
         return None
     if info.get("status") == "rejected":
-        reached = _EVENT_TYPE_TO_KEY.get(str(info.get("rateLimitType") or ""), "")
+        reached = event_reached_key(info.get("rateLimitType"))
         if reached.startswith("scoped:") or reached in specs:
             w.reached = reached
     return w

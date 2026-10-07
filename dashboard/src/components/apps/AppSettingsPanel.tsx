@@ -137,7 +137,7 @@ export default function AppSettingsPanel({ app, agent, onClose }: Props) {
 
   const secrets = data?.secrets ?? []
   const busy = set.isPending || del.isPending
-  const field = 'w-full min-w-0 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none'
+  const field = 'w-full min-w-0 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs pointer-coarse:text-base text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none'
 
   return (
     <div
@@ -262,7 +262,7 @@ export default function AppSettingsPanel({ app, agent, onClose }: Props) {
                           </button>
                         </div>
                       ) : (
-                        <p className="mt-0.5 text-p-text-light">fed by a vendor subscription; no address of its own</p>
+                        <p className="mt-0.5 text-p-text-light">fed by a vendor subscription, with no address of its own</p>
                       )}
                       {t.last_error && <p className="mt-0.5 text-p-text-light">{t.last_error}</p>}
                     </li>
@@ -275,7 +275,7 @@ export default function AppSettingsPanel({ app, agent, onClose }: Props) {
             <section className="mt-4" data-testid="inbound-section">
               <h3 className="text-[10px] font-semibold uppercase tracking-wide text-p-text-light">Inbound hooks</h3>
               <p className="mt-0.5 text-p-text-light">
-                Paste the address into the vendor’s webhook settings; its signing secret goes above.
+                Paste the address into the vendor’s webhook settings. Its signing secret goes above.
               </p>
               <ul className="mt-2 space-y-3">
                 {hooks.map(([name, h]) => {
@@ -299,8 +299,8 @@ export default function AppSettingsPanel({ app, agent, onClose }: Props) {
                       </div>
                       <p className="mt-0.5 text-p-text-light">
                         verified with the secret <code className="font-mono text-[11px]">{h.secret}</code>
-                        {secret ? (secret.set ? ' (set)' : ' (not set — the address is off until it is)') : ''};
-                        wakes <code className="font-mono text-[11px]">{h.handler}</code>
+                        {secret ? (secret.set ? ' (set)' : ' (not set — the address is off until it is)') : ''},
+                        and wakes <code className="font-mono text-[11px]">{h.handler}</code>
                       </p>
                     </li>
                   )

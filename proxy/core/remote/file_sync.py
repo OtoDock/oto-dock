@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -170,9 +171,10 @@ _CODEX_RUNTIME_GLOBS = ("*.sqlite*",)
 # start (the proxy's ``_write_config_toml`` for local sessions; the satellite
 # from the ``start_session`` payload for remote ones, with rewritten paths,
 # SENTINEL bearer tokens and broker fetch tokens instead of real secrets).
-# Syncing them copied the platform's secret-bearing ``config.toml`` (real
-# OAuth bearer in ``http_headers``) onto every satellite — bypassing the
-# bearer-swap; Windows Defender flagged exactly that file — and ping-ponged
+# Syncing them would copy the platform's ``config.toml`` (its session token
+# as ``PROXY_API_KEY`` and in the gateway entries' headers; before the
+# credential gateway, a real vendor bearer in ``http_headers``) onto every
+# satellite; Windows Defender flagged exactly that file — and ping-ponged
 # content between hosts on every session. Host-local, NEVER synced, either
 # direction. ``auth.json`` joined after the writeback audit: the
 # subscription pool's DB tokens are the source of truth (its own refresh
@@ -225,15 +227,29 @@ _CLAUDE_HOST_LOCAL_FILES = frozenset({
     "auth.json",
 })
 
+# The per-session MCP config copies, rewritten at every session start and
+# carrying that session's own token and broker fetch tokens: the satellite's
+# ``mcp-config-<session_id[:12]>.json`` (0.5.132+), the proxy's
+# ``<agent>-<sha256(user_sub)[:12]>-<session_id[:12]>.json``
+# (``session_config_dir._session_copy_path``), and the shared names earlier
+# releases wrote (``mcp-config.json``, ``<agent>-<sha256(user_sub)[:12]>.json``).
+# Host-local like the set above: synced, the proxy would push its local
+# session's copies to a satellite and scrub the satellite's own as push-only
+# extras. The satellite's twin is identical (the engine-contract test).
+_CLAUDE_HOST_LOCAL_RE = re.compile(
+    r"^(?:mcp-config(?:-[^/]{1,12})?|[A-Za-z0-9._-]+-[0-9a-f]{12}(?:-[^/]{1,12})?)\.json$"
+)
+
 
 def _is_claude_runtime_state(rel_path: str) -> bool:
     """True for host-local ``.claude`` config files that must never sync in
-    either direction (``_CLAUDE_HOST_LOCAL_FILES``). Matches only DIRECT children
-    of ``.claude/`` — so ``.claude/projects/<hash>/<sid>.jsonl`` is unaffected."""
+    either direction (``_CLAUDE_HOST_LOCAL_FILES``, ``_CLAUDE_HOST_LOCAL_RE``).
+    Matches only DIRECT children of ``.claude/`` — so
+    ``.claude/projects/<hash>/<sid>.jsonl`` is unaffected."""
     parts = rel_path.replace("\\", "/").split("/")
     if len(parts) < 2 or parts[-2] != ".claude":
         return False
-    return parts[-1] in _CLAUDE_HOST_LOCAL_FILES
+    return parts[-1] in _CLAUDE_HOST_LOCAL_FILES or bool(_CLAUDE_HOST_LOCAL_RE.match(parts[-1]))
 
 
 def _is_venv_dir(path: Path) -> bool:
@@ -1486,13 +1502,6 @@ def apply_incoming_file(
                 raise
 
 
-def pull_timeout_for_size(size_bytes: int) -> float:
-    """Overall pull deadline scaled to the file size (256KB/s floor): a 1GB
-    pull on a slow link must not die at the old fixed 180s. Callers pass this
-    when the remote side told them the size (file_changed msg / manifest)."""
-    return max(180.0, size_bytes / (256 * 1024))
-
-
 def _hash_file(path: Path) -> str:
     """Compute sha256 hash of a file (streamed — memory-bounded at any size)."""
     h = hashlib.sha256()
@@ -1591,3 +1600,12 @@ def prime_hash_cache(path: Path, file_hash: str) -> None:
         return
     with _hash_cache_lock:
         _hash_cache_put(str(path), st.st_size, st.st_mtime_ns, digest)
+
+
+def forget_hash(path: Path) -> None:
+    """Drop ``path``'s cached hash so the next manifest pass hashes the
+    file again. The cache trusts (size, mtime_ns): a same-size rewrite that
+    keeps its mtime leaves a stale hash, which a caller that saw it fail
+    (a push pinned to it) forgets here."""
+    with _hash_cache_lock:
+        _HASH_CACHE.pop(str(path), None)

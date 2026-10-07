@@ -2,12 +2,17 @@ import { useEffect, useMemo, useState } from 'react'
 import type { PinnedApp } from '../../api/apps'
 import {
   ConfirmRequired,
+  GRANTEE_KIND,
+  SHARE_DECISION,
+  SHARE_SCOPE,
+  SHARE_TARGET,
   useCreateShare,
   usePatchShare,
   useShares,
   useSharingSettings,
   useUserDirectory,
   type CreateShareResult,
+  type GranteeKind,
   type Share,
 } from '../../api/shares'
 import { passkeyConfirm } from '../../api/webauthn'
@@ -15,15 +20,19 @@ import { startOidcConfirm } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
 import { pushEscHandler } from '../../lib/escStack'
 import { formatExpiry } from '../../lib/format'
+import { AGENT_ROLES, ROLE, actingRole, isAdmin, rank, roleLabel, type AgentRole } from '../../lib/permissions'
 import { savePending, takeConfirm, takePending, type PendingShare } from '../../lib/shareConfirm'
 
 /**
  * The share popover (SHARING.md): who an app is shared with and how to add
  * someone. One component for the app menu and the full-screen page; the
- * chat-history row reuses it with a chat target later. "People" grants a
- * platform user access; "Link" makes a link for someone without an account
- * (password by default; making one, or turning its Buttons on, asks for a
- * confirm of the person at the keyboard).
+ * chat-history row reuses it with a chat target. "People" shares with a
+ * person (who accepts the app into one of their agents), an agent (its
+ * editors and managers place it in that agent's Apps panel) or, for an
+ * admin, a department; a role cap says what the recipients act as. "Link"
+ * makes a link for someone without an account (password by default; making
+ * one, or turning its Buttons on, asks for a confirm of the person at the
+ * keyboard).
  */
 
 /** What is being shared: an app row, or a chat (shared as a snapshot). */
@@ -34,6 +43,8 @@ export interface ShareTarget {
   slug?: string
   /** Apps: who sees it by default; chats: 'personal' (per-user) or 'shared' (a shared-only agent's). */
   scope?: 'shared' | 'personal'
+  /** The target's own agent (left out of the agents a share may name). */
+  agent?: string
   actions?: PinnedApp['actions']
   /** The app runs scripts on its own (APPS.md "Steps"): the link form says
    * that a visitor's input is data to them, never instructions. */
@@ -42,7 +53,7 @@ export interface ShareTarget {
 
 interface Props {
   /** An app row (the menu and the full-screen page pass the row itself). */
-  app?: Pick<PinnedApp, 'id' | 'title' | 'slug' | 'scope' | 'pin_scope'> & { actions?: PinnedApp['actions']; steps?: PinnedApp['steps'] }
+  app?: Pick<PinnedApp, 'id' | 'title' | 'slug' | 'scope' | 'pin_scope'> & { agent?: string; actions?: PinnedApp['actions']; steps?: PinnedApp['steps'] }
   /** Or any target; wins over `app` when both are given. */
   target?: ShareTarget
   onClose: () => void
@@ -70,17 +81,41 @@ const EXPIRY_CHOICES: Array<{ value: string; label: string }> = [
 const LINK_EXPIRY_CHOICES = EXPIRY_CHOICES.filter((c) => c.value)
 const LINK_NEVER_CHOICE = { value: 'never', label: 'Never expires' }
 
+// The role words from the weakest up: the cap select reads top to bottom.
+const CAPS_ASCENDING: readonly AgentRole[] = [...AGENT_ROLES].reverse()
+
 const expiryLabel = formatExpiry
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
+/** A personal app's scope word, typed to the row's own union. */
+const PERSONAL_SCOPE: PinnedApp['scope'] = 'personal'
+
+/** What the row says about a share's standing: a person's answer, a pause. */
+function shareState(s: Share): string {
+  if (s.state === 'suspended') return 'paused while the app is unpinned'
+  if (s.decision === SHARE_DECISION.DECLINED) return s.decided_by_name ? `declined by ${s.decided_by_name}` : 'declined'
+  if (s.decision === SHARE_DECISION.PENDING && s.target_kind === SHARE_TARGET.APP) return 'waiting to be accepted'
+  const accepted = s.decision === SHARE_DECISION.ACCEPTED && s.target_kind === SHARE_TARGET.APP && s.grantee ? 'accepted' : ''
+  return [accepted, expiryLabel(s.expires_at)].filter(Boolean).join(' · ')
+}
+
+/** The notice after a share landed, by what it did. */
+function madeNotice(share: Share, typed: string): string {
+  if (share.to_department) return `Shared with the ${share.to_department.name || 'department'} department.`
+  if (share.to_agent) return `Added to ${share.to_agent.name}'s apps.`
+  const who = share.grantee?.name || share.grantee?.username || typed
+  if (share.target_kind === SHARE_TARGET.APP) return `Waiting for ${who} to accept.`
+  return `Shared with ${who}.`
+}
+
 export default function SharePopover({ app: appProp, target: targetProp, onClose, initialTab, confirmError }: Props) {
   const target: ShareTarget = targetProp ?? {
     kind: 'app', id: appProp!.id, title: appProp!.title, slug: appProp!.slug,
-    scope: appProp!.scope, actions: appProp!.actions,
+    scope: appProp!.scope, agent: appProp!.agent, actions: appProp!.actions,
     has_steps: Object.keys(appProp!.steps ?? {}).length > 0,
   }
-  const isChat = target.kind === 'chat'
+  const isChat = target.kind === SHARE_TARGET.CHAT
   const hasSteps = !!target.has_steps
   // The popover reads `app` below as the target's row-like view.
   const app = { id: target.id, title: target.title, slug: target.slug || '', scope: target.scope, actions: target.actions }
@@ -93,10 +128,15 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const [includeTools, setIncludeTools] = useState(false)
   const create = useCreateShare()
   const patch = usePatchShare()
+  const user = useAuth()?.user ?? null
   // The account the identity-provider round trip files its entries under.
-  const sub = useAuth()?.user?.sub ?? ''
+  const sub = user?.sub ?? ''
   const [tab, setTab] = useState<Tab>(initialTab ?? 'people')
   const [who, setWho] = useState('')
+  const [kind, setKind] = useState<GranteeKind>(GRANTEE_KIND.PERSON)
+  const [agentPick, setAgentPick] = useState('')
+  const [deptPick, setDeptPick] = useState('')
+  const [cap, setCap] = useState<AgentRole>(ROLE.VIEWER)
   const [expiresIn, setExpiresIn] = useState('')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
@@ -140,7 +180,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     }
     const token = takeConfirm(sub)
     if (!token) {
-      setError('Your confirmation took too long; make the link again.')
+      setError('Your confirmation took too long. Make the link again.')
       return
     }
     setArmed({ token, op: pending.op, share_id: pending.share_id })
@@ -150,19 +190,47 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
 
   const title = app.title || app.slug
   const link = `${typeof window !== 'undefined' ? window.location.origin : ''}/apps/${app.id}`
-  const internal = useMemo(() => (shares ?? []).filter((s) => s.scope === 'internal'), [shares])
-  const external = useMemo(() => (shares ?? []).filter((s) => s.scope === 'external'), [shares])
-  const granted = useMemo(() => new Set(internal.map((s) => s.grantee?.sub)), [internal])
-  const candidates = useMemo(
-    () => (directory ?? []).filter((u) => !granted.has(u.sub)),
-    [directory, granted],
+  const internal = useMemo(() => (shares ?? []).filter((s) => s.scope === SHARE_SCOPE.INTERNAL), [shares])
+  const external = useMemo(() => (shares ?? []).filter((s) => s.scope === SHARE_SCOPE.EXTERNAL), [shares])
+  // The people already holding a live share (a declined one may be shared again).
+  const granted = useMemo(
+    () => new Set(internal.filter((s) => s.grantee && s.decision !== SHARE_DECISION.DECLINED).map((s) => s.grantee?.sub)),
+    [internal],
   )
+  const people = directory?.users ?? null
+  const candidates = useMemo(
+    () => (people ?? []).filter((u) => !granted.has(u.sub)),
+    [people, granted],
+  )
+  // Agents and departments a share may name (the server lists them per the
+  // admin's switches and the directory); never for a chat or a personal
+  // app, which go to people only.
+  const peopleOnly = isChat || app.scope === PERSONAL_SCOPE
+  // Only an agent the sharer edits or manages can take the app (the server
+  // refuses the rest with its reason).
+  const agentChoices = useMemo(
+    () => (peopleOnly ? [] : (directory?.agents ?? []).filter((a) =>
+      a.slug !== target.agent && (isAdmin(user) || rank(actingRole(user, a.slug)) >= rank(ROLE.EDITOR)))),
+    [directory, peopleOnly, target.agent, user],
+  )
+  const deptChoices = peopleOnly ? [] : (directory?.departments ?? [])
+  const kinds: GranteeKind[] = [
+    GRANTEE_KIND.PERSON,
+    ...(agentChoices.length ? [GRANTEE_KIND.AGENT] : []),
+    ...(deptChoices.length ? [GRANTEE_KIND.DEPARTMENT] : []),
+  ]
+  const effectiveKind: GranteeKind = kinds.includes(kind) ? kind : GRANTEE_KIND.PERSON
+  // The caps offered: up to the sharer's own standing on the app (the
+  // owner of a personal app is its manager); never on a chat (a copy is
+  // read-only).
+  const myRole = isAdmin(user) ? ROLE.ADMIN : app.scope === PERSONAL_SCOPE ? ROLE.MANAGER : actingRole(user, target.agent ?? '')
+  const capChoices = isChat ? [] : CAPS_ASCENDING.filter((r) => rank(r) <= rank(myRole))
   const platformActions = (app.actions ?? []).filter((a) => a.type === 'mcp_tool' || a.type === 'fire_task')
 
   // Where the identity-provider round trip comes back to: an app's own page
   // opens this popover from the URL; a chat's page does not, so the person
   // opens the share again and finds it armed.
-  const returnTo = target.kind === 'app'
+  const returnTo = target.kind === SHARE_TARGET.APP
     ? `/apps/${target.id}?share=1&tab=link`
     : `${window.location.pathname}${window.location.search}`
 
@@ -218,24 +286,30 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     startOidcConfirm(returnTo).catch((err) => setError(errorText(err)))
   }
 
-  const submitPerson = (e: React.FormEvent) => {
-    e.preventDefault()
-    const typed = who.trim()
-    if (!typed) return
+  const typedPerson = who.trim()
+  const grantee = effectiveKind === GRANTEE_KIND.PERSON
     // A directory pick resolves to the sub; anything else goes as typed
     // (an exact username or email, the only way with the directory closed).
-    const match = candidates.find((u) => u.name === typed || u.username === typed || u.sub === typed)
+    ? (candidates.find((u) => u.name === typedPerson || u.username === typedPerson || u.sub === typedPerson)?.sub ?? typedPerson)
+    : effectiveKind === GRANTEE_KIND.AGENT ? agentPick : deptPick
+  const canSubmit = !!grantee && !create.isPending
+
+  const submitShare = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!grantee) return
     setNotice('')
     setError('')
     create.mutate(
-      { target_kind: target.kind, target_id: app.id, grantee: match?.sub ?? typed, expires_in: expiresIn,
-        ...(isChat ? { include_tools: includeTools } : {}) },
+      { target_kind: target.kind, target_id: app.id, grantee_kind: effectiveKind, grantee, expires_in: expiresIn,
+        ...(isChat ? { include_tools: includeTools } : { role_cap: cap }) },
       {
         onSuccess: (body) => {
           setWho('')
           setNotice(body.share
-            ? `Shared with ${body.share.grantee?.name || typed}.`
-            : 'Done. If that user exists, they now have access.')
+            ? madeNotice(body.share, typedPerson)
+            : effectiveKind === GRANTEE_KIND.PERSON
+              ? 'Done. If that user exists, they will find it under Shared with you.'
+              : 'Done. If that agent exists, its members now have the app.')
         },
         onError: (err) => setError(errorText(err)),
       },
@@ -277,13 +351,18 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     } catch { /* clipboard unavailable: the text is selectable */ }
   }
 
-  const personRow = (s: Share) => {
-    const name = s.grantee?.name || s.grantee?.username || 'someone'
-    const state = s.state === 'suspended' ? 'paused while the app is unpinned' : expiryLabel(s.expires_at)
+  const shareRow = (s: Share) => {
+    const name = s.grantee?.name || s.grantee?.username || s.to_agent?.name || s.to_department?.name || 'someone'
+    const prefix = s.to_agent ? 'Agent: ' : s.to_department ? 'Department: ' : ''
+    const state = shareState(s)
+    const capWord = !isChat && s.role_cap !== ROLE.VIEWER ? roleLabel(s.role_cap).toLowerCase() : ''
     return (
       <li key={s.id} className="flex items-center gap-2 py-1.5">
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm text-p-text">{name}</p>
+          <p className="truncate text-sm text-p-text">
+            {prefix}{name}
+            {capWord && <span className="ml-1 rounded bg-p-accent-teal/15 px-1 py-px text-[10px] text-p-accent-teal">{capWord}</span>}
+          </p>
           {state && <p className="text-[11px] text-p-text-light">{state}</p>}
         </div>
         {s.state === 'suspended' && (
@@ -336,20 +415,23 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     </button>
   )
 
+  const subtitle = isChat
+    ? 'A read-only copy of the conversation as it stands now. Share again to send a newer one.'
+    : app.scope === 'shared'
+      ? 'Members of this agent already see it. Add a person, place it in another agent, or make a link.'
+      : 'Only you see this app. Add a colleague, or make a link.'
+
+  const kindLabel = (k: GranteeKind) => k === GRANTEE_KIND.PERSON ? 'A person' : k === GRANTEE_KIND.AGENT ? 'An agent' : 'A department'
+  const selectClass = 'min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none'
+
   return (
     <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center" onClick={onClose} role="presentation">
       <div role="dialog" aria-modal="true" aria-label={`Share ${title}`} onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md rounded-2xl border border-p-border-light bg-p-surface p-4 text-p-text shadow-xl">
+        className="max-h-[90dvh] w-full max-w-md overflow-y-auto rounded-2xl border border-p-border-light bg-p-surface p-4 text-p-text shadow-xl">
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
             <h2 className="truncate text-sm font-semibold">Share “{title}”</h2>
-            <p className="text-[11px] text-p-text-light">
-              {isChat
-                ? 'A read-only copy of the conversation as it stands now; share again to send a newer one.'
-                : app.scope === 'shared'
-                  ? 'Members of this agent already see it; add someone who is not a member, or make a link.'
-                  : 'Only you see this app; add a colleague, or make a link.'}
-            </p>
+            <p className="text-[11px] text-p-text-light">{subtitle}</p>
           </div>
           <button type="button" onClick={onClose} aria-label="Close"
             className="flex h-7 w-7 items-center justify-center rounded-full text-p-text-light hover:bg-p-surface-hover hover:text-p-text">
@@ -372,25 +454,56 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
 
         {tab === 'people' && (
           <>
-            <form onSubmit={submitPerson} className="mt-3 flex flex-col gap-2">
+            <form onSubmit={submitShare} className="mt-3 flex flex-col gap-2">
+              {kinds.length > 1 && (
+                <select value={effectiveKind} onChange={(e) => setKind(e.target.value as GranteeKind)} aria-label="Share with"
+                  className={selectClass}>
+                  {kinds.map((k) => <option key={k} value={k}>{kindLabel(k)}</option>)}
+                </select>
+              )}
               <div className="flex gap-2">
-                <input list={directory ? `share-directory-${app.id}` : undefined} value={who}
-                  onChange={(e) => setWho(e.target.value)}
-                  placeholder={directory ? 'Name or username' : 'Exact username or email'}
-                  aria-label="Who to share with"
-                  className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none" />
-                {directory && (
-                  <datalist id={`share-directory-${app.id}`}>
-                    {candidates.map((u) => <option key={u.sub} value={u.name || u.username}>{u.username}</option>)}
-                  </datalist>
+                {effectiveKind === GRANTEE_KIND.PERSON && (
+                  <>
+                    <input list={people ? `share-directory-${app.id}` : undefined} value={who}
+                      onChange={(e) => setWho(e.target.value)}
+                      placeholder={people ? 'Name or username' : 'Exact username or email'}
+                      aria-label="Who to share with"
+                      className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm pointer-coarse:text-base text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none" />
+                    {people && (
+                      <datalist id={`share-directory-${app.id}`}>
+                        {candidates.map((u) => <option key={u.sub} value={u.name || u.username}>{u.username}</option>)}
+                      </datalist>
+                    )}
+                  </>
+                )}
+                {effectiveKind === GRANTEE_KIND.AGENT && (
+                  <select value={agentPick} onChange={(e) => setAgentPick(e.target.value)} aria-label="Which agent" className={selectClass}>
+                    <option value="">Choose an agent</option>
+                    {agentChoices.map((a) => <option key={a.slug} value={a.slug}>{a.display_name || a.slug}</option>)}
+                  </select>
+                )}
+                {effectiveKind === GRANTEE_KIND.DEPARTMENT && (
+                  <select value={deptPick} onChange={(e) => setDeptPick(e.target.value)} aria-label="Which department" className={selectClass}>
+                    <option value="">Choose a department</option>
+                    {deptChoices.map((d) => <option key={d.id} value={d.id}>{d.name || d.id}</option>)}
+                  </select>
                 )}
                 <select value={expiresIn} onChange={(e) => setExpiresIn(e.target.value)} aria-label="Expiry"
-                  className="rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-xs text-p-text-secondary focus:border-brand focus:outline-none">
+                  className="rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-xs pointer-coarse:text-base text-p-text-secondary focus:border-brand focus:outline-none">
                   {EXPIRY_CHOICES.map((c) => <option key={c.value || 'never'} value={c.value}>{c.label}</option>)}
                 </select>
               </div>
+              {capChoices.length > 0 && (
+                <label className="flex items-center gap-2 text-[11px] text-p-text-secondary">
+                  <span className="shrink-0">They act as</span>
+                  <select value={capChoices.includes(cap) ? cap : ROLE.VIEWER} onChange={(e) => setCap(e.target.value as AgentRole)} aria-label="Role"
+                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none">
+                    {capChoices.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
+                  </select>
+                </label>
+              )}
               <div className="flex items-center gap-2">
-                <button type="submit" disabled={!who.trim() || create.isPending}
+                <button type="submit" disabled={!canSubmit}
                   className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-brand-hover disabled:opacity-50">
                   Share
                 </button>
@@ -406,7 +519,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                     {copied === 'link' ? 'Copied' : 'Copy link'}
                   </button>
                 </div>
-                <p className="mt-1 text-[10px] text-p-text-light">The link opens for members and for the people above after they sign in.</p>
+                <p className="mt-1 text-[10px] text-p-text-light">The link opens for members and for everyone above after they sign in.</p>
               </>
             )}
           </>
@@ -450,7 +563,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                     Public <span className="rounded bg-amber-500/15 px-1 py-px text-[10px] text-amber-700 dark:text-amber-300">anyone with the URL</span>
                   </label>
                   <select value={linkExpiry} onChange={(e) => setLinkExpiry(e.target.value)} aria-label="Link expiry"
-                    className="ml-auto rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text-secondary focus:border-brand focus:outline-none">
+                    className="ml-auto rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs pointer-coarse:text-base text-p-text-secondary focus:border-brand focus:outline-none">
                     {linkExpiryChoices.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
                   </select>
                 </div>
@@ -470,7 +583,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                     <input type="checkbox" checked={linkButtons} onChange={(e) => setLinkButtons(e.target.checked)} aria-label="Buttons on the link" />
                     <span>
                       Let the link use the buttons {platformActions.map((a) => `“${a.label}”`).join(', ')}
-                      {app.scope === 'personal'
+                      {app.scope === PERSONAL_SCOPE
                         ? ' — they run with your connected accounts, as you.'
                         : ' — they run on the agent\'s own authority.'}
                     </span>
@@ -499,8 +612,8 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
               <>
                 <p className="font-medium text-p-text">Confirm it is you</p>
                 <p className="mt-1 text-p-text-secondary">
-                  This page goes to {confirmAsk.provider} to check it is you, then comes back here;
-                  {isChat ? ' open the share again when you are back.' : ' the link and its password are shown when you return.'}
+                  This page goes to {confirmAsk.provider} to check it is you, then comes back here.
+                  {isChat ? ' Open the share again when you are back.' : ' The link and its password are shown when you return.'}
                 </p>
                 <div className="mt-2 flex gap-2">
                   <button type="button" onClick={continueToProvider}
@@ -519,7 +632,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                 <div className="mt-2 flex gap-2">
                   <input type="password" autoComplete="current-password" value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)} aria-label="Your password" placeholder="Your password"
-                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-surface px-2 py-1.5 text-sm text-p-text focus:border-brand focus:outline-none" />
+                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-surface px-2 py-1.5 text-sm pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none" />
                   <button type="submit" disabled={!confirmPassword}
                     className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-hover disabled:opacity-50">
                     Confirm
@@ -537,8 +650,8 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
             )}
           </form>
         )}
-        {/* Everything this is shared with, people and links alike, under
-            either tab: one glance says who can open it. */}
+        {/* Everything this is shared with, people, agents, departments and
+            links alike, under either tab: one glance says who can open it. */}
         <div className="mt-3 border-t border-p-border-light/60 pt-2" data-testid="share-list">
           <p className="text-[10px] font-semibold uppercase tracking-wide text-p-text-light">Shared with</p>
           {isLoading ? (
@@ -547,7 +660,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
             <p className="py-1.5 text-xs text-red-600 dark:text-red-400">{(loadError as Error).message}</p>
           ) : internal.length || external.length ? (
             <ul className="divide-y divide-p-border-light/60">
-              {internal.map(personRow)}
+              {internal.map(shareRow)}
               {external.map(linkRow)}
             </ul>
           ) : (

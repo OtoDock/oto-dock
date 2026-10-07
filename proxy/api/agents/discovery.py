@@ -597,6 +597,8 @@ async def list_agent_users(name: str, user: UserContext | None = Depends(get_cur
                      or r["email"] or r["sub"]),
             "email": r["email"],
             "role": r["agent_role"],
+            # An admin acts as admin whatever the row says.
+            "platform_role": r["platform_role"],
         }
         for r in rows
     ]

@@ -998,7 +998,7 @@ def delete_model(model_db_id: int) -> bool:
         return cur.rowcount > 0
 
 
-def sync_builtin_models(layer: str, models: list[dict]) -> None:
+def sync_builtin_models(layer: str, models: list[dict]) -> int:
     """Sync predefined models from LayerCapabilities into DB.
 
     Adds missing builtins, updates existing builtins to fully match the registry
@@ -1007,6 +1007,11 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
     builtin when the registry adopts them, and removes stale builtins no longer in
     the config. Preserves admin enable/disable state for current builtins; admin
     pricing customization applies to custom (non-builtin) models only.
+
+    Writes only what drifted: the update of an existing built-in matches a row
+    whose registry fields differ (compared in SQL, the prices as ``real``, the
+    column's type), and the transaction commits only when a statement changed
+    a row. Returns the number of rows written, 0 when nothing drifted.
 
     Custom→builtin promotion: if a user previously added a model as custom
     (is_builtin=FALSE) and that same model_id now appears in the registry,
@@ -1018,6 +1023,7 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
     now = _now()
     with get_conn() as conn:
         current_ids = set()
+        changed = 0
         for m in models:
             model_id = m.get("value", "")
             if not model_id:
@@ -1038,7 +1044,7 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
             # to builtin and apply the registry's metadata (the admin's tier
             # on that row is replaced by the registry's). Runs BEFORE the
             # insert so the UNIQUE(layer, model_id) constraint doesn't block it.
-            conn.execute(
+            cur = conn.execute(
                 """UPDATE execution_layer_models
                    SET is_builtin = TRUE,
                        display_name = %s,
@@ -1057,8 +1063,9 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
                 (display_name, provider, ctx_win, p_in, p_out, p_cw, p_cr,
                  reasoning, xhigh, tier, good_at, now, layer, model_id),
             )
+            changed += cur.rowcount or 0
             # Insert new builtins (with pricing + reasoning + xhigh + tier)
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO execution_layer_models
                    (layer, provider, model_id, display_name, is_builtin, enabled,
                     context_window, pricing_input, pricing_output,
@@ -1069,14 +1076,16 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
                 (layer, provider, model_id, display_name,
                  ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh, tier, good_at, now, now),
             )
+            changed += cur.rowcount or 0
             # Update existing builtins to fully match the registry — provider,
             # context_window, pricing, reasoning, xhigh and tier all follow the
             # registry. The platform owns builtin model definitions, so price /
             # context updates shipped in a release propagate to existing installs
             # on the next sync (no DB shadow). `enabled` is NOT touched here, so
             # admin enable/disable choices are preserved. Admins customize pricing
-            # via custom (non-builtin) models, not by editing builtin rows.
-            conn.execute(
+            # via custom (non-builtin) models, not by editing builtin rows. A row
+            # already equal to the registry is left alone (its updated_at too).
+            cur = conn.execute(
                 """UPDATE execution_layer_models
                    SET provider = %s,
                        context_window = %s,
@@ -1089,20 +1098,38 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
                        tier = %s,
                        good_at = %s,
                        updated_at = %s
-                   WHERE layer = %s AND model_id = %s AND is_builtin = TRUE""",
+                   WHERE layer = %s AND model_id = %s AND is_builtin = TRUE
+                     AND (provider IS DISTINCT FROM %s
+                          OR context_window IS DISTINCT FROM %s
+                          OR pricing_input IS DISTINCT FROM %s::real
+                          OR pricing_output IS DISTINCT FROM %s::real
+                          OR pricing_cache_write IS DISTINCT FROM %s::real
+                          OR pricing_cache_read IS DISTINCT FROM %s::real
+                          OR supports_reasoning IS DISTINCT FROM %s
+                          OR supports_xhigh IS DISTINCT FROM %s
+                          OR tier IS DISTINCT FROM %s
+                          OR good_at IS DISTINCT FROM %s)""",
                 (provider, ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh,
-                 tier, good_at, now, layer, model_id),
+                 tier, good_at, now, layer, model_id,
+                 provider, ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh,
+                 tier, good_at),
             )
+            changed += cur.rowcount or 0
         # Remove stale builtins no longer in config
         if current_ids:
             # Use ANY(%s) with a list for IN-clause (psycopg3 way)
-            conn.execute(
+            cur = conn.execute(
                 """DELETE FROM execution_layer_models
                     WHERE layer = %s AND is_builtin = TRUE
                     AND model_id != ALL(%s)""",
                 (layer, list(current_ids)),
             )
-        conn.commit()
+            changed += cur.rowcount or 0
+        if changed:
+            conn.commit()
+        else:
+            conn.rollback()
+    return changed
 
 
 def custom_model_exists(model_id: str) -> bool:
@@ -1176,6 +1203,13 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
             if cur.rowcount:
                 remapped[f"{table}.{col}"] = cur.rowcount
         conn.commit()
+    if remapped.get("agents.default_model"):
+        # The agents API answers from agent_store's in-process cache, which a
+        # boot fills before this walk runs: left alone it serves the retired
+        # id until the next agent write, and the dashboard seeds new chats
+        # from the first offered model instead of the successor.
+        from storage.agents import agent_store
+        agent_store._invalidate_cache()
     total = sum(remapped.values())
     if total:
         detail = ", ".join(f"{k}={v}" for k, v in remapped.items())

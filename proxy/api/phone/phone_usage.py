@@ -15,11 +15,13 @@ credit); this records the BASE price locally for display — a separate ledger.
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import config
+from adapters.phone import DIRECTIONS, INBOUND, is_outbound
 from core.layers.providers import ProviderUsage, get_adapter
 from services.billing import usage_service
 from services.infra import external_retention
@@ -36,7 +38,7 @@ router = APIRouter()
 
 def _require_master_key(authorization: str | None) -> None:
     """The phone daemon is the ONLY legitimate writer here. The generic
-    ``verify_api_key`` also admits session-scoped JWTs — which every
+    ``verify_api_key_async`` also admits session-scoped JWTs — which every
     sandboxed agent subprocess holds — and those must not be able to forge
     call-log rows or pollute usage records."""
     token = ""
@@ -107,7 +109,7 @@ class CallReport(BaseModel):
     route_id: str = ""
     phone_server_id: int | None = None
     agent: str = ""
-    direction: str = "inbound"
+    direction: str = INBOUND
     from_number: str = ""
     to_number: str = ""
     transport: str = ""
@@ -147,8 +149,8 @@ def _record_call(data: dict) -> dict:
     """Validate/enrich + insert one phone_call_log row (sync DB work)."""
     if data.get("outcome") not in phone_call_log_store.VALID_OUTCOMES:
         data["outcome"] = "failed"
-    if data.get("direction") not in ("inbound", "outbound"):
-        data["direction"] = "inbound"
+    if data.get("direction") not in DIRECTIONS:
+        data["direction"] = INBOUND
     data["pin_attempts"] = max(0, int(data.get("pin_attempts") or 0))
     route = (phone_route_store.get_route(data["route_id"])
              if data.get("route_id") else None)
@@ -157,7 +159,7 @@ def _record_call(data: dict) -> dict:
         data["agent"] = data.get("agent") or route.get("agent", "")
         data["phone_server_id"] = (data.get("phone_server_id")
                                    or route.get("phone_server_id"))
-        if data["direction"] == "outbound" and not data.get("from_number"):
+        if is_outbound(data["direction"]) and not data.get("from_number"):
             data["from_number"] = route.get("ami_caller_id", "") or ""
     else:
         # Unknown/deleted route: keep the row, drop the FK.
@@ -170,6 +172,24 @@ def _record_call(data: dict) -> dict:
         data, prune_before=external_retention.prune_cutoff(),
     )
     return {"recorded": True, "id": row_id}
+
+
+#: The daemon asks for its 15-minute lockout window plus a margin; a longer
+#: ask is cut to this.
+_PIN_WINDOW_MAX_S = 3600
+
+
+@router.get("/v1/phone/pin-failures")
+async def list_pin_failures(window_s: int = 900, authorization: str | None = Header(None)):
+    """The inbound calls of the last ``window_s`` seconds that entered the
+    PIN gate (caller, route, outcome, attempts, start and end), so the
+    daemon rebuilds its lockout windows after a restart
+    (``calls/pin_failures.py``). Master key only."""
+    _require_master_key(authorization)
+    window = min(max(int(window_s), 60), _PIN_WINDOW_MAX_S)
+    since = (datetime.now(timezone.utc) - timedelta(seconds=window)).isoformat()
+    calls = await asyncio.to_thread(phone_call_log_store.list_pin_attempts, since)
+    return {"calls": calls}
 
 
 @router.post("/v1/phone/calls/report")

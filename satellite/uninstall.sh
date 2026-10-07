@@ -96,15 +96,24 @@ if [ "$OS" = "Linux" ] && command -v systemctl &>/dev/null; then
     # but set them defensively for the detached self-uninstall context.
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     SERVICE_FILE="$HOME/.config/systemd/user/oto-dock-satellite.service"
-    info "Stopping oto-dock-satellite user service..."
-    systemctl --user stop oto-dock-satellite 2>/dev/null || true
-    systemctl --user disable oto-dock-satellite 2>/dev/null || true
-    if [ -f "$SERVICE_FILE" ]; then
-        info "Removing $SERVICE_FILE..."
-        rm -f "$SERVICE_FILE"
-        systemctl --user daemon-reload 2>/dev/null || true
+    # The user's one manager may run another install's unit under the same
+    # name (a second install of this OS user): act on it only when it runs
+    # this install's satellite folder.
+    UNIT_DIR="$(systemctl --user show -p WorkingDirectory --value oto-dock-satellite 2>/dev/null || true)"
+    if [ -n "$UNIT_DIR" ] && [ "$UNIT_DIR" != "$OTO_DIR/satellite" ]; then
+        warn "oto-dock-satellite runs $UNIT_DIR, another install: its service is left alone"
+    else
+        info "Stopping oto-dock-satellite user service..."
+        systemctl --user stop oto-dock-satellite 2>/dev/null || true
+        systemctl --user disable oto-dock-satellite 2>/dev/null || true
+        if [ -f "$SERVICE_FILE" ]; then
+            info "Removing $SERVICE_FILE..."
+            rm -f "$SERVICE_FILE"
+            rm -rf "$SERVICE_FILE.d"
+            systemctl --user daemon-reload 2>/dev/null || true
+        fi
+        ok "systemd user service removed"
     fi
-    ok "systemd user service removed"
     # Linger is left in place — disabling it could stop OTHER user services.
     # Remove manually with `loginctl disable-linger $USER` if desired.
 elif [ "$OS" = "Darwin" ]; then

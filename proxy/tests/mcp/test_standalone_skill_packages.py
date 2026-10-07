@@ -282,3 +282,22 @@ def test_delete_custom_mcp_still_rejected(wired, monkeypatch):
     monkeypatch.setattr(mcp_registry, "scan_manifests", lambda: None)
     r = wired.delete("/v1/admin/mcps/tts-mcp")
     assert r.status_code == 400
+
+
+def test_delete_rescans_off_the_loop(wired, monkeypatch):
+    import asyncio
+    from services.mcp import mcp_registry
+    scans = []
+
+    def _scan():
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            scans.append("worker")
+            return None
+        raise AssertionError("scan_manifests ran on the event loop")
+
+    monkeypatch.setattr(mcp_registry, "scan_manifests", _scan)
+    r = wired.delete("/v1/admin/mcps/pdf-skills")
+    assert r.status_code == 200
+    assert scans == ["worker"]

@@ -14,6 +14,7 @@ button and phone barge-in exercise daily) runs exactly as deployed.
 """
 
 import asyncio
+import json
 
 import pytest  # noqa: F401  (temp_db / monkeypatch fixtures)
 
@@ -104,12 +105,12 @@ class TestStopAndSend:
                 # Mid-turn typed message: queued + graceful interrupt fired
                 # → the turn closes → the drain delivers it immediately.
                 ws.client_send({"type": "chat", "text": "do this instead",
-                                "chat_id": chat_id})
-                await ws.expect({"type": "queued", "index": 0,
-                                 "text": "do this instead",
+                                "chat_id": chat_id, "queue_id": "q-1"})
+                await ws.expect({"type": "queued", "index": 0, "queue_id": "q-1",
+                                 "text": "do this instead", "author_sub": "user-admin",
                                  "chat_id": chat_id})
-                await ws.expect({"type": "queue_sent",
-                                 "text": "do this instead",
+                await ws.expect({"type": "queue_sent", "queue_ids": ["q-1"],
+                                 "message_ids": ANY, "text": "do this instead",
                                  "chat_id": chat_id})
                 await ws.expect({"type": "text", "content": "t2",
                                  "chat_id": chat_id})
@@ -163,9 +164,9 @@ class TestStopAndSend:
                                  "chat_id": chat_id})
 
                 ws.client_send({"type": "chat", "text": "later please",
-                                "chat_id": chat_id})
-                await ws.expect({"type": "queued", "index": 0,
-                                 "text": "later please",
+                                "chat_id": chat_id, "queue_id": "q-1"})
+                await ws.expect({"type": "queued", "index": 0, "queue_id": "q-1",
+                                 "text": "later please", "author_sub": "user-admin",
                                  "chat_id": chat_id})
                 # Give the fire task time to run + be refused.
                 await asyncio.sleep(0.05)
@@ -173,7 +174,8 @@ class TestStopAndSend:
 
                 # The turn keeps running until ITS OWN end.
                 gate.set()
-                await ws.expect({"type": "queue_sent", "text": "later please",
+                await ws.expect({"type": "queue_sent", "queue_ids": ["q-1"],
+                                 "message_ids": ANY, "text": "later please",
                                  "chat_id": chat_id})
                 await ws.expect({"type": "text", "content": "t2",
                                  "chat_id": chat_id})
@@ -217,6 +219,8 @@ def _viewer(ws, chat_id: str, sid: str):
     conn.live_queue = LiveQueue()
     conn._send_lock = asyncio.Lock()
     conn._client_pushback = collections.deque()
+    conn._ended = asyncio.Event()
+    conn._recheck_wake = asyncio.Event()
     conn.pending_control_requests = []
     # The session was checked just now: the throttled revalidation is not due.
     conn._last_authz_check = time.time()
@@ -299,6 +303,63 @@ async def test_a_client_message_is_read_while_a_backlog_is_pending(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_a_pushed_documents_token_reaches_only_the_pushing_persons_sockets(temp_db):
+    """One pump, two people viewing the chat: the live document_preview
+    frame (and the live_state snapshot a mid-turn attach gets) carries the
+    WOPI token to the connection of the person the turn runs as only."""
+    from core.session.session_state import _chat_streaming_state
+    doc = {"type": "document_preview", "wopi_url": "https://c/x", "access_token": "tok",
+           "access_token_ttl": 123, "filename": "x.docx", "file_id": "fid",
+           "download_url": "/v1/media/d"}
+    pump = _pump("vw-doc", [])
+    pump.producer.cancel()
+    pump.producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+    pump.wake_person = "user-a"
+    _chat_streaming_state["vw-doc"] = {"streaming": True, "live_blocks": [dict(doc)]}
+    viewers = {}
+    for person in ("user-a", "user-b"):
+        ws = _TimedWebSocket()
+        conn = _viewer(ws, "vw-doc", pump.session_id)
+        conn.user_sub = person
+        viewers[person] = (ws, conn)
+    try:
+        loops = [asyncio.create_task(conn._stream_via_pump(pump)) for _ws, conn in viewers.values()]
+        while len(pump._ws_queues) < 2:
+            await asyncio.sleep(0)
+        assert pump.push_ws_event(dict(doc))
+        for ws, _conn in viewers.values():
+            while not any(d.get("type") == "document_preview" for d in ws.sent):
+                await asyncio.sleep(0)
+            ws.client_send({"type": "resume_chat", "chat_id": "elsewhere"})
+        await asyncio.wait_for(asyncio.gather(*loops), timeout=5)
+        for person, (ws, _conn) in viewers.items():
+            frames = ws.sent
+            pushed = next(d for d in frames if d.get("type") == "document_preview")
+            snapshot = next(d for d in frames if d.get("type") == "live_state")["live_blocks"][0]
+            for frame in (pushed, snapshot):
+                assert frame["file_id"] == "fid" and frame["wopi_url"] == "https://c/x"
+                if person == "user-a":
+                    assert (frame["access_token"], frame["access_token_ttl"]) == ("tok", 123)
+                else:
+                    assert "access_token" not in frame and "access_token_ttl" not in frame
+        # The shared live state keeps the token for the pusher's next attach.
+        assert _chat_streaming_state["vw-doc"]["live_blocks"][0]["access_token"] == "tok"
+    finally:
+        stream_pump._active_pumps.pop("vw-doc", None)
+        _chat_streaming_state.pop("vw-doc", None)
+        pump.producer.cancel()
+
+
+def test_no_known_pusher_keeps_the_token_from_every_viewer():
+    from core.events import artifact_events
+    frame = {"type": "document_preview", "access_token": "tok", "access_token_ttl": 1}
+    assert artifact_events.for_viewer(frame, "", "") == {"type": "document_preview"}
+    assert artifact_events.for_viewer(frame, "user-a", "user-a") is frame
+    plain = {"type": "text", "content": "hi"}
+    assert artifact_events.for_viewer(plain, "", "user-b") is plain
+
+
+@pytest.mark.asyncio
 async def test_a_resync_marker_becomes_a_same_chat_resume(temp_db):
     pump = _pump("vw3", [])
     pump.producer.cancel()
@@ -350,6 +411,66 @@ async def test_a_non_object_client_message_gets_an_error_not_a_crash(temp_db):
         assert {"type": "error", "message": "Invalid message"} in [d for _t, d in ws.sent_at]
     finally:
         stream_pump._active_pumps.pop("vw5", None)
+        pump.producer.cancel()
+
+
+class _ViaWebSocket(FakeDashboardWebSocket):
+    """Records which send method carried each frame."""
+
+    def __init__(self):
+        super().__init__(cookie=None)
+        self.via: list[tuple[str, str]] = []
+
+    async def send_json(self, data: dict) -> None:
+        self.via.append((data.get("type"), "json"))
+        await super().send_json(data)
+
+    async def send_text(self, text: str) -> None:
+        self.via.append((json.loads(text).get("type"), "text"))
+        await super().send_text(text)
+
+
+@pytest.mark.asyncio
+async def test_the_attach_snapshot_is_encoded_once_and_sent_as_text(temp_db, monkeypatch):
+    """g13: the live_state of an attach is encoded to text once, at the
+    snapshot (no await since the attach), and sent as that text: the
+    string is the frozen copy, a later change to the live state is not in it."""
+    from ws import dashboard_chat_stream as dcs
+    pump = _pump("vw7", [])
+    pump.producer.cancel()
+    pump.producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+    live = {"streaming": True, "session_id": pump.session_id,
+            "live_blocks": [{"type": "text", "content": "so far"}]}
+    stream_pump._chat_streaming_state["vw7"] = live
+    decodes = []
+    real_json = dcs.json
+
+    class _CountingJson:
+        dumps = staticmethod(real_json.dumps)
+        JSONDecodeError = real_json.JSONDecodeError
+
+        @staticmethod
+        def loads(*args, **kwargs):
+            decodes.append(args)
+            return real_json.loads(*args, **kwargs)
+    monkeypatch.setattr(dcs, "json", _CountingJson)
+    ws = _ViaWebSocket()
+    conn = _viewer(ws, "vw7", pump.session_id)
+    try:
+        loop_task = asyncio.create_task(conn._stream_via_pump(pump))
+        while not any(t == "live_state" for t, _how in ws.via):
+            await asyncio.sleep(0)
+        live["live_blocks"].append({"type": "text", "content": "after the attach"})
+        pump._ws_queues[0].put_nowait({"pump_type": "all_done"})
+        await asyncio.wait_for(loop_task, timeout=5)
+        assert ws.via == [("chat_status", "json"), ("live_state", "text"), ("done", "json")]
+        assert decodes == []
+        snapshot = next(f for f in ws.sent if f["type"] == "live_state")
+        assert snapshot["live_blocks"] == [{"type": "text", "content": "so far"}]
+        assert snapshot["chat_id"] == "vw7"
+    finally:
+        stream_pump._chat_streaming_state.pop("vw7", None)
+        stream_pump._active_pumps.pop("vw7", None)
         pump.producer.cancel()
 
 

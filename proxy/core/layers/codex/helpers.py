@@ -164,9 +164,10 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
 # Platform "ultra" is an EXPLICIT user choice, never an alias for "max":
 # wire "ultra" is not a bigger reasoning budget but Codex-native multi-agent
 # orchestration (the model proactively spawns parallel sub-agent workstreams;
-# codex-rs sends the API the model's multi-agent effort — "max" on Sol/Terra,
-# "xhigh" on Astra — and flips MultiAgentMode::Proactive). It is offered
-# per-model in the dashboard (supports_ultra — GPT-6 Sol, gpt-5.6 Terra and
+# codex-rs sends the API the model's multi-agent effort — "max" on Terra and
+# the retired GPT-6 and 5.6 Sols, "xhigh" on GPT-6.1 Sol and Astra — and
+# flips MultiAgentMode::Proactive). It is offered
+# per-model in the dashboard (supports_ultra — GPT-6.1 Sol, gpt-5.6 Terra and
 # gpt-6-astra; OpenAI's own manifest caps Luna at "max") and clamps to the
 # model's ceiling everywhere else, so a stored "ultra" can never reach a
 # model/CLI that rejects it. It complements the platform's own delegation
@@ -185,20 +186,21 @@ _EFFORT_TO_CODEX: dict[str, str] = {
 # NOTE: keep _ULTRA in sync with the ``supports_ultra`` flags in
 # config.MODEL_REGISTRY (the dashboard gate) — this is the wire-level truth.
 # Exact GPT-6 ids rather than "gpt-6": a future GPT-6 tier without "max"
-# must not inherit the unlock. The retired 5.6 Sol / Luna prefixes stay: a
-# custom re-add, or a live session whose row remaps at the next boot, keeps
-# its ceiling (Codex 0.156.1 catalog: GPT-6 Sol low…max + ultra, GPT-6 Luna
-# low…max).
-_MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
-_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol")
+# must not inherit the unlock, and "gpt-6-sol" does not match "gpt-6.1-sol".
+# The retired 5.6 Sol / Luna and GPT-6 Sol prefixes stay: a custom re-add,
+# or a live session whose row remaps at the next boot, keeps its ceiling
+# (Codex 0.160.0 catalog: GPT-6.1 Sol and GPT-6 Sol low…max + ultra, GPT-6
+# Luna low…max).
+_MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna")
+_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol")
 
 
 def map_effort_to_codex(effort: str, model: str = "") -> str:
     """Map platform effort level to Codex ``model_reasoning_effort`` value.
 
     ``model`` (when given) unlocks the wire values newer families support —
-    platform "ultra" → wire "ultra" on gpt-5.6 Sol/Terra and gpt-6-astra,
-    platform "max" → wire "max" on gpt-5.6* and gpt-6*; without it (or on
+    platform "ultra" → wire "ultra" on the Sols, Terra and gpt-6-astra,
+    platform "max" → wire "max" on gpt-5.6* and the GPT-6 ids; without it (or on
     older models) both clamp down the scale ("ultra" → the model's max tier,
     "max" → "xhigh"). Returns an empty string when the effort is
     unknown/empty so the caller can skip the ``-c model_reasoning_effort=...``
@@ -243,3 +245,14 @@ def build_auth_json(token: str, *, auth_blob: dict) -> dict:
     auth_data["tokens"] = tokens
     auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
     return auth_data
+
+
+def will_retry(params) -> bool:
+    """Whether Codex retries the error an ``error`` notification reports.
+    The flag sits at the params' top level (0.156.1 and 0.160.0 schema); older builds
+    nested it in ``error``."""
+    if not isinstance(params, dict):
+        return False
+    if "willRetry" in params:
+        return bool(params.get("willRetry"))
+    return bool((params.get("error") or {}).get("willRetry"))

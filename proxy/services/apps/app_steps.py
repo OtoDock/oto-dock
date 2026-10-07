@@ -4,7 +4,9 @@ sandbox with the app identity's mount row, or the machine
 ``resolve_execution_target`` names — instead of the server route. No model,
 no MCP, never ``/config``; the approval is the authority (the script's
 sha256 is in the signed manifest and is checked against the live release at
-every fire); the verdict is the exit code, kept on the delivery with the
+every fire, and only those verified bytes run: a local step sees no other
+file of the release, as a machine is sent only the script); the verdict is
+the exit code, kept on the delivery with the
 first 32 KB of output; a finished step wakes the server handlers subscribed
 to ``step:<name>`` through the ordinary event path.
 
@@ -22,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +39,8 @@ from core import placement
 from storage.pg import run_db
 from auth import roles
 from core import layout
+from services.infra import safe_fs
+from services.infra.path_confinement import join_under
 
 logger = logging.getLogger("claude-proxy.apps")
 
@@ -48,6 +53,9 @@ CLAIM_MARGIN_S = 60
 OFFLINE_REARM_S = 300
 OUTPUT_KEEP_BYTES = deliveries.STEP_OUTPUT_KEEP_BYTES
 STEPS_DIR_NAME = "steps"
+# The folder of a local run's scratch directory the verified script is
+# staged into, mounted read-only at ``/app``.
+STAGED_DIR_NAME = "app"
 # The task type a step's OTO_* env names (no session, no model).
 TASK_TYPE = "step"
 
@@ -272,18 +280,33 @@ def _local_step_dir(row: dict, delivery_id: str) -> Path:
     return releases.app_release_dir(row) / STEPS_DIR_NAME / delivery_id
 
 
+def _stage_script(row: dict, delivery_id: str, run: str, data: bytes) -> Path:
+    """The verified bytes in the run's own scratch directory, at the path
+    the manifest names (``/app/<run>`` inside the sandbox): the approval
+    signs the script alone, so a sibling of it in the release (a library it
+    sources, say) is not there, and a redeploy that changes only a sibling
+    changes nothing a step runs. A machine likewise runs only the bytes it
+    was sent. Synchronous."""
+    staged = _local_step_dir(row, delivery_id) / STAGED_DIR_NAME
+    root, rel = releases.agents_rel(join_under(staged, run))
+    safe_fs.atomic_write_beneath(root, rel, data, mode=0o644, mkdirs=True)
+    return staged
+
+
 def _spec_for(plan: StepPlan, claim: str) -> ScriptSpec:
-    """The runner's spec: the identity's mount row, the live release
-    read-only at ``/app``, the step's scratch directory at ``/step``."""
+    """The runner's spec: the identity's mount row, the step's verified
+    script alone read-only at ``/app`` (staged into its scratch directory),
+    the scratch directory at ``/step``. Synchronous: it writes the staged
+    script."""
     from storage.agents import agent_store
     row, d, identity, vis = plan.row, plan.delivery, plan.identity, plan.vis
     env = step_env(plan, claim)
     env["OTO_TASK_TYPE"] = TASK_TYPE
-    live = None
+    staged = None
     if placement.is_local(plan.target):
-        live = releases.live_release_dir(row)
-        if live is None:
+        if releases.live_release_dir(row) is None:
             raise StepRefused("the app has no live release")
+        staged = _stage_script(row, d["id"], plan.run, plan.script)
     return ScriptSpec(
         run_id=d["id"], agent=row["agent"], script=plan.script, sha256=plan.sha256,
         run_name=plan.run,
@@ -294,7 +317,7 @@ def _spec_for(plan: StepPlan, claim: str) -> ScriptSpec:
         mount_shared=bool(getattr(vis, "mount_shared", True)),
         knowledge_rw=bool(getattr(identity, "knowledge_rw", False)),
         workspace_relative=plan.workspace_relative, knowledge_relative=plan.knowledge_relative,
-        script_dir=live, mount_at="/app", env=env,
+        script_dir=staged, mount_at="/app", env=env,
         payload_json=_runner.payload_text(d.get("payload") or {}),
         timeout=int(plan.timeout), secrets=secrets_of(plan, claim),
         scratch_root=releases.app_release_dir(row) / STEPS_DIR_NAME,
@@ -320,6 +343,11 @@ async def run_local(plan: StepPlan, claim: str) -> StepResult:
         raise StepRefused(e.reason)
     except ScriptUnavailable as e:
         raise StepUnavailable(e.reason)
+    finally:
+        # The runner removes the scratch directory after a run; a run that
+        # never started leaves the staged script there otherwise.
+        await asyncio.to_thread(
+            shutil.rmtree, _local_step_dir(plan.row, plan.delivery["id"]), True)
 
 
 async def run_remote(plan: StepPlan, claim: str, machine_id: str) -> StepResult:

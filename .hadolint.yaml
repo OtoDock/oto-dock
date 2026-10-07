@@ -1,0 +1,6 @@
+# hadolint runs in the release gate over the three Dockerfiles.
+ignored:
+  # Distro packages are installed at whatever version the base image's apt
+  # index provides, by design (VERSIONS.md "Distro-default dev tools"): a
+  # Debian apt pin breaks as soon as the repo prunes the version.
+  - DL3008

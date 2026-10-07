@@ -195,21 +195,37 @@ class TestInvalidGrantGiveUp:
         await _tick_with(prov)
         assert refresh.call_count == 1
 
+        # The verdict is written into the file: the card and the resolver
+        # read it, and it survives a proxy restart.
+        marked = json.loads(f.read_text())
+        assert marked["extra"]["refresh_failed"] == "invalid_grant"
+        assert marked["extra"]["refresh_failed_at"]
+
         # Way past any backoff cap: dead tokens are still not retried.
         clock["now"] += 100 * 3600
         await _tick_with(prov)
         assert refresh.call_count == 1
 
-        # Reconnect rewrites the file (new mtime) → the verdict is void.
+        # A reconnect rewrites the whole file (fresh content, no verdict,
+        # new mtime) → the verdict is void. The mtime is bumped by hand: a
+        # rewrite inside the same kernel clock tick keeps the old one.
+        _write_token_file(f)
         st = f.stat()
         os.utime(f, (st.st_atime, st.st_mtime + 10))
         await _tick_with(prov)
         assert refresh.call_count == 2
 
     def test_permanent_error_classification(self):
-        is_perm = oauth_refresh_worker._is_permanent_refresh_error
-        assert is_perm(RelayError("invalid_grant")) is True
-        assert is_perm(RelayError("refresh_failed")) is False
-        assert is_perm(RuntimeError("google token refresh failed: invalid_grant")) is True
-        assert is_perm(RuntimeError("connection reset")) is False
-        assert is_perm(ValueError("invalid_grant")) is False
+        from auth.oauth_providers.base import OAuthTokenError
+        code = oauth_refresh_worker._permanent_error_code
+        assert code(RelayError("invalid_grant"), "relay") == "invalid_grant"
+        assert code(RelayError("refresh_failed"), "relay") == ""
+        assert code(RuntimeError("google token refresh failed: invalid_grant"), "standard") == "invalid_grant"
+        assert code(RuntimeError("connection reset"), "standard") == ""
+        assert code(ValueError("invalid_grant"), "standard") == ""
+        # the typed error: the code decides, whatever the description says
+        assert code(OAuthTokenError("p", "refresh", "invalid_grant", "Token has been revoked"), "standard") == "invalid_grant"
+        assert code(OAuthTokenError("p", "refresh", "http_503", "", 503), "standard") == ""
+        # invalid_client is permanent for the registered client only
+        assert code(OAuthTokenError("p", "refresh", "invalid_client"), "mcp_authorization") == "invalid_client"
+        assert code(OAuthTokenError("p", "refresh", "invalid_client"), "standard") == ""

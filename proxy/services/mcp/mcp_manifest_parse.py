@@ -12,9 +12,11 @@ and the sub-parsers (the parser test-suite). The in-memory `_manifests` cache,
 registry engine.
 """
 
+import fnmatch
 import json
 import logging
 import re
+from urllib.parse import urlsplit
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -39,6 +41,9 @@ from services.mcp.mcp_manifest_types import (
     PathEnvValueRef,
     PermissionRule,
     PermissionsBlock,
+    REPLACES_KEY_RE,
+    ReplacesDecl,
+    SKILL_AUDIENCES,
     SKILL_ID_MAX_LEN,
     SKILL_ID_RE,
     SKILL_LOADING_DEFAULT,
@@ -57,6 +62,7 @@ from services.mcp.mcp_manifest_types import (
     _VALID_TOOL_ARG_MODES,
     _parse_companion_app,
 )
+from services.mcp import mcp_validate_oauth as _mvo
 from services.mcp.mcp_validate_oauth import _validate_oauth_services
 from services.mcp.mcp_validate_webhooks import _validate_webhooks_block
 
@@ -343,6 +349,26 @@ def _parse_builder_block(raw: dict, idx: int) -> AgentContextBuilder:
     )
 
 
+_CREDENTIAL_TOKEN_RE = re.compile(r"\$\{(credential\.[A-Za-z0-9_.]*)\}")
+
+
+def agent_context_credential_tokens(raw: Any) -> list[str]:
+    """The ``credential.*`` tokens an ``agent_context`` list names (a
+    template, a ``requires`` entry, a builder's args). No credential value
+    enters the token map (a block renders into the system prompt), so each
+    renders empty and a ``requires`` on one skips its block."""
+    if not isinstance(raw, list):
+        return []
+    found: set[str] = set()
+    for blk in raw:
+        if not isinstance(blk, dict):
+            continue
+        found.update(_CREDENTIAL_TOKEN_RE.findall(json.dumps(blk)))
+        found.update(r for r in blk.get("requires") or []
+                     if isinstance(r, str) and r.startswith("credential."))
+    return sorted(found)
+
+
 def _parse_agent_context(raw: Any, mcp_name: str) -> list[AgentContextBlock]:
     """Parse + validate a manifest's ``agent_context`` list.
 
@@ -418,6 +444,12 @@ def _parse_agent_context(raw: Any, mcp_name: str) -> list[AgentContextBlock]:
             builder=builder,
         ))
 
+    named = agent_context_credential_tokens(raw)
+    if named:
+        logger.warning(
+            "%s: agent_context names %s: no credential value enters a prompt, "
+            "so each renders empty and a requires on one skips its block",
+            mcp_name, ", ".join(named))
     return blocks
 
 
@@ -756,6 +788,96 @@ def _parse_hosted_block(
     return HostedConfig(oauth_app=oauth_app, api_key_relay=api_key_relay)
 
 
+# Header names the gateway owns or strips: a header-style key may not take
+# one of these, so a manifest can never move the session token, a cookie or
+# a transport header into the vendor's hands.
+_API_KEY_HEADER_DENIED = re.compile(
+    r"^(authorization|cookie|host|content-.*|accept.*|mcp-.*|forwarded|"
+    r"x-forwarded-.*|x-real-ip|connection|transfer-encoding|upgrade|te|"
+    r"trailer|keep-alive|proxy-.*)$", re.IGNORECASE,
+)
+_HEADER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+
+
+def _validate_api_key_header(
+    raw: Any, cred_raw: Any, server_raw: Any, instances_raw: Any, hosted_raw: Any,
+) -> None:
+    """``credentials.api_key_header``: a vendor-hosted MCP server that takes
+    an API key in a header of its own (Google Maps Grounding Lite takes
+    ``X-Goog-Api-Key``). The credential gateway adds the header; the value
+    comes from a declared ``credentials.fields`` password key or an
+    env-delivered instance field; the manifest proposes the hosts and the
+    admin approves them under the manifest's name. Streamable HTTP only (an
+    SSE endpoint event would escape the gateway's path), a literal host,
+    never beside a bearer or the hosted key relay."""
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ValueError("must be an object when declared")
+    for key in ("name", "value_from", "proposed_hosts"):
+        if key not in raw:
+            raise ValueError(f"{key} is required")
+    unknown = set(raw) - {"name", "value_from", "proposed_hosts"}
+    if unknown:
+        raise ValueError(f"unknown keys: {sorted(unknown)}")
+    name = raw.get("name")
+    if not isinstance(name, str) or not _HEADER_TOKEN_RE.match(name):
+        raise ValueError("name must be an HTTP header name")
+    if _API_KEY_HEADER_DENIED.match(name):
+        raise ValueError(f"name {name!r} is a header the platform owns")
+    value_from = raw.get("value_from")
+    if not isinstance(value_from, str) or not _ENV_VAR_NAME_RE.match(value_from):
+        raise ValueError("value_from must name a credential key")
+    cred = cred_raw if isinstance(cred_raw, dict) else {}
+    oauth = cred.get("oauth") if isinstance(cred.get("oauth"), dict) else {}
+    if oauth.get("bearer_required"):
+        raise ValueError("cannot be declared beside credentials.oauth.bearer_required")
+    hosted = hosted_raw if isinstance(hosted_raw, dict) else {}
+    if hosted.get("api_key_relay"):
+        raise ValueError("cannot be declared beside hosted.api_key_relay")
+    declared: set[str] = set()
+    if cred.get("type") in ("per_user", "infra"):
+        for f in cred.get("fields") or []:
+            if isinstance(f, dict) and f.get("input_type") == "password" and f.get("key"):
+                declared.add(str(f["key"]))
+    inst = instances_raw if isinstance(instances_raw, dict) else {}
+    if inst.get("delivery", "env") == "env":
+        for f in inst.get("fields") or []:
+            if isinstance(f, dict) and f.get("key"):
+                declared.add(str(f["key"]))
+    if value_from not in declared:
+        raise ValueError(
+            f"value_from {value_from!r} must be a credentials.fields key with "
+            "input_type password or an env-delivered instances field"
+        )
+    hosts = raw.get("proposed_hosts")
+    if not isinstance(hosts, list) or not hosts:
+        raise ValueError("proposed_hosts must be a non-empty list")
+    for idx, host in enumerate(hosts):
+        if not isinstance(host, str) or not host.strip() or not _mvo._HOSTNAME_RE.match(host):
+            raise ValueError(f"proposed_hosts[{idx}]={host!r} is not a valid hostname")
+    server = server_raw if isinstance(server_raw, dict) else {}
+    transport = server.get("transport", "")
+    if transport not in ("streamable_http", "streamable-http", "http"):
+        raise ValueError(
+            f"requires a streamable-HTTP server.transport; got {transport!r}"
+        )
+    template = str(server.get("url_template") or "")
+    if "${" in template:
+        raise ValueError("server.url_template must be a literal URL")
+    try:
+        parts = urlsplit(template)
+    except ValueError:
+        parts = None
+    host = (parts.hostname or "") if parts else ""
+    if not parts or parts.scheme not in ("http", "https") or not host:
+        raise ValueError("server.url_template must be an http(s) URL with a host")
+    if not any(fnmatch.fnmatchcase(host.lower(), h.lower()) for h in hosts):
+        raise ValueError(
+            f"server.url_template host {host!r} is not among proposed_hosts"
+        )
+
+
 def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     """Parse a manifest.json file into an McpManifest."""
     try:
@@ -826,6 +948,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     cred_data = data.get("credentials", {})
     oauth_data = cred_data.get("oauth")
     webhooks_data = cred_data.get("webhooks")
+    api_key_header = cred_data.get("api_key_header")
     app_cred_fields = oauth_data.get("app_credential_fields", []) if oauth_data else []
 
     credentials = CredentialConfig(
@@ -838,6 +961,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         has_service_account=cred_data.get("service_account", False),
         oauth=oauth_data,
         webhooks=webhooks_data,
+        api_key_header=api_key_header,
         ui_type=cred_data.get("ui_type", ""),
         app_credential_fields=app_cred_fields,
     )
@@ -901,12 +1025,24 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
                 sorted(VALID_SKILL_LOADING), SKILL_LOADING_DEFAULT,
             )
             loading = SKILL_LOADING_DEFAULT
+        audience = sk.get("audience", "") or ""
+        if skill_audience_error(audience) is not None:
+            # Fail closed: a skill meant for a tier must not reach everyone
+            # because its word is misspelt.
+            logger.warning(
+                "%s: skill %r has an invalid audience %r (expected one of %s); "
+                "skill dropped",
+                data.get("name", mcp_dir.name), skill_id, audience,
+                list(SKILL_AUDIENCES),
+            )
+            continue
         skills.append(SkillDef(
             id=skill_id,
             file=sk["file"],
             description=sk.get("description", ""),
             default_exclude_from=sk.get("default_exclude_from", []),
             loading=loading,
+            audience=audience,
         ))
 
     # System-level package dependencies (optional). Used by the installer
@@ -948,6 +1084,21 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         )
 
     name = data["name"]
+
+    try:
+        _validate_api_key_header(
+            api_key_header, cred_data, data.get("server"), data.get("instances"),
+            data.get("hosted"),
+        )
+    except ValueError as e:
+        raise ValueError(f"{name}: invalid credentials.api_key_header block — {e}") from e
+
+    audience = data.get("audience", "")
+    if audience not in ("", *SKILL_AUDIENCES):
+        raise ValueError(
+            f"{name}: audience must be one of {list(SKILL_AUDIENCES)} when declared, "
+            f"got {audience!r}"
+        )
 
     # OAuth services validation (optional block, but strict when present).
     # Pass the raw server block so the validator can cross-check
@@ -1074,6 +1225,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         author=str(data.get("author") or ""),
         author_url=str(data.get("author_url") or ""),
         assignment_mode=data.get("assignment_mode", "auto"),
+        audience=audience,
         requires_capability=data.get("requires_capability"),
         network_targets=[
             NetworkTargetDecl(
@@ -1122,8 +1274,65 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         device_capability=device_capability,
         companion_app=companion_app,
         device_high_risk_tools=device_high_risk_tools,
+        replaces=parse_replaces(data.get("replaces"), name),
         patched=data.get("patched", False),
         patch_note=data.get("patch_note"),
         manifest_path=manifest_path,
         mcp_dir=mcp_dir,
     )
+
+
+def skill_audience_error(audience) -> str | None:
+    """Why a ``skills[].audience`` value is not one of the three tiers (or
+    empty); ``None`` when it is."""
+    if audience in ("", None):
+        return None
+    if not isinstance(audience, str) or audience not in SKILL_AUDIENCES:
+        return f"must be one of {', '.join(SKILL_AUDIENCES)}"
+    return None
+
+
+def replaces_entry_error(entry) -> str | None:
+    """Why one ``replaces[]`` entry is malformed; ``None`` when it is well
+    formed: an object with a non-empty string ``source`` and an optional
+    ``credentials`` map of identifiers (``REPLACES_KEY_RE``) to identifiers,
+    no key starting with ``_`` on either side. Shared by the parser (which
+    drops a bad entry), the install gate and the package check (which refuse
+    it) and mirrored by the catalogs' registry generators."""
+    if not isinstance(entry, dict):
+        return "must be an object"
+    source = entry.get("source")
+    if not isinstance(source, str) or not source.strip():
+        return "needs a non-empty string source"
+    creds = entry.get("credentials", {})
+    if creds is None:
+        creds = {}
+    if not isinstance(creds, dict):
+        return "credentials must be an object of old key to new key"
+    for old, new in creds.items():
+        if not isinstance(old, str) or not REPLACES_KEY_RE.fullmatch(old):
+            return f"credential key {old!r} is not a plain identifier"
+        if not isinstance(new, str) or not REPLACES_KEY_RE.fullmatch(new):
+            return f"credential key {new!r} is not a plain identifier"
+    return None
+
+
+def parse_replaces(raw, label: str) -> list[ReplacesDecl]:
+    """The ``replaces`` list of a manifest, malformed entries dropped with a
+    warning (the installers refuse them instead)."""
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list):
+        logger.warning("%s: replaces is not a list; dropped", label)
+        return []
+    out: list[ReplacesDecl] = []
+    for entry in raw:
+        error = replaces_entry_error(entry)
+        if error is not None:
+            logger.warning("%s: replaces entry %r %s; dropped", label, entry, error)
+            continue
+        out.append(ReplacesDecl(
+            source=entry["source"].strip(),
+            credentials={str(k): str(v) for k, v in (entry.get("credentials") or {}).items()},
+        ))
+    return out

@@ -107,3 +107,98 @@ async def test_unguarded_deregister_keeps_old_behavior():
         await mgr.deregister("m1")  # no expected → unconditional
         assert mgr.get_connection("m1") is None
         assert await mgr.drain_persists()
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_fails_what_waits_on_the_old_connection(tmp_path, monkeypatch):
+    """The old socket's acks, pulls and credit fail by identity at the swap,
+    at once, and a push on it aborts: nothing waits out a timeout on a
+    socket that can never answer. What the new connection sends is kept."""
+    from core.remote.satellite_connection import CreditFailed
+    from services.path_policy_v2 import PathRef
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4)
+    mgr = SatelliteConnectionManager()
+    with patch("storage.remote_store.update_machine_status"), \
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
+        old_conn = await mgr.register("m1", _FakeWS(), {})
+        push = asyncio.create_task(mgr.push_file(
+            "m1", PathRef("agent_tree", "w.bin"), b"x" * 64, agent_slug="a1"))
+        pull = asyncio.create_task(mgr.pull_file_to_path(
+            "m1", PathRef("agent_tree", "w.bin"), tmp_path / "w.bin", agent_slug="a1"))
+        command = asyncio.create_task(mgr.send_command("m1", {"type": "file_stat"}, timeout=60))
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if len(mgr._pending_pulls) == 1 and old_conn.bulk_credit.inflight:
+                break
+        assert old_conn.bulk_credit.inflight > 0
+
+        new_conn = await mgr.register("m1", _FakeWS(), {})
+        later = asyncio.create_task(mgr.send_command("m1", {"type": "file_stat"}, timeout=60))
+        assert await asyncio.wait_for(push, 2) is False
+        assert await asyncio.wait_for(pull, 2) is False
+        with pytest.raises(RuntimeError, match="replaced"):
+            await asyncio.wait_for(command, 2)
+        with pytest.raises(CreditFailed):
+            old_conn.bulk_credit.try_take(1)
+        await asyncio.sleep(0)
+        assert old_conn.bulk_credit.inflight == 0
+        assert mgr._pending_pulls == {}
+        # Only the new socket's commands wait (its own verify kick and this).
+        assert mgr._pending_acks
+        assert all(e[2] is new_conn for e in mgr._pending_acks.values())
+        later.cancel()
+        await mgr.deregister("m1", expected=new_conn)
+        assert await mgr.drain_persists()
+
+
+@pytest.mark.asyncio
+async def test_a_transfer_that_starts_across_a_replacement_uses_the_new_connection(tmp_path, monkeypatch):
+    """A duplicate reconnect lands while a push hashes its file: the push
+    goes out on the new connection instead of failing on the replaced one."""
+    import json
+    from services.path_policy_v2 import PathRef
+
+    class _RecWS(_FakeWS):
+        def __init__(self):
+            super().__init__()
+            self.sent: list[dict] = []
+
+        async def send_text(self, text):
+            self.sent.append(json.loads(text))
+
+    mgr = SatelliteConnectionManager()
+    src = tmp_path / "doc.bin"
+    src.write_bytes(b"x" * 64)
+    new_ws = _RecWS()
+    conns: list = []
+
+    def _hash_during_reconnect(path):
+        conns.append(asyncio.run_coroutine_threadsafe(
+            _register_async(mgr, "m1", new_ws), loop).result())
+        return "sha256:" + "0" * 64
+    with patch("storage.remote_store.update_machine_status"), \
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
+        loop = asyncio.get_running_loop()
+        old_ws = _RecWS()
+        old_conn = await mgr.register("m1", old_ws, {})
+        monkeypatch.setattr("core.remote.file_sync._hash_file", _hash_during_reconnect)
+        push = asyncio.create_task(mgr.push_file(
+            "m1", PathRef("agent_tree", "w.bin"), src, agent_slug="a1"))
+        frames: list[dict] = []
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            frames = [f for f in new_ws.sent if f.get("type") == "file_push"]
+            if frames:
+                break
+        new_conn = conns[0]
+        assert new_conn is not old_conn and len(frames) == 1
+        assert not [f for f in old_ws.sent if f.get("type") == "file_push"]
+        assert old_conn.bulk_credit.inflight == 0
+        # Answer the frame on the new connection: the push lands.
+        await mgr.handle_message("m1", {"type": "ack", "command_id": frames[0]["command_id"],
+                                        "status": "ok", "error": ""})
+        assert await asyncio.wait_for(push, 2) is True
+        await mgr.deregister("m1", expected=new_conn)
+        assert await mgr.drain_persists()

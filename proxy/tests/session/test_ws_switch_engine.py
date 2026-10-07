@@ -679,3 +679,30 @@ class TestEngineSwitchSeedReason:
             if m.get("event_type") == "system"
         ]
         assert any(e.get("reason") == "engine_switch" for e in events)
+
+
+class TestBelowEditorWarmupReason:
+    def test_a_refusal_below_the_editor_tier_has_its_own_reason(self, temp_db, monkeypatch):
+        """The send's warmup refused below the editor tier (a chat that runs
+        as the agent) answers ``warmup_failed`` with the role reason, so the
+        dashboard shows a role card instead of the crash card."""
+        from core.sandbox.session_config_dir import AgentStateRefused
+
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        cid = _make_chat(slug, messages=(("user", "hi"),))
+
+        import ws.dashboard as wsd
+
+        async def _refused(self, *a, **k):
+            raise AgentStateRefused("This agent is set to Shared only (would run as viewer)")
+        monkeypatch.setattr(wsd.DashboardConnection, "_create_or_resume_session", _refused)
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "warmup", "agent": slug, "chat_id": cid, "text": "go"})
+                frame = await _drain_until(ws, "warmup_failed", timeout=6.0)
+                assert frame["reason"] == "below_editor", frame
+                assert "Shared only" in frame["error"]
+        run_ws_scenario(scenario)

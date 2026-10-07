@@ -243,6 +243,14 @@ export function useInteractiveChat(
     setSessionInteractive(false)
   }, [])
 
+  // The chat's stored mode as the server answered a pick: the ack, or the
+  // echo of a refused one (a chat that runs as the agent, below the editor
+  // tier). Takes the stored value and ends any switch the pick started.
+  const applyStoredExecMode = useCallback((executionMode: string) => {
+    setChatExecMode(executionMode === 'interactive' || executionMode === '-p' ? executionMode : '')
+    setSwitching(false)
+  }, [])
+
   // Clear the live-session state on chat switch / new chat, and clear the
   // per-chat override so a brand-new chat falls back to the AGENT default (a
   // switch to an existing chat then restores its stored mode via
@@ -354,6 +362,7 @@ export function useInteractiveChat(
     performSwitch,
     flushDeferredSwitch,
     restoreFromMeta,
+    applyStoredExecMode,
     seedExecMode,
     resetSession,
     routeSend,

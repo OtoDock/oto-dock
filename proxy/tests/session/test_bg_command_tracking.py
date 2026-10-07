@@ -16,6 +16,8 @@ or  ./venv/bin/python -m pytest tests/session/test_bg_command_tracking.py -q
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.layers.cli.layer import cli_chunk_to_events
@@ -491,3 +493,466 @@ async def test_the_abort_check_reads_the_chat_off_the_loop(monkeypatch, temp_db,
     with loop_db_guard.active():
         await pump_bg_monitors._bg_command_monitor(_MonitorLayer(idle_drain), sid, chat_id, 1)
     assert queued == []
+
+
+# ---------------------------------------------------------------------------
+# The review nobody views: after the monitor's guard, and a visible chat turn
+# ---------------------------------------------------------------------------
+
+class _ReviewLayer(_MonitorLayer):
+    """A session a monitor polls and then reviews in: ``on_drain`` resolves
+    the job, ``send_message`` answers one turn (running ``during_turn``)."""
+
+    def __init__(self, on_drain, *, during_turn=None, self_wakes=False):
+        super().__init__(on_drain)
+        self.sends: list[str] = []
+        self._during_turn = during_turn
+        self._self_wakes = self_wakes
+        self._locks: dict = {}
+
+    def session_lock(self, sid):
+        import asyncio
+        return self._locks.setdefault(sid, asyncio.Lock())
+
+    async def send_message(self, sid, prompt, **kwargs):
+        from core.events.common_events import CommonEvent, TEXT, DONE
+        self.sends.append(prompt)
+        if self._during_turn:
+            self._during_turn()
+        yield CommonEvent(type=TEXT, data={"content": "reviewed"})
+        yield CommonEvent(type=DONE, data={})
+
+    async def session_self_wakes(self, sid):
+        return self._self_wakes
+
+    def remote_stream_severed(self, sid):
+        return False
+
+    def session_idle_seconds(self, sid):
+        return 0.0
+
+    async def probe_session_process_dead(self, sid):
+        return False
+
+    async def prepare_resume(self, sid):
+        return
+
+
+def _resolver(sid: str, task_id: str):
+    from core.session.session_state import resolve_bg_command_frame
+
+    def _drain():
+        return resolve_bg_command_frame(sid, {
+            "type": "system", "subtype": "task_updated",
+            "task_id": task_id, "patch": {"status": "completed"}})
+    return _drain
+
+
+@pytest.fixture
+def review_env(monkeypatch, temp_db):
+    """A chat bound to its session, the pump's broadcasts recorded, and the
+    per-session state cleaned up after."""
+    from core.events import pump_bg_monitors, stream_pump
+    from core.events.bg_command_state import _bg_command_registries
+    from core.session.session_state import _subagent_registries
+    from storage import database as task_store
+    statuses: list[tuple[str, str]] = []
+    monkeypatch.setattr(stream_pump.notification_manager, "broadcast_chat_status",
+                        lambda owner, cid, status, agent="": statuses.append((cid, status)))
+
+    async def _quiet(*a, **k):
+        return None
+    monkeypatch.setattr(stream_pump.notification_manager, "fire_ephemeral", _quiet)
+    made: list[tuple[str, str]] = []
+
+    def _bind(chat_id: str, sid: str, *, row_sid: str = "", **kw):
+        owner = kw.pop("owner", "user-1")
+        task_store.create_chat(chat_id, owner, "agent-x", **kw)
+        task_store.update_chat(chat_id, session_id=row_sid or sid)
+        made.append((chat_id, sid))
+    yield SimpleNamespace(bind=_bind, statuses=statuses)
+    for chat_id, sid in made:
+        _bg_command_registries.pop(sid, None)
+        _subagent_registries.pop(sid, None)
+        stream_pump._active_pumps.pop(chat_id, None)
+        pump_bg_monitors._bg_command_monitors_running.discard(sid)
+        pump_bg_monitors._bg_monitors_running.discard(sid)
+
+
+def _rows(chat_id: str) -> list[tuple[str, str, str]]:
+    from storage import database as task_store
+    return [(r["role"], r.get("event_type") or "", r.get("content") or "")
+            for r in task_store.get_chat_messages(chat_id)]
+
+
+async def _monitor(layer, sid: str, chat_id: str, *, agents: bool = False) -> None:
+    import asyncio
+    from core.events import chat_writer, pump_bg_monitors
+    run = pump_bg_monitors._bg_agent_monitor if agents else pump_bg_monitors._bg_command_monitor
+    await asyncio.wait_for(run(layer, sid, chat_id, 1), timeout=10)
+    await chat_writer.drain(chat_id)
+
+
+@pytest.mark.asyncio
+async def test_a_review_nobody_views_is_a_streamed_chat_turn(review_env):
+    from storage import database as task_store
+    sid, chat_id = "s-rv1", "c-rv1"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bR1", "tuR1", label="bR1 — build")
+    layer = _ReviewLayer(_resolver(sid, "bR1"))
+
+    await _monitor(layer, sid, chat_id)
+
+    assert len(layer.sends) == 1 and "bR1 — build" in layer.sends[0]
+    rows = _rows(chat_id)
+    assert rows[0][:2] == ("event", "bg_command_nudge")
+    assert [r for r in rows if r[0] == "assistant"] == [("assistant", "", "reviewed")]
+    assert (chat_id, "streaming") in review_env.statuses
+    assert (chat_id, "ready") in review_env.statuses
+    assert (task_store.get_chat(chat_id) or {}).get("last_response_at")
+
+
+class _BlipReviewLayer(_ReviewLayer):
+    """The session's machine drops: the session reads gone while its reconnect
+    grace holds it (``away`` looks), then it is back or not, and its process
+    answers the probe."""
+
+    def __init__(self, on_drain, *, away: int, back: bool = True, probe_dead: bool = False):
+        super().__init__(on_drain)
+        self.away, self.back, self.probe_dead = away, back, probe_dead
+
+    async def is_session_alive(self, session_id: str) -> bool:
+        return self.away <= 0 and self.back
+
+    def is_session_grace_held(self, session_id: str) -> bool:
+        if self.away > 0:
+            self.away -= 1
+            return True
+        return False
+
+    async def probe_session_process_dead(self, sid):
+        return self.probe_dead
+
+
+@pytest.fixture
+def fast_grace(monkeypatch):
+    from core.events import pump_bg_monitors
+    monkeypatch.setattr(pump_bg_monitors, "GRACE_POLL_S", 0.001)
+
+
+@pytest.mark.asyncio
+async def test_a_monitor_rides_out_its_machines_blip(review_env, fast_grace):
+    sid, chat_id = "s-rvb1", "c-rvb1"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bRB1", "tuRB1", label="bRB1 — build")
+    layer = _BlipReviewLayer(_resolver(sid, "bRB1"), away=3)
+
+    await _monitor(layer, sid, chat_id)
+
+    assert len(layer.sends) == 1 and "bRB1 — build" in layer.sends[0]
+
+
+@pytest.mark.asyncio
+async def test_an_agent_monitor_rides_out_its_machines_blip(review_env, fast_grace):
+    from core.session.session_state import get_subagent_registry
+    sid, chat_id = "s-rvb2", "c-rvb2"
+    review_env.bind(chat_id, sid)
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-b", "tu-b", label="audit")
+
+    class _Layer(_BlipReviewLayer):
+        def is_session_grace_held(self, session_id: str) -> bool:
+            held = super().is_session_grace_held(session_id)
+            if not held:
+                reg.mark_done("sub-b")      # it finished while the machine was away
+            return held
+
+    layer = _Layer(lambda: False, away=2)
+
+    await _monitor(layer, sid, chat_id, agents=True)
+
+    assert len(layer.sends) == 1 and "audit" in layer.sends[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("back, probe_dead", [(False, False), (True, True)])
+async def test_a_monitor_whose_session_does_not_come_back_exits(
+        review_env, fast_grace, back, probe_dead):
+    sid, chat_id = f"s-rvb3-{back}", f"c-rvb3-{back}"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bRB3", "tuRB3")
+    layer = _BlipReviewLayer(lambda: False, away=2, back=back, probe_dead=probe_dead)
+
+    await _monitor(layer, sid, chat_id)
+
+    assert layer.sends == []
+
+
+@pytest.mark.asyncio
+async def test_a_review_that_starts_new_work_gets_its_own_monitor(review_env, monkeypatch):
+    import asyncio
+    from core.events import pump_bg_monitors
+    sid, chat_id = "s-rv2", "c-rv2"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bR2", "tuR2", label="bR2 — build")
+    real = pump_bg_monitors._bg_command_monitor
+    launched: list[tuple[str, str, int]] = []
+
+    async def _recorded(layer, s, c, count):
+        launched.append((s, c, count))
+    monkeypatch.setattr(pump_bg_monitors, "_bg_command_monitor", _recorded)
+    layer = _ReviewLayer(_resolver(sid, "bR2"), during_turn=lambda: get_bg_command_registry(
+        sid).register_spawn("bR2b", "tuR2b", label="bR2b — deploy"))
+
+    await asyncio.wait_for(real(layer, sid, chat_id, 1), timeout=10)
+    await asyncio.sleep(0)
+
+    assert launched == [(sid, chat_id, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag, kw", [
+    ("worker", {"delegate_role": "worker"}),
+    ("task", {"source_type": "task"}),
+])
+async def test_a_worker_or_task_chat_outside_a_report_gets_the_chat_turn(review_env, tag, kw):
+    sid, chat_id = f"s-rv1-{tag}", f"c-rv1-{tag}"
+    review_env.bind(chat_id, sid, **kw)
+    get_bg_command_registry(sid).register_spawn("bR1w", "tuR1w", label="bR1w — build")
+    layer = _ReviewLayer(_resolver(sid, "bR1w"))
+
+    await _monitor(layer, sid, chat_id)
+
+    assert len(layer.sends) == 1
+    assert (chat_id, "streaming") in review_env.statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag, kw", [
+    ("meeting", {"row_sid": "s-the-chats-own"}),       # a participant's session
+    ("phone", {"source_type": "phone", "owner": "phone"}),
+])
+async def test_elsewhere_the_review_is_the_direct_send(review_env, tag, kw):
+    sid, chat_id = f"s-rv3-{tag}", f"c-rv3-{tag}"
+    review_env.bind(chat_id, sid, **kw)
+    get_bg_command_registry(sid).register_spawn("bR3", "tuR3", label="bR3 — build")
+    layer = _ReviewLayer(_resolver(sid, "bR3"))
+
+    await _monitor(layer, sid, chat_id)
+
+    assert len(layer.sends) == 1
+    assert ("assistant", "", "reviewed") in _rows(chat_id)
+    assert not [s for s in review_env.statuses if s[0] == chat_id]
+
+
+class _HeldPump:
+    """A pump holding the chat that drains no system prompts; ``hold`` is how
+    long it keeps the chat, ``on_end`` what its turn did."""
+
+    def __init__(self, chat_id: str, hold: float = 0.0, on_end=None):
+        import asyncio
+        from core.events.stream_pump import _active_pumps
+        self.is_done = False
+
+        async def _run():
+            await asyncio.sleep(hold)
+            if on_end:
+                on_end()
+            self.is_done = True
+            if _active_pumps.get(chat_id) is self and hold:
+                _active_pumps.pop(chat_id, None)
+        self._task = asyncio.ensure_future(_run())
+        _active_pumps[chat_id] = self
+
+
+@pytest.mark.asyncio
+async def test_a_consumer_pump_takes_the_review(review_env, monkeypatch):
+    from core.events import pump_bg_monitors
+    sid, chat_id = "s-rv4", "c-rv4"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bR4", "tuR4", label="bR4 — build")
+    queued: list[str] = []
+    # The monitor's own Path 2 finds no consumer; the review round does.
+    monkeypatch.setattr(pump_bg_monitors, "queue_pump_prompt",
+                        lambda cid, text, system=False: queued.append(text) or len(queued) > 1)
+    held = _HeldPump(chat_id, hold=60)
+    layer = _ReviewLayer(_resolver(sid, "bR4"))
+
+    await _monitor(layer, sid, chat_id)
+    held._task.cancel()
+
+    assert layer.sends == [] and len(queued) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pump_that_holds_the_chat_is_waited_for(review_env):
+    sid, chat_id = "s-rv5", "c-rv5"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bR5", "tuR5", label="bR5 — build")
+    _HeldPump(chat_id, hold=0.2)
+    layer = _ReviewLayer(_resolver(sid, "bR5"))
+
+    await _monitor(layer, sid, chat_id)
+
+    assert len(layer.sends) == 1
+    assert (chat_id, "streaming") in review_env.statuses
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_read_the_completion_meanwhile_ends_the_review(review_env):
+    from core.events.bg_command_state import reset_bg_command_registry
+    sid, chat_id = "s-rv6", "c-rv6"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bR6", "tuR6", label="bR6 — build")
+    _HeldPump(chat_id, hold=0.2, on_end=lambda: reset_bg_command_registry(sid))
+    layer = _ReviewLayer(_resolver(sid, "bR6"))
+
+    await _monitor(layer, sid, chat_id)
+
+    assert layer.sends == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("self_wakes, reviewed", [(True, False), (False, True)])
+async def test_an_agent_review_after_another_turn_follows_the_engine(
+        review_env, monkeypatch, self_wakes, reviewed):
+    from core.events import pump_bg_monitors
+    monkeypatch.setattr(pump_bg_monitors, "WAKE_GRACE_S", 0.05)
+    sid, chat_id = f"s-rv7-{self_wakes}", f"c-rv7-{self_wakes}"
+    # The engine decides (``runtime.self_wakes``), read from the chat's.
+    review_env.bind(chat_id, sid,
+                    execution_path="claude-code-cli" if self_wakes else "codex-cli")
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("aR7", "tuaR7", label="aR7 — research")
+    reg.mark_done("aR7")
+    # Holds past the monitor's wake grace (one 0.5 s drain pass), so the
+    # review meets the pump.
+    _HeldPump(chat_id, hold=2.0)
+    layer = _ReviewLayer(lambda: False, self_wakes=self_wakes)
+
+    await _monitor(layer, sid, chat_id, agents=True)
+
+    assert bool(layer.sends) is reviewed
+
+
+@pytest.mark.asyncio
+async def test_a_chat_busy_for_every_round_logs_once(review_env, monkeypatch, caplog):
+    import logging
+    from core.events import pump_bg_monitors
+    monkeypatch.setattr(pump_bg_monitors, "REVIEW_WAIT_S", 0.05)
+    sid, chat_id = "s-rv8", "c-rv8"
+    review_env.bind(chat_id, sid)
+    get_bg_command_registry(sid).register_spawn("bR8", "tuR8", label="bR8 — build")
+    held = _HeldPump(chat_id, hold=60)
+    layer = _ReviewLayer(_resolver(sid, "bR8"))
+
+    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+        await _monitor(layer, sid, chat_id)
+    held._task.cancel()
+
+    assert layer.sends == []
+    assert len([r for r in caplog.records if "stayed busy" in r.getMessage()]) == 1
+
+
+# ---------------------------------------------------------------------------
+# A review owed while a run on the chat or its session owes its report: it
+# waits for the report window, then gives only what is still owed.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fast_window(monkeypatch):
+    from core.events import pump_bg_monitors
+    monkeypatch.setattr(pump_bg_monitors, "REPORT_POLL_S", 0.01)
+
+
+async def _release_after(key: str, delay: float, during=None) -> None:
+    import asyncio
+    from services.scheduler import lanes
+    await asyncio.sleep(delay)
+    if during:
+        during()
+    lanes.release_report(key)
+
+
+@pytest.mark.asyncio
+async def test_a_review_waits_for_the_report_window_then_runs(review_env, fast_window):
+    import asyncio
+    from services.scheduler import lanes
+    sid, chat_id = "s-rw1", "c-rw1"
+    review_env.bind(chat_id, sid, delegate_role="worker")
+    get_bg_command_registry(sid).register_spawn("bW1", "tuW1", label="bW1 — build")
+    layer = _ReviewLayer(_resolver(sid, "bW1"))
+    lanes.hold_report(chat_id)
+    sends_in_window: list[int] = []
+    releaser = asyncio.ensure_future(_release_after(
+        chat_id, 0.3, during=lambda: sends_in_window.append(len(layer.sends))))
+
+    await _monitor(layer, sid, chat_id)
+    await releaser
+
+    assert sends_in_window == [0]                 # nothing ran inside the window
+    assert len(layer.sends) == 1 and "bW1 — build" in layer.sends[0]
+    assert (chat_id, "streaming") in review_env.statuses   # the chat's own turn
+
+
+@pytest.mark.asyncio
+async def test_a_command_the_runs_producer_reviewed_is_not_reviewed_again(
+        review_env, fast_window):
+    import asyncio
+    from services.scheduler import lanes
+    sid, chat_id = "s-rw2", "c-rw2"
+    review_env.bind(chat_id, sid, delegate_role="worker")
+    reg = get_bg_command_registry(sid)
+    reg.register_spawn("bW2", "tuW2", label="bW2 — build")
+    layer = _ReviewLayer(_resolver(sid, "bW2"))
+    lanes.hold_report(sid)
+    releaser = asyncio.ensure_future(_release_after(sid, 0.3, during=reg.clear_unsurfaced))
+
+    await _monitor(layer, sid, chat_id)
+    await releaser
+
+    assert layer.sends == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer_named_it", [True, False])
+async def test_an_inherited_codex_agent_is_reviewed_exactly_once(
+        review_env, fast_window, producer_named_it):
+    import asyncio
+    from core.session.session_state import get_subagent_registry
+    from services.scheduler import lanes
+    sid, chat_id = f"s-rw3-{producer_named_it}", f"c-rw3-{producer_named_it}"
+    review_env.bind(chat_id, sid, delegate_role="worker", execution_path="codex-cli")
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-c", "sub-c", label="audit")
+    reg.mark_done("sub-c")
+    layer = _ReviewLayer(lambda: False)
+    lanes.hold_report(chat_id)
+    during = (lambda: reg.mark_reviewed({"sub-c"})) if producer_named_it else None
+    releaser = asyncio.ensure_future(_release_after(chat_id, 0.3, during=during))
+
+    await _monitor(layer, sid, chat_id, agents=True)
+    await releaser
+
+    assert len(layer.sends) == (0 if producer_named_it else 1)
+    assert "sub-c" in reg.reviewed
+
+
+@pytest.mark.asyncio
+async def test_a_claude_agent_is_not_reviewed_after_the_window(review_env, fast_window):
+    import asyncio
+    from core.session.session_state import get_subagent_registry
+    from services.scheduler import lanes
+    sid, chat_id = "s-rw4", "c-rw4"
+    review_env.bind(chat_id, sid, delegate_role="worker", execution_path="claude-code-cli")
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-k", "tu-k", label="probe")
+    reg.mark_done("sub-k")
+    layer = _ReviewLayer(lambda: False)
+    lanes.hold_report(chat_id)
+    releaser = asyncio.ensure_future(_release_after(chat_id, 0.3))
+
+    await _monitor(layer, sid, chat_id, agents=True)
+    await releaser
+
+    assert layer.sends == []

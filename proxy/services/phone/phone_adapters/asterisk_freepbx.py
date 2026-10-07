@@ -27,6 +27,8 @@ from __future__ import annotations
 import logging
 import uuid
 
+from adapters.phone import is_outbound
+
 from .ami import AMIClient
 from .base import (
     BootstrapResult,
@@ -122,12 +124,12 @@ class AsteriskFreePBXAdapter(PhoneServerAdapter):
 
     # -- Route provisioning -------------------------------------------------
     async def provision_route(self, route: dict) -> RouteHandle:
-        if route.get("direction", "inbound") == "outbound":
+        if is_outbound(route.get("direction")):
             return self._outbound_handle()
         return await self._provision_inbound(route)
 
     async def deprovision_route(self, route: dict) -> None:
-        if route.get("direction", "inbound") == "outbound":
+        if is_outbound(route.get("direction")):
             return
         number = self._route_number(route)
         if not number:

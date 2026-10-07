@@ -456,7 +456,7 @@ class TestInstallEnvironment:
 
 class TestBinaryOnlyPython:
     @pytest.mark.asyncio
-    async def test_pypi_install_is_binary_only_with_declared_exceptions(self, tmp_path, monkeypatch):
+    async def test_pypi_install_is_binary_only(self, tmp_path, monkeypatch):
         calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
         await mcp_installer.install_mcp(
             _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
@@ -464,7 +464,7 @@ class TestBinaryOnlyPython:
         )
         pip = calls[1]["argv"]
         assert "--only-binary=:all:" in pip
-        assert pip[pip.index("--no-binary") + 1] == "antlr4-python3-runtime"
+        assert "--no-binary" not in pip
         assert pip[-1] == "unifi-network-mcp==1.0.0"
 
     @pytest.mark.asyncio
@@ -632,3 +632,272 @@ class TestVenvRemovalOffTheLoop:
         with pytest.raises(self._Stop):
             await mcp_installer.install_mcp(mcp_dir, "python", source)
         assert seen == [False]
+
+
+# ---------------------------------------------------------------------------
+# The install timeout bounds the whole run of every subprocess, not its spawn:
+# a hung child is killed with its whole process tree, reaped, and the timeout
+# reaches the caller's rollback.
+# ---------------------------------------------------------------------------
+
+import sys
+import textwrap
+
+
+def _tool(path: Path, *, hang_on: str = "", body: str = "exit 0") -> Path:
+    """A stand-in executable that records its pid in ``<path>.pids`` and, when
+    its argument line holds ``hang_on``, starts a child that keeps the output
+    pipe open and hangs itself; otherwise it runs ``body``."""
+    pids = path.with_name(path.name + ".pids")
+    hang = ""
+    if hang_on:
+        hang = (f'case " $* " in *" {hang_on} "*) sleep 20 & echo $! >> "{pids}"; '
+                f'sleep 20; exit 0;; esac\n')
+    path.write_text(f'#!/bin/sh\necho $$ >> "{pids}"\n{hang}{body}\n')
+    path.chmod(0o755)
+    return path
+
+
+def _recorded_pids(tmp_path: Path) -> list[int]:
+    return [int(x) for f in tmp_path.rglob("*.pids") for x in f.read_text().split()]
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+
+
+async def _none_alive(pids: list[int]) -> bool:
+    for _ in range(40):
+        if not any(_alive(p) for p in pids):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+_UV_OK = ('case "$1" in venv) for a; do last="$a"; done; mkdir -p "$last/bin"; exit 0;; '
+          'pip) exit 0;; esac')
+_UV_FLOOR = ('case "$1" in venv) for a; do last="$a"; done; mkdir -p "$last/bin"; exit 0;; '
+             'pip) echo "the current Python version (3.10.12) does not satisfy Python>=3.11"; '
+             'exit 1;; esac')
+_NPM_OK = ('mkdir -p node_modules/pkg && printf \'{"version":"1.0.0"}\' > '
+           'node_modules/pkg/package.json')
+
+
+def _hung_site(site: str, tmp_path: Path, monkeypatch):
+    """The install call whose ``site`` subprocess hangs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '/usr/bin')}")
+    if site in ("npm install", "git apply"):
+        mcp_dir = tmp_path / "mcps" / "community" / "node-mcp"
+        mcp_dir.mkdir(parents=True)
+        _tool(bin_dir / "npm", hang_on="install" if site == "npm install" else "", body=_NPM_OK)
+        if site == "git apply":
+            (mcp_dir / "patches").mkdir()
+            (mcp_dir / "patches" / "pkg+1.0.0.patch").write_text(_PATCH)
+            git = _tool(bin_dir / "git", hang_on="apply")
+            monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: str(git) if n == "git" else None)
+        return mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0", timeout=1)
+    if site in ("pypi venv", "pypi pip install"):
+        uv = _tool(bin_dir / "uv", hang_on="venv" if site == "pypi venv" else "pip install", body=_UV_OK)
+        return mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:ha-mcp@6.7.0", uv_bin=str(uv), timeout=1)
+    mcp_dir = tmp_path / "mcps" / "custom" / "bundled"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "requirements.txt").write_text("x\n")
+    hang_on, body = {
+        "bundled venv": ("venv", _UV_OK),
+        "requirements install": ("pip install", _UV_OK),
+        "python floor retry venv": ("venv --python", _UV_FLOOR),
+    }[site]
+    uv = _tool(bin_dir / "uv", hang_on=hang_on, body=body)
+    return mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=str(uv), timeout=1)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+class TestInstallTimeout:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("site", [
+        "npm install", "git apply", "pypi venv", "pypi pip install",
+        "bundled venv", "requirements install", "python floor retry venv",
+    ])
+    async def test_a_hung_subprocess_is_killed_with_its_tree_and_times_out(
+            self, tmp_path, monkeypatch, site):
+        install = _hung_site(site, tmp_path, monkeypatch)
+        with pytest.raises(asyncio.TimeoutError, match="did not finish within 1 s"):
+            await asyncio.wait_for(install, 8)
+        pids = _recorded_pids(tmp_path)
+        assert len(pids) >= 2, pids  # the hung tool and the child it started
+        assert await _none_alive(pids), [p for p in pids if _alive(p)]
+
+    @pytest.mark.asyncio
+    async def test_the_child_runs_in_its_own_process_group(self, tmp_path, monkeypatch):
+        seen: list[dict] = []
+        real = asyncio.create_subprocess_exec
+
+        async def _spawn(*argv, **kw):
+            seen.append(kw)
+            return await real(*argv, **kw)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        rc, out = await mcp_installer._run_bounded(
+            ["sh", "-c", "echo hi"], cwd=str(tmp_path), env=dict(os.environ), timeout=5)
+        assert (rc, out.strip()) == (0, "hi")
+        assert seen[0]["start_new_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_install_kills_its_child(self, tmp_path, monkeypatch):
+        install = _hung_site("npm install", tmp_path, monkeypatch)
+        task = asyncio.ensure_future(install)
+        for _ in range(100):
+            if len(_recorded_pids(tmp_path)) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        pids = _recorded_pids(tmp_path)
+        assert await _none_alive(pids), [p for p in pids if _alive(p)]
+
+    def test_a_timeout_leaves_no_zombie_under_a_reaping_parent(self, tmp_path):
+        """Where the proxy is the reaper of last resort (PID 1 of a container),
+        the killed child's own children are its children once their parent
+        dies: they are reaped, not left as zombies."""
+        script = _tool(tmp_path / "hang", hang_on="go")
+        code = textwrap.dedent(f"""
+            import asyncio, ctypes, importlib.util, os, sys
+            ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+            spec = importlib.util.spec_from_file_location("inst", {str(Path(mcp_installer.__file__))!r})
+            inst = importlib.util.module_from_spec(spec)
+            sys.modules["inst"] = inst
+            spec.loader.exec_module(inst)
+
+            def children():
+                me, out = os.getpid(), []
+                for d in os.listdir("/proc"):
+                    if d.isdigit():
+                        try:
+                            stat = open(f"/proc/{{d}}/stat").read()
+                        except OSError:
+                            continue
+                        fields = stat.rsplit(")", 1)[1].split()
+                        if int(fields[1]) == me:
+                            out.append((int(d), fields[0]))
+                return out
+
+            async def main():
+                try:
+                    await inst._run_bounded([{str(script)!r}, "go"], cwd={str(tmp_path)!r},
+                                            env=dict(os.environ), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+                print(children())
+
+            asyncio.run(main())
+        """)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "[]", r.stdout
+
+
+class TestWindowsTreeKill:
+    @pytest.mark.asyncio
+    async def test_the_tree_is_killed_by_taskkill_then_the_child_itself(self, monkeypatch):
+        """``cmd /c npm`` leaves npm running when only cmd is killed: the whole
+        tree goes through ``taskkill /T /F``, then the child is killed and
+        reaped whatever taskkill did."""
+        proc = await asyncio.create_subprocess_exec(
+            "sleep", "20", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        ran: list[list[str]] = []
+        monkeypatch.setattr(mcp_installer.sys, "platform", "win32")
+        monkeypatch.setattr(mcp_installer.subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+        await mcp_installer._kill_tree(proc)
+        assert ran == [["taskkill", "/T", "/F", "/PID", str(proc.pid)]]
+        assert proc.returncode is not None
+
+
+# ---------------------------------------------------------------------------
+# source_build: a listed package installs from a wheel when one exists; only a
+# wheels-only resolve that fails on it retries it from source.
+# ---------------------------------------------------------------------------
+
+_NO_WHEEL = (b"  x No solution found when resolving dependencies:\n"
+             b"  Because antlr4-python3-runtime==4.13.2 has no usable wheels and building "
+             b"from source is disabled, we can conclude that unifi-network-mcp==1.0.0 "
+             b"cannot be used.\n")
+_NO_WHEEL_2 = (b"  x No solution found when resolving dependencies:\n"
+               b"  Because pycairo==1.26.0 has no usable wheels and building from source "
+               b"is disabled, we can conclude that unifi-network-mcp==1.0.0 cannot be used.\n")
+
+
+def _no_binary(argv: list[str]) -> list[str]:
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "--no-binary"]
+
+
+class TestSourceBuildFallback:
+    @pytest.mark.asyncio
+    async def test_a_listed_package_with_a_wheel_installs_from_the_wheel(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
+            uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime"],
+        )
+        assert r.ok, r.log
+        assert len(calls) == 2
+        assert "--only-binary=:all:" in calls[1]["argv"]
+        assert _no_binary(calls[1]["argv"]) == []
+
+    @pytest.mark.asyncio
+    async def test_a_listed_package_the_wheels_only_resolve_fails_on_is_built(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, _NO_WHEEL), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
+            uv_bin=_fake_uv(tmp_path), source_build=["Antlr4_Python3.Runtime", "pycairo"],
+        )
+        assert r.ok, r.log
+        assert len(calls) == 3
+        retry = calls[2]["argv"]
+        assert "--only-binary=:all:" in retry
+        assert _no_binary(retry) == ["Antlr4_Python3.Runtime"]
+        assert retry[-1] == "unifi-network-mcp==1.0.0"
+
+    @pytest.mark.asyncio
+    async def test_each_listed_package_is_added_only_when_the_resolve_names_it(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(
+            monkeypatch, [_Proc(0), _Proc(1, _NO_WHEEL), _Proc(1, _NO_WHEEL_2), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
+            uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime", "pycairo"],
+        )
+        assert r.ok, r.log
+        assert [_no_binary(c["argv"]) for c in calls[1:]] == [
+            [], ["antlr4-python3-runtime"], ["antlr4-python3-runtime", "pycairo"]]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_that_names_no_listed_package_is_not_retried(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, _NO_WHEEL_2)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
+            uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime"],
+        )
+        assert r.ok is False
+        assert len(calls) == 2
+        assert "pycairo" in r.log
+
+    @pytest.mark.asyncio
+    async def test_a_python_floor_is_retried_before_any_source_build(self, tmp_path, monkeypatch):
+        floor = (b"Because the current Python version (3.10.12) does not satisfy Python>=3.13 "
+                 b"and unifi-network-mcp==1.0.0 depends on Python>=3.13, we can conclude that "
+                 b"unifi-network-mcp==1.0.0 cannot be used.\n")
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, floor), _Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
+            uv_bin=_fake_uv(tmp_path), source_build=["unifi-network-mcp"],
+        )
+        assert r.ok, r.log
+        assert calls[2]["argv"][1:4] == ["venv", "--python", ">=3.13"]
+        assert all(_no_binary(c["argv"]) == [] for c in calls)

@@ -6,7 +6,11 @@ import { getFileExtension } from '../../lib/fileTypes'
 interface Props {
   filename: string
   onClose: () => void
-  children: ReactNode
+  children?: ReactNode
+  /** The body as a slot: a caller that presents its own element over it
+   * (the document pane's editor, which must not reload) gets the body
+   * element and renders no children. */
+  slotRef?: (el: HTMLDivElement | null) => void
   /** Optional download URL — if set, a download button appears in the chrome. */
   downloadUrl?: string
   /** If set, a reload button appears; only meaningful for live (Collabora) content. */
@@ -43,6 +47,7 @@ export default function FilePreviewPortal({
   onReload,
   headerExtra,
   bodyBg = 'bg-black/95',
+  slotRef,
 }: Props) {
   useEffect(() => {
     const pop = pushEscHandler(onClose)
@@ -112,7 +117,7 @@ export default function FilePreviewPortal({
         </div>
       </div>
       {/* Body */}
-      <div className="flex-1 min-h-0">{children}</div>
+      <div ref={slotRef} data-preview-slot={slotRef ? '' : undefined} className="flex-1 min-h-0">{children}</div>
     </div>,
     document.body,
   )

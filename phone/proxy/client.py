@@ -576,6 +576,29 @@ async def report_call(payload: dict) -> None:
         logger.warning(f"Call report failed: {e}")
 
 
+async def fetch_pin_failures(window_s: int) -> list[dict] | None:
+    """The inbound calls of the last ``window_s`` seconds that entered the
+    PIN gate (``GET /v1/phone/pin-failures``), for the lockout windows after
+    a restart; None when the proxy did not answer (the caller tries again
+    later). Same short-lived client and auth as ``report_call``."""
+    try:
+        async with httpx.AsyncClient(
+            base_url=config.PROXY_URL,
+            timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+        ) as http:
+            resp = await http.get(
+                "/v1/phone/pin-failures",
+                params={"window_s": window_s},
+                headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
+            )
+            resp.raise_for_status()
+            calls = resp.json().get("calls")
+            return calls if isinstance(calls, list) else None
+    except Exception as e:
+        logger.warning(f"PIN failure history unavailable: {e}")
+        return None
+
+
 async def report_turn_classifier_usage(
     *, agent: str, model: str, input_tokens: int, output_tokens: int,
     session_id: str = "",

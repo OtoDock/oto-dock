@@ -21,6 +21,7 @@ import config
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from auth.session_token import create_session_token, validate_session_token
+from tests.conftest import live_session_token
 from core.session import session_state
 
 
@@ -137,7 +138,7 @@ class TestPrincipalResolution:
 
     @pytest.mark.asyncio
     async def test_session_token_principal_resolves_off_loop(self, temp_db, loop_db_guard):
-        token = create_session_token(str(uuid.uuid4()), "support", "user-admin")
+        token = live_session_token(str(uuid.uuid4()), "support", "user-admin")
         with loop_db_guard.active():
             u = await get_current_user(_request_with_bearer(token))
         assert u is not None and u.sub == "user-admin" and u.is_api_key
@@ -146,7 +147,7 @@ class TestPrincipalResolution:
 class TestPrincipal:
     @pytest.mark.asyncio
     async def test_no_user_token_with_claim_is_external(self, temp_db):
-        token = create_session_token(str(uuid.uuid4()), "support", external="phone:+3021")
+        token = live_session_token(str(uuid.uuid4()), "support", external="phone:+3021")
         u = await get_current_user(_request_with_bearer(token))
         assert u is not None
         assert u.is_no_user_session and u.is_external
@@ -156,7 +157,7 @@ class TestPrincipal:
 
     @pytest.mark.asyncio
     async def test_user_tied_token_with_claim_is_not_external(self, temp_db):
-        token = create_session_token(str(uuid.uuid4()), "support", "user-admin",
+        token = live_session_token(str(uuid.uuid4()), "support", "user-admin",
                                      external="phone:+3021")
         u = await get_current_user(_request_with_bearer(token))
         assert u is not None and u.sub == "user-admin"
@@ -165,13 +166,13 @@ class TestPrincipal:
 
     @pytest.mark.asyncio
     async def test_plain_token_is_untouched(self, temp_db):
-        token = create_session_token(str(uuid.uuid4()), "support")
+        token = live_session_token(str(uuid.uuid4()), "support")
         u = await get_current_user(_request_with_bearer(token))
         assert u is not None and not u.is_external and u.external_claim == ""
 
     @pytest.mark.asyncio
     async def test_malformed_claim_is_ignored(self, temp_db):
-        token = create_session_token(str(uuid.uuid4()), "support", external="phone:not a number")
+        token = live_session_token(str(uuid.uuid4()), "support", external="phone:not a number")
         u = await get_current_user(_request_with_bearer(token))
         assert u is not None and not u.is_external and u.external_claim == ""
 

@@ -95,6 +95,23 @@ def delete_all() -> int:
         return cur.rowcount
 
 
+def list_pin_attempts(since_iso: str, *, limit: int = 5000) -> list[dict]:
+    """The inbound calls that started at or after ``since_iso`` and entered
+    the PIN gate (``pin_attempts > 0``), oldest first: what the daemon
+    replays into its lockout windows after a restart. Counts and outcomes
+    only; no digit is ever stored."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT from_number, route_id, outcome, pin_attempts, started_at, ended_at
+               FROM phone_call_log
+               WHERE started_at >= %s AND pin_attempts > 0 AND direction = 'inbound'
+               ORDER BY started_at, id
+               LIMIT %s""",
+            (since_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def list_calls(
     route_id: str | None = None, *, offset: int = 0, limit: int = 50,
 ) -> tuple[list[dict], int]:

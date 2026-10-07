@@ -1,7 +1,7 @@
 /**
  * AgentsPage — the top bar over the map. The 3D scene is always dark, so in
- * map view the bar and the Shared-with-me strip sit inside a scoped `.dark`
- * wrapper; the grid and departments views get no wrapper box at all.
+ * map view the bar sits inside a scoped `.dark` wrapper; the grid and
+ * departments views get no wrapper box at all.
  * jsdom has no WebGL, so the map is stubbed to keep the page in map view.
  */
 import { describe, expect, it, vi } from 'vitest'

@@ -12,6 +12,18 @@ from pathlib import Path
 from adapters.base import ClientAdapter
 
 
+# A phone call's direction: a route's and a call log row's ``direction``, a
+# phone session's ``call_type``. A missing direction is inbound.
+INBOUND = "inbound"
+OUTBOUND = "outbound"
+DIRECTIONS = (INBOUND, OUTBOUND)
+
+
+def is_outbound(direction: str | None) -> bool:
+    """Whether a call direction is outbound; a missing one is inbound."""
+    return (direction or INBOUND) == OUTBOUND
+
+
 # Common call rules — injected into the system prompt for all phone sessions.
 PHONE_CONTEXT = (
     "You are on a live phone call. This is voice — not chat.\n"
@@ -58,7 +70,7 @@ class PhoneAdapter(ClientAdapter):
     name = "phone"
 
     @staticmethod
-    def get_phone_context(call_type: str = "inbound") -> str:
+    def get_phone_context(call_type: str = INBOUND) -> str:
         """Return the call-context system-prompt block for the call direction.
 
         Inbound and outbound are INDEPENDENT full templates (not base + extra):
@@ -69,7 +81,7 @@ class PhoneAdapter(ClientAdapter):
         """
         from storage.database import get_platform_setting
 
-        if call_type == "outbound":
+        if is_outbound(call_type):
             return get_platform_setting("phone_context_outbound") or PHONE_OUTBOUND
         return get_platform_setting("phone_context_inbound") or PHONE_CONTEXT
 

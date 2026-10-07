@@ -42,9 +42,9 @@ Two places, same platform:
   endpoint by URL), plus per-provider model lists and pricing.
 
 Each engine has its own default model, chosen by tier, which an agent on **Auto** runs:
-Claude Opus 5.5 on Claude Code, GPT-6 Sol on Codex, Sonnet 5 on Direct LLM. Every model
-list shows its tier. Since 1.7 Claude Opus 5.5 replaces Opus 5, and GPT-6 Sol and GPT-6
-Luna replace their GPT-5.6 versions; pins on the old ids move over at the next start.
+Claude Opus 5.5 on Claude Code, GPT-6.1 Sol on Codex, Sonnet 5.5 on Direct LLM. Every
+model list shows its tier. Since 1.7.1 Claude Sonnet 5.5 replaces Sonnet 5 and GPT-6.1
+Sol replaces GPT-6 Sol; pins on the old ids move over at the next start.
 
 Routing rule: a user's own chats/tasks run on **their own** connections first; anything
 that belongs to an *agent* (agent-scope tasks, shared agents, meetings, triggers, phone
@@ -108,11 +108,20 @@ the same dashboard. Pairing is outbound-only (no open ports) and needs
   tab group inside the Chrome/Edge/Brave the machine's user is signed into, through
   the Playwright Extension; paste the extension's token on the card so unattended
   sessions such as tasks connect without a click). Only the machine's owner can
-  switch a user-paired machine to its own browser.
+  switch a user-paired machine to its own browser. Browser control reaches local
+  services only within the admin's site list, and its run-code tool asks or runs by the
+  chat's permission mode like its other tools.
 - Files sync **both ways** automatically; generated build directories are auto-skipped;
-  conflicts and deletes land in the workspace **Recover bin** (7 days). Machine cards
-  show live status, sessions/capacity, and the CLI versions the machine runs
-  (highlighted on drift).
+  conflicts and deletes land in the workspace **Recover bin** (7 days). Transfers are
+  paced so a slow uplink keeps its connection, and a large file keeps going instead of
+  failing on a timeout. Machine cards show live status, sessions/capacity, and the CLI
+  versions the machine runs (highlighted on drift).
+- **Updates**: with automatic updates on (the machine card, admin), the machine's agent
+  software updates itself at its next reconnect after a platform upgrade. The update
+  ends every session running on that machine, so a turn in flight there stops with a
+  card, and the chat continues from the next message. The Claude Code and Codex CLIs
+  move to the platform's pins on every reconnect; the machine's other tools stay as
+  they are.
 - Kill switch: **Setup → System Settings → "Allow users to pair their own remote
   machines"** *(admin)*; offline-fallback behavior lives next to it. An admin can also
   remove any one user's machine from **Admin → Remote Machines**; its owner is told.

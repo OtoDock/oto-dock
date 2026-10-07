@@ -36,6 +36,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("claude-proxy.webhook-providers")
 
 
+#: Providers whose events run large (a big push, an issue with a long
+#: history): a signed delivery of theirs may use the larger webhook cap
+#: (``MAX_WEBHOOK_SIGNED_BODY_BYTES``, ``api/events/webhook_body.py``). GitLab
+#: and Jira have no provider yet; the cap applies the day one exists.
+LARGE_BODY_PROVIDERS = frozenset({"github", "gitlab", "jira"})
+
 _HARDCODED: dict[str, "WebhookProvider"] = {}
 _MANIFEST_CACHE: dict[str, "WebhookProvider"] = {}
 

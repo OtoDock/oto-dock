@@ -41,8 +41,14 @@ case "$node_path" in
 esac
 
 if ! command -v uv &>/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
+    # The hint names the pin (UV_VERSION in VERSIONS.md), never Astral's latest.
+    uv_pin="$(bash "$PLATFORM_ROOT/scripts/versions.sh" UV_VERSION 2>/dev/null || true)"
     echo "WARNING: uv not found — required for Python MCPs that need a non-system Python version (e.g. ha-mcp)"
-    echo "  Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    if [ -n "$uv_pin" ]; then
+        echo "  Install uv ${uv_pin}, the pin: curl -LsSf https://astral.sh/uv/${uv_pin}/install.sh | sh"
+    else
+        echo "  Install the uv that UV_VERSION in VERSIONS.md names: curl -LsSf https://astral.sh/uv/<UV_VERSION>/install.sh | sh"
+    fi
 fi
 
 # Docker-MCP networking: OtoDock pins the subnet of every per-MCP bridge it

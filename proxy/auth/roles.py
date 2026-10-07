@@ -52,6 +52,10 @@ OWNER_TIER = ("manager", "admin")             # curates config and knowledge
 EDITOR_TIER = ("manager", "editor", "admin")  # automates as the agent, manages its apps
 WORKSPACE_TIER = ("manager", "editor", "contributor", "admin")  # writes the shared workspace
 CREATOR_TIER = ("admin", "creator")           # creates agents, reaches the creator surfaces
+# The per-agent roles a Shared-only agent's rows may hold: every session
+# there runs as the agent, which takes the editor tier, so a lower role
+# would be an assignment that can open no chat.
+SHARED_ONLY_ROLES = ("manager", "editor")
 
 # The effective roles by rank: the order an action floor (``min_role``)
 # is judged in. A word outside the table (NO_ACCESS, a claim's ``none``,
@@ -92,6 +96,12 @@ def can_write_workspace(role: str | None) -> bool:
     policy, the file API, uploads, a paired machine's write-back) and
     nothing under the agent's identity — the contributor's whole grant."""
     return role in WORKSPACE_TIER
+
+
+def allowed_on_shared_only(role: str | None) -> bool:
+    """Whether an assignment row of ``role`` may be written on a
+    Shared-only agent (``SHARED_ONLY_ROLES``)."""
+    return role in SHARED_ONLY_ROLES
 
 
 def rank(role: str | None) -> int:

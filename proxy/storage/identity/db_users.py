@@ -346,6 +346,12 @@ def _cascade_remove_user_scope_items(conn, sub: str, agent: str | None) -> None:
         "AND target = %s",
         (agent, agent, sub),
     )
+    # An app the person accepted into the agent returns to their "Shared
+    # with you" section to place elsewhere (SHARING.md); the read-time
+    # membership join already hides the placement, this keeps the row true.
+    if agent is not None:
+        from storage.sharing import share_store
+        share_store.reap_person_placements(conn, sub, agent)
 
 
 def _remove_user_scope_memory(sub: str, username: str | None, agent: str) -> None:
@@ -475,6 +481,11 @@ def delete_user(sub: str) -> bool:
         for agent in _agent_roles_in(conn, sub):
             _cascade_remove_user_scope_items(conn, sub, agent)
         _cascade_remove_user_scope_items(conn, sub, None)
+        # The apps they placed in agents and departments stay with the
+        # team (SHARING.md): the shares pass to the install owner before
+        # the row cascades the rest.
+        from storage.sharing import share_store
+        share_store.hand_over_team_shares(conn, sub)
         if row and row["username"]:
             conn.execute(
                 """INSERT INTO retired_usernames (username, sub, retired_at, archived_at)
@@ -586,6 +597,16 @@ def maybe_autoset_default_agent(sub: str) -> None:
 # --- Local Auth User Functions ---
 
 
+def email_taken_by_other(email: str, sub: str) -> bool:
+    """Whether another account than ``sub`` already uses ``email`` (any
+    case)."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM users WHERE LOWER(email) = LOWER(%s) AND sub <> %s LIMIT 1",
+            (email, sub),
+        ).fetchone() is not None
+
+
 def get_user_by_email(email: str) -> dict | None:
     """Look up user by email (for local login)."""
     with get_conn() as conn:
@@ -604,9 +625,6 @@ def create_local_user(
 
     Thread-safe: holds connection for the entire check+insert.
     """
-    import uuid
-    sub = f"local:{uuid.uuid4()}"
-    now = datetime.now(timezone.utc).isoformat()
     taken = usernames_on_disk()
     with get_conn() as conn:
         # Check email uniqueness
@@ -615,18 +633,10 @@ def create_local_user(
         ).fetchone()
         if existing:
             raise ValueError(f"Email already in use: {email}")
-        username = _make_username_slug(name or display_name or email.split("@")[0], conn, taken)
         try:
-            conn.execute(
-                """INSERT INTO users
-                   (sub, email, name, role, created_at, last_login, default_agent,
-                    username, display_name, password_hash, auth_provider,
-                    is_owner, must_change_password, password_changed_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (sub, email, name or display_name, role, now, now, "",
-                 username, display_name, password_hash, "local",
-                 is_owner, must_change_password, now),
-            )
+            sub = _insert_local_user(conn, email, name, display_name, role, password_hash,
+                                     is_owner=is_owner,
+                                     must_change_password=must_change_password, taken=taken)
             conn.commit()
         except Exception as e:
             conn.rollback()
@@ -637,6 +647,51 @@ def create_local_user(
                 raise ValueError("Setup already completed") from e
             raise
         return sub
+
+
+def create_first_owner(email: str, display_name: str, password_hash: str) -> str | None:
+    """Create the setup's owner admin, only while no user exists: the
+    owner's sub, or None when a user exists already.
+
+    The count and the insert are one transaction under a table lock that
+    conflicts with every insert into ``users`` (and with itself): a second
+    setup waits for this one and finds its owner, a first SSO login whose
+    insert is in flight is waited for and counted, and one arriving after
+    the lock lands once the owner exists. Readers are not blocked. A writer
+    holding ``users`` past the lock timeout raises ``LockNotAvailable``."""
+    taken = usernames_on_disk()
+    with get_conn() as conn:
+        conn.execute("SET LOCAL lock_timeout = '10s'")
+        conn.execute("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE")
+        if conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"] > 0:
+            conn.rollback()
+            return None
+        sub = _insert_local_user(conn, email, display_name, display_name, "admin", password_hash,
+                                 is_owner=True, must_change_password=False, taken=taken)
+        conn.commit()
+        return sub
+
+
+def _insert_local_user(conn, email: str, name: str, display_name: str, role: str,
+                       password_hash: str, *, is_owner: bool, must_change_password: bool,
+                       taken: frozenset[str]) -> str:
+    """Insert one local account on ``conn`` (the caller commits); returns
+    the generated sub."""
+    import uuid
+    sub = f"local:{uuid.uuid4()}"
+    now = datetime.now(timezone.utc).isoformat()
+    username = _make_username_slug(name or display_name or email.split("@")[0], conn, taken)
+    conn.execute(
+        """INSERT INTO users
+           (sub, email, name, role, created_at, last_login, default_agent,
+            username, display_name, password_hash, auth_provider,
+            is_owner, must_change_password, password_changed_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (sub, email, name or display_name, role, now, now, "",
+         username, display_name, password_hash, "local",
+         is_owner, must_change_password, now),
+    )
+    return sub
 
 
 def mark_default_agents_assigned(sub: str) -> None:
@@ -672,15 +727,28 @@ def is_default_agents_assigned(sub: str) -> bool:
 
 
 def set_user_password(sub: str, password_hash: str) -> None:
-    """Update password hash, clear must_change_password flag."""
+    """Update password hash, clear must_change_password flag. The change
+    ends the person's every sign-in and agent session token minted before
+    it: the password timeline and the token epoch move together."""
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
             "UPDATE users SET password_hash=%s, must_change_password=FALSE, "
-            "password_changed_at=%s WHERE sub=%s",
-            (password_hash, now, sub),
+            "password_changed_at=%s, token_epoch_at=%s WHERE sub=%s",
+            (password_hash, now, now, sub),
         )
         conn.commit()
+
+
+def bump_token_epoch(sub: str) -> str:
+    """Move the person's token epoch to now (an admin's "sign out
+    everywhere"): every session cookie and agent session token minted
+    before it is refused from then on. Returns the stamp."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET token_epoch_at=%s WHERE sub=%s", (now, sub))
+        conn.commit()
+    return now
 
 
 def update_user_email(sub: str, email: str) -> None:
@@ -736,6 +804,21 @@ def record_failed_login(sub: str) -> None:
             "UPDATE users SET failed_login_attempts = failed_login_attempts + 1, "
             "last_failed_login=%s WHERE sub=%s",
             (now, sub),
+        )
+        conn.commit()
+
+
+def undo_failed_login(sub: str) -> None:
+    """Give back one failure the login counted before a password check that
+    never ran (the hash gate was full): one less, and no last failure when
+    it was the only one. One statement, so a failure another attempt
+    counts meanwhile is kept."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET failed_login_attempts = GREATEST(failed_login_attempts - 1, 0), "
+            "last_failed_login = CASE WHEN failed_login_attempts <= 1 THEN NULL "
+            "ELSE last_failed_login END WHERE sub=%s",
+            (sub,),
         )
         conn.commit()
 

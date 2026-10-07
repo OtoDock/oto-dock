@@ -435,9 +435,28 @@ class TestValidateConfigToml:
         assert caplog.records == []
 
     def test_invalid_logs_error(self, tmp_path, caplog):
-        # The runtime validates only where the standard library parses TOML
-        # (3.11+); on the host floor it deliberately skips (warn-only guard).
         pytest.importorskip("tomllib")
+        with caplog.at_level("ERROR", logger="satellite"):
+            _validate_config_toml("bad = \n", tmp_path / "c.toml")
+        assert any("INVALID" in r.message for r in caplog.records)
+
+    def test_the_host_floor_validates_through_tomli(self, tmp_path, caplog, monkeypatch):
+        # 3.10 has no tomllib: the shipped tomli parses there instead of the
+        # check being skipped.
+        import sys
+        import types
+        fake = types.ModuleType("tomli")
+
+        class TOMLDecodeError(ValueError):
+            pass
+
+        def loads(text):
+            raise TOMLDecodeError("Invalid value (at line 1, column 7)")
+
+        fake.TOMLDecodeError = TOMLDecodeError
+        fake.loads = loads
+        monkeypatch.setitem(sys.modules, "tomllib", None)
+        monkeypatch.setitem(sys.modules, "tomli", fake)
         with caplog.at_level("ERROR", logger="satellite"):
             _validate_config_toml("bad = \n", tmp_path / "c.toml")
         assert any("INVALID" in r.message for r in caplog.records)

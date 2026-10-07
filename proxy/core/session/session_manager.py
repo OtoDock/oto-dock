@@ -130,16 +130,6 @@ def engine_layer_for_session(session_id: str) -> ExecutionLayer | None:
     return _LAYERS.get(holder.capabilities_for(session_id).name)
 
 
-def is_session_registered(session_id: str) -> bool:
-    """True while ``session_id`` is a LIVE session in some execution layer's
-    registry (cli / codex / direct / remote). This — not the persisted
-    security context — is the liveness a session-scoped token is checked
-    against (``middleware.external_session_confinement``): the registries
-    are populated at spawn and popped at close, so a token lifted from a
-    session is dead the moment the session ends."""
-    return find_layer_for_session(session_id) is not None
-
-
 # ---------------------------------------------------------------------------
 # SessionManager
 # ---------------------------------------------------------------------------

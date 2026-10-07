@@ -544,23 +544,21 @@ async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], 
     install pip-installs into a venv that matches the platform. Best-effort."""
     spec = f"{target[0]}.{target[1]}"
     # The installer's own scrubbed environment (its allowlisted names, no
-    # configuration file of any package manager), as every other subprocess
-    # of an install gets: no satellite-side variable reaches uv.
-    from .._vendored.mcp_installer import _install_env
-    env = _install_env({
+    # configuration file of any package manager) and its time bound, as every
+    # other subprocess of an install gets: no satellite-side variable reaches uv.
+    from .._vendored import mcp_installer
+    env = mcp_installer._install_env({
         "UV_PYTHON_INSTALL_DIR": str(mcp_dir.parent.parent / ".uv-python"),
         "UV_LINK_MODE": "copy",
     })
     try:
-        proc = await asyncio.create_subprocess_exec(
-            uv_bin, "venv", "--python", spec, str(venv_dir),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+        rc, out = await mcp_installer._run_bounded(
+            [uv_bin, "venv", "--python", spec, str(venv_dir)],
+            cwd=None, env=env, timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
         )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
+        if rc != 0:
             logger.warning(
-                "uv venv --python %s for %s failed: %s",
-                spec, mcp_dir.name, out.decode(errors="replace")[-300:],
+                "uv venv --python %s for %s failed: %s", spec, mcp_dir.name, out[-300:],
             )
     except Exception:
         logger.exception("uv venv --python %s for %s errored", spec, mcp_dir.name)
@@ -580,18 +578,17 @@ async def _reconcile_node_addons(mcp_dir: Path, name: str) -> str | None:
         return None
     logger.info("reconcile: %s node %s→%s — npm rebuild", name, recorded, current)
     try:
-        from .._vendored.mcp_installer import _shell_argv
-        proc = await asyncio.create_subprocess_exec(
-            *_shell_argv(["npm", "rebuild"]), cwd=str(mcp_dir),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        # The packages' lifecycle scripts run here: the installer's
+        # environment and time bound, as for every install subprocess.
+        from .._vendored import mcp_installer
+        rc, out = await mcp_installer._run_bounded(
+            mcp_installer._shell_argv(["npm", "rebuild"]), cwd=str(mcp_dir),
+            env=mcp_installer._install_env(), timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
         )
-        out, _ = await proc.communicate()
-        if proc.returncode == 0:
+        if rc == 0:
             _write_runtime_marker(mcp_dir, node_major=current)
             return "ok-node-rebuild"
-        logger.warning(
-            "npm rebuild for %s failed: %s", name, out.decode(errors="replace")[-300:],
-        )
+        logger.warning("npm rebuild for %s failed: %s", name, out[-300:])
         return "skipped-node-rebuild-fail"
     except Exception:
         logger.exception("npm rebuild for %s errored", name)

@@ -70,6 +70,9 @@ export interface AuthConfig {
   air_gapped: boolean
   relay_available: boolean
   cloud: boolean
+  // The document editor's origin when it has a host of its own (COLLABORA_URL
+  // on another origin); '' in sub-path mode, where it shares the page's.
+  collabora_origin: string
 }
 
 export interface LoginResult {
@@ -94,6 +97,7 @@ export async function fetchAuthConfig(): Promise<AuthConfig> {
       passkeys_enabled: false, passkey_login_mode: 'passwordless',
       passkey_rp_host: '',
       air_gapped: true, relay_available: false, cloud: false,
+      collabora_origin: '',
     }
   }
   return res.json()
@@ -110,11 +114,29 @@ async function openSignInBrowser(url: string): Promise<void> {
   await openNativeBrowser(url, 'auth')
 }
 
+function waitWords(seconds: number): string {
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`
+  const minutes = Math.ceil(seconds / 60)
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`
+}
+
+/** A refused sign-in start, worded for the person: the server's `detail`
+ * (the per-address SSO bound's 429 among them, "Too many sign-ins started…")
+ * with the `Retry-After` wait folded in when the answer carries one, else
+ * `fallback`. */
+async function startRefusal(res: Response, fallback: string): Promise<Error> {
+  const d = await res.json().catch(() => ({}))
+  let message = typeof d?.detail === 'string' && d.detail ? d.detail : fallback
+  const wait = Number(res.headers?.get?.('Retry-After') ?? '')
+  if (Number.isInteger(wait) && wait > 0) message += ` (retry in ${waitWords(wait)})`
+  return new Error(message)
+}
+
 export async function startOidcLogin(mobile?: boolean): Promise<void> {
   const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
   const url = isNative || mobile ? '/auth/oidc-url?mobile=true' : '/auth/oidc-url'
   const res = await fetch(url)
-  if (!res.ok) throw new Error('OIDC not configured')
+  if (!res.ok) throw await startRefusal(res, `Could not start the sign-in (HTTP ${res.status}).`)
   const data = await res.json()
 
   if (isNative && hasNativeBridge()) {
@@ -129,7 +151,7 @@ export async function startLogin(): Promise<void> {
   const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
   const loginUrl = isNative ? '/auth/login?mobile=true' : '/auth/login'
   const res = await fetch(loginUrl)
-  if (!res.ok) throw new Error('Failed to initiate login')
+  if (!res.ok) throw await startRefusal(res, `Could not start the sign-in (HTTP ${res.status}).`)
   const data = await res.json()
 
   if (data.url) {
@@ -158,9 +180,10 @@ export async function handleCallback(code: string, state: string): Promise<Callb
     body: JSON.stringify({ code, state }),
   })
   if (res.status === 403) {
-    // A login: not in any group. A confirm: the provider's answer was not
-    // this account (or not a new login, where one is required); the reason
-    // rides along for the popover.
+    // A login: not in any group, a failed ID-token check, or an unverified
+    // email another account here uses. A confirm: the provider's answer was
+    // not this account (or not a new login, where one is required). The
+    // server's reason rides along as `detail` for the page or the popover.
     const d = await res.json().catch(() => ({}))
     const err = new Error('ACCESS_DENIED') as Error & { detail?: string }
     err.detail = typeof d.detail === 'string' ? d.detail : undefined
@@ -283,6 +306,19 @@ export async function logout(): Promise<void> {
   window.location.href = data.logout_url || '/'
 }
 
+// An admin ends every sign-in and every running session's token of a
+// person; their open tabs close within a moment.
+export async function signOutEverywhere(sub: string): Promise<{ sessions_closed: number }> {
+  const res = await apiFetch(`/v1/admin/users/${encodeURIComponent(sub)}/sign-out-everywhere`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.detail || 'Sign out everywhere failed')
+  }
+  return res.json()
+}
+
 // --- Password reset ---
 
 export async function forgotPassword(email: string): Promise<string> {
@@ -351,8 +387,9 @@ export async function apiFetch(path: string, options: RequestInit = {}): Promise
 // A 401 is not always a lost session: a route that confirms the person at
 // the keyboard (a share link's password, a passkey confirm) answers 401 for a
 // wrong password or an expired confirmation, and the caller shows why. Only a
-// session /auth/me no longer knows sends the tab to the sign-in page.
-async function sessionStillValid(): Promise<boolean> {
+// session /auth/me no longer knows sends the tab to the sign-in page. The
+// dashboard socket asks the same question when the server closes it 4001.
+export async function sessionStillValid(): Promise<boolean> {
   try {
     const me = await fetch('/auth/me', { credentials: 'same-origin' })
     return me.ok

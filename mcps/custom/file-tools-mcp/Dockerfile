@@ -1,6 +1,6 @@
 # The base pin follows VERSIONS.md (PYTHON_IMAGE); the build overlay passes
 # it as a build arg and a bare `docker build` falls back to the default.
-ARG PYTHON_IMAGE=python:3.13.14-slim-bookworm
+ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm
 FROM ${PYTHON_IMAGE}
 
 # LibreOffice (Writer/Calc/Impress only — not the full metapackage)

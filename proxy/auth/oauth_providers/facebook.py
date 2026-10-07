@@ -46,7 +46,8 @@ GRAPH_VERSION = "v26.0"
 def _graph_error(data: dict[str, Any], action: str) -> RuntimeError:
     """Meta nests errors; surface a message the worker can classify. Code 190
     (OAuthException: invalid/expired token) maps to the canonical
-    ``invalid_grant`` marker ``_is_permanent_refresh_error`` looks for."""
+    ``invalid_grant`` marker the refresh worker's ``_permanent_error_code``
+    looks for."""
     err = data.get("error")
     if isinstance(err, dict):
         code = err.get("code")

@@ -45,6 +45,13 @@ SKILL_LOADING_DEFAULT = "on_demand"
 SKILL_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SKILL_ID_MAX_LEN = 64
 
+# A skill's audience names the tier of ``auth/roles.py`` a person needs for
+# the skill to be listed and materialized for them: ``owner`` (manager,
+# admin), ``editor`` (adds editor), ``workspace`` (adds contributor). Empty
+# = everyone. The readers in ``mcp_registry`` judge it when told the person;
+# a skill whose word is outside the three is dropped at parse.
+SKILL_AUDIENCES = ("owner", "editor", "workspace")
+
 
 @dataclass
 class SkillDef:
@@ -53,6 +60,21 @@ class SkillDef:
     description: str = ""
     default_exclude_from: list[str] = field(default_factory=list)
     loading: str = SKILL_LOADING_DEFAULT  # "always" | "on_demand"
+    audience: str = ""  # "" | "owner" | "editor" | "workspace"
+
+
+# ``replaces``: a catalog entry's declaration of the sources it supersedes and
+# the credential keys it renames. Information for the admin's switch decision,
+# never an authorization (COMMUNITY-MARKETPLACE.md "Source changes"). A key is
+# a plain identifier; the platform's control keys start with ``_`` and are
+# never renamed.
+REPLACES_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+@dataclass
+class ReplacesDecl:
+    source: str
+    credentials: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -60,7 +82,8 @@ class ServerConfig:
     # "none"/"none" = CONTEXT-ONLY MCP: no server process at all. The MCP
     # contributes instances (admin UI + per-agent authorization), skills,
     # dynamic prompt context, and network_targets, but emits no mcpServers
-    # entry and never installs on satellites (ssh-hosts is the archetype).
+    # entry and never installs on satellites (a skill package is the shape;
+    # ssh-hosts runs a small stdio server beside its instances and keys).
     runtime: str  # python, node, docker, none
     transport: str  # stdio, sse, none
     command: str = ""
@@ -117,6 +140,14 @@ class CredentialConfig:
     # GenericWebhookProvider + dispatcher walk the manifest at runtime — same
     # pattern as `oauth`. None = MCP doesn't receive vendor webhooks.
     webhooks: dict | None = None
+    # A header-style API key for a vendor-hosted MCP server: ``{name,
+    # value_from, proposed_hosts}``. The credential gateway adds the header
+    # named ``name`` with the value of the declared ``credentials.fields``
+    # key or env-delivered instance field ``value_from`` on the way out;
+    # the manifest proposes the hosts, the admin approves them on the
+    # Security tab under the manifest's name. Validated at parse
+    # (``mcp_manifest_parse._validate_api_key_header``).
+    api_key_header: dict | None = None
     ui_type: str = ""
     has_service_account: bool = False
     app_credential_fields: list[dict[str, str]] = field(default_factory=list)
@@ -328,8 +359,8 @@ class InstanceConfig:
       "config_file" — generate JSON with all matching instances, pass via arg/env (multi-instance MCPs)
       "none"        — no runtime delivery; instances exist for admin UI +
                       per-agent authorization + network_targets only
-                      (context-only MCPs — ssh-hosts consumes its instances
-                      via a dynamic-context provider instead)
+                      (ssh-hosts consumes its instances through a
+                      dynamic-context provider and its key files)
     """
     delivery: str  # "env" | "config_file" | "none"
     fields: list[InstanceFieldDef] = field(default_factory=list)
@@ -609,6 +640,12 @@ class McpManifest:
     author: str = ""
     author_url: str = ""
     assignment_mode: str = "auto"  # "auto" (managers can add) or "explicit" (admin assigns)
+    # The tier of ``auth/roles.py`` a person needs for this MCP to be part of
+    # their session (the skills' vocabulary, ``SKILL_AUDIENCES``); empty admits
+    # everyone. A session the agent runs as itself (agent scope) is not a
+    # person and is admitted. ssh-hosts declares the editor tier: its keys
+    # are the agent's own credentials.
+    audience: str = ""
     # Platform feature this MCP needs before it is assignable / loadable. None for
     # almost every MCP (→ always available, no cost). Known tokens: "audio_transcribe"
     # (a usable STT provider) and "phone_calls" (usable call STT+TTS). Resolved by
@@ -650,6 +687,8 @@ class McpManifest:
     # Tools EXCLUDED from the device auto-approve (still prompt even when the
     # capability is granted) — RCE-class app-connector tools.
     device_high_risk_tools: list[str] = field(default_factory=list)
+    # The sources this entry supersedes, with their credential key renames.
+    replaces: list[ReplacesDecl] = field(default_factory=list)
     patched: bool = False
     patch_note: str | None = None
     manifest_path: Path = field(default_factory=lambda: Path("."))

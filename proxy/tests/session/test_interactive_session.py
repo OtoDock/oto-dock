@@ -378,25 +378,66 @@ class TestInteractiveSession:
 
     async def test_idle_reaper_spares_question_parked_under_cap(self):
         # Parked on an unanswered AskUserQuestion: idle by every byte measure
-        # but waiting on a HUMAN — spared for ONE extra idle window
-        # (_QUESTION_PARK_TIMEOUT_MULT x the admin knob).
+        # but waiting on a person, so spared like a held prompt: until the
+        # session's token ends (24 h after the terminal started, less a
+        # minute), at most session_state.PROMPT_WAIT_S. Far past a few idle
+        # windows; this harness env carries no token, so the terminal's start
+        # plus the token life stands in.
         s = await _register("sid-qpark-spare")
         try:
             s._apply_turn_signal("end_turn", question_pending=True)
-            s.last_activity = time.monotonic() - 150  # > timeout, < 2x timeout
+            s.last_activity = time.monotonic() - 100 * 100  # 100 idle windows
             assert await isess.reap_idle(timeout_s=100) == 0
             assert isess.get("sid-qpark-spare") is s
         finally:
             await s.close()
 
     async def test_idle_reaper_reaps_question_parked_over_cap(self):
-        # Past the extra window an abandoned question no longer holds the slot —
-        # reaped as before (revival-on-answer covers a late reply).
+        # Past the prompt's wait an abandoned question no longer holds the
+        # slot (revival-on-answer covers a late reply).
+        from core.session import session_state
         s = await _register("sid-qpark-cap")
         s._apply_turn_signal("end_turn", question_pending=True)
-        s.last_activity = time.monotonic() - (isess._QUESTION_PARK_TIMEOUT_MULT * 100 + 60)
+        s.last_activity = time.monotonic() - (session_state.PROMPT_WAIT_S + 60)
         assert await isess.reap_idle(timeout_s=100) == 1
         assert isess.get("sid-qpark-cap") is None
+
+    async def test_idle_reaper_spares_a_prompt_waiting_on_a_person(self):
+        # Parity with the CLI, Codex, Direct and remote reapers: a prompt the
+        # platform holds for this session keeps it; the prompt's own wait
+        # bounds the spare.
+        from core.session import session_state
+        s = await _register("sid-prompt-spare")
+        try:
+            s.last_activity = time.monotonic() - 10_000
+            session_state._session_permission_requests["sid-prompt-spare"] = {"r-a1"}
+            session_state._permission_events["r-a1"] = asyncio.Event()
+            assert await isess.reap_idle(timeout_s=100) == 0
+            assert isess.get("sid-prompt-spare") is s
+            session_state._permission_events.pop("r-a1", None)
+            assert await isess.reap_idle(timeout_s=100) == 1
+            assert isess.get("sid-prompt-spare") is None
+        finally:
+            session_state._permission_events.pop("r-a1", None)
+            session_state._session_permission_requests.pop("sid-prompt-spare", None)
+            if isess.get("sid-prompt-spare") is not None:
+                await s.close()
+
+    async def test_a_parked_terminal_ends_with_its_session_token(self):
+        # The token in the spawn env ends within the margin: an answer now
+        # would let the turn go on with every later hook refused, so the park
+        # does not spare it, however short its idle time.
+        from auth.session_token import create_session_token
+        token = create_session_token(
+            "sid-qpark-token", "agent",
+            issued_at=int(time.time()) - 24 * 3600 + 30)
+        s = await isess.register(
+            session_id="sid-qpark-token", chat_id="chat-1", agent_name="agent",
+            argv=["cat"], env={**_ENV, "PROXY_API_KEY": token})
+        s._apply_turn_signal("end_turn", question_pending=True)
+        s.last_activity = time.monotonic() - 150  # > timeout, < 2x timeout
+        assert await isess.reap_idle(timeout_s=100) == 1
+        assert isess.get("sid-qpark-token") is None
 
     async def test_idle_reaper_spares_open_turn(self):
         # A byte-quiet stretch of a long unviewed turn can outlast the idle
@@ -443,6 +484,88 @@ class TestInteractiveSession:
         finally:
             session_state._session_hook_activity.pop("sid-hook-spare", None)
             if isess.get("sid-hook-spare") is not None:
+                await s.close()
+
+    # -- what counts as activity ------------------------------------------------
+
+    async def test_output_outside_a_turn_is_not_activity(self):
+        # A TUI redraws on its own between turns (a config reload, a status
+        # line): that is not the agent working, and it must not reset the age
+        # the idle reaper and the evictor read. Inside an open turn output is
+        # the agent working.
+        s = await _register("sid-noise")
+        try:
+            past = time.monotonic() - 1000
+            s.last_activity = past
+            s._fanout_output(b"redraw")
+            assert s.last_activity == past
+            s._turn_open = True
+            s._fanout_output(b"spinner")
+            assert s.idle_seconds < 5
+        finally:
+            await s.close()
+
+    async def test_input_prompts_and_turn_signals_are_activity(self):
+        s = await _register("sid-signals")
+        try:
+            s._mark_ready()
+            s.last_activity = time.monotonic() - 1000
+            s.write_input(b"x")
+            assert s.idle_seconds < 5
+            s.last_activity = time.monotonic() - 1000
+            s.submit_prompt("hello", settle=True)
+            assert s.idle_seconds < 5
+            # A turn the CLI opened on its own (a background subagent's
+            # result) shows up as a transcript signal, not as input.
+            s.last_activity = time.monotonic() - 1000
+            s._apply_turn_signal("user")
+            assert s.idle_seconds < 5
+            s.last_activity = time.monotonic() - 1000
+            s._apply_turn_signal("end_turn")
+            assert s.idle_seconds < 5
+        finally:
+            await s.close()
+
+    async def test_otodock_terminal_echo_counts_as_activity(self):
+        # A local otodock terminal types into the PTY on the satellite; its
+        # echo is the only trace of that input the proxy sees.
+        s = await _register("sid-otodock-echo")
+        try:
+            s.otodock_attached = True
+            s.last_activity = time.monotonic() - 1000
+            s._fanout_output(b"typed")
+            assert s.idle_seconds < 5
+        finally:
+            await s.close()
+
+    async def test_closed_turn_output_still_holds_injection_until_quiet(self):
+        # The injection gate keeps measuring PTY quiet from every byte: a CLI
+        # that resumed on its own is mid-output before its turn shows open.
+        s = await _register("sid-quiet")
+        try:
+            s._mark_ready()
+            s.created_at = time.monotonic() - 60
+            s.last_activity = time.monotonic() - 60
+            assert s._prompt_gates_blocked() is None
+            s._fanout_output(b"resumed output")
+            assert s._prompt_gates_blocked() == "not_quiet"
+        finally:
+            await s.close()
+
+    async def test_reapers_see_through_closed_turn_output(self):
+        # A new chat on the agent rewrites the scope's hook files and the idle
+        # TUI redraws between turns: both readers of the age still see it
+        # idle.
+        s = await _register("sid-reap-noise")
+        try:
+            s.last_activity = time.monotonic() - 1000
+            s._fanout_output(b"redraw")
+            scan = await concurrency._oldest_evictable_local(300)
+            assert scan.victim == ("sid-reap-noise", "interactive", False)
+            assert await isess.reap_idle(timeout_s=100) == 1
+            assert isess.get("sid-reap-noise") is None
+        finally:
+            if isess.get("sid-reap-noise") is not None:
                 await s.close()
 
     async def test_close_is_idempotent(self):
@@ -1175,3 +1298,84 @@ async def test_reap_idle_reads_the_cached_timeout(monkeypatch):
     assert await isess.reap_idle() == 1
     assert isess.get("sid-cached-timeout") is None
     session_state.cached_idle_timeout.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestClosingMark:
+    async def test_close_marks_the_session_closing(self):
+        from core.session import session_state
+        s = await _register("sid-closing")
+        assert session_state.session_is_held("sid-closing")
+        await s.close(reason="idle")
+        assert not session_state.session_is_held("sid-closing")
+        assert session_state.session_is_live("sid-closing")
+        session_state.reset_liveness_for_tests()
+
+
+class _FakeRemotePty:
+    pid = 4242
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self, signal_child: bool = True) -> None:
+        self.closed = True
+
+    def scrollback(self) -> bytes:
+        return b""
+
+    def write(self, data: bytes) -> None:
+        pass
+
+
+@pytest.fixture
+def _fake_satellite(monkeypatch):
+    from core.remote import remote_pty, satellite_connection
+
+    async def _spawn(**_kw):
+        return _FakeRemotePty()
+
+    class _Manager:
+        def satellite_os(self, _machine_id):
+            return "linux"
+
+        def is_pty_in_grace(self, _machine_id):
+            return False
+
+    monkeypatch.setattr(remote_pty, "spawn_remote_pty", _spawn)
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _Manager)
+
+
+async def _register_remote_parked(session_id: str, payload: dict):
+    from core.execution_layer import DEFAULT_EXECUTION_PATH
+    s = await isess.register_remote(
+        session_id=session_id, chat_id="chat-1", agent_name="agent",
+        machine_id="machine-1", execution_path=DEFAULT_EXECUTION_PATH,
+        config_payload=payload)
+    s._apply_turn_signal("end_turn", question_pending=True)
+    s.last_activity = time.monotonic() - 150  # > timeout, < 2x timeout
+    return s
+
+
+@pytest.mark.asyncio
+async def test_a_remote_parked_terminal_ends_with_its_payload_token(_fake_satellite):
+    # The token minted into the start payload, not the terminal's own start:
+    # the payload build (and a satellite MCP install) can run minutes before.
+    from auth.session_token import create_session_token
+    token = create_session_token(
+        "sid-rpark-token", "agent", issued_at=int(time.time()) - 24 * 3600 + 30)
+    await _register_remote_parked("sid-rpark-token", {"env": {"PROXY_API_KEY": token}})
+    assert await isess.reap_idle(timeout_s=100) == 1
+    assert isess.get("sid-rpark-token") is None
+
+
+@pytest.mark.asyncio
+async def test_a_remote_parked_terminal_with_no_readable_token_uses_its_start(
+        _fake_satellite, monkeypatch):
+    s = await _register_remote_parked("sid-rpark-fresh", {"env": {"PROXY_API_KEY": "junk"}})
+    assert await isess.reap_idle(timeout_s=100) == 0  # a day of token left
+    await s.close()
+    monkeypatch.setattr(isess, "_SESSION_TOKEN_LIFE_S", 30)
+    await _register_remote_parked("sid-rpark-old", {})
+    assert await isess.reap_idle(timeout_s=100) == 1
+    assert isess.get("sid-rpark-old") is None

@@ -113,6 +113,42 @@ class TestReapPass:
         assert s.session_id not in pool
 
     @pytest.mark.asyncio
+    async def test_a_prompt_waiting_on_a_person_keeps_the_session(self, pool, monkeypatch):
+        """A headless turn parked on a permission card is byte-idle, not
+        abandoned: the reaper spares it while the prompt waits (its own wait,
+        three days, bounds it), and reaps it once the prompt is answered."""
+        import asyncio as _aio
+        from core.session import session_state
+        monkeypatch.setattr(cli_session.config, "get_idle_timeout", lambda: 10)
+        s = _mk_session(started=True, proc_alive=True, idle_s=3600)
+        pool[s.session_id] = s
+        session_state._session_permission_requests[s.session_id] = {"r-1"}
+        session_state._permission_events["r-1"] = _aio.Event()
+        try:
+            await _reap_idle_pass()
+            assert s.session_id in pool and not s._closed
+        finally:
+            session_state._permission_events.pop("r-1", None)
+            session_state._session_permission_requests.pop(s.session_id, None)
+        await _reap_idle_pass()
+        assert s.session_id not in pool
+
+    @pytest.mark.asyncio
+    async def test_a_live_turn_is_left_to_its_own_ceiling(self, pool, monkeypatch):
+        """A turn with an open tool streams nothing for longer than the idle
+        timeout (a long MCP call): the reaper leaves a live turn alone, the
+        turn's silence ceiling governs it."""
+        monkeypatch.setattr(cli_session.config, "get_idle_timeout", lambda: 10)
+        s = _mk_session(started=True, proc_alive=True, idle_s=1200)
+        s._turn_active = True
+        pool[s.session_id] = s
+        await _reap_idle_pass()
+        assert s.session_id in pool and not s._closed
+        s._turn_active = False
+        await _reap_idle_pass()
+        assert s.session_id not in pool
+
+    @pytest.mark.asyncio
     async def test_active_session_untouched(self, pool, monkeypatch):
         monkeypatch.setattr(cli_session.config, "get_idle_timeout", lambda: 10)
         s = _mk_session(started=True, proc_alive=True, idle_s=1)

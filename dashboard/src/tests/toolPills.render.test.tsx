@@ -1,10 +1,24 @@
-import { describe, it, expect } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 
 import ToolActivity from '@/components/chat/ToolActivity'
 import SubagentInfo from '@/components/chat/SubagentInfo'
 import BgCommandInfo from '@/components/chat/BgCommandInfo'
-import DelegateTaskInfo from '@/components/chat/DelegateTaskInfo'
+import DelegateTaskInfo, { DelegateResultFiles, resultFileLabel } from '@/components/chat/DelegateTaskInfo'
+import { ChatFileProvider } from '@/components/chat/ChatFileContext'
+
+// The files list opens through the DELEGATING chat's resolve-path; the
+// preview surface is mocked to what it receives.
+const resolveMock = vi.hoisted(() => vi.fn())
+vi.mock('@/api/chats', async (orig) => ({
+  ...(await orig<typeof import('@/api/chats')>()),
+  resolveChatPath: (...args: unknown[]) => resolveMock(...args),
+}))
+vi.mock('@/components/chat/ChatFilePreview', () => ({
+  default: ({ resolved }: { resolved: { agent: string; path: string } }) => (
+    <div data-testid="chat-file-preview" data-agent={resolved.agent} data-path={resolved.path} />
+  ),
+}))
 
 describe('ToolActivity — the expanded input', () => {
   function expand(name: string, toolInput: Record<string, unknown>) {
@@ -194,5 +208,59 @@ describe('DelegateTaskInfo — expandable delegate pill', () => {
     const badges = screen.getAllByText('support-bot')
     expect(badges).toHaveLength(2) // sm+ inline + mobile row
     for (const b of badges) expect(b.className).toContain('shrink-0')
+  })
+})
+
+describe('DelegateResultFiles — the files a worker attached', () => {
+  const FILES = [
+    { path: 'users/alice/workspace/inbox/content-creator/report.md', bytes: 12600 },
+    { path: 'workspace/inbox/content-creator/data/a.csv', bytes: 300 },
+  ]
+  const SKIPPED = [{ path: 'notes/x.md', reason: 'symlink' }]
+
+  it('labels a landed path relative to the chat workspace, as the note does', () => {
+    expect(resultFileLabel('users/alice/workspace/inbox/w/report.md')).toBe('inbox/w/report.md')
+    expect(resultFileLabel('workspace/inbox/w/data/a.csv')).toBe('inbox/w/data/a.csv')
+    expect(resultFileLabel('users/alice/workspace/reports/q3.md')).toBe('reports/q3.md')
+    expect(resultFileLabel('knowledge/x.md')).toBe('knowledge/x.md')
+  })
+
+  it('opens a file through the delegating chat, never the bubble agent', async () => {
+    resolveMock.mockReset()
+    resolveMock.mockResolvedValue({
+      agent: 'head', path: FILES[0].path, filename: 'report.md', size: 12600, previewable: false,
+    })
+    render(
+      <ChatFileProvider chatId="chat-head" agent="head">
+        <DelegateResultFiles files={FILES} skipped={SKIPPED} />
+      </ChatFileProvider>,
+    )
+    expect(screen.getByText('inbox/content-creator/report.md')).toBeTruthy()
+    expect(screen.getByText('12.3 KB')).toBeTruthy()
+    expect(screen.getByText('notes/x.md')).toBeTruthy()
+    expect(screen.getByText('symlink')).toBeTruthy()
+    fireEvent.click(screen.getAllByText('Open ↗')[0])
+    await waitFor(() => expect(screen.getByTestId('chat-file-preview')).toBeTruthy())
+    expect(resolveMock).toHaveBeenCalledWith('chat-head', FILES[0].path)
+    expect(screen.getByTestId('chat-file-preview').dataset.agent).toBe('head')
+  })
+
+  it('shows a transient not-found when the chat cannot resolve the path', async () => {
+    resolveMock.mockReset()
+    resolveMock.mockResolvedValue(null)
+    render(
+      <ChatFileProvider chatId="chat-other" agent="head">
+        <DelegateResultFiles files={[FILES[1]]} skipped={[]} />
+      </ChatFileProvider>,
+    )
+    fireEvent.click(screen.getByText('Open ↗'))
+    await waitFor(() => expect(screen.getByText('not found')).toBeTruthy())
+    expect(screen.queryByTestId('chat-file-preview')).toBeNull()
+  })
+
+  it('is inert text without a chat context', () => {
+    render(<DelegateResultFiles files={FILES} skipped={[]} />)
+    expect(screen.getByText('inbox/content-creator/report.md')).toBeTruthy()
+    expect(screen.queryByText('Open ↗')).toBeNull()
   })
 })

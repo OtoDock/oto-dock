@@ -289,7 +289,7 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
     monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
 
     @asynccontextmanager
-    async def _instant_slot(session_id, target="", execution_path=None):
+    async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
         yield
     monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
     monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
@@ -373,7 +373,7 @@ def test_a_continue_round_never_drives_another_persons_terminal(temp_db, monkeyp
     monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
 
     @asynccontextmanager
-    async def _instant_slot(session_id, target="", execution_path=None):
+    async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
         yield
     monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
     monkeypatch.setattr(session_state, "_save_sessions", lambda: None)

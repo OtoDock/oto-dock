@@ -1,8 +1,11 @@
 /**
  * The Android app's native bridge. The app injects `OtoDockNative` (a WebView
- * message listener) only into the top-level document of the installation it
- * is showing, so on the web, and inside any frame, there is no channel and
- * every call here is a no-op.
+ * message listener) only into frames of the installation it is showing, and
+ * honours a message only when it is posted on the top-level document's
+ * object: the boundary is same-origin script (a same-origin child frame
+ * reaches the channel through `top.OtoDockNative`), so a frame that renders
+ * third-party content stays off this origin. On the web, and in a sandboxed
+ * or other-origin frame, there is no channel and every call here is a no-op.
  *
  * A message is a JSON header `{m, a, id?}`, optionally followed by a newline
  * and a raw body (a saved file's base64, so the app never parses it as JSON).

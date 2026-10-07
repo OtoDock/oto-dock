@@ -253,7 +253,8 @@ _KEEP_AFTER_DELETE = {
 
 class TestDeleteCoverageIsComplete:
     """Guard against re-introducing the orphan bug: EVERY table with an
-    agent/agent_name/agent_slug column must be handled on agent delete —
+    agent/agent_name/agent_slug column (and the shares table's
+    grantee_agent/placed_agent) must be handled on agent delete —
     either deleted by ``delete_agent``, cascaded via an agents-FK, or on the
     documented keep-list. A new table that forgets this fails here."""
 
@@ -267,7 +268,8 @@ class TestDeleteCoverageIsComplete:
                 """SELECT table_name, column_name
                    FROM information_schema.columns
                    WHERE table_schema = 'public'
-                     AND column_name IN ('agent', 'agent_name', 'agent_slug')"""
+                     AND column_name IN ('agent', 'agent_name', 'agent_slug',
+                                         'grantee_agent', 'placed_agent')"""
             ).fetchall()
             # Tables whose agents-FK is ON DELETE CASCADE (handled implicitly by
             # the final ``DELETE FROM agents``).

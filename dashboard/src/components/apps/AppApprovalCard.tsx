@@ -90,7 +90,7 @@ export function inboundWords(h: AppInboundHook): ReactNode {
 /** Where a secret's value goes, in words (APPS.md "Secrets"). */
 export function secretUseWords(s: AppSecret): ReactNode {
   if (s.sends_to) {
-    return <>sent by the platform to <Code>{s.sends_to.host}</Code> as <Code>{s.sends_to.header}</Code>; the server never sees it</>
+    return <>sent by the platform to <Code>{s.sends_to.host}</Code> as <Code>{s.sends_to.header}</Code>, never seen by the server</>
   }
   if (s.env) return <span className="text-amber-600 dark:text-amber-400">read by the server itself</span>
   return 'used by the platform only'
@@ -199,6 +199,9 @@ const PLATFORM_METHOD_WORDS: Record<string, string> = {
   'files.write': 'to write a text file under its declared write prefixes',
   'setup.status': 'whether your setup of this agent is still pending, and which of the tools it names are ready for you',
   'setup.complete': 'to mark your setup of this agent complete when you press its button (a manager may complete the agent’s own setup too)',
+  'app.audience': 'who uses this app: its members, the agents it is placed in with their members, and the people it is shared with, each with their role (read on a page by the app’s own editors and managers, the owner of a personal app or an admin, and by the app’s own server as the app)',
+  'viewer.data.read': 'your own saved data in this app (a small document each viewer keeps for themselves)',
+  'viewer.data.write': 'to save your own data in this app (your document alone, which nobody else reads)',
 }
 
 // The same methods in two or three words, for the summary line.
@@ -212,6 +215,9 @@ const PLATFORM_METHOD_SHORT: Record<string, string> = {
   'files.write': 'writing its files',
   'setup.status': 'your setup state and which tools are ready',
   'setup.complete': 'completing your setup',
+  'app.audience': 'who uses it',
+  'viewer.data.read': 'your saved data',
+  'viewer.data.write': 'saving your data',
 }
 
 // The platform events a handler may wake on (APPS.md "Handlers").
@@ -342,6 +348,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
     ...Object.entries(ex.snapshots ?? {}).map(([name, e]) => ({ kind: 'publishes the snapshot', name, ...e })),
     ...Object.entries(ex.events ?? {}).map(([name, e]) => ({ kind: 'emits the event', name, ...e })),
   ]
+  const placedCalls = Object.keys(ex.methods ?? {})
   const uses = app.bindings ?? []
   const needMcps = neededMcps(app)
   const needProviders = neededProviders(app)
@@ -373,7 +380,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
       {(hosts.length > 0 || links.length > 0) && (
         <Group heading="Hosts">
           {hosts.length > 0 && (
-            <li>its server may reach {codeList(hosts)}, and other sites that share their address (a CDN) and DNS; never your local network or the platform</li>
+            <li>its server may reach {codeList(hosts)}, and other sites that share their address (a CDN) and DNS, but never your local network or the platform</li>
           )}
           {links.length > 0 && (
             <li data-testid="external-links-line">
@@ -442,20 +449,25 @@ export function ManifestBlocks({ app, onSetSecret }: {
           )}
           {app.has_live_link && (
             <li className="text-amber-600 dark:text-amber-400" data-testid="step-link-warning">
-              this app runs scripts and is reachable by a link; a visitor’s input is data to the scripts, never instructions
+              this app runs scripts and is reachable by a link, so a visitor’s input is data to the scripts, never instructions
             </li>
           )}
         </Group>
       )}
       <SecretsGroup app={app} onSetSecret={onSetSecret} />
       {offers.length > 0 && (
-        <Group heading="Offers to other apps" count={offers.length}>
+        <Group heading={placedCalls.length ? 'Offers to other apps and to the agents it is placed in' : 'Offers to other apps'} count={offers.length}>
           {offers.map((o) => (
             <li key={`${o.kind}-${o.name}`} className="flex flex-wrap items-baseline gap-x-1.5">
               <span>{o.kind} <Code>{o.name}</Code> — {o.description}</span>
               <FloorChip role={o.min_role} />
             </li>
           ))}
+          {placedCalls.length > 0 && (
+            <li className="text-p-text-light" data-testid="offers-placed-note">
+              The calls also answer the chats and tasks of agents a share places this app in, at the role the share gives (a floor is judged there as here).
+            </li>
+          )}
         </Group>
       )}
       {uses.length > 0 && (
@@ -625,6 +637,13 @@ export function summaryLines(app: PinnedApp): SummaryLine[] {
     ...Object.keys(ex.events ?? {}).map((n) => <>the event <Code>{n}</Code></>),
   ]
   if (offers.length) out.push({ key: 'offers', text: <>Offers other apps {few(offers)}</> })
+  const placedCalls = Object.keys(ex.methods ?? {})
+  if (placedCalls.length) {
+    out.push({
+      key: 'placed-calls', testId: 'summary-placed-calls',
+      text: <>Answers the agents it is placed in with {few(placedCalls.map((n) => <>the call <Code>{n}</Code></>))}</>,
+    })
+  }
   const uses = app.bindings ?? []
   if (uses.length) {
     out.push({ key: 'uses', text: <>Uses {few(uses.map((b) => <>the app <Code>{b.app}</Code> of agent <Code>{b.agent}</Code></>))}</> })

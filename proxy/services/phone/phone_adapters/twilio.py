@@ -26,6 +26,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from adapters.phone import is_outbound
+
 from .base import (
     BootstrapResult,
     HealthStatus,
@@ -208,7 +210,7 @@ class TwilioAdapter(PhoneServerAdapter):
     # -- Route provisioning -------------------------------------------------
 
     async def provision_route(self, route: dict) -> RouteHandle:
-        if route.get("direction") == "outbound":
+        if is_outbound(route.get("direction")):
             caller_id = str(route.get("ami_caller_id") or "").strip()
             if not caller_id:
                 raise PhoneAdapterError(
@@ -264,7 +266,7 @@ class TwilioAdapter(PhoneServerAdapter):
         )
 
     async def deprovision_route(self, route: dict) -> None:
-        if route.get("direction") == "outbound":
+        if is_outbound(route.get("direction")):
             return
         number_sid = (route.get("adapter_data") or {}).get("number_sid")
         if not number_sid:

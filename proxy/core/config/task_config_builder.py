@@ -361,6 +361,7 @@ async def build_task_agent_config(
             mcp_registry.build_session_mcp_config,
             agent_name,
             user_sub_for_creds,
+            session_id=session_id,
             task_mode=True,
             task_scope=identity.scope,
             delegation_targets=resolved_targets,

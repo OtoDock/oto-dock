@@ -21,6 +21,9 @@ baseline and only emits genuinely new changes.
 
 from __future__ import annotations
 
+import os
+
+import pytest
 
 from satellite.transport.file_sync import (
     compute_manifest,
@@ -265,6 +268,34 @@ def test_symlinks_skipped_in_snapshot_and_manifest(tmp_path):
     assert "workspace/link.txt" not in paths
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are POSIX")
+def test_a_named_pipe_is_skipped_without_blocking(tmp_path):
+    """A FIFO in a workspace (a tool's control pipe) is listed by the walk
+    with size 0; opening it for a hash would block until a writer appears,
+    so the snapshot and the manifest skip it and hash only regular files."""
+    import threading
+    agent = tmp_path
+    (agent / "workspace").mkdir()
+    (agent / "workspace" / "real.txt").write_text("content")
+    os.mkfifo(agent / "workspace" / "pipe")
+    out: dict = {}
+
+    def run():
+        out["snap"] = snapshot_agent_dir(agent)
+        out["paths"] = {e["path"] for e in compute_manifest(agent)}
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(10)
+    if t.is_alive():
+        # Unblock the stalled open so the thread can end, then fail.
+        fd = os.open(agent / "workspace" / "pipe", os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        pytest.fail("hashing a named pipe blocked")
+    assert "workspace/real.txt" in out["snap"] and "workspace/pipe" not in out["snap"]
+    assert out["paths"] == {"workspace/real.txt"}
+
+
 def test_cli_runtime_cruft_excluded(tmp_path):
     """Satellite mirrors the proxy: session transcripts + temp/caches/snapshots/
     backups + hidden dirs under .claude/.codex are pruned from the snapshot AND
@@ -301,6 +332,27 @@ def test_cli_runtime_cruft_excluded(tmp_path):
                        "users/alice/.claude/.claude.json.backup.1",
                        "users/alice/.codex/skills/.system/sk.md"):
             assert leaked not in paths, f"leaked: {leaked}"
+
+
+def test_the_per_session_mcp_config_copies_never_sync(tmp_path):
+    """The session MCP config copies carry that session's own tokens and are
+    rewritten at every start: this satellite's ``mcp-config-<sid12>.json``,
+    the proxy's ``<agent>-<sha256(sub)[:12]>-<sid12>.json`` and the shared
+    names earlier releases wrote are host-local, so the manifest never lists
+    them (the proxy would push its copies here and scrub ours)."""
+    cl = tmp_path / "users" / "alice" / ".claude"
+    cl.mkdir(parents=True)
+    copies = ("mcp-config.json", "mcp-config-1a2b3c4d-5e6.json",
+              "personal-assistant-0123456789ab-1a2b3c4d-5e6.json",
+              "personal-assistant-0123456789ab.json")
+    for name in copies:
+        (cl / name).write_text("{}")
+    (cl / "notes.json").write_text("{}")
+    for paths in (set(snapshot_agent_dir(tmp_path)),
+                  {e["path"] for e in compute_manifest(tmp_path)}):
+        for name in copies:
+            assert f"users/alice/.claude/{name}" not in paths, name
+        assert "users/alice/.claude/notes.json" in paths
 
 
 def test_large_changed_file_reports_hash_size_without_reading(tmp_path, monkeypatch):

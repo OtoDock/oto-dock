@@ -310,3 +310,24 @@ async def test_detached_prewarm_asks_the_ledger_before_building(monkeypatch):
     sid = await dp.spawn_detached_prewarm(
         agent="alpha", user={"username": "pw"}, user_sub="user-pw")
     assert sid is None and calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_below_the_editor_tier_is_left_to_the_send(monkeypatch, caplog):
+    """A viewer or contributor opening a Shared-only chat: the pre-warm's
+    build refuses, quietly (no "Pre-warmup failed" frame, no traceback); the
+    first send's warmup card is the one place the refusal shows."""
+    from core.sandbox.session_config_dir import AgentStateRefused
+    from ws import dashboard_warmup as dw
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+
+    async def _refused(**kwargs):
+        raise AgentStateRefused("This agent is set to Shared only (would run as contributor)")
+    monkeypatch.setattr(dw, "build_agent_config", _refused)
+    with caplog.at_level("INFO"):
+        await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                       "execution_path": "codex-cli"})
+    assert conn.errors == [] and conn.sent == []
+    assert conn._pre_warmed_sid is None
+    assert not any(r.levelname == "ERROR" for r in caplog.records)

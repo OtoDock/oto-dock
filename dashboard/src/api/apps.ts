@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiFetch } from './auth'
-import type { ActionFloor, EffectiveRole } from '../lib/permissions'
+import type { AgentRole, ActionFloor, EffectiveRole } from '../lib/permissions'
 import type { SiteKind } from '../lib/placement'
 import { appKind, type AppKindName } from '../lib/kinds/app'
 import type { DeployState } from '../lib/status/appDeploy'
@@ -104,7 +104,9 @@ export interface PinnedApp {
   scope: 'shared' | 'personal'
   /** Where the pin lives: the standing apps strip, or a chat/project Dock. */
   pin_scope?: 'standing' | 'chat' | 'project'
-  /** Set on Dock pin rows (a project pin may come from another agent). */
+  /** The row's own agent: set on every row (a placed row's frame and cards
+   * subscribe to it, never the panel's host; a project Dock pin may come
+   * from another agent). */
   agent?: string
   position: number
   rel_path: string
@@ -118,9 +120,27 @@ export interface PinnedApp {
   /** This viewer parked the shared app off their own strip (per-user hide —
    * the row still returns so the hidden affordance can restore it). */
   hidden_for_me: boolean
-  /** Another user's personal app this viewer holds a share on ("Shared
-   * with me"): never managed, hidden through the share. */
+  /** Another user's personal app this viewer holds a share on (SHARING.md):
+   * never managed, hidden through the share. */
   granted?: boolean
+  /** The viewer's own share on this row (`GET /v1/apps/{id}` only, for the
+   * page's hide), when a person share admits them. */
+  share_id?: string
+  /** An app of another agent placed here by a share (SHARING.md): the kind
+   * of share, where it comes from, the agent it sits in for this viewer,
+   * the role the share gives them, and whether they may remove it from
+   * this agent. A placed row is never managed here. */
+  placement?: {
+    kind: 'person' | 'agent' | 'department'
+    share_id: string
+    from_agent: string
+    from_agent_name: string
+    agent: string
+    role_cap: AgentRole
+    shared_by: string
+    shared_by_name: string
+    can_remove: boolean
+  }
   /** The role this viewer's action floors are judged against. */
   viewer_role?: EffectiveRole
   /** The release viewers are served (0 = the working file, not deployed yet). */
@@ -466,7 +486,10 @@ export const useHideAppForMe = (agent: string) => {
       const res = await apiFetch(`/v1/apps/${appId}/hide`, { method: 'POST' })
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Hide failed')
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['apps', agent] }),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['apps', agent] })
+      qc.invalidateQueries({ queryKey: ['app'] })
+    },
   })
 }
 
@@ -477,7 +500,10 @@ export const useUnhideAppForMe = (agent: string) => {
       const res = await apiFetch(`/v1/apps/${appId}/unhide`, { method: 'POST' })
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Restore failed')
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['apps', agent] }),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['apps', agent] })
+      qc.invalidateQueries({ queryKey: ['app'] })
+    },
   })
 }
 
@@ -525,7 +551,7 @@ export function rollbackNoticeText(app: PinnedApp, left: number, r: RollbackResu
   const head = `Release ${r.release} serves again.`
   if (!appKind(app).keepsData || r.db_restored === undefined) return head
   if (r.db_restored) {
-    return `${head} The database was restored from before release ${left} went live; the newer writes are kept in a snapshot beside the releases.`
+    return `${head} The database was restored from before release ${left} went live. The newer writes are kept in a snapshot beside the releases.`
   }
   return `${head} No copy from before release ${left} exists, so the app keeps its current data.`
 }

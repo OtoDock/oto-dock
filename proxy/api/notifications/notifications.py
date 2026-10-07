@@ -21,11 +21,13 @@ from auth.providers import (
     UserContext,
     get_current_user,
     require_auth,
+    require_user,
 )
 from core.session import visibility as _vis
 
 logger = logging.getLogger("claude-proxy.notification-api")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 # --- Request models ---
@@ -362,7 +364,11 @@ def _definitions_view(u: UserContext, scope: str | None, source: str | None,
         n.get("target") or "" for n in notifications
         if n.get("target") and n["scope"] == _vis.SCOPE_USER
     ])
+    from services.agents import offboarding_transfer
+    moved_from = offboarding_transfer.transferred_from_names(
+        [n.get("transferred_from") or "" for n in notifications])
     for n in notifications:
+        n["transferred_from_name"] = moved_from.get(n.get("transferred_from") or "", "")
         is_own_target = n.get("target") == u.sub  # user-scope ownership
         is_own_creator = n.get("created_by") == u.sub
         is_static = n.get("source") == "static"

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 import config
 from storage import database as task_store
+from storage.pg import run_db
 from auth.path_policy import (
     check_host_path_access,
 )
@@ -193,7 +194,8 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
         chat_id = await routing.resolve_hook_chat_id(req.session_id) or None
         sec = get_session_security(req.session_id)
         download_token = secrets.token_urlsafe(32)
-        task_store.create_media_token(
+        await run_db(
+            task_store.create_media_token,
             download_token,
             str(file_path),
             media_kind="file",
@@ -205,8 +207,8 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
             expires_at="",  # durable until the chat is deleted
             agent=sec.agent if sec else "",
         )
-        # No fn= here: DisplayFile/DocumentPreview append it client-side from
-        # their filename prop (baking it in too would duplicate the param).
+        # No fn= here: the dashboard appends it from the file's name
+        # (baking it in too would duplicate the param).
         download_url = f"/v1/media/{download_token}?download=1"
 
     result = await adapter.handle_file_display(
@@ -318,7 +320,8 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
     sec = get_session_security(req.session_id)
 
     token = secrets.token_urlsafe(32)
-    task_store.create_media_token(
+    await run_db(
+        task_store.create_media_token,
         token,
         str(served_path),
         mime=mime,
@@ -461,7 +464,8 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
     token = secrets.token_urlsafe(32)
     # cache_owned MUST stay False: True would make the chat-delete reap unlink
     # the user's workspace .html — the artifact file outlives its chat.
-    task_store.create_media_token(
+    await run_db(
+        task_store.create_media_token,
         token,
         str(target),
         mime="text/html",

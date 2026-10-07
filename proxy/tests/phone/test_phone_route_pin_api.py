@@ -70,19 +70,19 @@ class TestPinSecret:
     def test_set_masks_and_encrypts(self, client):
         route = _make_route("inbound")
         r = client.put(f"/v1/admin/phone/routes/{route['id']}/pin",
-                       json={"value": "4711"})
+                       json={"value": "471125"})
         assert r.status_code == 200 and r.json()["pin_configured"] is True
 
         listed = client.get("/v1/admin/phone/routes").json()["routes"]
         mine = next(x for x in listed if x["id"] == route["id"])
         assert mine["pin_configured"] is True
         # The value never appears anywhere in the API response.
-        assert "4711" not in str(listed)
+        assert "471125" not in str(listed)
         # Encrypted at rest — ciphertext only.
         rows = _cred_rows(route["id"])
-        assert rows and "4711" not in rows[0]["credential_value_enc"]
+        assert rows and "471125" not in rows[0]["credential_value_enc"]
 
-    @pytest.mark.parametrize("bad", ["123", "1234567", "abcd", "12 34", ""])
+    @pytest.mark.parametrize("bad", ["123", "1234", "12345", "1234567", "abcd", "12 34", ""])
     def test_format_validation_never_echoes(self, client, bad):
         route = _make_route("inbound")
         r = client.put(f"/v1/admin/phone/routes/{route['id']}/pin",
@@ -94,7 +94,7 @@ class TestPinSecret:
     def test_inbound_only(self, client):
         route = _make_route("outbound")
         r = client.put(f"/v1/admin/phone/routes/{route['id']}/pin",
-                       json={"value": "1234"})
+                       json={"value": "123456"})
         assert r.status_code == 400
         listed = client.get("/v1/admin/phone/routes").json()["routes"]
         mine = next(x for x in listed if x["id"] == route["id"])
@@ -116,7 +116,7 @@ class TestPinLifecycleGuards:
     def test_route_delete_removes_credential(self, client):
         route = _make_route("inbound")
         client.put(f"/v1/admin/phone/routes/{route['id']}/pin",
-                   json={"value": "9876"})
+                   json={"value": "987654"})
         assert _cred_rows(route["id"])
         assert client.delete(
             f"/v1/admin/phone/routes/{route['id']}").status_code == 200
@@ -125,7 +125,7 @@ class TestPinLifecycleGuards:
     def test_direction_flip_blocked_while_pin_configured(self, client):
         route = _make_route("inbound")
         client.put(f"/v1/admin/phone/routes/{route['id']}/pin",
-                   json={"value": "1234"})
+                   json={"value": "123456"})
         r = client.put(f"/v1/admin/phone/routes/{route['id']}",
                        json={"direction": "outbound"})
         assert r.status_code == 409
@@ -140,9 +140,24 @@ class TestConfigPushContract:
         plain = _make_route("inbound")
         out = _make_route("outbound")
         client.put(f"/v1/admin/phone/routes/{gated['id']}/pin",
-                   json={"value": "2468"})
+                   json={"value": "246813"})
 
         pushed = {r["id"]: r for r in assemble_phone_config()["routes"]}
-        assert pushed[gated["id"]]["pin"] == "2468"
+        assert pushed[gated["id"]]["pin"] == "246813"
         assert "pin" not in pushed[plain["id"]]
         assert "pin" not in pushed[out["id"]]
+
+    def test_a_shorter_pin_stored_earlier_keeps_working(self, client, temp_db):
+        """The 6-digit floor applies to a PIN being set: a 4-digit one
+        stored before it still reaches the daemon and survives a save."""
+        from services.phone.phone_config import assemble_phone_config
+
+        route = _make_route("inbound")
+        phone_route_store.set_route_pin(route["id"], "4711")
+        r = client.put(f"/v1/admin/phone/routes/{route['id']}", json={"name": "renamed"})
+        assert r.status_code == 200, r.text
+        pushed = {x["id"]: x for x in assemble_phone_config()["routes"]}
+        assert pushed[route["id"]]["pin"] == "4711"
+        r = client.put(f"/v1/admin/phone/routes/{route['id']}/pin", json={"value": "4712"})
+        assert r.status_code == 400 and "6 digits" in r.json()["detail"]
+        assert phone_route_store.get_route_pin(route["id"]) == "4711"

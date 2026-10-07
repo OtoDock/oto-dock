@@ -1,4 +1,4 @@
-"""Delegation (Projects) API — worker spawn.
+"""Delegation (Projects) API: the delegation session surface.
 
 ``POST /v1/delegation/spawn`` replaces the old MCP-side create→patch→run
 dance with ONE atomic call: authorization (``services/delegation/spawn_authz``
@@ -6,9 +6,16 @@ dance with ONE atomic call: authorization (``services/delegation/spawn_authz``
 creation for ``surface="chat"``, the dynamic-task row with its on-complete
 callback registered BEFORE the fire, and the ``delegate_spawn`` badge event
 on the delegating chat.
+
+Beside the spawn: the visibility reads (``/v1/delegation/sessions``,
+``…/peek``), ``send_files`` (``services/delegation/file_transfer``),
+``attach_result_files`` (a delegated worker's deliverables,
+``services/delegation/result_files``; the one route the kill-switch does not
+gate) and ``adopt``.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -19,7 +26,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user, require_auth
+from auth.providers import UserContext, get_current_user, require_auth, require_user
 from core.session import session_kind
 from core.session.visibility import (
     chat_history_owner, is_task_chat_owner, nouser_read_targets, shared_chat_owner,
@@ -27,14 +34,15 @@ from core.session.visibility import (
 from services.delegation.spawn_authz import (
     authorize_spawn, check_delegation_chain, validate_spawn_overrides,
 )
-from services.delegation import file_transfer, lane_status
+from services.delegation import file_transfer, lane_status, result_files
 from services.scheduler import lane_steer, scheduler, task_kinds
 from storage import database as task_store
 from storage.mcp import mcp_store
 from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.delegation-api")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 _PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -77,8 +85,9 @@ class SpawnDelegateRequest(BaseModel):
     # Optional per-lane execution overrides — for task-specific needs only;
     # omitted = the worker inherits the agent's configured defaults exactly
     # as before. Validated against the agent's envelope (enabled layers,
-    # layer's model registry); IGNORED on continue_id — the existing worker
-    # keeps its configuration.
+    # layer's model registry). On continue_id `layer` and `mode` are IGNORED
+    # (the existing worker keeps its configuration); `model` moves the
+    # continued worker to that model (``_continue_model_change``).
     model: str | None = None
     layer: str | None = None
     mode: Literal["interactive", "non-interactive"] | None = None
@@ -139,6 +148,105 @@ def _model_is_cross_layer_poison(model: str, layer: str) -> bool:
         return False
 
 
+def _worker_mid_turn(chat_id: str) -> bool:
+    """The steer's own signals (``lane_steer.try_steer_continue``) that the
+    worker is working: a live pump on its chat (a task round or a person's
+    turn), or a RUNNING run on it (the spawn window before the pump, the
+    delivery phase after it)."""
+    from core.events.stream_pump import _active_pumps
+    from storage.automation import run_status
+    pump = _active_pumps.get(chat_id)
+    if pump is not None and not pump.is_done:
+        return True
+    return bool(task_store.list_runs(limit=1, chat_id=chat_id, status=run_status.RUNNING))
+
+
+def _round_drives_live_terminal(chat_id: str, continue_session: str | None) -> bool:
+    """The runner's predicate (step 1 of ``_run_task_body``): a continue
+    round on a resumable session drives the chat's live interactive
+    terminal instead of spawning — the terminal keeps the model it runs."""
+    from services.scheduler import interactive
+    from services.scheduler.runner import _is_valid_session_uuid
+    return (_is_valid_session_uuid(continue_session)
+            and interactive.borrow_terminal(chat_id) is not None)
+
+
+def _provider_change_blocker(chat: dict, layer: str, model: str) -> str:
+    """The dashboard's rule for an engine that pins its model provider for
+    the life of a chat (Codex: ``model_provider`` in config.toml, kept by the
+    thread): a continue cannot move the worker to another provider's model."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(layer)
+    if caps is None or not caps.behaviour.provider_pinned_per_session:
+        return ""
+    current = chat.get("model") or ""
+    if not current:
+        return ""
+    import config as app_config
+    if app_config.get_model_provider(model, layer=layer) == app_config.get_model_provider(current, layer=layer):
+        return ""
+    return (f"{caps.display_name} keeps its model provider for the life of a chat: this "
+            f"worker runs {current} and {model} needs another provider. Delegate a new "
+            "worker to use it.")
+
+
+async def _continue_model_change(
+    chat: dict, model: str | None, continue_session: str | None,
+) -> bool:
+    """Apply ``delegate(continue_id=…, model=…)`` to the continued worker.
+
+    False when there is nothing to change (no model, or the chat's current
+    one). Otherwise the model is validated against the chat's layer (the
+    cross-layer rule of the continue re-derivation), refused while the worker
+    is mid-turn (a steer cannot change a model) or when the round would drive
+    a live terminal, then persisted on the chat row — the round's billing
+    and the dashboard header read it — and announced to a viewer of the chat
+    the way the dashboard's own model switch is. True = the round must
+    respawn the worker (``TaskDefinition.respawn_for_model``)."""
+    if not model or model == (chat.get("model") or ""):
+        return False
+    chat_id = chat["id"]
+    from core.session.session_manager import resolve_execution_path
+    layer = await asyncio.to_thread(
+        resolve_execution_path, chat.get("agent") or "", chat.get("execution_path") or "",
+    )
+    # The fresh spawn's rule: a model the worker's layer serves and the
+    # admin left enabled.
+    from services.delegation.spawn_authz import validate_spawn_overrides
+    await asyncio.to_thread(validate_spawn_overrides, chat.get("agent") or "", layer, model)
+    blocker = await asyncio.to_thread(_provider_change_blocker, chat, layer, model)
+    if blocker:
+        raise HTTPException(400, blocker)
+    if await asyncio.to_thread(_worker_mid_turn, chat_id):
+        raise HTTPException(
+            409,
+            "The worker is mid-turn, and a running turn cannot change its "
+            "model. Wait for the worker's result, then continue with the "
+            "model; or continue without a model to send this follow-up now.",
+        )
+    if _round_drives_live_terminal(chat_id, continue_session):
+        raise HTTPException(
+            409,
+            "The worker's chat has a live terminal open, and a follow-up is "
+            "typed into that terminal on the model it runs. Continue without "
+            "a model, or continue with it once the terminal is closed.",
+        )
+    from core.events import chat_writer
+    await chat_writer.submit(
+        chat_id, functools.partial(task_store.update_chat, chat_id, model=model),
+        label="delegate_model",
+    )
+    from core.session.session_state import broadcast_chat_frame
+    broadcast_chat_frame(chat_id, {
+        "type": wire.MODEL_CHANGED, "model": model, "chat_id": chat_id,
+    })
+    logger.info(
+        f"Delegated continue moves worker chat {chat_id[:8]} to model={model} "
+        f"(was {chat.get('model') or '-'}): the round respawns it"
+    )
+    return True
+
+
 @router.post("/v1/delegation/spawn")
 async def spawn_delegate(
     req: SpawnDelegateRequest,
@@ -192,7 +300,9 @@ async def spawn_delegate(
         )
 
     # Per-lane execution overrides: continue keeps the existing worker's
-    # configuration (fresh spawns validate against the agent's envelope).
+    # configuration (fresh spawns validate against the agent's envelope);
+    # only its model may move, below.
+    respawn_for_model = False
     ov_model, ov_layer, ov_mode = (
         (None, None, None) if req.continue_id
         else (req.model, req.layer, req.mode)
@@ -263,11 +373,20 @@ async def spawn_delegate(
         ov_mode = (continued_chat.get("execution_mode")
                    if continued_chat.get("execution_mode") in
                    ("interactive", "non-interactive") else None)
+        # A model on the continue moves the worker to it: refused (4xx)
+        # while it works — BEFORE the steer below, which cannot change a
+        # model — or when the round would drive a live terminal; the round
+        # then respawns the worker on it.
+        respawn_for_model = await _continue_model_change(
+            continued_chat, req.model, continue_session,
+        )
+        if respawn_for_model:
+            ov_model = req.model
         # A lane that is WORKING on this caller's run takes the follow-up
         # into its live turn (the engine reads it at its next tool boundary,
         # nothing is interrupted) — no second run, the running run's report
         # covers it. Any refusal queues a run behind the lane, as before.
-        steered = await lane_steer.try_steer_continue(
+        steered = None if respawn_for_model else await lane_steer.try_steer_continue(
             continued_chat, req.prompt,
             parent_chat_id=parent_chat_id, source_agent=authz.source_agent,
         )
@@ -347,6 +466,7 @@ async def spawn_delegate(
         override_model=ov_model,
         override_execution_path=ov_layer,
         override_execution_mode=ov_mode,
+        respawn_for_model=respawn_for_model,
         checks=checks,
     )
     await scheduler.add_dynamic_task(task)
@@ -491,7 +611,7 @@ async def send_files(
                    f"and the remote machine {machine} could not provide it "
                    "(offline, or the file does not exist there)",
         ) from None
-    _schedule_transfer_fanout(
+    file_transfer.schedule_inbox_fanout(
         authz.target_agent, result.landed, origin_user_sub=authz.owner_sub,
     )
     return {
@@ -505,34 +625,81 @@ async def send_files(
     }
 
 
-def _schedule_transfer_fanout(
-    target_agent: str, rel_paths: list[str], *, origin_user_sub: str,
-) -> None:
-    """Background satellite push per landed inbox file — best-effort, never
-    blocks the response (uploads precedent: a target agent living on a
-    remote machine must see the inbox too). ``include_idle`` so a connected
-    satellite holding the agent receives it even with no live session."""
+class AttachResultFilesRequest(BaseModel):
+    paths: list[str]
+    dest_dir: str = ""
+
+
+@router.post("/v1/delegation/attach_result_files")
+async def attach_result_files(
+    req: AttachResultFilesRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """A delegated worker attaches deliverables to its result
+    (``services/delegation/result_files``, PROJECTS.md "Result files").
+
+    The caller is resolved from its session token alone: the RUNNING
+    delegate run of that session on the token's agent, and the run's
+    dynamic task row name the delegating agent and chat. The destination is
+    the delegating chat's workspace by the delivery's own who-wakes rule,
+    never anything the worker sent; the files land under
+    ``inbox/<worker agent>/`` (never overwriting), one row per file is
+    recorded on the run, and the result names the rows when it is handed
+    back. A session with no such run (a plain chat, a scheduled task, a turn
+    after the run ended) gets one sentence and no copy. The kill-switch is
+    not consulted: a running worker's result reports regardless."""
+    u = require_auth(user)
+    if not req.paths:
+        raise HTTPException(400, "`paths` must name at least one file or directory.")
+    if not u.session_id or not u.agent:
+        raise HTTPException(400, "Only a delegated worker's session can attach result files.")
+    # The cheap refusals before any run lookup or satellite read.
+    if req.dest_dir and (err := file_transfer.validate_rel_dir(req.dest_dir)):
+        raise HTTPException(400, f"Invalid dest_dir '{req.dest_dir}': {err}")
+    if len(req.paths) > (cap := result_files.max_per_call()):
+        raise HTTPException(413, f"Too many files ({len(req.paths)}, max {cap} per call): "
+                                 "split the attach or send an archive.")
+    from storage.pg import run_db
     try:
-        from services.remote import workspace_fanout
-    except Exception:
-        return
-    agent_dir = config.get_agent_dir(target_agent)
-    for rel in rel_paths:
-        if not workspace_fanout.has_fanout_candidates(
-            target_agent, rel, include_idle=True,
-        ):
-            continue
-
-        async def _push(rel: str = rel) -> None:
-            try:
-                await workspace_fanout.fan_out_write(
-                    target_agent, rel, agent_dir / rel,
-                    include_idle=True, origin_user_sub=origin_user_sub,
+        run, task_row = await run_db(result_files.resolve_run, u.session_id, u.agent)
+        authz = await result_files.authorize(run, task_row, u.session_id)
+    except result_files.AttachRefused as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from None
+    try:
+        async with result_files.run_lock(authz.run_id):
+            await run_db(result_files.check_run_cap, authz.run_id, req.paths)
+            # The worker's current bytes, read through from its machine while
+            # the session is live (the send_files rule); a path neither side
+            # has is reported with the machine's name.
+            unavailable = await file_transfer.prefetch_remote_sources(
+                u.session_id, authz.as_send_files_authz(), req.paths,
+            )
+            label = await file_transfer.remote_source_label(u.session_id) if unavailable else ""
+            result = await asyncio.to_thread(
+                lambda: result_files.attach(
+                    authz, paths=req.paths, dest_dir=req.dest_dir,
+                    unavailable=unavailable, remote_label=label,
                 )
-            except Exception:
-                logger.exception("send_files fan-out failed: %s", rel)
-
-        asyncio.create_task(_push())
+            )
+    except result_files.AttachRefused as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from None
+    if result.landed:
+        file_transfer.schedule_inbox_fanout(
+            authz.target_agent, [r["landed_path"] for r in result.landed],
+            origin_user_sub=authz.owner_sub,
+        )
+    return {
+        "run_id": authz.run_id,
+        "target_agent": authz.target_agent,
+        "same_tree": authz.same_tree,
+        "files": result.landed,
+        "named": result.named,
+        "skipped": result.skipped,
+        "total_bytes": sum(int(r["bytes"]) for r in result.landed + result.named),
+        "max_files": result.max_files,
+        "max_per_run": result.max_per_run,
+        "attached": result.attached,
+    }
 
 
 class AdoptProjectRequest(BaseModel):

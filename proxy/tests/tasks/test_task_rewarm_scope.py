@@ -603,6 +603,7 @@ class TestSharedOnlyBelowEditorRefused:
                     client_type="dashboard", chat_id="agent::voicebot",
                 ))
             assert f"run as {role}" in str(err.value)
+            assert "Shared only" in str(err.value)
         assert seats == []
         # An editor acts as the agent: built in the agent scope.
         editor = {"username": "sub-e", "display_name": "E", "email": "", "role": "member"}

@@ -109,15 +109,19 @@ def _call(authorization):
     return asyncio.run(hook_mcp_credentials(authorization=authorization))
 
 
-def test_endpoint_returns_only_the_tokens_mcp():
+def test_endpoint_returns_only_the_tokens_mcp_and_never_a_gateway_credential():
+    from core.credentials.mcp_gateway import GatewayCredential
     mcp_broker.provision("s1", {
-        "github": SecretBundle(env={"GH_TOKEN": "gh"}, http_bearer="B"),
+        "github": SecretBundle(env={"GH_TOKEN": "gh"}, gateway=GatewayCredential(
+            upstream="http://localhost:8935", path="/mcp", allowlist_key="github",
+            value="ghp_secret", proxy_local=True)),
         "slack": SecretBundle(env={"SLACK_TOKEN": "sk"}),
     })
     gh = _call(f"Bearer {mcp_broker.mint_token('s1', 'github')}")
-    assert gh == {"env": {"GH_TOKEN": "gh"}, "http_bearer": "B"}
+    assert gh == {"env": {"GH_TOKEN": "gh"}}
+    assert "ghp_secret" not in repr(gh)
     sk = _call(f"Bearer {mcp_broker.mint_token('s1', 'slack')}")
-    assert sk == {"env": {"SLACK_TOKEN": "sk"}, "http_bearer": None}
+    assert sk == {"env": {"SLACK_TOKEN": "sk"}}
 
 
 def test_endpoint_rejects_session_jwt_and_master_key():
@@ -156,7 +160,7 @@ def test_cleanup_session_permission_state_purges_broker():
 
 def _token_world(monkeypatch):
     """Two stdio OAuth MCPs with a credentials_dir, one bound file each in
-    the collector's virtual-path shape, plus neighbours that contribute
+    the collector's per-manifest shape, plus neighbours that contribute
     nothing (no credentials_dir, no bound file)."""
     from types import SimpleNamespace
     from services.mcp import mcp_registry
@@ -179,13 +183,15 @@ def _token_world(monkeypatch):
         seen.update(agent=agent, user_sub=user_sub, session_scope=session_scope)
         base = "/users/alice/.credentials" if session_scope == "user" else "/knowledge/.credentials"
         return {
-            f"{base}/google-tokens/a@b.com.json": b'{"access_token": "x"}',
-            f"{base}/google-analytics-tokens/a@b.com.json": b'{"access_token": "y"}',
+            "google-workspace": {
+                f"{base}/google-tokens/a@b.com.json": b'{"access_token": "x"}'},
+            "google-analytics-mcp": {
+                f"{base}/google-analytics-tokens/a@b.com.json": b'{"access_token": "y"}'},
         }
 
     monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda a, **k: manifests)
     monkeypatch.setattr(mcp_registry, "get_credentials_dirs", lambda n: dirs.get(n, []))
-    monkeypatch.setattr(cr, "collect_oauth_token_files", _collect)
+    monkeypatch.setattr(cr, "collect_oauth_token_files_by_manifest", _collect)
     return seen
 
 
@@ -207,7 +213,7 @@ def test_token_file_env_is_keyed_by_config_key_and_is_a_json_string(monkeypatch)
 
 def test_merge_token_files_extends_and_creates_bundles(monkeypatch):
     from core.credentials import credential_files as cf
-    bundles = {"analytics": SecretBundle(env={"GOOGLE_PROJECT_ID": "p"}, http_bearer=None)}
+    bundles = {"analytics": SecretBundle(env={"GOOGLE_PROJECT_ID": "p"})}
     cf.merge_token_files(bundles, {"analytics": {"OTO_CREDENTIAL_FILES": "{}"},
                                    "google-workspace": {"OTO_CREDENTIAL_FILES": "{}"}})
     assert bundles["analytics"].env == {"GOOGLE_PROJECT_ID": "p", "OTO_CREDENTIAL_FILES": "{}"}
@@ -229,7 +235,7 @@ def test_attach_token_files_reads_the_session_off_the_config(monkeypatch):
 
     def _boom(*a, **k):
         raise RuntimeError("store down")
-    monkeypatch.setattr(cr, "collect_oauth_token_files", _boom)
+    monkeypatch.setattr(cr, "collect_oauth_token_files_by_manifest", _boom)
     cfg2 = AgentConfig(agent_name="agent", security_context=SimpleNamespace(session_scope="user"))
     cf.attach_token_files(cfg2)
     assert cfg2.mcp_secret_bundles == {}
@@ -247,3 +253,63 @@ def test_token_files_round_trip_through_the_interceptor(monkeypatch):
     assert "OTO_MCP_FETCH_TOKEN" not in child
     spec = json.loads(child[cf.CREDENTIAL_FILES_ENV])
     assert spec["WORKSPACE_MCP_CREDENTIALS_DIR"]["files"] == {"a@b.com.json": '{"access_token": "x"}'}
+
+
+def test_a_shared_subpath_delivers_each_mcp_only_its_own_account(monkeypatch, tmp_path):
+    """Two OAuth stdio MCPs that declare the same ``credentials_dir`` subpath
+    each receive the file collected for their own binding: two accounts stay
+    apart, one account shared on purpose reaches both, and an MCP with no
+    binding of its own receives nothing from its neighbour. The remote
+    channel's flat map keeps every file (one directory per subpath)."""
+    import json
+    from types import SimpleNamespace
+    from core.credentials import credential_files as cf
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver as cr
+
+    token_dir = tmp_path / "central" / "alice"
+    token_dir.mkdir(parents=True)
+    (token_dir / "work@x.com.json").write_bytes(b'{"access_token": "w"}')
+    (token_dir / "home@x.com.json").write_bytes(b'{"access_token": "h"}')
+
+    def _manifest(name, server_name="", oauth=None):
+        return SimpleNamespace(
+            name=name, server_name=server_name,
+            server=SimpleNamespace(runtime="python"),
+            credentials=SimpleNamespace(
+                oauth={"provider_id": "google"} if oauth is None else oauth),
+        )
+
+    manifests = [
+        _manifest("google-workspace"),
+        _manifest("google-workspace-extra", server_name="extra"),
+        _manifest("companion", oauth={}),
+    ]
+    labels = {"google-workspace": "work@x.com", "google-workspace-extra": "home@x.com"}
+    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda a, **k: manifests)
+    monkeypatch.setattr(mcp_registry, "get_credentials_dirs",
+                        lambda n: [("WORKSPACE_MCP_CREDENTIALS_DIR", "google-tokens")])
+    monkeypatch.setattr(
+        cr, "_bound_token_source",
+        lambda mcp, pid, *, user_sub, task_scope, agent_name: (
+            (token_dir, labels[mcp], "alice") if mcp in labels else None),
+    )
+
+    def _delivered():
+        out = cf.token_file_env("agent", user_sub="sub-1", session_scope="user")
+        return {key: json.loads(env[cf.CREDENTIAL_FILES_ENV])
+                ["WORKSPACE_MCP_CREDENTIALS_DIR"]["files"] for key, env in out.items()}
+
+    assert _delivered() == {
+        "google-workspace": {"work@x.com.json": '{"access_token": "w"}'},
+        "extra": {"home@x.com.json": '{"access_token": "h"}'},
+    }
+    flat = cr.collect_oauth_token_files("agent", user_sub="sub-1", session_scope="user")
+    assert sorted(p.rsplit("/", 1)[1] for p in flat) == ["home@x.com.json", "work@x.com.json"]
+    assert {p.rsplit("/", 1)[0] for p in flat} == {"/users/alice/.credentials/google-tokens"}
+
+    labels["google-workspace-extra"] = "work@x.com"
+    assert _delivered() == {
+        "google-workspace": {"work@x.com.json": '{"access_token": "w"}'},
+        "extra": {"work@x.com.json": '{"access_token": "w"}'},
+    }

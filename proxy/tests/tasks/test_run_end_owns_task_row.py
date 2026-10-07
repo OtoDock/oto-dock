@@ -55,7 +55,7 @@ def _row_gone(task_id: str) -> bool:
 
 
 @contextlib.asynccontextmanager
-async def _parked_slot(session_id, target="", execution_path=None):
+async def _parked_slot(session_id, target="", execution_path=None, ring_key=""):
     await asyncio.sleep(3600)
     yield
 

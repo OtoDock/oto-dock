@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 from ..transport import file_sync
+from . import alive_report
 from .cli_session import CLISession, _write_cli_hooks
 from .codex_session import CodexSession, _write_codex_hooks
 from ..config import atomic_replace, force_rmtree, kill_process_tree
@@ -66,22 +67,34 @@ MCP_CATEGORIES = frozenset({"core", "custom", "community"})
 def _validate_satellite_host_path(raw: str) -> None:
     """Defensive validation before writing/reading a satellite-host path.
 
-    Structural checks only — absolute form, no NUL, no `..`. The
-    semantic policy check (home-only vs full-FS) lives in
-    `_check_satellite_host_policy` and runs in addition to this one.
+    Structural checks only — absolute form, no NUL, no `..`, and on Windows
+    no network or device path. The semantic policy check (home-only vs
+    full-FS) lives in `_check_satellite_host_policy` and runs in addition to
+    this one.
     """
     if not raw:
         raise ValueError("empty satellite-host path")
     if "\x00" in raw:
         raise ValueError("path contains NUL byte")
+    windows = config.HOST.name == config.WINDOWS
     # Permit absolute Unix paths and Windows drive-rooted paths (forward
-    # or backward slash variants).
-    is_unix_abs = raw.startswith("/")
+    # or backward slash variants); on Windows a root-relative path names the
+    # current drive in either slash.
+    lead = raw.replace("\\", "/") if windows else raw
+    is_unix_abs = lead.startswith("/")
     is_win_abs = (
         len(raw) >= 3 and raw[1] == ":" and raw[2] in ("/", "\\")
     )
     if not (is_unix_abs or is_win_abs):
         raise ValueError(f"satellite-host path must be absolute: {raw!r}")
+    # A leading `//` or `\\` on Windows is a UNC share or a device path
+    # (`\\?\C:\...`, `\\.\...`, `\\localhost\c$\...`): it can name any drive,
+    # and realpath keeps the spelling, so no root compare would match it.
+    if windows and lead.startswith("//"):
+        raise ValueError(
+            f"satellite-host path {raw!r} is a network or device path, which "
+            "sessions cannot use; state the drive path (C:/...)"
+        )
     # Reject ``..`` segments (post-normalize they'd resolve to a
     # different path than the policy admitted).
     normalized = raw.replace("\\", "/")
@@ -144,6 +157,19 @@ def _is_claude_runtime_path(raw: str) -> bool:
     return True
 
 
+def _host_real(path: str) -> str:
+    """``os.path.realpath`` in forward-slash form, without the Win32 device
+    prefix realpath keeps when the input had it or adds for a long path
+    (``\\\\?\\C:\\...`` -> ``C:/...``, ``\\\\?\\UNC\\host\\share`` ->
+    ``//host/share``), so every root compare sees the plain spelling."""
+    real = os.path.realpath(path).replace("\\", "/")
+    if real[:8].upper() == "//?/UNC/":
+        return "/" + real[7:]
+    if real.startswith(("//?/", "//./")):
+        return real[4:]
+    return real
+
+
 def _under(path: str, root: str, *, fold: bool) -> bool:
     """Whether ``path`` is ``root`` or below it, on whole segments, both in
     forward-slash form; ``fold`` compares case-insensitively (Windows, the
@@ -166,8 +192,10 @@ def _check_satellite_host_policy(
 
     First, on every pairing (``allow_full_fs`` included): the machine's own
     OtoDock state (``config.otodock_dir()``: the machine secret, the
-    configuration, the browser profiles, the installed MCPs), the MCP folder
-    and the agents root are refused, with realpath on both sides, except the
+    configuration, the browser profiles, the installed MCPs; on Windows also
+    ``<home>/.oto-dock``, where earlier releases kept the browser profiles),
+    the MCP folder and the agents root are refused, with realpath on both
+    sides and the Win32 device prefix dropped (``_host_real``), except the
     session's own ``agents/<own_agent>`` subtree when ``own_agent`` is a safe
     slug (the agent-tree frames never take this branch; a host-path frame
     that names no slug gets no exception). REMOTE-AGENTS.md promises this
@@ -189,11 +217,14 @@ def _check_satellite_host_policy(
     from ..host.auth_paths import is_safe_slug
     from ..host.satellite_policy import is_full_fs_allowed
     fold = config.HOST.case_insensitive
-    real = os.path.realpath(raw).replace("\\", "/")
-    state_roots = [str(config.otodock_dir().resolve()).replace("\\", "/")]
+    real = _host_real(raw)
+    state_roots = [_host_real(str(config.otodock_dir()))]
+    if config.HOST.name == config.WINDOWS:
+        # The proxy refuses this folder too (placement.state_dirs).
+        state_roots.append(_host_real(str(Path.home() / ".oto-dock")))
     if mcps_dir is not None:
-        state_roots.append(str(Path(mcps_dir).resolve()).replace("\\", "/"))
-    agents_root = str(Path(agents_dir).resolve()).replace("\\", "/") if agents_dir is not None else ""
+        state_roots.append(_host_real(str(mcps_dir)))
+    agents_root = _host_real(str(agents_dir)) if agents_dir is not None else ""
     own_root = f"{agents_root}/{own_agent}" if agents_root and is_safe_slug(own_agent) else ""
     if own_root and _under(real, own_root, fold=fold):
         pass  # the session's own synced tree, judged by the home band below
@@ -208,7 +239,7 @@ def _check_satellite_host_policy(
         return
     if _is_claude_runtime_path(raw):
         return
-    home_dir = str(Path.home().resolve()).replace("\\", "/")
+    home_dir = _host_real(str(Path.home()))
     if not home_dir:
         raise ValueError(
             "satellite cannot determine its OS home directory — "
@@ -219,7 +250,7 @@ def _check_satellite_host_policy(
     # actual I/O lands outside home (the exact escape this band exists to
     # block). realpath keeps non-existent tails, so pushes that CREATE a
     # new file still validate against the real parent chain.
-    normalized = os.path.realpath(raw).replace("\\", "/")
+    normalized = real
     # Case-fold for Windows / macOS-HFS+ (matches the proxy's
     # `_normalize_for_compare`).
     is_case_insensitive = config.HOST.case_insensitive
@@ -249,9 +280,10 @@ _SOURCE_BUILD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 def _source_build_of(spec: dict) -> list[str]:
     """The ``source_build`` list of a sync spec: the package names the
-    manifest allows to build from source, each a plain distribution name
-    (the installer's own rule); anything else is dropped, a missing or
-    malformed field is the empty list (an older proxy)."""
+    installer may build from source when a wheels-only resolve fails on them,
+    each a plain distribution name (the installer's own rule); anything else
+    is dropped, a missing or malformed field is the empty list (an older
+    proxy)."""
     raw = spec.get("source_build")
     if not isinstance(raw, list):
         return []
@@ -353,6 +385,14 @@ async def _apply_satellite_host_push(
         })
 
 
+def _close_opened(fut: "asyncio.Future") -> None:
+    """Close the descriptor an open finished with after its pull was cancelled."""
+    if fut.cancelled() or fut.exception() is not None:
+        return
+    with contextlib.suppress(OSError):
+        os.close(fut.result()[0])
+
+
 class SessionManager:
     """Routes commands to CLI or Codex sessions."""
 
@@ -378,6 +418,11 @@ class SessionManager:
         self._steps: dict[str, asyncio.subprocess.Process] = {}
         from .step_runner import wipe_steps_root
         wipe_steps_root()
+        # The file pulls producing right now, by request id (0.5.137): the
+        # proxy's file_pull_cancel stops one, a dropped link stops them all
+        # (the proxy failed them, and their chunks must not reach the next
+        # connection).
+        self._pulls: dict[str, asyncio.Task] = {}
         # Proxy-restart re-attach (Mode C): per-CLI-session retention of the
         # CURRENT turn's forwarded events, replayable to a restarted proxy.
         # turn_state carries {command_id, active, seq, start_seq}; the buffer
@@ -487,6 +532,16 @@ class SessionManager:
         # flag AND the version, and never sends the frame to a satellite
         # without it (the router would drop it silently).
         caps["steps"] = True
+        # The credential gateway (0.5.132): this satellite holds a session's
+        # vendor MCP tokens in memory and adds them on the way out; the proxy
+        # gates on the flag AND the version, and below it keeps a vendor
+        # entry's inline shape.
+        caps["mcp_gateway"] = True
+        # Paced transfers (0.5.137): file pulls ride a bounded bulk lane
+        # after control and PTY, are purged on a drop, and stop on
+        # ``file_pull_cancel``. The proxy gates the cancel on the flag AND
+        # the version.
+        caps["paced_transfers"] = True
         # Per-satellite budget: raw resources + this host's own
         # physical-safety session ceiling. The proxy displays these and may apply
         # a lower admin override (remote_machines.max_sessions) on top.
@@ -582,6 +637,7 @@ class SessionManager:
                     logger.exception(f"Failed to close stale session {session_id}")
 
             session = engine.headless_cls()(session_id, agent_dir, config_payload, self.config)
+            session.incarnation = alive_report.next_incarnation()
             await session.start()
 
             self.sessions[session_id] = session
@@ -855,6 +911,13 @@ class SessionManager:
         """Clean shutdown of a session."""
         session_id = msg.get("session_id", "")
         command_id = msg.get("command_id", "")
+        held = self.sessions.get(session_id)
+        wanted = msg.get("incarnation")
+        if held is not None and wanted and getattr(held, "incarnation", "") != wanted:
+            # Aimed at an earlier object of this id (decided on a report that
+            # predates a later start): the live one stays.
+            await ws.enqueue_send({"type": "ack", "command_id": command_id, "status": "ok"})
+            return
         session = self.sessions.pop(session_id, None)
         # A proxy-commanded close is deliberate — drop the turn retention.
         self.turn_buffers.pop(session_id, None)
@@ -1358,6 +1421,7 @@ class SessionManager:
                 "execution_path": session.execution_path,
                 "agent_slug": getattr(session, "agent_slug", ""),
                 "turn_active": bool(state.get("active")),
+                "incarnation": getattr(session, "incarnation", "") or "",
                 "command_id": state.get("command_id", ""),
                 "buffered_events": len(buffer) if buffer is not None else 0,
                 "use_native_permissions": bool(
@@ -1699,6 +1763,41 @@ class SessionManager:
             pass
 
     async def file_pull(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        """Read and send a file back to the platform, registered by its
+        request id while it runs so ``file_pull_cancel`` and a dropped link
+        can stop it."""
+        request_id = msg.get("request_id", "")
+        task = asyncio.current_task()
+        if request_id and task is not None:
+            self._pulls[request_id] = task
+        try:
+            await self._file_pull(msg, ws)
+        finally:
+            if request_id and self._pulls.get(request_id) is task:
+                self._pulls.pop(request_id, None)
+
+    def file_pull_cancel(self, msg: dict, ws: "SatelliteWSClient | None" = None) -> None:
+        """The proxy gave up on a pull (a stall, its own refusal, a caller
+        that left): stop producing it, and drop its chunks still queued (the
+        proxy drops them on arrival). An unknown id is a pull already done."""
+        request_id = msg.get("request_id", "")
+        task = self._pulls.get(request_id)
+        if task is not None and not task.done():
+            task.cancel()
+            logger.info("file pull %s cancelled by the platform", request_id[:8])
+        if ws is not None and request_id:
+            ws.drop_bulk(lambda m: m.get("request_id") == request_id)
+
+    def cancel_pulls(self) -> int:
+        """Stop every running pull (the link dropped). Returns how many."""
+        n = 0
+        for task in list(self._pulls.values()):
+            if not task.done():
+                task.cancel()
+                n += 1
+        return n
+
+    async def _file_pull(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Read and send a file back to the platform.
 
         ``path_kind``:
@@ -1763,15 +1862,23 @@ class SessionManager:
         # would reject it (close 1009), and the reconnect → initial-sync →
         # pull loop would brick the chat. The final chunk carries the sha256
         # as the eof marker (mirrors the write_chunk push convention). Reads
-        # one block at a time so the satellite never holds the whole file.
+        # one block at a time, off the loop, and hands each to the bounded
+        # bulk lane, which waits for room: heartbeats, acks and hook calls
+        # go out between the chunks instead of behind the whole file.
         import hashlib
 
         fh = None
         try:
             if opener is not None:
                 from ..host import safe_fs as _sfs
+                opening = asyncio.ensure_future(asyncio.to_thread(opener))
                 try:
-                    fd, st = await asyncio.to_thread(opener)
+                    fd, st = await asyncio.shield(opening)
+                except asyncio.CancelledError:
+                    # Cancelled while the thread opens: its descriptor is
+                    # closed when it arrives.
+                    opening.add_done_callback(_close_opened)
+                    raise
                 except FileNotFoundError:
                     raise
                 except _sfs.FileTooLarge:
@@ -1826,12 +1933,12 @@ class SessionManager:
         total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
         hasher = hashlib.sha256()
         try:
-            with fh:
+            try:
                 for chunk_index in range(total_chunks):
-                    block = fh.read(chunk_size)
+                    block = await asyncio.to_thread(fh.read, chunk_size)
                     hasher.update(block)
                     is_last = chunk_index == total_chunks - 1
-                    await ws.enqueue_send({
+                    sent = await ws.enqueue_bulk({
                         "type": "file_content",
                         "request_id": request_id,
                         "path": rel_path,
@@ -1840,6 +1947,13 @@ class SessionManager:
                         "content_b64": base64.b64encode(block).decode(),
                         "hash": f"sha256:{hasher.hexdigest()}" if is_last else "",
                     })
+                    if not sent:
+                        # The link dropped: the platform failed this pull.
+                        return
+            finally:
+                # Off the loop: a read cancelled in its thread still holds
+                # the reader, and a close here would wait for it.
+                asyncio.get_running_loop().run_in_executor(None, fh.close)
         except OSError as e:
             await ws.enqueue_send({
                 "type": "file_content",
@@ -2262,18 +2376,25 @@ class SessionManager:
                 results[name] = {"status": "error", "error": err}
 
         # --- Removals ---
+        # A platform from 1.7.1 sends only MCPs it no longer ships and says
+        # so with ``remove_any_category``: those go from any category. An
+        # older platform also names MCPs a session merely left out, so
+        # without the flag ``core`` stays untouched as before.
+        categories = (("core", "custom", "community") if msg.get("remove_any_category")
+                      else ("custom", "community"))
         for name in to_remove:
             if err := _bad_mcp_ref(name):
                 logger.warning("sync_mcps: rejected removal — %s", err)
                 results[name or "?"] = {"status": "error", "error": err}
                 continue
             removed = False
-            for cat in ("custom", "community"):
+            for cat in categories:
                 d = self.config.mcps_dir / cat / name
                 if d.is_dir():
                     try:
                         shutil.rmtree(d)
                         removed = True
+                        logger.info("sync_mcps: removed %s/%s", cat, name)
                         break
                     except OSError as e:
                         logger.warning("failed to remove %s: %s", d, e)

@@ -100,6 +100,11 @@ export function AccountCard({
                   Missing access
                 </span>
               )}
+              {account.needs_reconnect && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  Reconnect needed
+                </span>
+              )}
             </div>
           </div>
         </div>

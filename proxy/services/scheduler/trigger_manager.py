@@ -25,6 +25,7 @@ from storage.automation import trigger_store
 from storage import database as task_store
 from storage import db_apps
 from storage.automation import notification_store
+from services.infra import external_data
 from services.scheduler import task_kinds
 from core.session import visibility as _vis
 
@@ -725,8 +726,15 @@ def delete_trigger(trigger_id: str) -> tuple[bool, str | None]:
 # =====================================================================
 
 
-def _substitute_placeholders(template: str | None, context: dict) -> str | None:
+def _substitute_placeholders(template: str | None, context: dict, *,
+                             fence: bool = False) -> str | None:
     """Replace ``{{key}}`` and ``{{a.b.c}}`` with values from ``context``.
+
+    ``fence``: the result is a model's prompt and the values came from an
+    outside party (a webhook body, an external link's visitor), so each one
+    is fenced and the prompt says what the fence means
+    (``services/infra/external_data.py``). Notifications a person reads
+    keep plain values.
 
     Dot-paths walk nested dicts — ``{{subject.title}}`` resolves
     ``context["subject"]["title"]``. Missing keys / non-dict intermediates
@@ -754,11 +762,19 @@ def _substitute_placeholders(template: str | None, context: dict) -> str | None:
                 return None
         return cursor
 
-    def _repl(match):
-        val = _walk(match.group(1).strip())
-        return str(val) if val is not None else ""
+    fenced = False
 
-    return re.sub(r"\{\{([^{}]+)\}\}", _repl, template)
+    def _repl(match):
+        nonlocal fenced
+        val = _walk(match.group(1).strip())
+        text = str(val) if val is not None else ""
+        if fence and text:
+            fenced = True
+            return external_data.fence(text)
+        return text
+
+    out = re.sub(r"\{\{([^{}]+)\}\}", _repl, template)
+    return external_data.with_note(out) if fenced else out
 
 
 def _build_substitution_context(
@@ -1001,7 +1017,7 @@ async def _fire_linked_task(
     # notifications — task prompts can reference {{subject.title}} etc.
     # for vendor fires, or {{phone}}/raw-body keys for phone/generic fires.
     context = _build_substitution_context(body, vendor_event)
-    final_prompt = _substitute_placeholders(task_def.prompt, context) or task_def.prompt
+    final_prompt = _substitute_placeholders(task_def.prompt, context, fence=True) or task_def.prompt
     return await scheduler.trigger_task_now(
         task_def,
         trigger_type=task_kinds.TRIGGER_TRIGGER,

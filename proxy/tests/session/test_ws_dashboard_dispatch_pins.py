@@ -128,7 +128,8 @@ class TestPlanReviewMidStream:
                     await _turn_end(ws, chat_id)
                 else:
                     # The queued implement prompt drains as the next turn.
-                    await ws.expect({"type": "queue_sent",
+                    await ws.expect({"type": "queue_sent", "queue_ids": [],
+                                     "message_ids": ANY,
                                      "text": "Please implement the plan now.", "chat_id": chat_id})
                     await ws.expect({"type": "text", "content": "implementing", "chat_id": chat_id})
                     await ws.expect({"type": "done", "chat_id": chat_id})
@@ -274,13 +275,19 @@ class TestCancelAllQueuedMidStream:
                 await ws.expect(_live_state(chat_id, sid))
                 await ws.expect({"type": "text", "content": "working…", "chat_id": chat_id})
 
-                ws.client_send({"type": "chat", "text": "queued A"})
-                await ws.expect({"type": "queued", "index": 0, "text": "queued A", "chat_id": chat_id})
-                ws.client_send({"type": "chat", "text": "queued B"})
-                await ws.expect({"type": "queued", "index": 1, "text": "queued B", "chat_id": chat_id})
-                ws.client_send({"type": "cancel_all_queued"})
-                await ws.expect({"type": "queue_cleared", "text": "queued A\n\nqueued B",
+                ws.client_send({"type": "chat", "text": "queued A", "queue_id": "qa"})
+                await ws.expect({"type": "queued", "index": 0, "queue_id": "qa",
+                                 "text": "queued A", "author_sub": "user-admin",
                                  "chat_id": chat_id})
+                ws.client_send({"type": "chat", "text": "queued B", "queue_id": "qb"})
+                await ws.expect({"type": "queued", "index": 1, "queue_id": "qb",
+                                 "text": "queued B", "author_sub": "user-admin",
+                                 "chat_id": chat_id})
+                # Edit: the person's own messages back into their composer.
+                ws.client_send({"type": "cancel_all_queued"})
+                await ws.expect({"type": "queue_cleared", "queue_ids": ["qa", "qb"],
+                                 "reason": "cancel", "returned": True,
+                                 "text": "queued A\n\nqueued B", "chat_id": chat_id})
                 hold.set()
                 await _turn_end(ws, chat_id)
                 # Nothing drained: the queue was cleared.

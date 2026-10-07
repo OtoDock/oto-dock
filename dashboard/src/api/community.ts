@@ -43,6 +43,9 @@ export interface CommunityMcpEntry {
   installed: boolean
   installed_version: string | null
   update_available: boolean
+  // The catalog source moved: the Browse button cannot apply it, the MCP
+  // Servers page carries the switch (proxy COMMUNITY-MARKETPLACE.md).
+  source_changed?: boolean
   enabled_for_agents: string[]
   // Manager scope: open request id for this (mcp, agent). Admin scope:
   // always null (admins don't request).

@@ -119,7 +119,14 @@ class Caller:
     extra: dict = field(default_factory=dict)
     # Which process answers: the live release, the owner's preview copy, or
     # the check instance a render runs against (APPS.md "Deploy pipeline").
-    instance: str = "live"
+    instance: str = app_supervisor.LIVE
+
+    @property
+    def wire_basis(self) -> str:
+        """The ``X-OtoDock-Basis`` an app reads: a placed agent's session
+        says so (its claim's principal says the same), every other caller
+        its basis."""
+        return app_tokens.PRINCIPAL_PLACEMENT if self.extra.get("placement") else self.basis
 
     @property
     def actor(self) -> str:
@@ -128,7 +135,11 @@ class Caller:
             # human with the app open loses nothing to it.
             return f"render:{self.extra['render']}"
         if self.basis == "app":
-            return f"app:{self.sub}"
+            # The preview copy runs code nobody approved: its own buckets,
+            # never the live server's.
+            if self.instance == app_supervisor.LIVE:
+                return f"app:{self.sub}"
+            return f"app:{self.sub}:{self.instance}"
         if self.basis == "step":
             return f"step:{str(self.extra.get('delivery') or '')[:8]}"
         if self.basis == "external":
@@ -171,16 +182,18 @@ async def caller_from_token(token: str, row: dict) -> Caller:
     claims = app_tokens.verify(token, app_id, app_tokens.PURPOSE_VIEWER)
     if claims:
         basis = "external" if claims.get("external") else "viewer"
-        instance = str(claims.get("instance") or "live")
+        instance = str(claims.get("instance") or app_supervisor.LIVE)
         return Caller(basis=basis, sub=str(claims.get("sub") or ""),
                       username=str(claims.get("username") or ""),
                       role=str(claims.get("role") or roles.VIEWER),
                       grant=str(claims.get("grant") or ""), claim=token,
                       exp=int(claims.get("exp") or 0), extra=claims,
-                      instance=instance if instance in ("live", "preview", "check") else "live")
+                      instance=instance if instance in app_supervisor.INSTANCES else app_supervisor.LIVE)
     launch = app_tokens.verify(token, app_id, app_tokens.PURPOSE_LAUNCH)
     if launch:
-        for name in ("live", "preview"):
+        # Never a check instance's token: a check runs unapproved code
+        # without the approval gate, so it is never the app identity.
+        for name in (app_supervisor.LIVE, app_supervisor.PREVIEW):
             inst = app_supervisor.get(app_id, name)
             if inst is not None and inst.token == token:
                 return Caller(basis="app", sub=app_id, role="app", claim="",
@@ -195,13 +208,26 @@ async def caller_from_token(token: str, row: dict) -> Caller:
 async def _agent_caller(payload: dict, row: dict) -> Caller:
     """Basis ``agent``: the session agent's own shared apps and the session
     user's personal apps on that same agent (a personal app lives in its
-    agent's tree, and a session never crosses one), never an external
-    session."""
+    agent's tree, and a session never crosses one), and, through a share
+    that placed the app in the session's agent, the app's signed exports
+    at the capped role (SHARING.md "Agents use a placed app"); never an
+    external session."""
     if payload.get("ext"):
         raise _refuse(401, "external sessions cannot call apps")
+    # The session must be live and the token of its current life (the app
+    # routes and the app socket's auth frames reach no middleware for it).
+    from core.session.session_state import get_session_security, session_token_refusal
+    from core.session.visibility import SCOPE_USER
+    if session_token_refusal(payload):
+        raise _refuse(401, "the session token is no longer valid")
     agent = payload.get("agent") or ""
     sid = payload.get("sid") or ""
-    holder_ok, user, username = await run_db(_agent_principal, payload)
+    # A person's own placement answers only a session that mounts their
+    # scope: a Shared-only chat carries the person but writes the agent's
+    # one shared history, so it sees none; an unregistered context neither.
+    ctx = get_session_security(sid)
+    person_scope = ctx is not None and ctx.session_scope == SCOPE_USER
+    holder_ok, user, username, placement = await run_db(_agent_principal, payload, row, person_scope)
     # A token whose person is gone, or was minted before their last password
     # change, reaches no app, never the no-user principal.
     if not holder_ok:
@@ -212,31 +238,66 @@ async def _agent_caller(payload: dict, row: dict) -> Caller:
     if allowed and (row.get("scope_chat_id") or row.get("scope_project_id")):
         from api.apps.apps import _scope_access
         allowed = user is not None and await run_db(_scope_access, row, user)
-    if not allowed:
+    if not allowed and placement is None:
         raise _refuse(404, "App not found")
-    # The row alone, never the owner's platform role: a bearer principal
-    # presents its per-agent row to an app (viewer without one) so a prompt
-    # never carries an admin's standing into a floored button.
-    role = (roles.row_role(user.agent_roles, row.get("agent") or "") or roles.VIEWER) if user else "agent"
     sub = user.sub if user else f"session:{sid}"
-    claim = app_tokens.mint(row["id"], app_tokens.PURPOSE_CALLER, {
-        "principal": app_tokens.PRINCIPAL_AGENT, "sub": sub, "username": username, "role": role,
-        "agent": agent, "session": sid, "external": False,
-    }, app_tokens.CALLER_TTL_S)
+    if allowed:
+        # The row alone, never the owner's platform role: a bearer principal
+        # presents its per-agent row to an app (viewer without one) so a
+        # prompt never carries an admin's standing into a floored button.
+        role = (roles.row_role(user.agent_roles, row.get("agent") or "") or roles.VIEWER) if user else roles.SERVICE
+        claim = app_tokens.mint(row["id"], app_tokens.PURPOSE_CALLER, {
+            "principal": app_tokens.PRINCIPAL_AGENT, "sub": sub, "username": username, "role": role,
+            "agent": agent, "session": sid, "external": False,
+        }, app_tokens.CALLER_TTL_S)
+        return Caller(basis="agent", sub=sub, username=username, role=role, claim=claim,
+                      exp=int(time.time()) + app_tokens.CALLER_TTL_S, user=user)
+    # A placed app: the role the share gives on the receiving agent; the
+    # marker is what every guard tests, and the claim names the placement.
+    marker = {"kind": placement["source"], "share_id": placement["share_id"],
+              "from_agent": row.get("agent") or "", "agent": agent, "role_cap": placement["role_cap"]}
+    role = placement["role"]
+    claim = _placement_claim(row, sub, username, role, agent, sid, marker)
     return Caller(basis="agent", sub=sub, username=username, role=role, claim=claim,
-                  exp=int(time.time()) + app_tokens.CALLER_TTL_S, user=user)
+                  exp=int(time.time()) + app_tokens.CALLER_TTL_S, user=user,
+                  extra={"placement": marker})
 
 
-def _agent_principal(payload: dict) -> tuple[bool, UserContext | None, str]:
-    """``(holder ok, the user, their username)`` of a session token in one
-    executor job. Synchronous."""
+def _placement_claim(row: dict, sub: str, username: str, role: str, agent: str, sid: str,
+                     marker: dict) -> str:
+    """The claim a placed agent's session presents to the app: the
+    ``placement`` principal (never ``agent``, so an app that takes that
+    word for its own agent never takes a placed session for it), the role
+    the share gives, the CALLING session's agent, and the placement itself
+    (``from_agent`` names the app's own agent). Basis ``placement`` on the
+    wire; the platform route and the broker refuse it when relayed."""
+    return app_tokens.mint(row["id"], app_tokens.PURPOSE_CALLER, {
+        "principal": app_tokens.PRINCIPAL_PLACEMENT, "sub": sub, "username": username, "role": role,
+        "agent": agent, "session": sid, "external": False, "placement": marker,
+    }, app_tokens.CALLER_TTL_S)
+
+
+def _agent_principal(payload: dict, row: dict, person_scope: bool
+                     ) -> tuple[bool, UserContext | None, str, dict | None]:
+    """``(holder ok, the user, their username, the placement)`` of a session
+    token in one executor job. The placement is read only for another
+    agent's unscoped row: the share placing it in the token's agent and the
+    role the session acts at (``share_store.placement_role``), the person's
+    own placement only when the session mounts their scope. Synchronous."""
     from auth.providers import session_token_holder_ok, user_context_for_sub
     if not session_token_holder_ok(payload):
-        return False, None, ""
+        return False, None, "", None
     user_sub = payload.get("user_sub") or ""
     user = user_context_for_sub(user_sub) if user_sub else None
     username = ((task_store.get_user(user.sub) or {}).get("username") or "") if user else ""
-    return True, user, username
+    placement = None
+    agent = payload.get("agent") or ""
+    if agent and row.get("agent") != agent and not (row.get("scope_chat_id") or row.get("scope_project_id")):
+        from storage.sharing import share_store
+        own = (roles.row_role(user.agent_roles, agent) or roles.VIEWER) if user else roles.SERVICE
+        person_sub = user.sub if (user is not None and person_scope) else None
+        placement = share_store.placement_role(row["id"], agent, person_sub, own)
+    return True, user, username, placement
 
 
 async def resolve_caller(request: Request, row: dict) -> Caller:
@@ -302,7 +363,7 @@ def _forward_headers(request: Request, caller: Caller) -> list[tuple[str, str]]:
         out.append((k, v))
     if caller.claim:
         out.append(("X-OtoDock-Viewer", caller.claim))
-    out.append(("X-OtoDock-Basis", caller.basis))
+    out.append(("X-OtoDock-Basis", caller.wire_basis))
     origin = urlsplit(config.DASHBOARD_PUBLIC_URL or "") if config.DASHBOARD_PUBLIC_URL else None
     if origin and origin.scheme and origin.netloc:
         out.append(("X-Forwarded-Proto", origin.scheme))
@@ -394,8 +455,8 @@ async def instance_for(row: dict, caller: Caller) -> app_supervisor.Instance:
     the live release wakes on demand, the preview copy too (an approver's
     claim), the check instance never — it exists only while a render job
     runs it, and a claim that outlives it answers 503."""
-    if caller.instance == "check":
-        inst = app_supervisor.get(row["id"], "check")
+    if caller.instance == app_supervisor.CHECK:
+        inst = app_supervisor.get(row["id"], app_supervisor.CHECK)
         if inst is None or inst.state not in app_supervisor.SERVING:
             raise app_supervisor.AppUnavailable("the check instance is not running", 5,
                                                 state=app_supervisor.STOPPED)
@@ -464,8 +525,30 @@ async def proxy_api(app_id: str, path: str, request: Request):
         raise _refuse(401, "a link's claim is for the link's own routes")
     rest = _rest_path(request, app_id, path)
     check_app_path(path, rest)
+    if caller.extra.get("placement"):
+        _check_placed_export(row, path, caller)
+        # The exported method's own route, where the broker forwards a
+        # binding's call too (``app_bindings.broker``): one route answers
+        # both, so an app that offers a method serves it once.
+        rest = "/api" + rest
     check_rate(app_id, caller.actor)
     return await proxy_request(row, caller, request, rest)
+
+
+def _check_placed_export(row: dict, path: str, caller: Caller) -> None:
+    """A placed agent's session reaches the app's signed ``exports.methods``
+    alone (SHARING.md "Agents use a placed app"), as a brokered call does:
+    the manifest approved, the first path segment an exported method, its
+    floor met at the role the share gives."""
+    from api.apps import manifest as _mf
+    if not task_store.app_actions_approved(row):
+        raise _refuse(404, "not available")
+    entry = _mf.exported_method(row, path)
+    if entry is None:
+        raise _refuse(404, "not exported by that app")
+    if not _mf.meets_floor(entry, caller.role):
+        raise _refuse(403, f"this call needs the {entry.get('min_role')} role on "
+                           f"{caller.extra['placement']['agent']} as the share gives it")
 
 
 # ── the WebSocket bridge ────────────────────────────────────────────────────
@@ -555,6 +638,10 @@ async def proxy_ws(websocket: WebSocket, app_id: str, path: str):
     if caller.basis == "external":
         await _close(websocket, 4401, "a link's claim is for the link's own routes")
         return
+    if caller.extra.get("placement"):
+        # Exports are HTTP methods; a placed agent's session opens no socket.
+        await _close(websocket, 1008, "a placed app answers its exported methods only")
+        return
     try:
         raw = websocket.scope.get("raw_path") or b""
         check_app_path(path, raw.decode("latin-1") if isinstance(raw, bytes) else str(raw))
@@ -622,7 +709,8 @@ async def bridge_ws(websocket: WebSocket, row: dict, path: str, caller: Caller) 
                         # keep it alive — close, and the page reconnects as
                         # whoever it now is.
                         if (fresh.basis, fresh.sub, fresh.grant, fresh.instance) != \
-                                (caller.basis, caller.sub, caller.grant, caller.instance):
+                                (caller.basis, caller.sub, caller.grant, caller.instance) \
+                                or fresh.extra.get("placement"):
                             await _close(websocket, 4401, "the token names another viewer")
                             return
                         deadline["exp"] = fresh.exp
@@ -716,16 +804,24 @@ async def mint_viewer_token(app_id: str, preview: int = 0,
         (row.get("owner_sub") or "") == u.sub if row.get("username")
         else u.can_access_agent(row.get("agent") or ""))
     if not direct:
-        share = await run_db(share_store.internal_grant, "app", app_id, u.sub)
-        grant = (share or {}).get("id") or ""
-    instance = "live"
+        # The share that admits them: their own, else the strongest
+        # placement on an agent they hold (SHARING.md).
+        def _admitting_share() -> str:
+            share = share_store.internal_grant("app", app_id, u.sub)
+            if share:
+                return share["id"]
+            placed = share_store.placements_for_user(app_id, u.sub, list(u.agents))
+            return placed[0]["share_id"] if placed else ""
+        grant = await run_db(_admitting_share)
+    role = await run_db(_mf.caller_role, row, u)
+    instance = app_supervisor.LIVE
     if render:
-        instance = "check"
+        instance = app_supervisor.CHECK
     elif preview and _can_approve_surface(row, u):
-        instance = "preview"
+        instance = app_supervisor.PREVIEW
     claims = {
         "principal": "viewer", "sub": u.sub, "username": username,
-        "role": _mf.caller_role(row, u), "grant": grant, "agent": row.get("agent") or "",
+        "role": role, "grant": grant, "agent": row.get("agent") or "",
         "visibility": db_apps.app_scope(row.get("username")), "external": False,
         "instance": instance,
     }
@@ -1017,6 +1113,10 @@ async def _viewer_behind(request_headers, row: dict, caller: Caller):
         claims = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_VIEWER)
         if not claims:
             relayed = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_CALLER) or {}
+            if relayed.get("placement"):
+                # A placed agent's session reaches the exports alone, and its
+                # claim passed on by the server reaches no more than that.
+                raise _refuse(403, "not available to a placed agent's session")
             if relayed.get("principal") == app_tokens.PRINCIPAL_AGENT:
                 # An agent's call the server passes on (APPS.md "Agents call
                 # apps"): the session's user, as the agent's own call to this
@@ -1105,6 +1205,10 @@ async def platform_method(app_id: str, method: str, request: Request):
     # renders as they see it; it reads and writes nothing as them.
     if caller.extra.get("render"):
         raise _refuse(403, "not available in the rendered check")
+    # Before the viewer behind the call is resolved: with no person, the
+    # fall-through would hand such a session the home app's own identity.
+    if caller.extra.get("placement"):
+        raise _refuse(403, "not available to a placed agent's session")
     if method not in catalog.METHODS:
         raise _refuse(404, "unknown platform method")
     if not _take(f"{app_id}|platform|{caller.actor}", PLATFORM_RATE, PLATFORM_RATE):
@@ -1121,8 +1225,14 @@ async def platform_method(app_id: str, method: str, request: Request):
     # a server says "a booking landed" from a customer's request or a
     # vendor's event alike (APPS.md "Secrets" / "Inbound hooks").
     own_notify = method == "notifications.create" and basis == "app" and not has_viewer
-    if own_notify and caller.instance != "live":
+    # The app reads its own audience the same way, and so does a session of
+    # its own agent with no person behind it: the approval is the floor (a
+    # person is judged at editor or above).
+    own_audience = method == catalog.AUDIENCE_METHOD and not has_viewer and basis in ("app", "agent")
+    if own_notify and caller.instance != app_supervisor.LIVE:
         raise _refuse(403, "the preview copy never notifies the app's people")
+    if own_audience and caller.instance != app_supervisor.LIVE:
+        raise _refuse(403, "the preview copy never reads the app's audience")
     if method == "files.write" and not has_viewer and basis != "platform":
         raise _refuse(403, "a viewer claim is required for a write"
                       if basis != "inbound" else "not available to an inbound wake")
@@ -1132,11 +1242,16 @@ async def platform_method(app_id: str, method: str, request: Request):
     # A person's setup is theirs: the page's own call, or a server call that
     # forwards that person's claim — never the app identity, a wake, an
     # agent session or an inbound event.
-    if method in catalog.SETUP_METHODS and basis != "viewer":
+    if method in catalog.PERSON_METHODS and basis != "viewer":
         raise _refuse(403, "a person's own page is required")
+    if floor_role is None and basis == "viewer":
+        # A forwarded viewer: the role their floors are judged at (a share's
+        # role for a person a share admits), which viewer.me reports too.
+        floor_role = await run_db(_mf.caller_role, row, principal)
     try:
         entry = _catalog_entry(row, principal, method=method,
-                               unattended=(basis == "platform" or own_notify), role=floor_role)
+                               unattended=(basis == "platform" or own_notify or own_audience),
+                               role=floor_role)
     except HTTPException as e:
         raise _refuse(e.status_code, str(e.detail))
     body = await _read_body(request)
@@ -1157,7 +1272,8 @@ async def platform_method(app_id: str, method: str, request: Request):
     def _run() -> dict:
         try:
             return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "",
-                                                              row, principal, args)}
+                                                              row, principal, args,
+                                                              role=floor_role)}
         except (ValueError, PermissionError) as e:
             return {"ok": False, "reason": str(e)}
 
@@ -1211,7 +1327,7 @@ async def platform_ws(websocket: WebSocket, app_id: str):
     agent = row.get("agent") or ""
     # The launch claim names the process: the preview copy's server keeps
     # its own subscriptions and never takes the live server's down.
-    sub = catalog.open_app_subscription(app_id, agent, str(caller.extra.get("instance") or "live"))
+    sub = catalog.open_app_subscription(app_id, agent, caller.instance)
 
     async def reader() -> None:
         while True:
@@ -1277,7 +1393,9 @@ async def _writer(request: Request, app_id: str) -> tuple[dict, Caller]:
     caller = await resolve_caller(request, row)
     if caller.basis not in ("agent", "app"):
         raise _refuse(403, "the page never writes the shared document")
-    if caller.instance != "live":
+    if caller.extra.get("placement"):
+        raise _refuse(403, "not available to a placed agent's session")
+    if caller.instance != app_supervisor.LIVE:
         raise _refuse(403, "the preview copy never writes the live app's document")
     # The pin authority of the session hooks (api/hooks/pins.py
     # ``_require_shared_pin_authority``): a shared row takes a human session

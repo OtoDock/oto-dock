@@ -27,6 +27,7 @@ import time
 import httpx
 
 from auth.webhook_providers.base import NormalizedEvent
+from services.webhooks import vendor_http
 from services.webhooks.event_normalizer import walk_path
 
 logger = logging.getLogger("claude-proxy.event-enrichment")
@@ -72,8 +73,14 @@ async def _enrich(event: NormalizedEvent, *, row: dict, lookups: list[dict]) -> 
         if not value:
             continue
         request = lookup.get("request") or {}
-        url = _substitute(str(request.get("url_template", "")), value=value, token="")
-        if not url:
+        template = str(request.get("url_template", ""))
+        if not template:
+            continue
+        try:
+            url = vendor_http.url_from_template(template, {"value": value})
+            await vendor_http.check_url(url)
+        except vendor_http.VendorURLRefused as e:
+            logger.debug("enrichment lookup skipped: %s", e)
             continue
 
         ttl = int(lookup.get("ttl_seconds") or _DEFAULT_TTL_SECONDS)

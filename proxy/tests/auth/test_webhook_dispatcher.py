@@ -24,6 +24,7 @@ if _proxy_root not in sys.path:
 
 from auth import webhook_providers  # noqa: E402
 from auth.webhook_providers.generic import GenericWebhookProvider  # noqa: E402
+from api.events import webhook_body  # noqa: E402
 from services.webhooks import webhook_dispatcher  # noqa: E402
 from services.webhooks.event_normalizer import resolve_catalog_keys  # noqa: E402
 from storage.identity import credential_store # noqa: E402
@@ -969,7 +970,8 @@ def test_relay_forward_secret_is_cached_and_rechecked_on_refusal(monkeypatch):
 # ── the receive routes before the dispatcher ─────────
 
 
-def _receive_request(chunks, *, ip="198.51.100.60", delay=0.0, path="/v1/webhooks/relay/slack"):
+def _receive_request(chunks, *, ip="198.51.100.60", delay=0.0, path="/v1/webhooks/relay/slack",
+                     headers=(), server=("testserver", 80)):
     from starlette.requests import Request
     pending = list(chunks)
 
@@ -981,9 +983,13 @@ def _receive_request(chunks, *, ip="198.51.100.60", delay=0.0, path="/v1/webhook
         chunk = pending.pop(0)
         return {"type": "http.request", "body": chunk, "more_body": bool(pending)}
 
-    return Request({"type": "http", "method": "POST", "path": path, "headers": [],
-                    "client": (ip, 1234), "server": ("testserver", 80), "scheme": "http",
+    return Request({"type": "http", "method": "POST", "path": path,
+                    "headers": [(k.lower().encode(), v.encode()) for k, v in headers],
+                    "client": (ip, 1234), "server": server, "scheme": "http",
                     "query_string": b""}, receive)
+
+
+_NOTHING_IN_FLIGHT = {"reads": 0, "bytes": 0, "small_bytes": 0, "clients": 0}
 
 
 @pytest.fixture
@@ -1016,7 +1022,7 @@ def test_a_body_over_the_cap_is_refused_413_and_never_dispatched(_receivers, mon
 
 def test_a_stalled_body_is_refused_408(_receivers, monkeypatch):
     webhooks, calls = _receivers
-    monkeypatch.setattr(webhooks, "_CHUNK_GAP_S", 0.05)
+    monkeypatch.setattr(webhook_body, "_CHUNK_GAP_S", 0.05)
     r = asyncio.run(webhooks.receive_relay_webhook(
         "slack", _receive_request([b"{", b"}"], delay=0.2)))
     assert r.status_code == 408 and calls == []
@@ -1024,7 +1030,7 @@ def test_a_stalled_body_is_refused_408(_receivers, monkeypatch):
 
 def test_the_read_bounds_answer_503_before_reading(_receivers, monkeypatch):
     webhooks, calls = _receivers
-    monkeypatch.setattr(webhooks, "_READS_PER_CLIENT", 1)
+    monkeypatch.setattr(webhook_body, "_READS_PER_CLIENT", 1)
 
     async def scenario():
         slow = asyncio.create_task(webhooks.receive_relay_webhook(
@@ -1057,25 +1063,25 @@ def test_the_read_bounds_cover_the_body_read_only(_receivers, monkeypatch):
 
     async def scenario():
         deliveries = []
-        for _ in range(3 * webhooks._READS_PER_CLIENT):
+        for _ in range(3 * webhook_body._READS_PER_CLIENT):
             deliveries.append(asyncio.create_task(
                 webhooks.receive_relay_webhook("slack", _receive_request([b"{}"]))))
             await asyncio.sleep(0.01)
         return [r.status_code for r in await asyncio.gather(*deliveries)]
 
     codes = asyncio.run(scenario())
-    assert codes == [200] * (3 * webhooks._READS_PER_CLIENT)
-    assert in_dispatch["most"] > webhooks._READS_PER_CLIENT
-    assert webhooks._reads == {"total": 0} and webhooks._reads_by_client == {}
+    assert codes == [200] * (3 * webhook_body._READS_PER_CLIENT)
+    assert in_dispatch["most"] > webhook_body._READS_PER_CLIENT
+    assert webhook_body.in_flight() == _NOTHING_IN_FLIGHT
 
 
 def test_a_refused_read_gives_its_slot_back(_receivers, monkeypatch):
     webhooks, _calls = _receivers
-    monkeypatch.setattr(webhooks, "_CHUNK_GAP_S", 0.05)
+    monkeypatch.setattr(webhook_body, "_CHUNK_GAP_S", 0.05)
     r = asyncio.run(webhooks.receive_relay_webhook(
         "slack", _receive_request([b"{", b"}"], delay=0.2)))
     assert r.status_code == 408
-    assert webhooks._reads == {"total": 0} and webhooks._reads_by_client == {}
+    assert webhook_body.in_flight() == _NOTHING_IN_FLIGHT
 
 
 def test_only_preauth_refusals_count_against_a_distinct_address(_receivers, monkeypatch):
@@ -1098,26 +1104,70 @@ def test_only_preauth_refusals_count_against_a_distinct_address(_receivers, monk
     assert codes == [404] * 5
 
 
-def test_no_per_address_throttle_for_a_shared_address(_receivers, monkeypatch):
+@pytest.mark.parametrize("shared_by", ["hop_without_xff", "gateway", "internal_listener"])
+def test_no_per_address_throttle_for_a_shared_address(_receivers, monkeypatch, shared_by):
+    """An address every client shares (a trusted proxy that sends no
+    X-Forwarded-For, the container's gateway, the internal listener) is
+    never counted, and nothing lands on the loopback's key."""
     import config
+    from auth import lan_check, rate_limiter
     webhooks, calls = _receivers
     monkeypatch.setitem(config.RATE_LIMIT_RULES, "webhook_receive_ip",
                         {"max": 2, "window": 60, "base_block": 60, "max_block": 600})
-    # A private peer sending forwarding headers without being a trusted proxy:
-    # every client behind it shares its address.
-    from starlette.requests import Request
-
-    def shared():
-        async def receive():
-            return {"type": "http.request", "body": b"{}", "more_body": False}
-        return Request({"type": "http", "method": "POST", "path": "/v1/webhooks/relay/slack",
-                        "headers": [(b"x-forwarded-for", b"203.0.113.9")],
-                        "client": ("10.200.0.1", 1), "server": ("testserver", 80),
-                        "scheme": "http", "query_string": b""}, receive)
-
-    codes = [asyncio.run(webhooks.receive_relay_webhook("slack", shared())).status_code
-             for _ in range(5)]
+    kw: dict = {"ip": "10.200.0.1"}
+    if shared_by == "hop_without_xff":
+        monkeypatch.setattr(config, "TRUSTED_PROXIES", ["10.200.0.1"])
+        kw["headers"] = [("X-Forwarded-Proto", "https")]
+    elif shared_by == "gateway":
+        monkeypatch.setattr(config, "RUNNING_IN_DOCKER", True)
+        monkeypatch.setattr(lan_check, "_docker_gateway", lambda: "10.200.0.1")
+        kw["headers"] = [("X-Forwarded-For", "203.0.113.9")]
+    else:
+        monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 45123)
+        kw = {"ip": "127.0.0.1", "server": ("127.0.0.1", 45123)}
+    codes = [asyncio.run(webhooks.receive_relay_webhook(
+        "slack", _receive_request([b"{}"], **kw))).status_code for _ in range(5)]
     assert codes == [401] * 5
+    assert not [k for k in rate_limiter._attempts if k[0] == "webhook_receive_ip"]
+
+
+def test_an_untrusted_forwarder_is_throttled_as_one_client(_receivers, monkeypatch):
+    """f8: a private peer that is not a trusted proxy and sends a forwarding
+    header is counted under its own address, like a request without one."""
+    import config
+    from auth import rate_limiter
+    webhooks, calls = _receivers
+    monkeypatch.setitem(config.RATE_LIMIT_RULES, "webhook_receive_ip",
+                        {"max": 2, "window": 60, "base_block": 60, "max_block": 600})
+    codes = [asyncio.run(webhooks.receive_relay_webhook("slack", _receive_request(
+        [b"{}"], ip="10.200.0.1", headers=[("X-Real-IP", "1.2.3.4")]))).status_code
+        for _ in range(4)]
+    assert codes == [401, 401, 429, 429]
+    keys = {k[1] for k in rate_limiter._attempts if k[0] == "webhook_receive_ip"}
+    assert keys == {"ip:10.200.0.1"}
+    # Without the header the same address is the same bucket.
+    r = asyncio.run(webhooks.receive_relay_webhook(
+        "slack", _receive_request([b"{}"], ip="10.200.0.1")))
+    assert r.status_code == 429
+
+
+def test_an_untrusted_forwarder_meets_the_per_client_read_bound(_receivers, monkeypatch):
+    webhooks, calls = _receivers
+    monkeypatch.setattr(webhook_body, "_READS_PER_CLIENT", 1)
+    forged = {"ip": "10.200.0.1", "headers": [("X-Forwarded-For", "203.0.113.9")]}
+
+    async def scenario():
+        slow = asyncio.create_task(webhooks.receive_relay_webhook(
+            "slack", _receive_request([b"{", b"}"], delay=0.1, **forged)))
+        await asyncio.sleep(0.02)
+        assert webhook_body.in_flight()["clients"] == 1
+        second = await webhooks.receive_relay_webhook(
+            "slack", _receive_request([b"{}"], ip="10.200.0.1"))
+        return second, await slow
+
+    second, first = asyncio.run(scenario())
+    assert second.status_code == 503 and first.status_code == 401
+    assert webhook_body.in_flight() == _NOTHING_IN_FLIGHT
 
 
 def test_the_dispatchers_503_passes_through(_receivers, monkeypatch):
@@ -1153,3 +1203,171 @@ def test_a_large_body_signature_check_runs_off_the_loop():
     loop_thread, small, large = asyncio.run(scenario())
     assert (small, large) == ("ok", "ok")
     assert seen[0] == loop_thread and seen[1] != loop_thread
+
+
+# --- the webhook caps: a checked sender may send more -------------------------
+
+
+class _Webhooks:
+    signature = {"algorithm": "hmac-sha256", "header": "x-hub-signature-256"}
+
+
+def _vendor(monkeypatch, *, provider="github", signature=True, early=None):
+    """The vendor route with its subscription context and dispatch faked;
+    returns (webhooks module, dispatched body sizes, refusal notes)."""
+    from api.events import webhooks
+    dispatched, notes = [], []
+    block = {"signature": _Webhooks.signature} if signature else {}
+    ctx = webhook_dispatcher.ReceiveContext(
+        row={"id": "sub-1", "provider_id": provider, "status": "active"},
+        manifest=type("M", (), {"credentials": type("C", (), {"webhooks": block})()})(),
+        signing_secret="s")
+
+    async def load(provider_id, subscription_id):
+        return (None, early) if early else (ctx, None)
+
+    async def dispatch(**kw):
+        assert kw["context"] is ctx
+        dispatched.append(len(kw["raw_body"]))
+        return 200, {"status": "ok"}, {"content-type": "application/json"}
+
+    async def note(row, cap):
+        notes.append(cap)
+
+    monkeypatch.setattr(webhook_dispatcher, "load_receive_context", load)
+    monkeypatch.setattr(webhook_dispatcher, "dispatch_webhook", dispatch)
+    monkeypatch.setattr(webhook_dispatcher, "note_body_refusal", note)
+    return webhooks, dispatched, notes
+
+
+def _vendor_post(webhooks, chunks, *, declared=None, provider="github"):
+    req = _receive_request(chunks, path=f"/v1/webhooks/{provider}/sub-1")
+    if declared is not None:
+        req.scope["headers"] = [(b"content-length", str(declared).encode())]
+    return asyncio.run(webhooks.receive_webhook(provider, "sub-1", req)), req
+
+
+def test_a_disconnect_is_noted_only_when_the_middleware_cut_the_body(_receivers, monkeypatch):
+    """A sender that goes away is no oversized body; the middleware's cut
+    (a chunked body past the outer cap) is one, and the subscription says so."""
+    from starlette.requests import Request
+    webhooks, _, notes = _vendor(monkeypatch)
+
+    def gone(cut):
+        async def receive():
+            return {"type": "http.disconnect"}
+        scope = {"type": "http", "method": "POST", "path": "/v1/webhooks/github/sub-1",
+                 "headers": [], "client": ("198.51.100.70", 1), "server": ("testserver", 80),
+                 "scheme": "http", "query_string": b""}
+        if cut:
+            scope["otodock.body_cut"] = True
+        return Request(scope, receive)
+
+    assert asyncio.run(webhooks.receive_webhook("github", "sub-1", gone(False))).status_code == 413
+    assert notes == []
+    assert asyncio.run(webhooks.receive_webhook("github", "sub-1", gone(True))).status_code == 413
+    assert len(notes) == 1
+
+
+def test_a_signed_github_delivery_may_use_the_larger_cap(_receivers, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 1024)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_SIGNED_BODY_BYTES", 8192)
+    webhooks, dispatched, _ = _vendor(monkeypatch)
+    r, req = _vendor_post(webhooks, [b"x" * 3000])
+    assert r.status_code == 200 and dispatched == [3000]
+    assert req.scope[webhook_body.SCOPE_KEY] == 8192
+
+
+def test_an_unsigned_provider_keeps_the_unknown_sender_cap(_receivers, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 1024)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_SIGNED_BODY_BYTES", 8192)
+    webhooks, dispatched, notes = _vendor(monkeypatch, provider="slack")
+    r, req = _vendor_post(webhooks, [b"x" * 3000], provider="slack")
+    assert r.status_code == 413 and dispatched == [] and notes == [1024]
+    assert webhook_body.SCOPE_KEY not in req.scope
+
+
+def test_a_declared_length_over_the_cap_is_refused_before_reading(_receivers, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "MAX_WEBHOOK_SIGNED_BODY_BYTES", 8192)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 1024)
+    webhooks, dispatched, notes = _vendor(monkeypatch)
+    r, _ = _vendor_post(webhooks, [b"x" * 10], declared=30_000)
+    assert r.status_code == 413 and dispatched == [] and notes == [8192]
+    assert webhook_body.in_flight() == _NOTHING_IN_FLIGHT
+
+
+def test_an_unknown_subscription_is_answered_without_a_large_read(_receivers, monkeypatch):
+    webhooks, dispatched, _ = _vendor(
+        monkeypatch, early=(404, {"error": "subscription not found"}, {}))
+    r, _ = _vendor_post(webhooks, [b"{}"])
+    assert r.status_code == 404 and dispatched == []
+
+
+def test_the_bytes_in_flight_are_bounded(_receivers, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "MAX_WEBHOOK_INFLIGHT_BYTES", 256 * 1024)
+    monkeypatch.setattr(config, "MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT", 0)
+    webhooks, calls = _receivers
+
+    def declared(req):
+        req.scope["headers"] = [(b"content-length", b"2")]
+        return req
+
+    async def scenario():
+        # Each slow read reserves the 64 KB floor; the small tier holds half.
+        slow = [asyncio.create_task(webhooks.receive_relay_webhook(
+            "slack", declared(_receive_request([b"{", b"}"], delay=0.1, ip=f"198.51.100.{70 + i}"))))
+            for i in range(2)]
+        await asyncio.sleep(0.02)
+        third = await webhooks.receive_relay_webhook(
+            "slack", declared(_receive_request([b"{}"], ip="198.51.100.90")))
+        return third, await asyncio.gather(*slow)
+
+    third, firsts = asyncio.run(scenario())
+    assert third.status_code == 503
+    assert [r.status_code for r in firsts] == [401, 401]
+    assert webhook_body.in_flight() == _NOTHING_IN_FLIGHT
+
+
+def test_a_slow_large_read_gets_a_longer_deadline():
+    assert webhook_body._BODY_S <= 25 * 1024 * 1024 / webhook_body._MIN_RATE <= webhook_body._BODY_MAX_S
+
+
+def test_a_large_body_is_parsed_off_the_loop(monkeypatch):
+    threads = []
+    real = asyncio.to_thread
+
+    async def spy(fn, *a, **k):
+        threads.append(fn.__name__)
+        return await real(fn, *a, **k)
+
+    monkeypatch.setattr(webhook_dispatcher.asyncio, "to_thread", spy)
+    big = json.dumps({"x": "y" * (2 * 1024 * 1024)}).encode()
+    assert asyncio.run(webhook_dispatcher._parse_body(big))["x"].startswith("yyy")
+    assert asyncio.run(webhook_dispatcher._parse_body(b'{"a": 1}')) == {"a": 1}
+    assert threads == ["_safe_parse_json"]
+
+
+def test_a_refused_body_is_noted_on_the_subscription(monkeypatch):
+    notes = []
+
+    async def fake_note(sid, text):
+        notes.append((sid, text))
+
+    monkeypatch.setattr(webhook_dispatcher, "run_db",
+                        lambda fn, *a: fake_note(*a))
+    webhook_dispatcher.reset_caches()
+    asyncio.run(webhook_dispatcher.note_body_refusal(
+        {"id": "sub-9", "status": "active"}, 25 * 1024 * 1024))
+    assert notes == [("sub-9", "body over 25 MB refused (1 refused)")]
+
+
+def test_a_body_with_no_declared_length_reserves_its_cap(_receivers, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "MAX_WEBHOOK_INFLIGHT_BYTES", 2 * 1024 * 1024)
+    webhooks, _calls = _receivers
+    r = asyncio.run(webhooks.receive_relay_webhook("slack", _receive_request([b"{}"])))
+    assert r.status_code == 503  # 2 MB reserved > the small tier's 1 MB half

@@ -284,22 +284,107 @@ export function useDeleteMcp() {
   })
 }
 
+// One end of a source change: the identity the updater judges and the
+// form the page shows (a registry page, an image reference or a host).
+export interface McpSourceEnd {
+  kind: string
+  identity: string
+  url: string
+  runtime: string
+  version?: string
+}
+
+export interface McpSourceChangePlan {
+  runtime?: { from: string; to: string }
+  credentials?: {
+    carry: string[]
+    rename: Record<string, string>
+    reconnect: string[]
+    oauth: 'none' | 'carry' | 'reconnect'
+  }
+  bearer_host_change?: boolean
+}
+
+export interface McpSourceChangeResult {
+  version?: string
+  renamed?: Record<string, string>
+  kept?: string[]
+  reconnect_needed?: string[]
+  oauth?: string
+  container_started?: boolean | null
+  switched_at?: string
+  // A failed or interrupted switch: the change is still pending.
+  error?: string
+  failed_at?: string
+}
+
+// A community MCP whose catalog source differs from the installed one
+// (proxy COMMUNITY-MARKETPLACE.md "Source changes"): shown until the admin
+// switches it or the catalog reverts, then as the switch's result until
+// dismissed.
+export interface McpSourceChange {
+  status: 'pending' | 'switching' | 'switched'
+  from: McpSourceEnd
+  to: McpSourceEnd
+  declared: boolean
+  plan: McpSourceChangePlan
+  // The catalog manifest the card describes; the Switch sends it back so the
+  // proxy refuses a switch onto an entry that changed since the page loaded.
+  to_manifest_hash: string
+  detected_at: string
+  accepted_at: string
+  result: McpSourceChangeResult
+}
+
 export interface McpUpdateInfo {
   current: string
   latest: string
-  // 'catalog' = docker MCP compared against the catalog version tag.
-  registry: 'npm' | 'pypi' | 'catalog'
+  // 'catalog' = docker MCP compared against the catalog version tag;
+  // 'skills-catalog' = a skill package; a source change carries the
+  // catalog kind of its new source ('npm' | 'pypi' | 'git' | 'image' | 'remote').
+  registry: string
   package: string
-  // Why an update is offered: a newer package version ('package'), a changed
-  // catalog integration manifest ('manifest'), or both. For 'manifest' the
-  // package version is unchanged (current === latest).
-  reason?: 'package' | 'manifest' | 'both'
+  // Why an entry exists: a newer package version ('package'), a changed
+  // catalog integration manifest ('manifest'), or both; the catalog source
+  // moved ('source', a pending switch); a finished switch not yet dismissed
+  // ('switched'); the install is ahead of the catalog ('ahead', no update).
+  reason?: 'package' | 'manifest' | 'both' | 'source' | 'switched' | 'ahead'
+  source_change?: McpSourceChange
+}
+
+export interface McpUpdateState {
+  updates: Record<string, McpUpdateInfo>
+  checked: number
+  // Empty until the first check.
+  checked_at: string
+}
+
+// An update offer the page counts and badges: never a finished switch nor an
+// install ahead of the catalog.
+export function isUpdateOffer(info: McpUpdateInfo | undefined): boolean {
+  if (!info) return false
+  const reason = info.reason ?? 'package'
+  return reason === 'package' || reason === 'manifest' || reason === 'both' || reason === 'source'
+}
+
+// The last check as the proxy persisted it: the MCP Servers page shows it on
+// load, after a navigation or a restart, without Check Updates pressed.
+export function useMcpUpdateState() {
+  return useQuery({
+    queryKey: ['mcp-update-state'],
+    queryFn: async (): Promise<McpUpdateState> => {
+      const res = await apiFetch('/v1/admin/mcps/update-state')
+      if (!res.ok) throw new Error('Failed to load the update state')
+      return res.json()
+    },
+    staleTime: 60_000,
+  })
 }
 
 export function useCheckMcpUpdates() {
   return useQuery({
     queryKey: ['mcp-updates'],
-    queryFn: async (): Promise<{ updates: Record<string, McpUpdateInfo>; checked: number }> => {
+    queryFn: async (): Promise<McpUpdateState> => {
       const res = await apiFetch('/v1/admin/mcps/check-updates')
       if (!res.ok) throw new Error('Failed to check updates')
       return res.json()
@@ -307,6 +392,16 @@ export function useCheckMcpUpdates() {
     staleTime: 300_000, // 5 min cache
     enabled: false, // only fetch on demand
   })
+}
+
+function dropFromUpdates(qc: ReturnType<typeof useQueryClient>, name: string) {
+  for (const key of (['mcp-updates', 'mcp-update-state'] as const)) {
+    qc.setQueryData([key], (old: McpUpdateState | undefined) => {
+      if (!old?.updates) return old
+      const { [name]: _, ...rest } = old.updates
+      return { ...old, updates: rest }
+    })
+  }
 }
 
 export function useUpdateMcp() {
@@ -323,11 +418,59 @@ export function useUpdateMcp() {
     onSuccess: (_data, name) => {
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
       // Remove this MCP from the cached updates
-      qc.setQueryData(['mcp-updates'], (old: any) => {
-        if (!old?.updates) return old
-        const { [name]: _, ...rest } = old.updates
-        return { ...old, updates: rest }
+      dropFromUpdates(qc, name)
+    },
+  })
+}
+
+export interface AcceptSourceResult {
+  status: 'switched'
+  name: string
+  from: string
+  to: string
+  version: string
+  install_log: string
+  result: McpSourceChangeResult
+}
+
+// The admin's switch: the body names exactly the pair the card showed.
+export function useAcceptMcpSource() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, from, to, manifest_hash }: { name: string; from: string; to: string; manifest_hash: string }): Promise<AcceptSourceResult> => {
+      const res = await apiFetch(`/v1/admin/mcps/${name}/accept-source`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to, manifest_hash }),
       })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Switch failed' }))
+        throw new Error(err.detail || `Switch failed (${res.status})`)
+      }
+      return res.json()
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['admin-mcps'] })
+      qc.invalidateQueries({ queryKey: ['mcp-update-state'] })
+      qc.removeQueries({ queryKey: ['mcp-updates'] })
+    },
+  })
+}
+
+export function useDismissMcpSourceChange() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) => {
+      const res = await apiFetch(`/v1/admin/mcps/${name}/source-change`, { method: 'DELETE' })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Dismiss failed' }))
+        throw new Error(err.detail || `Dismiss failed (${res.status})`)
+      }
+      return res.json()
+    },
+    onSuccess: (_data, name) => {
+      dropFromUpdates(qc, name)
+      qc.invalidateQueries({ queryKey: ['mcp-update-state'] })
     },
   })
 }
@@ -339,7 +482,7 @@ export interface McpAutoUpdateRow {
   runtime: string
   old_version: string
   new_version: string
-  status: 'updated' | 'no_change' | 'skipped_in_use' | 'failed' | 'held'
+  status: 'updated' | 'no_change' | 'skipped_in_use' | 'failed' | 'held' | 'needs_approval'
   error: string
   trigger: string
   ts: string

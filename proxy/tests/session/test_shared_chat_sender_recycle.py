@@ -199,3 +199,40 @@ class TestSenderChangeRecycle:
         assert sent_sid == live_sid
         # Same sender → no transition note.
         assert "message is from" not in prompt
+
+
+class TestRecycleAcrossAReconnect:
+    def test_a_queued_turn_after_a_short_reconnect_still_recycles(
+            self, temp_db, monkeypatch):
+        """A queued message by another sender, delivered while the chat's
+        machine reconnects: the delivery waits for the machine ahead of the
+        sender check (once; the turn start does not wait again), then the
+        check reads the live session and recycles it, so the turn never runs
+        on a session warmed for someone else."""
+        import asyncio
+        from core.events import input_queue
+        from core.events.common_events import TurnInput
+        layer, slug, live_sid, cid = _setup(monkeypatch)
+
+        async def scenario():
+            cookie = session_cookie(sub="user-manager", email="manager@test.com",
+                                    name="Manager User", role="creator")
+            async with dashboard_connection(cookie) as ws:
+                await drain_startup(ws)
+                q = await input_queue.loaded(cid)
+                await q.add("q-b", "user-manager", TurnInput("from B"))
+                layer.alive.discard(live_sid)
+                layer.reconnecting[live_sid] = 0.05
+                assert await input_queue.deliver(cid)
+                for _ in range(250):
+                    if layer.messages:
+                        break
+                    await asyncio.sleep(0.02)
+
+        run_ws_scenario(scenario)
+        _clear_pool_maps()
+
+        assert layer.reconnect_waits == [live_sid]
+        assert live_sid in layer.closed_sessions
+        assert layer.messages and layer.messages[-1][0] != live_sid
+        assert "from B" in layer.messages[-1][1]

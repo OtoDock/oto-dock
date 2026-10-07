@@ -6,10 +6,12 @@ annotate, encrypt, etc.)
 pdf_to_images: render pages as PNG.
 images_to_pdf: combine images into PDF.
 write_pdf: HTML/Markdown → PDF via WeasyPrint.
-convert_document: LibreOffice headless format conversion.
+convert_document: format conversion (Markdown and HTML through write_pdf's
+renderer, the Office formats through LibreOffice headless).
 """
 
 import asyncio
+import codecs
 import contextlib
 import os
 import re
@@ -20,6 +22,8 @@ from pathlib import Path
 from isolation import run_parse
 import safe_fs
 from shared import (
+    HOST_CACHE_SEGMENT,
+    MOUNT_AGENTS_DIR,
     _checked_resolved,
     _dropped_note,
     _libreoffice_convert,
@@ -451,11 +455,36 @@ def _render_pdf_core(full_html: str, path: str, allowed=()) -> None:
         HTML(string=full_html, url_fetcher=fetcher, base_url=None).write_pdf(fh)
 
 
-async def _resolve_references(*texts: str) -> dict[str, str]:
+def _render_temp_pdf_core(full_html: str, path: str, allowed=()) -> None:
+    """Worker core: the same render into a file of a private temp directory
+    outside the tree (screenshot_document's intermediate PDF)."""
+    from weasyprint import HTML
+
+    fetcher = _allowed_files_fetcher(allowed)
+    HTML(string=full_html, url_fetcher=fetcher, base_url=None).write_pdf(path)
+
+
+# A reference that names a scheme (``http:``, ``file:``, ``data:``, a drive
+# letter) is never joined to a base folder.
+_URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _anchored(ref: str, base_dir: str | None) -> str:
+    """``ref`` joined to ``base_dir`` when it is a relative path: the
+    references of a converted file name files beside it. The joined path is
+    resolved through the proxy like any other, so a ``..`` that leaves the
+    session's tree resolves to nothing."""
+    if not base_dir or ref.startswith("/") or _URL_SCHEME_RE.match(ref):
+        return ref
+    return os.path.normpath(os.path.join(base_dir, ref))
+
+
+async def _resolve_references(*texts: str, base_dir: str | None = None) -> dict[str, str]:
     """``{reference: resolved container path}`` for every ``src``, CSS
     ``url()`` and ``@import`` in ``texts`` that the proxy resolves for this
     session; a ``data:`` URL is left to the fetcher, an unresolved reference
-    is left out (and so never fetched)."""
+    is left out (and so never fetched). With ``base_dir`` a relative
+    reference is resolved against that folder."""
     refs: set[str] = set()
     for text in texts:
         refs.update(_SRC_RE.findall(text))
@@ -466,7 +495,7 @@ async def _resolve_references(*texts: str) -> dict[str, str]:
         if ref.lower().startswith("data:"):
             continue
         with contextlib.suppress(Exception):
-            out[ref] = await _resolve_path(ref)
+            out[ref] = await _resolve_path(_anchored(ref, base_dir))
     return out
 
 
@@ -491,9 +520,16 @@ def _rewrite_references(text: str, resolved: dict[str, str]) -> str:
 
 
 async def handle_write_pdf(args: dict) -> str:
-    import markdown as md
-
     path = await _resolve_path(args["path"], writing=True)
+    return f"PDF created: {_to_agents_relative(path)}" + await _write_pdf(path, args)
+
+
+async def _pdf_html(args: dict, *, base_dir: str | None = None) -> tuple[str, list[str], int, list[str]]:
+    """``(full HTML, files the fetcher may read, equations rendered,
+    equation errors)`` of write_pdf's ``content``/``css``/``page_size``/
+    ``margins``. With ``base_dir`` a relative reference names a file in that
+    folder (a converted file's own)."""
+    import markdown as md
 
     content = args.get("content", "")
     content_type = args.get("content_type", "markdown")
@@ -514,7 +550,7 @@ async def handle_write_pdf(args: dict) -> str:
 
     # Pre-resolve every reference in the parent (the proxy hop is async);
     # the worker's fetcher then admits exactly these files.
-    src_map = await _resolve_references(html_body, custom_css)
+    src_map = await _resolve_references(html_body, custom_css, base_dir=base_dir)
     html_body = _rewrite_references(html_body, src_map)
     custom_css = _rewrite_references(custom_css, src_map)
     allowed = sorted(set(src_map.values()))
@@ -544,17 +580,23 @@ pre {{ background: #f5f5f5; padding: 12px; border-radius: 5px; overflow-x: auto;
 img {{ max-width: 100%; }}
 {custom_css}
 </style></head><body>{html_body}</body></html>"""
+    return full_html, allowed, len(math_spans) - len(math_errors), math_errors
 
-    # Assembly above is cheap and needs the async resolver; the WeasyPrint
-    # render is the memory hazard and runs in a bounded worker child.
+
+async def _write_pdf(path: str, args: dict, *, base_dir: str | None = None) -> str:
+    """Render write_pdf's ``args`` into the resolved write target ``path``
+    and push its preview. Returns the result text's tail (the equation
+    count and warnings) for the caller's first line."""
+    # Assembly is cheap and needs the async resolver; the WeasyPrint render
+    # is the memory hazard and runs in a bounded worker child.
+    full_html, allowed, rendered_eqs, math_errors = await _pdf_html(args, base_dir=base_dir)
     try:
         await run_parse(_render_pdf_core, full_html, path, allowed, _advice=_WRITE_PDF_ADVICE)
     except Exception:
         cleanup_partials(path)
         raise
     await _push_preview(path)
-    msg = f"PDF created: {_to_agents_relative(path)}"
-    rendered_eqs = len(math_spans) - len(math_errors)
+    msg = ""
     if rendered_eqs:
         msg += f" ({rendered_eqs} equation(s) rendered)"
     if math_errors:
@@ -1208,13 +1250,24 @@ async def handle_pdf_to_images(args: dict) -> str:
 
     output_dir = args.get("output_dir")
     if not output_dir:
-        output_dir = str(Path(path).parent / (Path(path).stem + "_pages"))
+        output_dir = _write_form(str(Path(path).parent / (Path(path).stem + "_pages")))
     out_dir = await _resolve_path(output_dir, writing=True)
 
     page_spec = args.get("pages", "all")
     dpi = int(args.get("dpi", 150))
     fmt = args.get("format", "png").lower()
+    saved = await _pdf_to_images(path, out_dir, page_spec, dpi, fmt)
+    return (
+        f"Rendered {len(saved)} pages from {_to_agents_relative(path)} at {dpi}dpi.\n"
+        f"Output: {_to_agents_relative(out_dir)}/\n"
+        f"Files: {', '.join(s['name'] for s in saved[:5])}"
+        + (f" ... +{len(saved) - 5} more" if len(saved) > 5 else "")
+    )
 
+
+async def _pdf_to_images(path: str, out_dir: str, page_spec, dpi: int, fmt: str) -> list:
+    """Render ``path``'s pages into the resolved write target ``out_dir``
+    and push the first one inline. Returns the saved page entries."""
     # The pages render into a temp directory outside the tree and land in
     # the output folder beneath the mount, each through the write helper.
     tmp_dir = tempfile.mkdtemp(prefix="file-tools-pages-")
@@ -1232,13 +1285,7 @@ async def handle_pdf_to_images(args: dict) -> str:
     if saved:
         mime = "image/png" if fmt == "png" else "image/jpeg"
         await _push_image_preview(first, mime, f"Page 1 of {Path(path).name}")
-
-    return (
-        f"Rendered {len(saved)} pages from {_to_agents_relative(path)} at {dpi}dpi.\n"
-        f"Output: {_to_agents_relative(out_dir)}/\n"
-        f"Files: {', '.join(s['name'] for s in saved[:5])}"
-        + (f" ... +{len(saved) - 5} more" if len(saved) > 5 else "")
-    )
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -1246,7 +1293,7 @@ async def handle_pdf_to_images(args: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _SCREENSHOT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-                    ".odt", ".ods", ".odp", ".csv", ".rtf", ".html"}
+                    ".odt", ".ods", ".odp", ".csv", ".rtf", ".html", ".htm"}
 _MAX_INLINE_PAGES = 10
 # Payload caps (see handle_screenshot_document): long-edge px per page
 # (dpi-aware — the high cap keeps A4@300 ≈ 3508 px untouched, the skill's
@@ -1345,7 +1392,7 @@ async def handle_screenshot_document(args: dict) -> list:
     ext = Path(path).suffix.lower()
     if ext not in _SCREENSHOT_EXTS:
         return [TextContent(type="text",
-                text=f"Error: unsupported format '{ext}'. Supported: PDF, DOCX, XLSX, PPTX and other Office formats.")]
+                text=f"Error: unsupported format '{ext}'. Supported: PDF, DOCX, XLSX, PPTX, other Office formats and HTML.")]
 
     pages_spec = args.get("pages", "1")
     dpi = int(args.get("dpi", 150))
@@ -1355,8 +1402,23 @@ async def handle_screenshot_document(args: dict) -> list:
     temp_dir = None
 
     try:
-        # For non-PDF: convert to temp PDF via LibreOffice
-        if ext != ".pdf":
+        # HTML: write_pdf's renderer into a temp PDF (its fetcher reads only
+        # the files the proxy resolves; a relative reference names a file
+        # beside the input), never LibreOffice.
+        if ext in _HTML_EXTS:
+            temp_dir = tempfile.mkdtemp(prefix="file-tools-shot-")
+            content = await asyncio.to_thread(_read_source, path, html=True)
+            full_html, allowed, _eqs, _errors = await _pdf_html(
+                {"content": content, "content_type": "html"},
+                base_dir=str(Path(path).parent),
+            )
+            pdf_path = os.path.join(temp_dir, Path(path).stem + ".pdf")
+            await run_parse(
+                _render_temp_pdf_core, full_html, pdf_path, allowed,
+                _advice=_RENDER_ADVICE,
+            )
+        # Other non-PDF formats: convert to a temp PDF via LibreOffice
+        elif ext != ".pdf":
             temp_dir = tempfile.mkdtemp(prefix="file-tools-shot-")
             convert_path = path
 
@@ -1581,6 +1643,13 @@ async def handle_images_to_pdf(args: dict) -> str:
             continue
         image_paths.append(img_path)
 
+    await _images_to_pdf(image_paths, out, page_size, fit)
+    return f"PDF created: {_to_agents_relative(out)} ({len(images)} images, {page_size})"
+
+
+async def _images_to_pdf(image_paths: list, out: str, page_size: str, fit: str) -> None:
+    """Build the PDF of the resolved, existing ``image_paths`` at the
+    resolved write target ``out`` and push its preview."""
     try:
         await run_parse(
             _images_to_pdf_core, image_paths, out, page_size, fit,
@@ -1589,14 +1658,78 @@ async def handle_images_to_pdf(args: dict) -> str:
     except Exception:
         cleanup_partials(out)
         raise
-
     await _push_preview(out)
-    return f"PDF created: {_to_agents_relative(out)} ({len(images)} images, {page_size})"
 
 
 # ---------------------------------------------------------------------------
 # Convert document
 # ---------------------------------------------------------------------------
+
+
+_MARKDOWN_EXTS = (".md", ".markdown")
+_HTML_EXTS = (".html", ".htm")
+
+
+def _write_form(container_path: str) -> str:
+    """A resolved path in the session's agent tree as the sandbox path the
+    proxy resolves as a write (``/agents/<slug>/users/u/x`` becomes
+    ``/users/u/x``). ``_resolve_path`` hands the proxy a container path in
+    its agents-relative form, which the proxy resolves for reads only. A
+    path outside the mount or in the host cache (no sandbox form) is
+    returned unchanged."""
+    if not container_path.startswith(MOUNT_AGENTS_DIR + "/"):
+        return container_path
+    slug, _, rest = container_path[len(MOUNT_AGENTS_DIR) + 1:].partition("/")
+    return container_path if slug == HOST_CACHE_SEGMENT else "/" + rest
+
+
+# A converted or screenshotted Markdown or HTML file is read whole in the
+# parent, under the cap a render reads any one file with.
+_MAX_SOURCE_BYTES = _MAX_FETCH_BYTES
+# BOMs, the four-byte ones before the UTF-16 ones they begin with.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+)
+# ``<meta charset=...>`` and ``<meta http-equiv="Content-Type"
+# content="...; charset=...">`` alike, in the first 1024 bytes (where a
+# browser's prescan looks).
+_META_CHARSET_RE = re.compile(rb"""<meta[^>]*?charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.IGNORECASE)
+
+
+def _decode_source(data: bytes, *, html: bool) -> str:
+    """``data`` decoded by its BOM, else (HTML) by the charset its ``<meta>``
+    declares, else as UTF-8; an undecodable byte is replaced, never fatal."""
+    for bom, codec in _BOMS:
+        if data.startswith(bom):
+            return data.decode(codec, errors="replace")
+    encoding = "utf-8"
+    match = _META_CHARSET_RE.search(data[:1024]) if html else None
+    if match:
+        try:
+            declared = codecs.lookup(match.group(1).decode("ascii")).name
+        except LookupError:
+            declared = ""
+        # A declaration readable as ASCII rules a UTF-16 or UTF-32 body out.
+        if declared and not declared.startswith(("utf-16", "utf-32")):
+            encoding = declared
+    return data.decode(encoding, errors="replace")
+
+
+def _read_source(container_path: str, *, html: bool) -> str:
+    """The text of a Markdown or HTML input: read beneath the mount with no
+    link followed, refused past ``_MAX_SOURCE_BYTES``, decoded by
+    ``_decode_source``. Blocking: run it in a thread."""
+    root, rel = _rel_beneath_root(container_path)
+    try:
+        data = safe_fs.read_bytes_beneath(root, rel, max_size=_MAX_SOURCE_BYTES)
+    except safe_fs.FileTooLarge:
+        raise ValueError(
+            f"{Path(container_path).name} is over the {_MAX_SOURCE_BYTES // (1024 * 1024)} MB "
+            "a document render reads: split it into smaller files"
+        ) from None
+    return _decode_source(data, html=html)
 
 
 async def handle_convert_document(args: dict) -> str:
@@ -1606,46 +1739,43 @@ async def handle_convert_document(args: dict) -> str:
 
     output_format = args.get("output_format", "pdf")
     output_path = args.get("output_path")
-
-    if output_path:
-        output_dir = str(Path(await _resolve_path(output_path, writing=True)).parent)
-    else:
-        output_dir = str(Path(input_path).parent)
-
     ext = Path(input_path).suffix.lower()
 
-    # Markdown → PDF via WeasyPrint
-    if ext in (".md", ".markdown") and output_format == "pdf":
-        content = Path(input_path).read_text(encoding="utf-8")
-        out = str(Path(output_dir) / (Path(input_path).stem + ".pdf"))
-        # Internal handler calls pass CONTAINER-ABSOLUTE paths — the display
-        # form does not survive a _resolve_path round-trip (see pdf_to_images).
-        await handle_write_pdf({
-            "path": out,
-            "content": content,
-            "content_type": "markdown",
-        })
-        return f"Converted: {_to_agents_relative(out)}"
+    # Markdown and HTML → PDF through write_pdf's renderer, whose fetcher
+    # reads only the files the proxy resolves for this session (LibreOffice
+    # would load an HTML file's linked pictures from any path it can read).
+    # An HTML file's relative references name files beside it. The output
+    # is output_path, else the input's name with .pdf beside it, resolved
+    # once as a write.
+    if ext in _MARKDOWN_EXTS + _HTML_EXTS and output_format == "pdf":
+        is_html = ext in _HTML_EXTS
+        content = await asyncio.to_thread(_read_source, input_path, html=is_html)
+        out = await _resolve_path(
+            output_path or _write_form(str(Path(input_path).with_suffix(".pdf"))),
+            writing=True,
+        )
+        tail = await _write_pdf(
+            out,
+            {"content": content, "content_type": "html" if is_html else "markdown"},
+            base_dir=str(Path(input_path).parent) if is_html else None,
+        )
+        return f"Converted: {_to_agents_relative(out)}" + tail
+
+    # Every other output is likewise output_path itself, else derived from
+    # the input's own path in sandbox form, resolved once as a write.
+    beside = str(Path(input_path).with_suffix(""))
 
     # Image → PDF via pymupdf
     if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp") and output_format == "pdf":
-        out = str(Path(output_dir) / (Path(input_path).stem + ".pdf"))
-        await handle_images_to_pdf({
-            "images": [input_path],
-            "output_path": out,
-            "page_size": "original",
-        })
+        out = await _resolve_path(output_path or _write_form(beside + ".pdf"), writing=True)
+        await _images_to_pdf([input_path], out, "original", "contain")
         return f"Converted: {_to_agents_relative(out)}"
 
-    # PDF → PNG via pymupdf
+    # PDF → PNG via pymupdf, into a folder: output_path, else one named
+    # after the input beside it
     if ext == ".pdf" and output_format in ("png", "jpg", "jpeg"):
-        out_dir = str(Path(output_dir) / Path(input_path).stem)
-        await handle_pdf_to_images({
-            "path": input_path,
-            "output_dir": out_dir,
-            "format": output_format,
-            "dpi": 150,
-        })
+        out_dir = await _resolve_path(output_path or _write_form(beside), writing=True)
+        await _pdf_to_images(input_path, out_dir, "all", 150, output_format)
         return f"Converted: {_to_agents_relative(out_dir)}/"
 
     # LibreOffice headless for everything else. Deliberately NOT a worker
@@ -1656,16 +1786,19 @@ async def handle_convert_document(args: dict) -> str:
     # fork+exec, see isolation.py) or cap soffice confusingly. It writes by
     # name, so it writes into a temp directory outside the tree; the result
     # lands in the output folder beneath the mount through the write helper.
+    # An output_path is resolved (and refused) before the conversion runs;
+    # the default takes the name LibreOffice gives its result.
+    out = await _resolve_path(output_path, writing=True) if output_path else None
     lo_dir = tempfile.mkdtemp(prefix="file-tools-lo-")
     try:
         try:
             produced = await _libreoffice_convert(input_path, output_format, lo_dir)
         except RuntimeError as exc:
             return f"Conversion error: {exc}"
-        if output_path:
-            out = await _resolve_path(output_path, writing=True)
-        else:
-            out = await _resolve_path(str(Path(output_dir) / Path(produced).name), writing=True)
+        if out is None:
+            out = await _resolve_path(
+                _write_form(str(Path(input_path).parent / Path(produced).name)), writing=True,
+            )
         await asyncio.to_thread(_copy_beneath, produced, out)
     finally:
         shutil.rmtree(lo_dir, ignore_errors=True)

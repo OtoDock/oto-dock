@@ -37,16 +37,11 @@ def test_manifest_device_fields(manifest):
     assert "phone" not in manifest.exclude_from  # allowed on calls; gated by device placement + grants
 
 
-def test_manifest_default_blocklist_is_valid_loopback(manifest):
-    blocked = manifest.env.get("PLAYWRIGHT_MCP_BLOCKED_ORIGINS", "")
-    assert blocked, "a default blocked-origins must ship"
-    entries = blocked.split(";")
-    assert len(entries) >= 2
-    # Every entry is a well-formed scheme://host[:port] (NOT a scheme-only
-    # 'chrome://*' which @playwright/mcp would not treat as a network origin).
-    for e in entries:
-        assert "://" in e, f"malformed origin {e!r}"
-        assert "localhost" in e or "127.0.0.1" in e, f"default blocklist is loopback-only, got {e!r}"
+def test_manifest_ships_no_origin_blocklist(manifest):
+    """Restricting the Local Browser will not be built (F46, the operator,
+    2026-09-30): whatever the machine reaches, the agent reaches, loopback
+    included. The per-agent allow-list stays the admin's optional limit."""
+    assert "PLAYWRIGHT_MCP_BLOCKED_ORIGINS" not in manifest.env
 
 
 def test_manifest_node_stdio_source(manifest):
@@ -105,8 +100,8 @@ def test_resolve_server_config_node_stdio(manifest, monkeypatch):
         assert e["type"] == "stdio"
         assert e["command"] == "node"
         assert e["args"] == [str(_MANIFEST.parent / "index.js")]  # bare index.js -> mcp_dir
-        # manifest env (default blocklist) + DB config both reach the process
-        assert e["env"]["PLAYWRIGHT_MCP_BLOCKED_ORIGINS"].startswith("http://localhost")
+        # the DB config reaches the process; no origin is blocked by default
+        assert "PLAYWRIGHT_MCP_BLOCKED_ORIGINS" not in e["env"]
         assert e["env"]["OTO_BROWSER_CHANNEL"] == "chrome"
 
 
@@ -138,9 +133,9 @@ def test_apply_allowed_origins_creates_env_when_absent():
 # Own-browser mode: the framework owns the browser env keys on the entry
 # ---------------------------------------------------------------------------
 
-def _own(token=None):
+def _own(token=None, *, unattended=False):
     from storage.remote_store import BrowserTargetSettings
-    return BrowserTargetSettings(mode="own", extension_token=token)
+    return BrowserTargetSettings(mode="own", extension_token=token, unattended=unattended)
 
 
 def test_apply_browser_mode_dedicated_leaves_nothing_but_strips_poison():
@@ -164,9 +159,10 @@ def test_apply_browser_mode_dedicated_leaves_nothing_but_strips_poison():
 
 
 def test_apply_browser_mode_own_with_token_uses_the_bundle():
+    # An ATTENDED session uses the saved token.
     entry = {"type": "stdio", "command": "node", "env": {"OTO_BROWSER_CHANNEL": "auto"}}
     bundles = {}
-    reg._apply_browser_mode(entry, bundles, _own("T" * 43), unattended=True)
+    reg._apply_browser_mode(entry, bundles, _own("T" * 43), unattended=False)
     assert entry["env"] == {
         "OTO_BROWSER_CHANNEL": "auto", "OTO_BROWSER_MODE": "own",
         "OTO_BROWSER_TOKEN_EXPECTED": "1",
@@ -174,6 +170,21 @@ def test_apply_browser_mode_own_with_token_uses_the_bundle():
     # The token rides the broker bundle only — never the config env.
     assert bundles["local"].env == {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "T" * 43}
     assert "PLAYWRIGHT_MCP_EXTENSION_TOKEN" not in str(entry)
+
+
+def test_apply_browser_mode_unattended_needs_the_machine_optin_for_the_token():
+    # F47: an unattended session (task / call / meeting) does NOT spend an
+    # own-browser token left for a person unless the machine row opts in.
+    entry = {"type": "stdio", "command": "node"}
+    bundles = {}
+    reg._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=False), unattended=True)
+    assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_UNATTENDED": "1"}
+    assert bundles == {}
+    # With the opt-in, the unattended session uses it.
+    entry, bundles = {"type": "stdio", "command": "node"}, {}
+    reg._apply_browser_mode(entry, bundles, _own("T" * 43, unattended=True), unattended=True)
+    assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_EXPECTED": "1"}
+    assert bundles["local"].env == {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "T" * 43}
 
 
 def test_apply_browser_mode_own_without_token_flags_unattended():
@@ -208,7 +219,7 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
     )
     path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
         "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
-        task_mode=True, target_browser=_own("V" * 43),
+        task_mode=True, target_browser=_own("V" * 43, unattended=True),
     )
     local = json.loads(path.read_text())["mcpServers"]["local"]
     assert local["env"] == {

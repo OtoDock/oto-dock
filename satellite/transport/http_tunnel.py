@@ -39,6 +39,9 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
+from ..config import HOOK_WAIT_S
+from .mcp_gateway import GATEWAY_PATH_PREFIX, LocalMcpGateway
+
 if TYPE_CHECKING:
     from .ws_client import SatelliteWSClient
 
@@ -184,6 +187,9 @@ class LocalTunnelServer:
         self._site: web.TCPSite | None = None
         # stream_id → _PendingStream
         self._streams: dict[str, _PendingStream] = {}
+        # The credential gateway for vendor MCPs (``/v1/mcp-gateway/``):
+        # served here, never tunneled.
+        self.gateway = LocalMcpGateway()
 
     async def start(self) -> int:
         """Bind aiohttp to 127.0.0.1:<ephemeral>. Returns the chosen port."""
@@ -209,6 +215,7 @@ class LocalTunnelServer:
         self._site = web.TCPSite(self._runner, "127.0.0.1", port)
         await self._site.start()
         self.port = port
+        self.gateway.start()
 
         logger.info("Local tunnel server listening on 127.0.0.1:%d", port)
         return port
@@ -228,6 +235,7 @@ class LocalTunnelServer:
                 })
         self._streams.clear()
 
+        await self.gateway.stop()
         if self._site is not None:
             await self._site.stop()
         if self._runner is not None:
@@ -285,6 +293,22 @@ class LocalTunnelServer:
             path_with_query = f"{path}?{request.query_string}"
         else:
             path_with_query = path
+
+        # The credential gateway's own path: served from this machine's
+        # memory (the vendor is dialled from here), never tunneled, and
+        # ahead of the link check so it serves within its lease while the
+        # link is down. A dot segment or an encoded separator is refused
+        # before anything else, as for every path.
+        if path.startswith(GATEWAY_PATH_PREFIX + "/"):
+            if _has_traversal(path):
+                return web.Response(
+                    status=403,
+                    body=json.dumps({"error": "path-not-allowlisted"}).encode(),
+                    content_type="application/json",
+                )
+            tail = path[len(GATEWAY_PATH_PREFIX) + 1:]
+            mcp, _, rest = tail.partition("/")
+            return await self.gateway.handle(request, mcp, "/" + rest)
 
         # Defense-in-depth: reject non-allowlisted paths without ever
         # sending a frame to the platform. Codex CLI specifically probes
@@ -352,9 +376,9 @@ class LocalTunnelServer:
                 if k.lower() not in _HOP_BY_HOP_HEADERS
             }
 
-            # Honor the longest hook timeout (permission_gate uses 7 days).
+            # The longest hook wait by default (a prompt waits on a person).
             timeout_header = request.headers.get("X-Tunnel-Timeout-S")
-            timeout_s = 604800  # 7 days default to cover the permission case
+            timeout_s = HOOK_WAIT_S
             try:
                 if timeout_header:
                     timeout_s = max(1, int(timeout_header))
@@ -375,7 +399,7 @@ class LocalTunnelServer:
             # (``http_abort``) — before this the proxy held such streams
             # until its idle sweep.
             first = await self._wait_frame(
-                stream, request, min(timeout_s + 5, 604800 + 60),
+                stream, request, min(timeout_s + 5, HOOK_WAIT_S + 60),
             )
             if first is _CLIENT_GONE:
                 await self._send_abort(stream_id)

@@ -1,23 +1,24 @@
-"""Tests for the bounded-window chunked file push (proxy side, 1b).
+"""Tests for the chunked file push (proxy side).
 
 ``SatelliteConnectionManager.push_file`` sends ``write_chunk`` frames on the
-BULK lane in windows of ``PUSH_WINDOW_CHUNKS``: a ``command_id`` is attached to
-the last chunk of each window (and the final chunk) and the push awaits that ack
-before sending the next window. The satellite commits + sha256-verifies only on
-the final chunk. A non-ok / timed-out / WS-dropped window aborts the transfer.
+BULK lane, each with a ``command_id`` the satellite acks after applying it
+(every satellite from 0.5.76 does), each taking its share of the
+connection's bulk credit before it is enqueued. The satellite commits and
+sha256-verifies only on the final chunk. An error ack, a dropped connection
+or a stall aborts the transfer.
 
 These drive ``push_file`` against a fake connection whose ``enqueue_send``
 records frames and feeds an ``ack`` back through the manager (the satellite
-round-trip), so windowing + early-abort are exercised deterministically.
+round-trip), so the per-frame acks and the early abort run deterministically.
 """
 
+import asyncio
 import base64
 import hashlib
 
 import pytest
 
-from core.remote import satellite_connection as sc
-from core.remote.satellite_connection import SatelliteConnectionManager
+from core.remote.satellite_connection import SatelliteConnectionManager, _BulkCredit
 from services.path_policy_v2 import PathRef
 
 
@@ -35,9 +36,12 @@ class _AckingConn:
         self.machine_id = machine_id
         self.frames: list[dict] = []
         self.status_for = status_for or (lambda i, f: "ok")
+        self.bulk_credit = _BulkCredit()
+        self.last_transfer_at = 0.0
 
     async def enqueue_send(self, msg: dict, *, bulk: bool = False) -> None:
         idx = len(self.frames)
+        msg.pop("_xfer", None)
         self.frames.append({"_bulk": bulk, **msg})
         cmd = msg.get("command_id")
         if cmd:
@@ -46,6 +50,12 @@ class _AckingConn:
                 "type": "ack", "command_id": cmd,
                 "status": status, "error": "" if status == "ok" else "boom",
             })
+
+
+async def _settled(conn) -> int:
+    """The credit after the frames' done callbacks ran."""
+    await asyncio.sleep(0)
+    return conn.bulk_credit.inflight
 
 
 @pytest.mark.asyncio
@@ -68,10 +78,9 @@ async def test_inline_small_push_uses_bulk_and_acks():
 
 
 @pytest.mark.asyncio
-async def test_chunked_push_windows_and_commits(monkeypatch):
-    # Shrink chunk + window so a tiny payload exercises multi-window behavior.
+async def test_chunked_push_acks_every_chunk_and_commits(monkeypatch):
+    # Shrink the chunk so a tiny payload exercises the chunked path.
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
-    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
     mgr = SatelliteConnectionManager()
     conn = _AckingConn(mgr, "m1")
     mgr._connections["m1"] = conn
@@ -88,31 +97,32 @@ async def test_chunked_push_windows_and_commits(monkeypatch):
     assert all(c["total_chunks"] == 3 for c in fr)
     # Reassembled bytes are correct + in order.
     assert b"".join(base64.b64decode(c["content_b64"]) for c in fr) == data
-    # Flush (command_id) only at the window boundary (idx 1) + final (idx 2).
-    assert not fr[0].get("command_id")
-    assert fr[1].get("command_id")
-    assert fr[2].get("command_id")
-    # Full-file hash only on the final chunk; intermediate flushes carry none.
+    # Every chunk asks for its ack: the credit comes back per frame.
+    assert all(c.get("command_id") for c in fr)
+    assert len({c["command_id"] for c in fr}) == 3
+    # Full-file hash only on the final chunk.
     assert fr[0]["hash"] == "" and fr[1]["hash"] == ""
     assert fr[2]["hash"] == _h(data)
+    assert await _settled(conn) == 0
+    assert mgr._pending_acks == {}
 
 
 @pytest.mark.asyncio
 async def test_chunked_push_aborts_early_on_error_ack(monkeypatch):
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
-    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
     mgr = SatelliteConnectionManager()
-    # Error on every flush → the FIRST window boundary (chunk idx 1) aborts it.
+    # Error on every ack → the FIRST chunk's answer aborts it.
     conn = _AckingConn(mgr, "m1", status_for=lambda i, f: "error")
     mgr._connections["m1"] = conn
 
-    data = b"abcdefghijklmnop"  # 16 bytes / 4 → 4 chunks; first flush at idx 1
+    data = b"abcdefghijklmnop"  # 16 bytes / 4 → 4 chunks
     ok = await mgr.push_file(
         "m1", PathRef("agent_tree", "workspace/x.bin"), data, agent_slug="a1",
     )
     assert ok is False
-    # Only the first window (chunks 0, 1) was sent — the rest were aborted.
-    assert [c["chunk_index"] for c in conn.frames] == [0, 1]
+    # Only the first chunk was sent — the rest were never read.
+    assert [c["chunk_index"] for c in conn.frames] == [0]
+    assert await _settled(conn) == 0
 
 
 @pytest.mark.asyncio
@@ -150,7 +160,6 @@ async def test_path_source_small_uses_inline_write(tmp_path):
 @pytest.mark.asyncio
 async def test_path_source_chunked_reassembles_and_hashes(tmp_path, monkeypatch):
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
-    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
     mgr = SatelliteConnectionManager()
     conn = _AckingConn(mgr, "m1")
     mgr._connections["m1"] = conn
@@ -184,49 +193,47 @@ async def test_path_source_missing_file_returns_false(tmp_path):
 @pytest.mark.asyncio
 async def test_path_source_shrink_mid_push_aborts(tmp_path, monkeypatch):
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
-    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
     mgr = SatelliteConnectionManager()
     src = tmp_path / "x.bin"
     src.write_bytes(b"abcdefghijklmnop")  # 4 chunks
 
-    def _truncate_on_first_flush(idx, frame):
-        # After the first window ack the file shrinks under the reader.
+    def _truncate_on_first_ack(idx, frame):
+        # After the first chunk's ack the file shrinks under the reader.
         src.write_bytes(b"abcd")
         return "ok"
 
-    conn = _AckingConn(mgr, "m1", status_for=_truncate_on_first_flush)
+    conn = _AckingConn(mgr, "m1", status_for=_truncate_on_first_ack)
     mgr._connections["m1"] = conn
     ok = await mgr.push_file(
         "m1", PathRef("agent_tree", "workspace/x.bin"), src, agent_slug="a1",
     )
     assert ok is False
-    # First window (chunks 0,1) went out; the short read aborted before any
-    # further frame — never a truncated stream under a stale total_chunks.
-    assert [c["chunk_index"] for c in conn.frames] == [0, 1]
+    # The first chunk went out; the short read aborted before any further
+    # frame — never a truncated stream under a stale total_chunks.
+    assert [c["chunk_index"] for c in conn.frames] == [0]
+    assert await _settled(conn) == 0
 
 
 @pytest.mark.asyncio
-async def test_progress_cb_flush_points_and_terminal(monkeypatch):
+async def test_progress_cb_per_chunk_and_terminal(monkeypatch):
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
-    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
     mgr = SatelliteConnectionManager()
     conn = _AckingConn(mgr, "m1")
     mgr._connections["m1"] = conn
 
     ticks: list[tuple[int, int]] = []
-    data = b"abcdefghijklmnopqr"  # 18 bytes → 5 chunks; flush at idx 1, 3, 4
+    data = b"abcdefghijklmnopqr"  # 18 bytes → 5 chunks
     ok = await mgr.push_file(
         "m1", PathRef("agent_tree", "w.bin"), data, agent_slug="a1",
         progress_cb=lambda s, t: ticks.append((s, t)),
     )
     assert ok is True
-    assert ticks == [(8, 18), (16, 18), (18, 18)]  # window acks + terminal
+    assert ticks == [(4, 18), (8, 18), (12, 18), (16, 18), (18, 18)]  # chunk acks + terminal
 
 
 @pytest.mark.asyncio
 async def test_progress_cb_async_and_raising(monkeypatch):
     monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
-    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
     mgr = SatelliteConnectionManager()
     conn = _AckingConn(mgr, "m1")
     mgr._connections["m1"] = conn
@@ -303,3 +310,31 @@ async def test_config_cap_enforced_for_new_satellite(monkeypatch):
     )
     assert ok is False
     assert conn.frames == []
+
+
+# --- a caller's content hash pins the content ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_given_content_hash_is_sent_and_the_source_is_not_hashed(tmp_path, monkeypatch):
+    def _no_hash(*_a, **_k):
+        raise AssertionError("the source was hashed again")
+    monkeypatch.setattr("core.remote.file_sync._hash_file", _no_hash)
+    pinned = "sha256:" + "ab" * 32
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+    src = tmp_path / "x.bin"
+    src.write_bytes(b"abcdefghij")
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), src, agent_slug="a1",
+        content_hash=pinned,
+    )
+    assert ok is True and [f["hash"] for f in conn.frames] == [pinned]
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
+    conn.frames.clear()
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), src, agent_slug="a1",
+        content_hash=pinned,
+    )
+    assert ok is True and [f["hash"] for f in conn.frames] == ["", "", pinned]

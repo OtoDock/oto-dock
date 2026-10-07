@@ -150,7 +150,7 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
                             detail="Platform methods are called through otodock.platform, not fired")
     if not task_store.app_actions_approved(row):
         raise HTTPException(status_code=409, detail="Actions not approved")
-    if not handler and not _mf.meets_floor(action, _mf.caller_role(row, u)):
+    if not handler and not _mf.meets_floor(action, await asyncio.to_thread(_mf.caller_role, row, u)):
         raise HTTPException(status_code=403, detail=_mf.floor_reason(action))
 
     if action.get("type") == "mcp_tool":
@@ -210,7 +210,11 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
         # Safe now: the values are schema-bounded (type/enum/length) and the
         # SCHEMA was what the user approved — never free-form page text.
         from services.scheduler.trigger_manager import _substitute_placeholders
-        prompt_override = _substitute_placeholders(task_def.prompt or "", validated) or ""
+        # A caller that is not a platform user (an external link's visitor,
+        # a handler woken by a trigger delivery) brings outside values:
+        # fenced as webhook data is.
+        prompt_override = _substitute_placeholders(
+            task_def.prompt or "", validated, fence=bool(actor)) or ""
         if len(prompt_override) > 8000:
             raise HTTPException(status_code=400, detail="Prompt too large after substitution")
     from services.scheduler import task_kinds

@@ -6,6 +6,7 @@ Attaches to the shared core-auth router."""
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import re
 import time
@@ -13,17 +14,18 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi import Body, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
-from auth.lan_check import check_local_auth_allowed, get_client_ip
+from auth.lan_check import auth_bucket_key, check_local_auth_allowed, client_address, get_client_ip
 from auth.license import check_seat_limit
 from auth.password import HashBusy, check_password_strength_async, hash_password_async, verify_password_async
-from auth.providers import UserContext, apply_session_cookie, create_session_jwt, get_current_user, mask_email, require_auth, validate_oauth_state
+from auth.providers import ClientStatesFull, StateStoreFull, UserContext, apply_session_cookie, create_session_jwt, discard_oauth_state, get_current_user, mask_email, peek_oauth_state, require_auth, require_human, validate_oauth_state
+from auth import session_revocation, token_holder
 from auth.providers.local_provider import LocalAuthProvider
 from auth.providers.oidc_provider import OIDCAuthProvider, ensure_oidc_discovery
 from auth import rate_limiter
-from auth.rate_limiter import clear_rate_limit, hit as rate_limit_hit, record_successful_login
+from auth.rate_limiter import hit as rate_limit_hit, record_successful_login
 from auth.totp import consume_2fa_session_token, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, validate_2fa_session_token, verify_recovery_code, verify_totp
 from services.agents import offboarding_sessions
 from storage import database as task_store
@@ -54,7 +56,9 @@ _recovery_consume_lock = asyncio.Lock()
 # recent in-flight states (``.``-joined — state is URL-safe base64, no dots) so
 # concurrent login tabs in one browser don't clobber each other, and a 30-min
 # TTL covers a slow IdP page; the binding still blocks login-CSRF because an
-# attacker-chosen state was never put in the victim's cookie.
+# attacker-chosen state was never put in the victim's cookie. A live sign-in
+# state in the ring also marks a browser already signing in, whose next start
+# is not counted again (``_sso_start_budget``).
 _OIDC_STATE_COOKIE_MAX = 4
 _OIDC_STATE_TTL = 1800  # 30 min — generous headroom for a slow IdP login
 
@@ -105,7 +109,7 @@ class TotpDisableRequest(BaseModel):
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: str
+    email: str = Field(max_length=320)
 
 
 class ResetPasswordRequest(BaseModel):
@@ -257,6 +261,10 @@ def _auth_config_payload() -> dict:
         # at this host instead of letting the browser fail with its own
         # security error.
         "passkey_rp_host": passkey_rp_host() if passkeys_enabled() else "",
+        # The document editor's origin when it is not served on the
+        # dashboard's own origin (COLLABORA_URL on another host or port);
+        # empty in sub-path mode. The chat preview judges its frame by it.
+        "collabora_origin": _collabora_origin(),
         # OtoDock connectivity + deployment. `air_gapped` (effective — forced
         # false on cloud) = this install makes no outbound calls to OtoDock.
         # `relay_base` stays server-side; only these derived booleans are exposed.
@@ -264,6 +272,104 @@ def _auth_config_payload() -> dict:
         "relay_available": relay_client.is_available(),
         "cloud": config.OTODOCK_CLOUD,
     }
+
+
+def _origin_of(url: str) -> str:
+    u = urlparse((url or "").strip())
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return ""
+    try:
+        port = u.port
+    except ValueError:
+        return ""
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    default = 443 if u.scheme == "https" else 80
+    return f"{u.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def _collabora_origin() -> str:
+    collabora = _origin_of(config.COLLABORA_URL)
+    return "" if collabora == _origin_of(config.DASHBOARD_PUBLIC_URL) else collabora
+
+
+def _sso_client(request: Request) -> tuple[str, bool]:
+    """``(key, capped)``: the client a sign-in start counts against, the
+    bucket key with an IPv6 address collapsed to its /64 (one host commonly
+    holds a whole /64), and whether the state store's per-client cap applies
+    (not on an address every client shares)."""
+    addr = client_address(request)
+    key = addr.bucket_key
+    try:
+        ip = ipaddress.ip_address(key)
+    except ValueError:
+        return key, not addr.shared
+    if isinstance(ip, ipaddress.IPv6Address):
+        key = (str(ip.ipv4_mapped) if ip.ipv4_mapped is not None
+               else str(ipaddress.IPv6Network((ip, 64), strict=False)))
+    return key, not addr.shared
+
+
+def _sso_start_allowed(key: str) -> None:
+    """A per-client bound on SSO sign-ins started (each holds a state)."""
+    ok, retry_after = rate_limiter.hit("sso_start", key)
+    if not ok:
+        raise HTTPException(status_code=429,
+                            detail="Too many sign-ins started; try again in a few minutes.",
+                            headers={"Retry-After": str(retry_after)})
+
+
+# A sign-in start from a browser whose state ring already holds a live
+# sign-in state (a reload, another tab, the bypass page shown again) is not
+# counted against ``sso_start`` while that ring holds fewer than
+# ``_OIDC_STATE_COOKIE_MAX`` live sign-in states; it still mints its own
+# state. A counted start opens a budget of that many uncounted starts less
+# one, shared by every state minted from it, so a ring a client builds
+# itself (one live state sent back again and again) gets no more uncounted
+# starts than a browser's ring does. Only a state the same client started
+# (``_sso_client``) offers its budget.
+_SSO_UNCOUNTED_STARTS = _OIDC_STATE_COOKIE_MAX - 1
+
+
+def _sso_start_budget(request: Request, key: str) -> dict:
+    """Count this sign-in start (429 past the bound), or draw it from the
+    budget a live sign-in state of the browser's ring carries; the check
+    and the count or the draw run with no await between. Returns the
+    budget the new state joins (``_keep_budget``)."""
+    ring = [s for s in (request.cookies.get(_oidc_state_cookie_name()) or "").split(".") if s]
+    live = [m for m in map(peek_oauth_state, ring[-_OIDC_STATE_COOKIE_MAX:])
+            if m and m.get("purpose") == "login" and m.get("client") == key]
+    if 0 < len(live) < _OIDC_STATE_COOKIE_MAX:
+        for meta in reversed(live):
+            budget = meta.get("sso_budget")
+            if budget and budget["left"] > 0:
+                budget["left"] -= 1
+                return budget
+    _sso_start_allowed(key)
+    return {"left": _SSO_UNCOUNTED_STARTS}
+
+
+def _keep_budget(url: str, budget: dict) -> None:
+    meta = peek_oauth_state(_state_of(url))
+    if meta is not None:
+        meta["sso_budget"] = budget
+
+
+def _sso_login_url(client: tuple[str, bool], **kwargs) -> str | None:
+    """The provider's login URL (``get_login_url``), its state recorded for
+    ``client`` (``_sso_client``). A client holding its cap of live states
+    answers 429, a full sign-in state store 503, each with the wait until
+    the oldest state concerned lapses."""
+    key, capped = client
+    try:
+        return _oidc_provider.get_login_url(client=key, client_capped=capped, **kwargs)
+    except ClientStatesFull as full:
+        raise HTTPException(status_code=429,
+                            detail="Too many sign-ins started from your address; try again in a few minutes.",
+                            headers={"Retry-After": str(full.retry_after)})
+    except StateStoreFull as full:
+        raise HTTPException(status_code=503,
+                            detail="Too many sign-ins in progress; try again in a few minutes.",
+                            headers={"Retry-After": str(full.retry_after)})
 
 
 @router.get("/auth/login")
@@ -276,14 +382,18 @@ async def auth_login(request: Request, mobile: bool = False):
     """
     if config.AUTH_PROVIDER_BYPASS and config.OIDC_ENABLED:
         # Bypass mode: go straight to OIDC (current Authentik behavior)
+        client = _sso_client(request)
+        budget = _sso_start_budget(request, client[0])
         await ensure_oidc_discovery()
-        url = _oidc_provider.get_login_url(
+        url = _sso_login_url(
+            client,
             redirect_uri="otodock://auth/callback" if mobile else None,
             mobile=mobile,
         )
         if url:
+            _keep_budget(url, budget)
             resp = JSONResponse({"url": url})
-            _bind_oidc_state(request, resp, url)
+            _bind_oidc_state(request, resp, url, client[0])
             return resp
         raise HTTPException(status_code=503, detail="OIDC not configured")
 
@@ -291,18 +401,22 @@ async def auth_login(request: Request, mobile: bool = False):
     return {"login_page": True}
 
 
-def _bind_oidc_state(request: Request, resp: JSONResponse, url: str) -> None:
+def _bind_oidc_state(request: Request, resp: JSONResponse, url: str, client: str) -> None:
     """The login-CSRF binding: the state the URL carries joins the browser's
     ring of recent states (the note above the cookie name). Every state is
     bound, the native app's included: its WebView fetches the URL itself, so
     the cookie lands in the WebView's jar, and the deep link reloads that
-    same WebView at the callback."""
-    state_val = parse_qs(urlparse(url).query).get("state", [""])[0]
+    same WebView at the callback. A state the ring pushes out can no longer
+    complete in this browser: one the same ``client`` started leaves the
+    store, so a browser holds at most the ring's count of live states."""
+    state_val = _state_of(url)
     if not state_val:
         return
     name = _oidc_state_cookie_name()
     prior = [s for s in (request.cookies.get(name) or "").split(".") if s]
     states = (prior + [state_val])[-_OIDC_STATE_COOKIE_MAX:]
+    for dropped in set(prior[-_OIDC_STATE_COOKIE_MAX:]) - set(states):
+        discard_oauth_state(dropped, client)
     resp.set_cookie(
         name, ".".join(states),
         max_age=_OIDC_STATE_TTL, httponly=True, secure=config.COOKIE_SECURE,
@@ -310,20 +424,28 @@ def _bind_oidc_state(request: Request, resp: JSONResponse, url: str) -> None:
     )
 
 
+def _state_of(url: str) -> str:
+    return parse_qs(urlparse(url).query).get("state", [""])[0]
+
+
 @router.get("/auth/oidc-url")
 async def auth_oidc_url(request: Request, mobile: bool = False):
     """Get OIDC authorization URL (called when user clicks 'Sign in with SSO')."""
     if not config.OIDC_ENABLED:
         raise HTTPException(status_code=503, detail="OIDC not configured")
+    client = _sso_client(request)
+    budget = _sso_start_budget(request, client[0])
     await ensure_oidc_discovery()
-    url = _oidc_provider.get_login_url(
+    url = _sso_login_url(
+        client,
         redirect_uri="otodock://auth/callback" if mobile else None,
         mobile=mobile,
     )
     if not url:
         raise HTTPException(status_code=503, detail="OIDC not configured")
+    _keep_budget(url, budget)
     resp = JSONResponse({"url": url})
-    _bind_oidc_state(request, resp, url)
+    _bind_oidc_state(request, resp, url, client[0])
     return resp
 
 
@@ -364,8 +486,10 @@ async def auth_confirm_oidc_url(request: Request, return_to: str = "", mobile: b
         raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
                             headers={"Retry-After": str(retry_after)})
     path = _safe_return_to(return_to) if return_to else "/"
+    client = _sso_client(request)
     await ensure_oidc_discovery()
-    url = _oidc_provider.get_login_url(
+    url = _sso_login_url(
+        client,
         redirect_uri="otodock://auth/callback" if mobile else None,
         mobile=mobile, prompt_login=config.OIDC_CONFIRM_FRESH_LOGIN,
         purpose="confirm", sub=u.sub, return_to=path,
@@ -373,7 +497,7 @@ async def auth_confirm_oidc_url(request: Request, return_to: str = "", mobile: b
     if not url:
         raise HTTPException(status_code=503, detail="OIDC not configured")
     resp = JSONResponse({"url": url})
-    _bind_oidc_state(request, resp, url)
+    _bind_oidc_state(request, resp, url, client[0])
     return resp
 
 
@@ -417,23 +541,22 @@ async def _finish_oidc_confirm(state_meta: dict, code: str) -> JSONResponse:
     the answer is a one-shot confirm token the share routes consume
     (``auth/confirm.py``)."""
     from auth import confirm
-    result = await _oidc_provider.authenticate({
-        "code": code, "redirect_uri": state_meta.get("redirect_uri"),
-    })
+    result = await _oidc_provider.authenticate(_oidc_request(state_meta, code))
     if not result.success:
-        raise HTTPException(status_code=403 if result.error_code == "no_group" else 502,
+        raise HTTPException(status_code=_oidc_refusal_status(result.error_code),
                             detail=result.error)
     expected = state_meta.get("sub") or ""
     if not expected or result.sub != expected:
         raise HTTPException(status_code=403, detail="Signed in as a different account")
     claims = result.id_claims or {}
-    if claims:
-        aud = claims.get("aud")
-        auds = aud if isinstance(aud, list) else [aud]
-        if config.OIDC_CLIENT_ID not in auds:
-            raise HTTPException(status_code=403, detail="The login was not for this platform")
-        if str(claims.get("sub") or "") != result.sub:
-            raise HTTPException(status_code=403, detail="Signed in as a different account")
+    # authenticate verified the ID token (signature, issuer, audience,
+    # nonce) and that it names the userinfo's account; these hold anyway.
+    aud = claims.get("aud")
+    auds = aud if isinstance(aud, list) else [aud]
+    if config.OIDC_CLIENT_ID not in auds:
+        raise HTTPException(status_code=403, detail="The login was not for this platform")
+    if str(claims.get("sub") or "") != result.sub:
+        raise HTTPException(status_code=403, detail="Signed in as a different account")
     if config.OIDC_CONFIRM_FRESH_LOGIN:
         _require_fresh_login(claims, state_meta, result.email)
     token = confirm.mint_confirm_token(result.sub)
@@ -442,15 +565,34 @@ async def _finish_oidc_confirm(state_meta: dict, code: str) -> JSONResponse:
                                  "return_to": state_meta.get("return_to") or "/"})
 
 
+def _oidc_request(state_meta: dict, code: str) -> dict:
+    """The provider's sign-in request: the code and what the state kept
+    server-side for it (the redirect, the nonce, the PKCE verifier)."""
+    return {"code": code, "redirect_uri": state_meta.get("redirect_uri"),
+            "nonce": state_meta.get("nonce") or "",
+            "code_verifier": state_meta.get("code_verifier") or ""}
+
+
+# What the provider's refusals answer: a check on the ID token or the
+# account is the person's 403; a provider that could not be reached is 502.
+_OIDC_UPSTREAM_FAILURES = frozenset({"token_exchange_failed", "userinfo_failed",
+                                     "no_access_token", "jwks_unavailable"})
+
+
+def _oidc_refusal_status(code: str) -> int:
+    return 502 if code in _OIDC_UPSTREAM_FAILURES else 403
+
+
 @router.post("/auth/login/local")
 async def auth_login_local(req: LocalLoginRequest, request: Request):
     """Authenticate with email + password. Sets session cookie on success."""
     client_ip = get_client_ip(request)
+    bucket_key = auth_bucket_key(request)
 
     # The address's attempt is counted before anything awaits, so a burst
     # from one address cannot all pass the check while the hashes run; one
     # that proves the password or is refused by the tarpit is given back.
-    ip_ok, retry_after = rate_limiter.hit_ip_login(client_ip)
+    ip_ok, retry_after = rate_limiter.hit_login(bucket_key)
     if not ip_ok:
         raise HTTPException(
             status_code=429,
@@ -471,17 +613,17 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
         result = await _local_provider.authenticate(
             {"email": req.email, "password": req.password}, device=device)
     except HashBusy:
-        rate_limiter.release_ip_attempt(client_ip)
+        rate_limiter.release_login_attempt(bucket_key)
         raise _hash_busy()
 
     if not result.success:
         if result.error_code == "account_locked":
             # The tarpit refused it before any password was checked.
-            rate_limiter.release_ip_attempt(client_ip)
+            rate_limiter.release_login_attempt(bucket_key)
             raise HTTPException(status_code=429, detail=result.error)
         raise HTTPException(status_code=401, detail=result.error)
     # The password was right: whatever follows, this attempt guessed nothing.
-    rate_limiter.release_ip_attempt(client_ip)
+    rate_limiter.release_login_attempt(bucket_key)
 
     # LAN restriction — checked ONLY after the credentials verify, so the
     # distinctive "local network" 403 can no longer be used pre-auth as an
@@ -518,7 +660,7 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
                 "second_factors": factors}
 
     # Full success
-    await record_successful_login(client_ip, result.sub)
+    await record_successful_login(result.sub)
     user = await run_db(task_store.get_user, result.sub)
     response = await _login_response(user or user_row, "local")
     logger.info(f"Local login: {mask_email(result.email)} role={result.role}")
@@ -530,8 +672,8 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
     """Verify TOTP code after successful email+password authentication."""
     # Brute-force guard: a 6-digit TOTP is only 1M combos, so this surface MUST
     # be rate-limited. Record-before-check (``hit``) at entry is burst-safe.
-    client_ip = get_client_ip(request)
-    ok, retry_after = rate_limit_hit("2fa", client_ip)
+    bucket_key = auth_bucket_key(request)
+    ok, retry_after = rate_limit_hit("2fa", bucket_key)
     if not ok:
         raise HTTPException(
             status_code=429,
@@ -587,8 +729,9 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
     # 2FA verified — issue session. Spend the step token so a replay can't
     # mint a second session (failed attempts above did NOT consume it).
     consume_2fa_session_token(req.totp_session_token)
-    await record_successful_login(client_ip, sub)
-    clear_rate_limit("2fa", client_ip)
+    await record_successful_login(sub)
+    # The right code guessed nothing; the wrong ones stay counted.
+    rate_limiter.release_attempt("2fa", bucket_key)
     response = await _login_response(user, "local")
     logger.info(f"2FA verified: {mask_email(user['email'])}")
     return response
@@ -627,15 +770,24 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
     if purpose != "login":
         raise HTTPException(status_code=400, detail="Invalid or expired state")
 
-    result = await _oidc_provider.authenticate({
-        "code": req.code,
-        "redirect_uri": state_meta.get("redirect_uri"),
-    })
+    result = await _oidc_provider.authenticate(_oidc_request(state_meta, req.code))
 
     if not result.success:
-        if result.error_code == "no_group":
-            raise HTTPException(status_code=403, detail=result.error)
-        raise HTTPException(status_code=502, detail=result.error)
+        raise HTTPException(status_code=_oidc_refusal_status(result.error_code),
+                            detail=result.error)
+
+    # An email the provider does not vouch for (Authentik's default mapping
+    # sends email_verified false) is kept, unless another account here
+    # already uses it: that sign-in is refused, so no one takes over an
+    # address by claiming it at the provider.
+    if (result.email and not result.email_verified
+            and await run_db(task_store.email_taken_by_other, result.email, result.sub)):
+        logger.warning(f"OIDC login refused for {mask_email(result.email)}: the email is "
+                       f"not verified by the provider and another account here uses it")
+        raise HTTPException(status_code=403, detail=(
+            "Your identity provider does not confirm this email address, and another "
+            "account here already uses it. Ask your administrator to verify the email "
+            "at the identity provider, or to change the other account's email."))
 
     # Seat-limit check for new OIDC users (deployment-aware; two-stage grace).
     existing = await run_db(task_store.get_user, result.sub)
@@ -694,14 +846,19 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
 
 @router.post("/auth/logout")
 async def auth_logout(request: Request):
-    """Clear session cookie and return provider logout URL (if OIDC)."""
+    """Sign this device out: revoke the presented cookie's sign-in (its
+    lineage of re-mints included), clear the cookie and return the
+    provider's logout URL (OIDC). The person's other devices stay signed
+    in; an admin's "sign out everywhere" ends those."""
     logout_url = ""
-    # Check if user was authenticated via OIDC — read from cookie before clearing
     session_cookie = request.cookies.get("session")
     if session_cookie:
         from auth.providers import validate_session_jwt
         payload = validate_session_jwt(session_cookie)
         if payload:
+            hours = await run_db(config.get_jwt_expiry_hours)
+            cookie_id = session_revocation.revoke(payload, lifetime_s=hours * 3600)
+            await run_db(session_revocation.persist, cookie_id, payload.get("sub") or "")
             auth_prov = payload.get("auth_provider", "")
             if auth_prov.startswith("oidc:") and config.OIDC_LOGOUT_URL:
                 logout_url = _oidc_provider.get_logout_url(
@@ -710,6 +867,54 @@ async def auth_logout(request: Request):
     response = JSONResponse(content={"status": "logged_out", "logout_url": logout_url})
     response.delete_cookie(key="session", path="/")
     return response
+
+
+async def end_every_sign_in(sub: str, username: str, reason: str) -> int:
+    """Move the person's token epoch and act on it at once: every cookie and
+    agent session token minted before it is refused (the holder cache
+    forgets the person, so no cached pass outlives the move), their push
+    registrations go (the devices the ended sign-ins registered; each
+    registers again at its next launch), their warm chats close (the next
+    message starts them again with fresh tokens) and their open dashboard
+    sockets are re-checked now. A cookie minted after the move, in the same
+    second or later, passes. Returns how many chat sessions closed."""
+    from storage.automation import notification_store
+
+    def _epoch_job() -> None:
+        task_store.bump_token_epoch(sub)
+        notification_store.delete_push_subscriptions_of(sub)
+
+    await asyncio.to_thread(_epoch_job)
+    token_holder.forget(sub)
+    closed = await offboarding_sessions.close_person_sessions(sub, username, reason)
+    from ws import dashboard as dashboard_ws
+    dashboard_ws.revalidate_user(sub)
+    return closed
+
+
+@router.post("/v1/admin/users/{sub}/sign-out-everywhere")
+async def admin_sign_out_everywhere(
+    sub: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """End every sign-in and every agent session token of a person: their
+    token epoch moves, so the cookies and tokens minted before it are
+    refused everywhere, their warm chats close (the next message starts
+    them again with fresh tokens) and their open dashboard sockets close
+    at once. A person's decision on the Users page, never a bearer's; an
+    admin may sign themselves out everywhere too."""
+    u = require_human(user)
+    if not u.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    target = await asyncio.to_thread(task_store.get_user, sub)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("is_owner") and not u.is_owner:
+        raise HTTPException(status_code=403, detail="Cannot sign out the owner")
+    closed = await end_every_sign_in(sub, target.get("username") or "", "signed_out")
+    logger.info(f"Admin {mask_email(u.email)} signed {mask_email(target['email'])} out everywhere "
+                f"({closed} chat session(s) closed)")
+    return {"status": "ok", "sessions_closed": closed}
 
 
 @router.get("/auth/me")
@@ -806,7 +1011,7 @@ async def update_my_profile(
     u = require_auth(user)
     if u.is_api_key:
         raise HTTPException(403, "Dashboard only")
-    task_store.update_user_display_name(u.sub, req.display_name.strip())
+    await run_db(task_store.update_user_display_name, u.sub, req.display_name.strip())
     return {"status": "ok", "display_name": req.display_name.strip()}
 
 
@@ -824,7 +1029,7 @@ async def set_my_default_agent(
                 status_code=400,
                 detail=f"Agent '{agent}' is not accessible to you",
             )
-    task_store.set_user_default_agent(u.sub, agent)
+    await run_db(task_store.set_user_default_agent, u.sub, agent)
     logger.info(f"User {mask_email(u.email)} set their default agent: {agent or '(none)'}")
     return {"status": "updated", "default_agent": agent}
 
@@ -1009,12 +1214,11 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
     from services.notifications.smtp import is_smtp_configured, send_password_reset_email
     import jwt as pyjwt
 
-    # Throttle per source IP AND per target email so this can't be used to bomb a
+    # Throttle per source address AND per target email so this can't be used to bomb a
     # victim's inbox or sweep emails. Both keys are independent of user existence,
     # so a 429 is not an enumeration oracle.
     email = req.email.strip().lower()
-    client_ip = get_client_ip(request)
-    for key in (client_ip, f"email:{email}"):
+    for key in (auth_bucket_key(request), rate_limiter.forgot_email_key(email)):
         ok, retry_after = rate_limit_hit("forgot", key)
         if not ok:
             raise HTTPException(
@@ -1061,9 +1265,9 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
     """Reset password using a token from the forgot-password email."""
     import jwt as pyjwt
 
-    # Per-IP throttle so the reset endpoint can't be hammered (token guessing /
+    # Per-address throttle so the reset endpoint can't be hammered (token guessing /
     # strength-check abuse). Burst-safe record-before-check.
-    ok, retry_after = rate_limit_hit("reset", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("reset", auth_bucket_key(request))
     if not ok:
         raise HTTPException(
             status_code=429,
@@ -1115,9 +1319,9 @@ async def accept_invite(req: AcceptInviteRequest, request: Request):
     admin password reset) is dead."""
     import jwt as pyjwt
 
-    # Per-IP throttle, same posture as the reset endpoint (token guessing /
+    # Per-address throttle, same posture as the reset endpoint (token guessing /
     # strength-check abuse). Burst-safe record-before-check.
-    ok, retry_after = rate_limit_hit("invite", get_client_ip(request))
+    ok, retry_after = rate_limit_hit("invite", auth_bucket_key(request))
     if not ok:
         raise HTTPException(
             status_code=429,

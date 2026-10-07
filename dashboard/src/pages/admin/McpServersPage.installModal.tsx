@@ -64,7 +64,7 @@ export function InstallModal({ onClose }: { onClose: () => void }) {
                       ? 'border-green-400 dark:border-green-600 bg-green-50/50 dark:bg-green-900/10'
                       : 'border-p-border-light hover:border-brand/50 hover:bg-p-surface-hover/30'}`}
               >
-                <input ref={inputRef} type="file" accept=".zip" className="hidden" onChange={handleFileChange} />
+                <input ref={inputRef} type="file" accept=".zip,application/zip,application/x-zip-compressed,application/octet-stream" className="hidden" onChange={handleFileChange} />
                 {file ? (
                   <div>
                     <svg className="w-8 h-8 mx-auto mb-2 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">

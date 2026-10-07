@@ -13,11 +13,12 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_user
 from services.media import audio_service, duplex_service, ws_audio_token
 from storage import database as task_store
 
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 
 class DuplexSessionRequest(BaseModel):

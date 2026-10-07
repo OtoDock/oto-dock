@@ -25,15 +25,22 @@ agent.
 
 The person's user-scope automations on agents they can no longer reach are
 deleted (a deletion sweeps every agent), and the meetings they convened on
-those agents end. The standing is read again, under the person's row lock,
+those agents end. The wakes stored for them or scheduled by them on those
+agents' chats (and on a Shared-only agent where they fell below the editor
+tier) are dropped, so no later turn on such a chat replays them. The standing is read again, under the person's row lock,
 before anything moves: a person re-added since the event keeps their rows.
 
 The event is sent once and a restart can drop it, so the transfer is redone
 once more after ``RESWEEP_AFTER_S`` (a request that authorised before the
 change may commit a row after the first pass) and at boot, where every
 agent-scope row whose creator is a live person below the editor tier there
-or a person deleted since moves to the install owner. Any other creator
-value (an agent slug, ``api``, a master-key caller) is left alone.
+or a person deleted since moves to the install owner. A local account's
+subject (``local:<uuid>``) that no user row carries is a person deleted
+before retired usernames were kept, and moves the same way. An agent slug,
+``api``, the master key and a session principal are not a person's and are
+left alone; any other creator no user row carries (an identity provider's
+subject, which has no shape of its own) is left in place and named in the
+owner's boot notice for review.
 
 A deleted person's ``users/<username>`` directories leave every agent tree
 into ``AGENTS_DIR/.offboarded/<username>/<agent>/`` (0700), by rename
@@ -49,6 +56,8 @@ import asyncio
 import errno
 import logging
 import os
+import re
+from collections.abc import Iterable
 
 import config
 from auth import roles
@@ -56,6 +65,7 @@ from core import layout
 from services.agents import offboarding
 from services.scheduler import task_kinds
 from storage import database as task_store
+from storage.automation import notification_store
 from storage.chat import meeting_status
 from storage.pg import run_db
 
@@ -83,6 +93,14 @@ _REASON_TEXT = {
     REASON_BOOT: "no longer holds the editor tier",
 }
 _NAMED = 10
+# The subject a local account is minted with (``db_users.create_local_user``).
+_LOCAL_SUB = re.compile(r"local:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Creator values that name no person: an agent-scope API call with no agent
+# header, the master key.
+_NOT_A_PERSON = ("api", "api-key")
+# The unknown creators the owner was already told about, as a JSON list of
+# ``[agent, creator]``: each is named once, not at every restart.
+_REPORTED_KEY = "offboarding_unknown_creators_reported"
 
 _background: set[asyncio.Task] = set()
 _repasses: dict[str, asyncio.Task] = {}
@@ -128,6 +146,30 @@ def _api_keys_minted_by(sub: str) -> list[dict]:
     return [k for k in api_key_store.list_agent_api_keys() if k.get("created_by") == sub]
 
 
+def _unreported(unknown: dict[str, list[str]]) -> dict[str, list[str]]:
+    """The unknown creators not named in an earlier boot notice; the stored
+    list becomes the current set. Synchronous."""
+    import json
+    try:
+        told = {tuple(pair) for pair in json.loads(
+            task_store.get_platform_setting(_REPORTED_KEY) or "[]")}
+    except (TypeError, ValueError):
+        told = set()
+    now = sorted((agent, creator) for agent, creators in unknown.items() for creator in creators)
+    fresh: dict[str, list[str]] = {}
+    for agent, creator in now:
+        if (agent, creator) not in told:
+            fresh.setdefault(agent, []).append(creator)
+    task_store.set_platform_setting(_REPORTED_KEY, json.dumps([list(pair) for pair in now]))
+    return fresh
+
+
+def _not_a_person(creator: str, agents: set[str]) -> bool:
+    from auth.providers import SESSION_SUB_PREFIX
+    return (creator in agents or creator in _NOT_A_PERSON
+            or creator.startswith(SESSION_SUB_PREFIX))
+
+
 def _counts(result: dict) -> dict[str, int]:
     return {
         "tasks": len(result["tasks"]),
@@ -157,11 +199,14 @@ def _drop_jobs(result: dict) -> None:
 
 
 def _notification_text(sub: str, reason: str, names: tuple[str, str, str],
-                       moved: dict[str, dict], keys: list[dict]) -> tuple[str, str]:
+                       moved: dict[str, dict], keys: list[dict],
+                       unknown: dict[str, list[str]] | None = None) -> tuple[str, str]:
     who = _person_label(sub, names)
-    lines = [f"{who} ({_REASON_TEXT.get(reason, reason)}) left automations that act as "
-             f"agents you manage. They are yours now and keep their schedules; their chat "
-             f"continuations ended."]
+    lines = []
+    if any(_moved_anything(r) for r in moved.values()):
+        lines.append(f"{who} ({_REASON_TEXT.get(reason, reason)}) left automations that act "
+                     f"as agents you manage. They are yours now and keep their schedules; "
+                     f"their chat continuations ended.")
     for agent, result in sorted(moved.items()):
         c = _counts(result)
         parts = []
@@ -187,17 +232,26 @@ def _notification_text(sub: str, reason: str, names: tuple[str, str, str],
                      + ", ".join(f"{k['agent']}/{k['name']}" for k in keys[:_NAMED])
                      + (f" and {len(keys) - _NAMED} more" if len(keys) > _NAMED else "")
                      + ". Review them under the agent's API keys.")
-    lines.append("A transferred task runs without knowledge writes until you or another "
-                 "manager edits its prompt.")
-    return "Automations transferred to you", "\n".join(lines)
+    if lines:
+        lines.append("A transferred task runs without knowledge writes until you or another "
+                     "manager edits its prompt.")
+    for agent, creators in sorted((unknown or {}).items()):
+        shown = ", ".join(creators[:_NAMED])
+        more = f" and {len(creators) - _NAMED} more" if len(creators) > _NAMED else ""
+        lines.append(f"{agent}: automations created by an account this install does not "
+                     f"know ({shown}{more}) act as the agent. They were left as they are; "
+                     f"review them.")
+    title = ("Automations transferred to you" if any(_moved_anything(r) for r in moved.values())
+             else "Automations to review")
+    return title, "\n".join(lines)
 
 
 async def _notify(target: str, sub: str, reason: str, names: tuple[str, str, str],
-                  moved: dict[str, dict]) -> None:
+                  moved: dict[str, dict], unknown: dict[str, list[str]] | None = None) -> None:
     from services.notifications.notification_manager import fire_notification
     # The boot notice speaks for several people and names no minter.
     keys = await run_db(_api_keys_minted_by, sub) if sub else []
-    title, body = _notification_text(sub, reason, names, moved, keys)
+    title, body = _notification_text(sub, reason, names, moved, keys, unknown)
     try:
         await fire_notification(title, body, severity="info", scope="user", target=target,
                                 source=NOTIFICATION_SOURCE, href=NOTIFICATION_HREF)
@@ -232,6 +286,22 @@ async def _end_meetings(sub: str, people: dict) -> int:
     if ended:
         logger.info("offboarding: ended %d meeting(s) of %s", ended, sub)
     return ended
+
+
+def _drop_stored_wakes(sub: str, reason: str, people: dict) -> int:
+    """The wakes stored for the person, or scheduled by them, on chats of an
+    agent they lost (every agent for a deletion), and of a Shared-only agent
+    where they fell below the editor tier (its chats run from the agent's
+    own state). Synchronous."""
+    from core.session.visibility import is_shared_only
+    if reason == offboarding.DELETED:
+        return task_store.drop_pending_wakes_of(sub, None)
+    lost = []
+    for agent in task_store.pending_wake_agents_of(sub):
+        role = _role_now(people, sub, agent)
+        if role == roles.NO_ACCESS or (is_shared_only(agent) and not roles.can_edit(role)):
+            lost.append(agent)
+    return task_store.drop_pending_wakes_of(sub, lost) if lost else 0
 
 
 async def _sweep_user_scope(sub: str, reason: str, people: dict) -> list[str]:
@@ -280,6 +350,23 @@ async def reconcile_person(sub: str, *, actor: str, reason: str,
         await _sweep_user_scope(sub, reason, people)
     except Exception:
         logger.exception("offboarding: the user-scope rows of %s were not swept", sub)
+    if reason != offboarding.DELETED:
+        # An app share placed in an agent they no longer hold (a demoted
+        # admin held every agent) waits again in their section (SHARING.md);
+        # a membership removal already did this in its own transaction.
+        try:
+            from storage.sharing import share_store
+            unplaced = await run_db(share_store.reap_unheld_placements, sub)
+            if unplaced:
+                logger.info("offboarding: %d placed share(s) of %s un-placed", unplaced, sub)
+        except Exception:
+            logger.exception("offboarding: the placed shares of %s were not un-placed", sub)
+    try:
+        dropped = await run_db(_drop_stored_wakes, sub, reason, people)
+        if dropped:
+            logger.info("offboarding: %d stored wake(s) of %s dropped", dropped, sub)
+    except Exception:
+        logger.exception("offboarding: the stored wakes of %s were not dropped", sub)
     try:
         await _end_meetings(sub, people)
     except Exception:
@@ -386,29 +473,53 @@ async def archive_person(username: str) -> bool:
     return True
 
 
+def transferred_from_names(subs: Iterable[str]) -> dict[str, str]:
+    """``{sub: name}`` for the first creators rows were transferred from, for
+    the rows' "transferred from" line: a live person's display name, else a
+    deleted person's retired username. Synchronous: call it off the loop."""
+    wanted = [s for s in dict.fromkeys(subs) if s]
+    if not wanted:
+        return {}
+    names = notification_store.resolve_subs_to_display_names(wanted)
+    if len(names) < len(wanted):
+        retired = {r["sub"]: r["username"] for r in task_store.list_retired_usernames()}
+        for sub in wanted:
+            if sub not in names and retired.get(sub):
+                names[sub] = retired[sub]
+    return names
+
+
 # --- boot ----------------------------------------------------------------------
 
 
 async def reconcile_at_boot() -> dict[str, dict]:
     """Every agent-scope row whose creator is a live person below the
-    editor tier on the agent, or a person deleted since, moves to the
-    install owner; the meetings of those people on agents they cannot
-    reach end; every retired username with a tree still present is
-    archived. Returns what moved, by agent."""
+    editor tier on the agent, or a person deleted since (a retired subject,
+    or a local one no user row carries), moves to the install owner; the
+    meetings of those people on agents they cannot reach end; every retired
+    username with a tree still present is archived. A creator the install
+    cannot place is named in the owner's notice. Returns what moved, by
+    agent."""
     pairs = await run_db(task_store.list_automation_creators, list(KINDS))
     moved: dict[str, dict] = {}
+    unknown: dict[str, list[str]] = {}
     creators = {creator for _agent, creator in pairs}
     people = await run_db(_people, creators) if creators else {}
     retired = await run_db(task_store.retired_subs)
     owner = await run_db(task_store.get_owner_sub) or ""
+    from storage.agents import agent_store
+    agents = set(await run_db(agent_store.get_agent_slugs))
     to_end: set[str] = set()
     for agent, creator in pairs:
         user, _agent_roles = people.get(creator) or (None, {})
         if user:
             if roles.can_edit(_role_now(people, creator, agent)):
                 continue
-        elif creator not in retired:
-            logger.debug("offboarding: %s on %s is not a person's; left alone", creator, agent)
+        elif creator not in retired and not _LOCAL_SUB.fullmatch(creator):
+            if not _not_a_person(creator, agents):
+                unknown.setdefault(agent, []).append(creator)
+            logger.debug("offboarding: %s on %s is not a known person's; left alone",
+                         creator, agent)
             continue
         to_end.add(creator)
         if creator == owner:
@@ -447,9 +558,16 @@ async def reconcile_at_boot() -> dict[str, dict]:
         except Exception:
             logger.exception("offboarding: the trees of %s were not archived at boot",
                              row["username"])
-    if owner and any(_moved_anything(r) for r in moved.values()):
+    try:
+        from services.agents import shared_only_members
+        await run_db(shared_only_members.log_legacy_rows)
+    except Exception:
+        logger.exception("offboarding: the Shared-only assignment check failed at boot")
+    if owner:
+        unknown = await run_db(_unreported, unknown)
+    if owner and (unknown or any(_moved_anything(r) for r in moved.values())):
         _keep(asyncio.ensure_future(_notify(owner, "", REASON_BOOT,
-                                            ("several people", "", ""), moved)))
+                                            ("several people", "", ""), moved, unknown)))
     logger.info("offboarding: boot reconcile over %d creator row(s): %d agent(s) with rows moved, "
                 "%d person(s) checked for meetings, %d retired name(s) checked for trees",
                 len(pairs), len(moved), len(to_end), archived)

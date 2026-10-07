@@ -6,7 +6,7 @@ and nothing else: the id shape and the app row first (a malformed or
 unknown id is a 404 that counts against no bucket), then the per-address
 bucket (skipped for an address every client shares) and the per-app bucket,
 one 404 for an unknown hook, an unapproved manifest and an unset secret,
-the body cap, the
+the body cap, the hook's failed-signature bucket, the
 four schemes over the raw bytes with a payload signed here, 401 on a bad
 signature, the vendor's event id as the idempotency key, a replay as a
 duplicate, a full queue as 503; an inbound wake fires with basis
@@ -307,22 +307,95 @@ def test_garbage_ids_never_arm_the_per_address_bucket(agent_tree, monkeypatch):
         target = "zzz" if i % 2 else str(uuid.uuid4())
         assert client.post(f"/v1/apps/{target}/inbound/x", content=b"x").status_code == 404
     assert _post(row, "stripe", body, signed).status_code == 200
-    # The edge's address, shared by every client (an untrusted forwarder).
+    # The edge's address, shared by every client (a trusted proxy that sends
+    # no X-Forwarded-For).
     rate_limiter._attempts.clear()
     lan_check.reset_state()
-    monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", ["10.200.0.1"])
     edge = _TC(app, client=("10.200.0.1", 40000))
     for i in range(10):
         r = edge.post(f"/v1/apps/{uuid.uuid4()}/inbound/x", content=b"x",
-                      headers={"X-Forwarded-For": "203.0.113.66"})
+                      headers={"X-Forwarded-Proto": "https"})
         assert r.status_code == 404
         assert edge.post(f"/v1/apps/{row['id']}/inbound/nope-{i}", content=b"x",
-                         headers={"X-Forwarded-For": "203.0.113.66"}).status_code == 404
+                         headers={"X-Forwarded-Proto": "https"}).status_code == 404
     body = json.dumps({"id": "evt_vendor", "type": "checkout.session.completed"}).encode()
     r = edge.post(f"/v1/apps/{row['id']}/inbound/stripe", content=body,
-                  headers={"Content-Type": "application/json", "X-Forwarded-For": "54.187.174.169",
+                  headers={"Content-Type": "application/json", "X-Forwarded-Proto": "https",
                            "Stripe-Signature": _stripe_header(VALUES["STRIPE_WEBHOOK_SECRET"], body)})
     assert r.status_code == 200, r.text
+    lan_check.reset_state()
+
+
+def test_an_untrusted_forwarder_is_one_client_for_the_per_address_bucket(agent_tree, monkeypatch):
+    """f8: a private peer that is not a trusted proxy counts under its own
+    address whatever forwarding header it sends."""
+    from fastapi.testclient import TestClient as _TC
+    from auth import lan_check
+    row = _row(inbound=INBOUND, secrets=SECRETS)
+    monkeypatch.setitem(config.RATE_LIMIT_RULES, "app_inbound_ip",
+                        {"max": 3, "window": 60, "base_block": 60, "max_block": 600})
+    lan_check.reset_state()
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
+    edge = _TC(app, client=("10.200.0.1", 40000))
+    codes = [edge.post(f"/v1/apps/{row['id']}/inbound/nope-{i}", content=b"x",
+                       headers={"X-Real-IP": f"203.0.113.{i}"}).status_code for i in range(4)]
+    assert codes == [404, 404, 404, 429]
+    assert edge.post(f"/v1/apps/{row['id']}/inbound/nope", content=b"x").status_code == 429
+    keys = {k[1] for k in rate_limiter._attempts if k[0] == "app_inbound_ip"}
+    assert keys == {"ip:10.200.0.1"}
+    lan_check.reset_state()
+
+
+def test_wrong_signatures_meet_the_hooks_failure_bucket(agent_tree, monkeypatch):
+    """c7: a signature that fails against the secret counts against the hook,
+    and against the client too for a distinct client, checked right before
+    the next verification: a bearer hook on an address every client shares
+    faces more than the per-app event bucket. A delivery that verifies, a
+    refusal that tested no secret, another hook, another app and another
+    client's own key never count."""
+    from fastapi.testclient import TestClient as _TC
+    from auth import lan_check
+    row = _row(inbound=INBOUND, secrets=SECRETS)
+    other = _row("other", inbound=INBOUND, secrets=SECRETS)
+    monkeypatch.setitem(config.RATE_LIMIT_RULES, "app_inbound_fail",
+                        {"max": 3, "window": 60, "base_block": 60, "max_block": 600})
+    lan_check.reset_state()
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", ["10.200.0.1"])
+    # A trusted proxy that sends no X-Forwarded-For: every client shares it.
+    edge = _TC(app, client=("10.200.0.1", 40000))
+    edge_headers = {"X-Forwarded-Proto": "https"}
+
+    def post(via, app_row, name, headers, extra=None):
+        return via.post(f"/v1/apps/{app_row['id']}/inbound/{name}", content=b"{}",
+                        headers={"Content-Type": "application/json", **(extra or {}), **headers})
+
+    good = {"Authorization": f"Bearer {VALUES['BEARER_SECRET']}"}
+    signed = {"X-Signature": "sha256=" + _hex(VALUES["HMAC_SECRET"], b"{}")}
+    for _ in range(5):
+        assert post(edge, row, "token", good, edge_headers).status_code == 200
+    for _ in range(5):  # missing_header: no secret tested
+        assert post(edge, row, "token", {}, edge_headers).status_code == 401
+    for i in range(3):
+        r = post(edge, row, "token", {"Authorization": f"Bearer wrong-{i}"}, edge_headers)
+        assert r.status_code == 401 and "signature_mismatch" in r.text
+    r = post(edge, row, "token", {"Authorization": "Bearer wrong-3"}, edge_headers)
+    assert r.status_code == 429 and r.headers.get("retry-after")
+    # Refused before the verification: the right secret too, on that hook.
+    assert post(edge, row, "token", good, edge_headers).status_code == 429
+    # Another hook of the app, and another app, are not locked.
+    assert post(edge, row, "generic", signed, edge_headers).status_code == 200
+    assert post(edge, other, "token", good, edge_headers).status_code == 200
+    assert ("app_inbound_fail", f"{row['id']}:token") in rate_limiter._attempts
+    # A distinct client counts against its own key: it locks only itself.
+    a = _TC(app, client=("198.51.100.7", 40000))
+    b = _TC(app, client=("198.51.100.8", 40000))
+    for i in range(3):
+        assert post(a, other, "token", {"Authorization": f"Bearer wrong-{i}"}).status_code == 401
+    assert post(a, other, "token", good).status_code == 429
+    assert post(b, other, "token", good).status_code == 200
+    assert post(edge, other, "token", good, edge_headers).status_code == 200
+    assert ("app_inbound_fail", f"{other['id']}:token:ip:198.51.100.7") in rate_limiter._attempts
     lan_check.reset_state()
 
 

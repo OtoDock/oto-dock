@@ -13,7 +13,6 @@
     "@capacitor-community/text-to-speech": "^8.0.0",
     "@capacitor/android": "^8.2.0",
     "@capacitor/browser": "^8.0.3",
-    "@capacitor/cli": "^8.2.0",
     "@capacitor/core": "^8.2.0",
     "@capacitor/geolocation": "^8.1.0",
     "@capacitor/push-notifications": "^8.0.2",
@@ -23,7 +22,6 @@
     "@fontsource/comfortaa": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@tailwindcss/browser": "^4.3.2",
-    "@tailwindcss/typography": "^0.5.20",
     "@tanstack/react-query": "^5.56.2",
     "@types/react-syntax-highlighter": "^15.5.13",
     "@xterm/addon-clipboard": "^0.1.0",
@@ -47,6 +45,8 @@
     "zxcvbn": "^4.4.2"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.2.0",
+    "@tailwindcss/typography": "^0.5.20",
     "@tailwindcss/vite": "^4.3.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

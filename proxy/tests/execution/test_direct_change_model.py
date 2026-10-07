@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.layers.direct.layer import _text_only_history
+from concurrent.futures import Future
 
 
 def test_text_only_history_keeps_the_visible_text_of_every_stored_shape():
@@ -121,8 +122,13 @@ def switch_env(monkeypatch):
                         lambda sid: calls.append(("release", sid)))
     monkeypatch.setattr(subscription_pool, "acquire_subscription",
                         lambda layer, user_sub, provider=None: handles.get(provider))
-    monkeypatch.setattr(subscription_pool, "bind_session",
-                        lambda *a, **kw: calls.append(("bind", a[1])))
+    def _bind(*a, **kw):
+        calls.append(("bind", a[1]))
+        done = Future()        # the writer's future the spawn flow awaits
+        done.set_result(None)
+        return done
+
+    monkeypatch.setattr(subscription_pool, "bind_session", _bind)
     monkeypatch.setattr(layer_mod.app_config, "get_model_provider",
                         lambda m: "anthropic" if m.startswith("claude") else "openai")
     return layer_mod.DirectLLMExecutionLayer(), session, calls
@@ -133,9 +139,9 @@ async def test_cross_provider_switch_keeps_the_history_as_text_and_swaps_the_ser
     switch_env,
 ):
     layer, session, calls = switch_env
-    await layer.change_model(session.session_id, "claude-sonnet-5")
+    await layer.change_model(session.session_id, "claude-sonnet-5-5")
 
-    assert (session.provider, session.model, session.api_key) == ("anthropic", "claude-sonnet-5", "AK")
+    assert (session.provider, session.model, session.api_key) == ("anthropic", "claude-sonnet-5-5", "AK")
     assert calls == [("release", "switch-test"), ("bind", "sub-a")]
     # Plain text turns only — nothing the Anthropic API would reject.
     assert session.messages == [{"role": "user", "content": "q"},

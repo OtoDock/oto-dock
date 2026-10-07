@@ -63,6 +63,6 @@ describe('the empty-bubble recovery and a ui-only turn', () => {
     act(() => captured.cb.onText(''))
     act(() => captured.cb.onDone())
     act(() => { vi.advanceTimersByTime(1000) })
-    expect(wsMock.resumeChat).toHaveBeenCalledWith('chat-1')
+    expect(wsMock.resumeChat).toHaveBeenCalledWith('chat-1', { delta: true })
   })
 })

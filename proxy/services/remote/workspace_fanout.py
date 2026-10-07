@@ -54,6 +54,8 @@ import errno
 import hashlib
 import logging
 import os
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import config
@@ -64,6 +66,9 @@ from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.workspace-fanout")
+
+# A tracked push's progress rows move at most this often.
+_PROGRESS_EVERY_S = 0.5
 
 
 def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, str]]:
@@ -321,8 +326,8 @@ async def fan_out_write(
 
     ``source`` is either the file's bytes (small in-memory payloads — WOPI,
     hooks) or its platform filesystem ``Path`` — the streaming mode all
-    large-file callers use: ``push_file`` reads per-window from disk, so a
-    1GB file fanning out to N machines costs O(N × window) memory, never
+    large-file callers use: ``push_file`` reads one chunk at a time from disk, so a
+    1GB file fanning out to N machines costs O(N × chunk) memory, never
     N × the file.
 
     Targets active-session machines (``fanout_targets``); when ``include_idle`` is set
@@ -395,7 +400,9 @@ async def fan_out_write(
     # descriptor's own path, so a swap of any name meanwhile changes nothing
     # it sends, and the merge base recorded below is the hash of what was
     # read from that same descriptor (D3: taken before the pushes, never
-    # after).
+    # after). Every push sends that hash as the frame's hash: a writer that
+    # changes the inode in place after the hash makes the satellite refuse
+    # the push, so no base names bytes the target never got.
     src_fd: int | None = None
     base_mtime = 0.0
     if from_path:
@@ -410,16 +417,27 @@ async def fan_out_write(
             await _empty_terminal(0)
             return
         size, base_mtime = st.st_size, st.st_mtime
+        platform_stat: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
         content_hash = await asyncio.to_thread(_hash_fd, src_fd)
         source = Path(safe_fs.fd_path(src_fd))
     else:
         size = len(source)
         content_hash = "sha256:" + hashlib.sha256(source).hexdigest()
+        # The platform copy these bytes were written to (the callers write
+        # it first, under the path lock they still hold).
+        try:
+            pst = await asyncio.to_thread(
+                safe_fs.lstat_beneath, config.AGENTS_DIR,
+                f"{agent_slug}/{normalize_rel_path(rel_path)}")
+            platform_stat = (pst.st_size, pst.st_mtime_ns)
+        except (OSError, PathOutsideRoot):
+            platform_stat = None
     try:
         await _fan_out_pushes(
             agent_slug, rel_path, source, machines, size, content_hash, base_mtime,
             transfer_kind=transfer_kind, transfer_id=transfer_id,
             origin_user_sub=origin_user_sub, max_chunk=MAX_CHUNK_SIZE,
+            platform_stat=platform_stat,
         )
     finally:
         if src_fd is not None:
@@ -437,6 +455,7 @@ async def _fan_out_pushes(
     agent_slug: str, rel_path: str, source: "bytes | Path", machines: list[str],
     size: int, content_hash: str, base_mtime: float, *,
     transfer_kind: str, transfer_id: str | None, origin_user_sub: str, max_chunk: int,
+    platform_stat: tuple[int, int] | None = None,
 ) -> None:
     from core.remote import transfer_registry
     from core.remote.satellite_connection import get_connection_manager
@@ -459,7 +478,15 @@ async def _fan_out_pushes(
         cb = None
         on_state = None
         if tid:
+            # A push reports every acked chunk: the row moves at most every
+            # _PROGRESS_EVERY_S (its terminal goes out below regardless).
+            last = {"t": 0.0}
+
             async def cb(sent: int, total: int, _mid=mid):
+                now = time.monotonic()
+                if sent < total and now - last["t"] < _PROGRESS_EVERY_S:
+                    return
+                last["t"] = now
                 await transfer_registry.progress(tid, _mid, sent, total)
 
             # The gate drives the queued→active lifecycle for tracked rows
@@ -467,13 +494,18 @@ async def _fan_out_pushes(
             async def on_state(state: str, _mid=mid):
                 await transfer_registry.set_state(tid, _mid, state)
 
-        # Global outbound gate (Feature F): only ≥threshold pushes contend;
+        # The machine's outbound gate (Feature F): only ≥threshold pushes contend;
         # a machine waiting on a slot shows 'queued' in the progress popup.
         async with transfer_gate.slot(
             mid, agent_slug, rel_path, size, on_state=on_state,
         ):
+            if platform_stat is not None:
+                # The in-flight mark counts from the slot, not the queue.
+                remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *platform_stat,
+                                                     in_flight_s=in_flight_s)
             ok = await cm.push_file(
                 mid, ref, source, agent_slug=agent_slug, progress_cb=cb,
+                content_hash=content_hash,
             )
         if tid:
             if ok:
@@ -486,6 +518,19 @@ async def _fan_out_pushes(
                 )
         return ok
 
+    # Until its push lands, each target holds older bytes than the platform
+    # copy: a read there meanwhile serves the platform copy (this fan-out
+    # runs outside the path lock, so a read could otherwise pull the older
+    # bytes over it). Marked now, and again when the push gets its transfer
+    # slot, for as long as the push may run (its ceiling): a mark that
+    # outlives a push which never answers turns into a failure's rules.
+    from core.remote import remote_file_flow
+    from core.remote.satellite_file_transfer import push_ceiling_s
+    in_flight_s = push_ceiling_s(size)
+    if platform_stat is not None:
+        for mid in machines:
+            remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *platform_stat,
+                                                 in_flight_s=in_flight_s)
     results = await asyncio.gather(
         *(_push_one(mid) for mid in machines),
         return_exceptions=True,
@@ -534,6 +579,17 @@ async def _fan_out_pushes(
             logger.debug(
                 "fan_out_write %s -> %s not acked (offline?)", rel_path, mid[:8],
             )
+    # Each target that missed the bytes holds an older copy than the
+    # platform's: a read there must not pull it over them
+    # (remote_file_flow's platform-ahead marker). An acked push clears it.
+    missed = [mid for mid, res in zip(machines, results) if isinstance(res, Exception) or res is False]
+    for mid in acked:
+        remote_file_flow.clear_platform_ahead(mid, agent_slug, rel_path, stat=platform_stat)
+    if missed and platform_stat is not None:
+        await asyncio.gather(*(
+            remote_file_flow.note_push_failed(cm, mid, agent_slug, rel_path, *platform_stat)
+            for mid in missed
+        ), return_exceptions=True)
 
 
 async def fan_out_delete(
@@ -593,7 +649,7 @@ async def _atomic_write_agent_file(
     followed, a link at the name replaced and never written through). Runs
     in a thread. Raises ``ValueError`` (a bad slug or rel) / ``OSError`` (I/O,
     a refusal of the helpers) on failure; the caller decides whether that's
-    fatal (Collabora save) or best-effort (file-tools). A failed write leaves
+    fatal (the Collabora save, its one caller). A failed write leaves
     no temp behind (quota is never leaked by an orphan)."""
     try:
         if not config.is_safe_agent_name(agent_slug):
@@ -609,20 +665,20 @@ async def _atomic_write_agent_file(
 async def propagate_write(
     agent_slug: str, rel_path: str, content: bytes, *,
     exclude_machine_id: str | None = None, writer: str | None = None,
-) -> None:
+    precheck: Callable[[], Awaitable[bool]] | None = None,
+) -> bool:
     """Atomically write ``content`` to the platform agent tree AND fan it out to
-    every OTHER satellite running ``agent_slug`` — all under the global
+    every machine running ``agent_slug`` (``exclude_machine_id`` aside) — all under the global
     per-(agent, rel_path) lock so it never interleaves with the ``file_changed``
     applier / ``push_back`` / ``pull_through``.
 
-    The shared propagation entry point for platform-side writes whose bytes are
-    produced OUTSIDE the ``file_changed`` applier (so the proxy gets the final
-    bytes directly, not a pull from a satellite):
-      * **Collabora save** — ``api/media/wopi.py::wopi_put_file`` (Collabora already
-        live-merged concurrent human editors → ``content`` IS the merged result);
-      * **file-tools on a LOCAL session** — ``api/hooks/lifecycle.py::hook_file_written``
-        local branch (the Docker MCP wrote the platform agent dir directly; we
-        re-publish those bytes atomically + fan them out to remote satellites).
+    The propagation entry point of a Collabora save
+    (``api/media/wopi.py::wopi_put_file``), whose bytes are produced OUTSIDE
+    the ``file_changed`` applier, so the proxy gets the final bytes directly,
+    not a pull from a satellite. Collabora already live-merged concurrent
+    human editors, so ``content`` IS the merged result. A file-tools write
+    goes through ``hook_file_written`` instead: ``push_back`` and its
+    fan-out on a remote session, nothing to fan out on a local one.
 
     Deliberately NO conflict-detect / recover-bin: by the time these callers run,
     the pre-overwrite bytes are already gone (there is no proxy-side pre-write
@@ -636,13 +692,21 @@ async def propagate_write(
     (``fan_out_write`` swallows per-push failures), so a satellite being offline
     never fails the write; it reconciles at that satellite's next session start.
 
-    NOTE: ``push_back`` does NOT call this — it already holds the global lock for
-    its own-machine push, so it calls ``fan_out_write`` directly (re-acquiring the
-    same non-reentrant lock here would deadlock).
+    ``precheck`` (the WOPI save check) is awaited inside the path lock,
+    before the write: a write queued for the lock meanwhile cannot land
+    between the check and this write. When it answers False nothing is
+    written or fanned out and False is returned; otherwise True.
+
+    NOTE: ``push_back`` does NOT call this — it takes the global path lock for
+    its own-machine push, takes the fan-out lock inside it, releases the path
+    lock, and then calls ``fan_out_write`` directly under the fan-out lock alone
+    (since 1.7.1), so a slow target never holds the next writer of the path.
     """
     from core.remote.remote_file_flow import _acquire_global_path_lock, acquire_fanout_lock
     lock = await _acquire_global_path_lock(agent_slug, rel_path)
     async with lock:
+        if precheck is not None and not await precheck():
+            return False
         await _atomic_write_agent_file(agent_slug, rel_path, content)
         # Versioned-sync bookkeeping: the path is live again (retire any tombstone)
         # and ``writer`` (the editing user's slug, if known) becomes its author for
@@ -677,3 +741,4 @@ async def propagate_write(
             asyncio.create_task(
                 library_projector.propagate_source_write(
                     agent_slug, rel_path[len("knowledge/"):]))
+    return True

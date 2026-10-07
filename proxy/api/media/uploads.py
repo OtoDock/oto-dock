@@ -35,7 +35,7 @@ from pydantic import BaseModel
 import config
 from storage.agents import agent_store
 from auth import rate_limiter
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from auth.providers import UserContext, get_current_user, require_agent_access, require_auth, require_user
 from core import file_commit, layout
 from services.infra import safe_fs
 from services.infra.path_confinement import (
@@ -45,7 +45,8 @@ from storage import database as task_store
 from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.uploads")
-router = APIRouter()
+# No route here takes an anonymous caller (auth.providers.require_user).
+router = APIRouter(dependencies=[Depends(require_user)])
 
 # The per-file cap is the UNIVERSAL config.MAX_UPLOAD_SIZE_BYTES
 # (OTODOCK_MAX_FILE_MB, default 1GB) — read live in the endpoint so tests and
@@ -610,22 +611,37 @@ def _staging_root() -> Path:
     return config.UPLOAD_STAGING_DIR.parent
 
 
-def _load_chunk_meta(upload_id: str, user: UserContext) -> tuple[dict, Path, Path]:
-    """Meta for an in-flight chunked upload, owner- and access-checked.
-
-    404 for an unknown id (or a swept meta); 403 when the caller isn't the
-    user who ran init. Re-runs the agent-access check — access may have been
-    revoked mid-upload.
-    """
-    staging, meta_path = _staging_paths(upload_id, user.sub)
+def _read_chunk_meta(upload_id: str, sub: str) -> tuple[dict, Path, Path, int | None]:
+    """``(meta, staging, meta path, staged size)`` of an in-flight chunked
+    upload; the staged size is None when the staging file is gone. 404 for
+    an unknown id (or a swept meta). Runs on the file-commit executor."""
+    staging, meta_path = _staging_paths(upload_id, sub)
     try:
         meta = json.loads(meta_path.read_text())
     except (OSError, ValueError):
         raise HTTPException(status_code=404, detail="Unknown upload id")
+    try:
+        staged: int | None = staging.stat().st_size
+    except FileNotFoundError:
+        staged = None
+    return meta, staging, meta_path, staged
+
+
+async def _load_chunk_meta(
+    upload_id: str, user: UserContext,
+) -> tuple[dict, Path, Path, int | None]:
+    """``_read_chunk_meta`` off the loop, then owner- and access-checked.
+
+    403 when the caller isn't the user who ran init. Re-runs the agent-access
+    check: access may have been revoked mid-upload.
+    """
+    meta, staging, meta_path, staged = await file_commit.run(
+        _read_chunk_meta, upload_id, user.sub,
+    )
     if meta.get("sub") != user.sub:
         raise HTTPException(status_code=403, detail="Not your upload")
     require_agent_access(user, meta.get("agent", ""))
-    return meta, staging, meta_path
+    return meta, staging, meta_path, staged
 
 
 def _save_chunk_meta_atomic(meta_path: Path, meta: dict) -> None:
@@ -664,16 +680,25 @@ def _open_metas(user_dir: Path) -> list[tuple[Path, dict, float]]:
     return out
 
 
-def _evict_idle(opened: list[tuple[Path, dict, float]]) -> list[tuple[Path, dict, float]]:
+def _remove_pair(staging: Path, meta_path: Path) -> None:
+    """Remove an upload's staging file, then its meta. Executor-side."""
+    staging.unlink(missing_ok=True)
+    meta_path.unlink(missing_ok=True)
+
+
+def _evict_idle(
+    opened: list[tuple[Path, dict, float]], evicted: list[str],
+) -> list[tuple[Path, dict, float]]:
     """Remove the oldest of the caller's pairs that received no chunk in the
-    idle window; returns the list without it (unchanged when none is idle)."""
+    idle window and append its id to ``evicted``; returns the list without
+    it (unchanged when none is idle). Called under the admission lock."""
     cutoff = time.time() - _IDLE_EVICT_S
     idle = sorted((m for m in opened if m[2] < cutoff), key=lambda m: m[2])
     if not idle:
         return opened
     meta_path, _meta, _mtime = idle[0]
-    meta_path.with_suffix(".partial").unlink(missing_ok=True)
-    meta_path.unlink(missing_ok=True)
+    _remove_pair(meta_path.with_suffix(".partial"), meta_path)
+    evicted.append(meta_path.stem)
     return [m for m in opened if m[0] != meta_path]
 
 
@@ -692,11 +717,13 @@ def _count_open_total(root: Path) -> int:
     return n
 
 
-def _admit_and_stage(sub: str, upload_id: str, meta: dict) -> None:
+def _admit_and_stage(sub: str, upload_id: str, meta: dict, evicted: list[str]) -> None:
     """Open one chunked upload for ``sub`` (file-commit thread, under the
     admission lock): the staging root and the user dir exist, the free-disk
     floor holds, the per-user caps hold (an idle pair of the caller's is
-    evicted first), the global cap holds, and the pair is created."""
+    evicted first), the global cap holds, and the pair is created. The id
+    of an evicted pair is appended to ``evicted`` before any refusal, so the
+    caller releases its lock whether the admission passes or not."""
     incoming = int(meta["size"])
     with _admission_lock:
         root = config.UPLOAD_STAGING_DIR
@@ -708,7 +735,7 @@ def _admit_and_stage(sub: str, upload_id: str, meta: dict) -> None:
         opened = _open_metas(user_dir)
         max_open = config.UPLOAD_MAX_OPEN
         if max_open > 0 and len(opened) >= max_open:
-            opened = _evict_idle(opened)
+            opened = _evict_idle(opened, evicted)
             if len(opened) >= max_open:
                 raise HTTPException(
                     status_code=429,
@@ -720,7 +747,7 @@ def _admit_and_stage(sub: str, upload_id: str, meta: dict) -> None:
         if max_mb > 0:
             cap = max_mb * 1024 * 1024
             if sum(_occupancy(m) for _p, m, _t in opened) + incoming > cap:
-                opened = _evict_idle(opened)
+                opened = _evict_idle(opened, evicted)
                 if sum(_occupancy(m) for _p, m, _t in opened) + incoming > cap:
                     raise HTTPException(
                         status_code=429,
@@ -775,8 +802,10 @@ def sweep_stale_staging() -> list[str]:
                     except (OSError, ValueError):
                         stale = True
                 if stale:
-                    p.with_suffix(".partial").unlink(missing_ok=True)
-                    p.unlink(missing_ok=True)
+                    # Under the admission lock: a chunk commit never saves
+                    # a meta between the two removals.
+                    with _admission_lock:
+                        _remove_pair(p.with_suffix(".partial"), p)
                     swept.append(p.stem)
             elif p.suffix in (".partial", ".tmp") and mtime < ttl_cutoff:
                 if Path(p.stem).stem not in metas and p.stem not in metas:
@@ -793,8 +822,8 @@ def sweep_stale_staging() -> list[str]:
 
 
 def release_swept_locks(upload_ids: list[str]) -> None:
-    """Drop the chunk locks of swept uploads; a held lock stays for its
-    holder, whose PUT answers 410 and drops it."""
+    """Drop the chunk locks of swept or evicted uploads; a held lock stays
+    for its holder, whose PUT answers 410 and drops it."""
     for uid in upload_ids:
         lock = _chunk_locks.get(uid)
         if lock is not None and not lock.locked():
@@ -901,7 +930,11 @@ async def chunked_upload_init(
         "chunk_size": chunk_size,
         "received": [],
     }
-    await file_commit.run(_admit_and_stage, user.sub, upload_id, meta)
+    evicted: list[str] = []
+    try:
+        await file_commit.run(_admit_and_stage, user.sub, upload_id, meta, evicted)
+    finally:
+        release_swept_locks(evicted)
     return {"upload_id": upload_id, "chunk_size": chunk_size}
 
 
@@ -912,7 +945,7 @@ async def chunked_upload_status(
 ):
     """Received-chunk indexes — what makes a blip a resume, not a restart."""
     user = require_auth(user)
-    meta, _staging, _meta_path = _load_chunk_meta(upload_id, user)
+    meta, _staging, _meta_path, _staged = await _load_chunk_meta(upload_id, user)
     return {
         "received": sorted(meta.get("received", [])),
         "chunk_size": meta["chunk_size"],
@@ -931,16 +964,24 @@ def _open_chunk_target(staging: Path, offset: int, incoming: int):
     return f
 
 
-def _commit_chunk(f, meta_path: Path, meta: dict) -> None:
+def _commit_chunk(f, staging: Path, meta_path: Path, meta: dict) -> None:
     """Flush, fsync, close, then record the chunk. Executor-side. A 2xx is a
-    durability promise the client's resume logic relies on."""
+    durability promise the client's resume logic relies on.
+
+    The meta is saved under the admission lock, and only while the staging
+    file exists: an eviction or a sweep removes the pair under the same
+    lock, so a chunk that lands after it never re-creates the meta of a
+    removed upload (``FileNotFoundError``, the caller's 410)."""
     _flush_fsync_close(f)
-    _save_chunk_meta_atomic(meta_path, meta)
+    with _admission_lock:
+        if not staging.exists():
+            raise FileNotFoundError(errno.ENOENT, "upload staging removed", str(staging))
+        _save_chunk_meta_atomic(meta_path, meta)
 
 
-def _gone(upload_id: str, meta_path: Path) -> HTTPException:
-    # Meta survived but staging was swept (TTL): unrecoverable.
-    meta_path.unlink(missing_ok=True)
+async def _gone(upload_id: str, meta_path: Path) -> HTTPException:
+    # Meta survived but staging was swept (TTL) or evicted: unrecoverable.
+    await file_commit.run(meta_path.unlink, missing_ok=True)
     _chunk_locks.pop(upload_id, None)
     return HTTPException(
         status_code=410, detail="Upload staging expired: restart the upload",
@@ -966,9 +1007,9 @@ async def chunked_upload_chunk(
     client's resume logic relies on.
     """
     user = require_auth(user)
-    meta, staging, meta_path = _load_chunk_meta(upload_id, user)
-    if not staging.exists():
-        raise _gone(upload_id, meta_path)
+    meta, staging, meta_path, staged = await _load_chunk_meta(upload_id, user)
+    if staged is None:
+        raise await _gone(upload_id, meta_path)
 
     size = int(meta["size"])
     chunk_size = int(meta["chunk_size"])
@@ -978,16 +1019,17 @@ async def chunked_upload_chunk(
     expected = min(chunk_size, size - index * chunk_size)
 
     # The lock is minted after the checks above; an upload whose first PUT
-    # fails gives it back below. The meta is read again under the lock: a
-    # sibling chunk's commit between the check and this write would
-    # otherwise be dropped from ``received`` by this writer's stale copy.
+    # fails, or that is gone by the time the lock is held, gives it back
+    # below. The meta is read again under the lock: a sibling chunk's commit
+    # between the check and this write would otherwise be dropped from
+    # ``received`` by this writer's stale copy.
     had_chunks = bool(meta.get("received"))
     lock = _chunk_locks.setdefault(upload_id, asyncio.Lock())
     async with lock:
-        meta, staging, meta_path = _load_chunk_meta(upload_id, user)
         received = 0
         f = None
         try:
+            meta, staging, meta_path, _staged = await _load_chunk_meta(upload_id, user)
             f = await file_commit.run(_open_chunk_target, staging, index * chunk_size, expected)
             batch = bytearray()
             async for part in request.stream():
@@ -1012,12 +1054,15 @@ async def chunked_upload_chunk(
                 )
             if index not in meta["received"]:
                 meta["received"] = sorted([*meta["received"], index])
-            await file_commit.run(_commit_chunk, f, meta_path, meta)
+            await file_commit.run(_commit_chunk, f, staging, meta_path, meta)
             f = None
-        except HTTPException:
-            if not had_chunks:
+        except HTTPException as exc:
+            if not had_chunks or exc.status_code == 404:
                 _chunk_locks.pop(upload_id, None)
             raise
+        except FileNotFoundError:
+            # The pair was evicted or swept while this chunk was in flight.
+            raise await _gone(upload_id, meta_path)
         except Exception as e:
             logger.error(f"Chunk write failed ({upload_id}/{index}): {e}", exc_info=True)
             if not had_chunks:
@@ -1086,12 +1131,17 @@ async def chunked_upload_complete(
     same shape as ``POST /v1/upload`` so callers can't tell the paths apart.
     """
     user = require_auth(user)
-    _load_chunk_meta(upload_id, user)
+    await _load_chunk_meta(upload_id, user)
     lock = _chunk_locks.setdefault(upload_id, asyncio.Lock())
     async with lock:
-        meta, staging, meta_path = _load_chunk_meta(upload_id, user)
-        if not staging.exists():
-            raise _gone(upload_id, meta_path)
+        try:
+            meta, staging, meta_path, actual = await _load_chunk_meta(upload_id, user)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                _chunk_locks.pop(upload_id, None)
+            raise
+        if actual is None:
+            raise await _gone(upload_id, meta_path)
 
         size = int(meta["size"])
         chunk_size = int(meta["chunk_size"])
@@ -1101,12 +1151,10 @@ async def chunked_upload_complete(
             raise HTTPException(
                 status_code=409, detail=f"Upload incomplete ({missing} chunks missing)",
             )
-        actual = staging.stat().st_size
         if actual != size:
             # Should be unreachable given the exact per-chunk size checks; a
             # mismatch means torn staging: drop it so the client restarts clean.
-            staging.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
+            await file_commit.run(_remove_pair, staging, meta_path)
             _chunk_locks.pop(upload_id, None)
             raise HTTPException(
                 status_code=409, detail="Assembled size mismatch: restart the upload",
@@ -1172,17 +1220,19 @@ async def chunked_upload_abort(
     Takes the upload's lock, so a DELETE during a complete waits for the
     landing and then finds nothing to remove."""
     user = require_auth(user)
-    staging, meta_path = _staging_paths(upload_id, user.sub)
+    # A malformed id answers 404 before a lock is minted for it.
+    _staging_paths(upload_id, user.sub)
     lock = _chunk_locks.setdefault(upload_id, asyncio.Lock())
     async with lock:
         try:
-            meta = json.loads(meta_path.read_text())
-        except (OSError, ValueError):
+            meta, staging, meta_path, _staged = await file_commit.run(
+                _read_chunk_meta, upload_id, user.sub,
+            )
+        except HTTPException:
             _chunk_locks.pop(upload_id, None)
             return {"ok": True}  # already gone
         if meta.get("sub") != user.sub:
             raise HTTPException(status_code=403, detail="Not your upload")
-        staging.unlink(missing_ok=True)
-        meta_path.unlink(missing_ok=True)
+        await file_commit.run(_remove_pair, staging, meta_path)
         _chunk_locks.pop(upload_id, None)
     return {"ok": True}

@@ -29,6 +29,9 @@ and reachable teammates.
 Managing: **admins** manage all departments, **creators** the ones they created — from
 the Agents page's **Departments** tab or the map's ⋯ menu. Everyone sees only
 departments they're part of.
+An admin can also share a team app with a department: it appears in the Apps panel of
+every agent in it, follows the department as agents join or leave, and ends when the
+department is deleted (apps.md).
 
 **The company map**: the Agents page renders departments as a 3D map — amphitheater
 seating by level, activity-heat borders, a pulse on agents responding right now,
@@ -48,13 +51,16 @@ sessions — a chat lane the user can watch and steer, or a background task — 
 report back to the delegating chat. Multi-lane jobs turn the delegating chat into an
 **orchestrator** with a dock of live lane cards and a board file. Agents can also pass
 real files: deliverables copy into the target's `workspace/inbox/<sender>/` (passive —
-delegate with a prompt to make the target act). Admin caps live on the Delegation MCP
-row.
+delegate with a prompt to make the target act), and a delegated worker attaches its
+deliverables to its result (`attach_result_files`): they land in the delegating chat's
+`inbox/<worker>/` with no edge back and the result names them, with an Open per file
+in the chat. Admin caps live on the Delegation MCP row.
 
 **Visibility is not delegation.** In a user's chat, an agent can read whatever that user
 could see on other agents (schedules, task history, sessions, triggers, notifications),
 but it hands work or files (`delegate`, `send_files`) only to its own targets — reads
-cross agents, writes never do. An agent's *scheduled* (no-user) runs read the shared
+cross agents, writes do not (a worker's result files go back only to the chat
+that delegated it). An agent's *scheduled* (no-user) runs read the shared
 activity of its delegation roster — the mechanism behind a CEO agent's morning briefing
 that summarizes what the team's agents did overnight.
 

@@ -113,6 +113,62 @@ def test_rate_limiter_record_does_not_wipe_active_block():
 
 # --- sandbox: symlink-refusing literal path guard ----------------------------
 
+def test_a_bucket_keeps_a_bounded_number_of_keys(monkeypatch):
+    """F61: a flood of fresh keys (rotating addresses, invented emails)
+    cannot grow a bucket past its bound; quiet keys go first, a blocked one
+    and its escalation stay."""
+    from auth import rate_limiter as rl
+    rl._attempts.clear()
+    monkeypatch.setattr(config, "RATE_LIMIT_MAX_KEYS", 100)
+    monkeypatch.setitem(config.RATE_LIMIT_RULES, "forgot",
+                        {"max": 1, "window": 3600, "base_block": 3600, "max_block": 14400})
+    # One key gets blocked: two attempts over a cap of one.
+    rl.hit("forgot", "blocked-key")
+    rl.hit("forgot", "blocked-key")
+    assert rl.check_rate_limit("forgot", "blocked-key")[0] is False
+    for i in range(500):
+        rl.record_attempt("forgot", f"k{i}")
+    assert rl._attempts.per_bucket["forgot"] <= 100
+    assert ("forgot", "blocked-key") in rl._attempts
+    assert rl.check_rate_limit("forgot", "blocked-key")[0] is False
+    # Other buckets are untouched by this one's bound.
+    rl.record_attempt("login", "1.2.3.4")
+    assert ("login", "1.2.3.4") in rl._attempts
+    rl._attempts.clear()
+    assert rl._attempts.per_bucket == {}
+
+
+def test_a_full_bucket_of_blocked_keys_leaves_a_new_key_untracked(monkeypatch):
+    from auth import rate_limiter as rl
+    rl._attempts.clear()
+    monkeypatch.setattr(config, "RATE_LIMIT_MAX_KEYS", 100)
+    now = time.time()
+    for i in range(100):
+        rl._attempts[("forgot", f"b{i}")] = {"count": 9, "first_at": now,
+                                             "blocked_until": now + 600, "block_count": 1}
+    scans = []
+    real = rl._make_room
+    monkeypatch.setattr(rl, "_make_room", lambda b, n: scans.append(b) or real(b, n))
+    for i in range(50):
+        rl.record_attempt("forgot", f"new{i}")
+    assert not [k for k in rl._attempts if k[1].startswith("new")]
+    assert rl._attempts.per_bucket["forgot"] == 100
+    # One scan found it full; the next new keys wait out the rescan delay.
+    assert scans == ["forgot"]
+    rl._attempts.full_until["forgot"] = 0.0
+    rl.record_attempt("forgot", "later")
+    assert scans == ["forgot", "forgot"]
+    rl._attempts.clear()
+
+
+def test_the_forgot_email_key_is_a_fixed_size_hash():
+    from auth import rate_limiter as rl
+    k = rl.forgot_email_key("  Someone@Example.COM ")
+    assert k == rl.forgot_email_key("someone@example.com")
+    assert k.startswith("email:") and len(k) == len("email:") + 32
+    assert "someone" not in k
+
+
 def test_verified_literal_path_refuses_symlink(tmp_path):
     from core.sandbox.sandbox import _verified_literal_path
     root = tmp_path / "agent"

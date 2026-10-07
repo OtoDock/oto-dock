@@ -9,7 +9,7 @@ import {
 import {
   searchSection, pruneTree, expandedDirsOf, SEARCH_RESULT_CAP,
 } from '../lib/workspaceSearch'
-import type { FileNode } from '../api/agents'
+import { batchFailureMessage, type FileNode } from '../api/agents'
 
 describe('typeAhead', () => {
   const names = ['alpha.md', 'beta.txt', 'test.mp4', 'testing.md', 'toast.png']
@@ -138,5 +138,23 @@ describe('pruneTree', () => {
     expect(expandedDirsOf(pruned)).toEqual(
       new Set(['workspace/projects', 'workspace/projects/video']),
     )
+  })
+})
+
+describe('batchFailureMessage', () => {
+  it('is empty when everything landed', () => {
+    expect(batchFailureMessage('copied', [])).toBe('')
+    expect(batchFailureMessage('moved', undefined)).toBe('')
+  })
+
+  it('names the refused paths with the server reason, the first few', () => {
+    const failed = Array.from({ length: 7 }, (_, i) => ({
+      src: `workspace/dir/file${i}.txt`, reason: i === 0 ? 'copy stops at 100000 entries' : 'exists',
+    }))
+    const msg = batchFailureMessage('copied', failed)
+    expect(msg.startsWith('7 items were not copied:\nfile0.txt: copy stops at 100000 entries\n')).toBe(true)
+    expect(msg.endsWith('…and 2 more')).toBe(true)
+    expect(batchFailureMessage('moved', failed.slice(0, 1))).toBe(
+      '1 item was not moved:\nfile0.txt: copy stops at 100000 entries')
   })
 })

@@ -293,8 +293,16 @@ async def install_from_extracted_template(
     # admin-editable column. Empty when the manifest doesn't declare the
     # block (or declares it disabled).
     ignored_fields: list[str] = []
+    from services.agents import shared_only_members
     if template.default_for_new_users.get("enabled"):
-        if allow_default_for_new_users:
+        if not roles.allowed_on_shared_only(template.default_for_new_users["role"]) \
+                and shared_only_members.is_shared_only_row(
+                    {"collaborative": template.collaborative,
+                     "default_scope": template.default_scope}):
+            # A Shared-only agent takes the editor tier: a lower default
+            # would attach people who can open no chat there.
+            ignored_fields.append("default_for_new_users")
+        elif allow_default_for_new_users:
             await asyncio.to_thread(
                 agent_store.set_default_for_new_users_role,
                 target_slug, template.default_for_new_users["role"],

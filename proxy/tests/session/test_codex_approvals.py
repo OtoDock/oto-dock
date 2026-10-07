@@ -49,6 +49,30 @@ def test_exec_v2_carries_command_and_cwd():
     assert ti == {"command": "printf probe > /home/u/x.txt", "cwd": "/work"}
 
 
+def test_exec_v2_write_stdin_is_terminal_input_not_a_command():
+    # Codex 0.158 turned terminal-input approvals on by default: the same
+    # method with kind "writeStdin" asks before Codex types into a terminal
+    # running with elevated permissions. The request carries the terminal's
+    # command and the reason, never the text about to be typed, so the
+    # bridge presents it as its own tool for a person to judge, not as a
+    # Bash command the shell gate would re-judge.
+    tn, ti = approval_to_tool(
+        "item/commandExecution/requestApproval",
+        {"kind": "writeStdin", "command": "sudo apt-get install -y x", "cwd": "/work",
+         "itemId": "c1", "approvalId": "a1", "reason": "the command waits for input",
+         "commandActions": [{"command": "sudo apt-get install -y x"}]},
+    )
+    assert tn == "CodexTerminalInput"
+    assert ti == {"command": "sudo apt-get install -y x", "cwd": "/work",
+                  "reason": "the command waits for input", "approval_id": "a1"}
+    # The explicit default kind and a request without the field stay commands.
+    for params in ({"kind": "command", "command": "ls", "cwd": "/w"}, {"command": "ls", "cwd": "/w"}):
+        assert approval_to_tool("item/commandExecution/requestApproval", params)[0] == "Bash"
+    # The answer shape is the method's, not the tool's.
+    assert build_response("item/commandExecution/requestApproval", {"kind": "writeStdin"}, True) == {"decision": "accept"}
+    assert build_response("item/commandExecution/requestApproval", {"kind": "writeStdin"}, False) == {"decision": "decline"}
+
+
 def test_exec_legacy_joins_array_command():
     tn, ti = approval_to_tool(
         "execCommandApproval",

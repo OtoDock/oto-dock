@@ -87,6 +87,26 @@ async def build_meeting_agent_config(
         user_sub=user_sub_for_creds or "",
         scope_override=identity.scope,
     )
+    # A participant that would run as the agent below the editor tier is
+    # refused here, before any seat (every engine's start refuses it too): a
+    # Shared-only participant its creator holds below editor, and an
+    # agent-scope meeting whose creator lost the editor tier after convening
+    # it (the create route judged them then).
+    from auth import roles as _roles
+    from auth.providers import acting_role_of
+    from core.sandbox.session_config_dir import refuse_agent_state_below_editor
+    from core.session.visibility import SCOPE_AGENT, is_shared_only
+    _shared_only = is_shared_only(agent_name)
+    refuse_agent_state_below_editor(vis.mount_scope, task_role or "", shared_only=_shared_only)
+    if scope == SCOPE_AGENT and created_by:
+        from storage.pg import run_db
+
+        def _creator_role() -> str | None:
+            return acting_role_of(created_by, agent_name) if task_store.get_user(created_by) else None
+
+        creator_role = await run_db(_creator_role)
+        if creator_role is not None and not _roles.can_edit(creator_role):
+            refuse_agent_state_below_editor(SCOPE_AGENT, creator_role, shared_only=_shared_only)
 
     db_targets = agent_store.get_delegation_targets(agent_name)
     if identity.scope == "user" and user_sub_for_creds:
@@ -146,6 +166,7 @@ async def build_meeting_agent_config(
             mcp_registry.build_session_mcp_config,
             agent_name,
             user_sub_for_creds,
+            session_id=session_id,
             task_mode=True,
             # ALSO match "meeting" in exclude_from (union with "task") — keeps
             # the tool config in step with the prompt catalog, which filters by
@@ -342,8 +363,8 @@ def build_turn_prompt(meeting: dict, agent_slug: str, transcript: list[dict],
         name = (ad or {}).get("display_name", entry["agent"])
         if entry.get("role") == "user":
             name = f"{name} (human)"
-        if entry.get("thinking"):
-            transcript_lines.append(f"**{name}** (thinking): {entry['thinking'][:300]}")
+        # A speaker's thinking never reaches the other participants (the
+        # rules above tell them so); only the response text does.
         transcript_lines.append(f"**{name}**: {entry['content']}")
         tools = entry.get("tools", [])
         if tools:

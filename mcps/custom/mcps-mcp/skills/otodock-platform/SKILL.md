@@ -20,16 +20,22 @@ deeper than this file, read the matching reference in `references/`.
   their own Claude/ChatGPT subscriptions or API keys) plus a lightweight **direct**
   engine for low-latency work like phone calls. No model ships with the platform.
 - **Sessions** are live running instances of an agent (a chat, a task run, a call).
-  The platform warms, resumes, and idles them automatically.
+  The platform warms, resumes, and idles them automatically. A message typed while the
+  agent works reaches a Claude Code or Codex turn at its next step, otherwise it waits
+  as a faded "queued" bubble at the end of the conversation (every tab of the chat sees
+  it) and goes out with the next turn. A turn that cannot finish ends with a card that says why and, where a
+  retry helps, **Send again**.
 - **Apps** are pages an agent builds and keeps running (buttons that put it to work,
   live data, a server and database when needed): **shared** with the agent's team or
-  **personal**, shareable by link. The first opens as the agent's home; a person
-  approves what each may do.
+  **personal**, shareable with a person, another agent or a department, or by
+  link. The first opens as the agent's home; a person approves what each may do.
 - **Checks** judge an agent's work at the end of a turn and send it back to fix what
   they find.
 - **Tools (MCPs)** give agents abilities; **skills** (like this one) give technique.
 - Agents run inside a strict **sandbox** on the server — or with full access on a
-  paired **remote machine** the user owns.
+  paired **remote machine** the user owns. The machine's agent software updates itself
+  at reconnect; an update ends the turns running there and the chat continues from the
+  next message.
 
 ## The two role systems — always state the required role
 
@@ -48,8 +54,10 @@ memory); **contributor** → adds files to the shared workspace and nothing else
 outside collaborator on a project who must never act as the agent; **viewer** → chats,
 with a private personal space. A person can be manager of one agent and viewer of
 another. Platform admins override per-agent roles. On a **Shared only** agent every chat
-runs as the agent itself, so chatting there takes **editor+**: viewers and contributors
-can read its shared history but get a message instead of a chat.
+runs as the agent itself, which takes **editor+**, so such an agent holds **editor** and
+**manager** assignments only: nothing lower is offered or accepted there, and switching
+an agent to Shared only names the viewers and contributors who lose their assignment and
+asks a manager to confirm.
 
 Common surprises worth pre-empting: department assignment and shared-knowledge wiring
 need platform **admin/creator** (agent managers alone can't); agent-scope schedules and
@@ -68,6 +76,12 @@ installing tools and skills is **admin**, installing an agent from the community
   meetings).
 - **Apps**: the apps button beside the chat composer and each app's ⋯ menu; a chat is
   shared from its row in the chat history.
+- **Documents** an agent delivers open in the chat's document pane (the right half of
+  the chat; a floating window on a phone and in a terminal chat), one tab per document,
+  where the person can edit and save them (on a phone the tick ends editing and saves)
+  and reopen earlier deliveries read-only under its Versions button. The pane saves when
+  it is minimized or hidden and before a message is sent, so the agent's next turn reads
+  the edit.
 - **Admin** (admins only): Users · Usage · MCP Servers · Skills · MCP Requests · Remote
   Machines · Shares · Monitoring · **Setup** (tabs: General · AI Engines · OtoDock ·
   Audio · Phone · Security · System Settings).
@@ -77,16 +91,20 @@ installing tools and skills is **admin**, installing an agent from the community
 ## What you can do yourself vs. hand to the user
 
 You (an agent) can, with the right session role: create and manage tasks, triggers, and
-notifications; browse the tool/skill catalogs and enable or request them; update your
-own persona; manage knowledge libraries and department assignment via your
+notifications; browse the tool/skill catalogs and enable or request them; as an editor
+or above, package an MCP and check it with `validate_mcp_package` (skill
+`mcp-authoring`) before handing the zip to an admin; update your own persona; manage knowledge libraries and department assignment via your
 self-configuration tools (each change confirmed in chat); build, check, deploy and pin
 apps, push to them, open them on the user's screen and roll them back; attach and run
-checks; delegate to wired agents; and read other agents' activity your user could see.
+checks; delegate to wired agents (a worker's result carries the files it attached into
+your workspace); call what an app placed in your agent exports; and read other agents'
+activity your user could see.
 
 You cannot: approve an app, share an app or a chat, set an app's secret, install
 catalog packages (admin approves your request), pair machines, manage users, change
-platform settings, or connect engines/accounts — for those, give the user the exact
-page, tab, and role from `references/settings-map.md`.
+platform settings, or connect engines/accounts (a hosted MCP server's own sign-in is
+the person's too, under User Settings → Integrations) — for those, give the user the
+exact page, tab, and role from `references/settings-map.md`.
 
 ## Routing — read the reference that matches
 
@@ -94,7 +112,7 @@ page, tab, and role from `references/settings-map.md`.
 | --- | --- |
 | Installing, first run, connecting Claude/ChatGPT/keys, voice & phone add-on, pairing remote machines | `references/setup.md` |
 | What an agent is, folders/workspaces, visibility modes, engines & models per agent, tools, skills, creating agents | `references/agents.md` |
-| Apps (shared, personal, the agent's home), the approval card, releases and rollback, secrets, templates and `.otoapp`, sharing apps and chats by link | `references/apps.md` |
+| Apps (shared, personal, the agent's home), the approval card, releases and rollback, secrets, templates and `.otoapp`, sharing apps and chats (people, agents, departments, "Shared with you", links) | `references/apps.md` |
 | Departments, delegation modes and targets, the company map, meetings, shared knowledge libraries, bulletins, memory — running a company on OtoDock | `references/company-management.md` |
 | Schedules, one-time and trigger-fired tasks, model pinning, webhooks, event subscriptions, checks, notifications | `references/automation.md` |
 | "Where is the setting for X?" / "who can do X?" | `references/settings-map.md` |

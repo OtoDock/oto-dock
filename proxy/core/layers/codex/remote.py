@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator
 
+from core.events import turn_ending, turn_life
 from core.events.common_events import CommonEvent, DONE, ERROR, METADATA, PLAN_MODE
 from core.execution_layer import (
     AgentConfig, RemoteEngineAdapter, RemoteStartContext, RemoteStartPlan,
@@ -38,14 +39,16 @@ from core.layers.codex.helpers import (
     codex_hooks_floor,
     map_effort_to_codex,
     permission_to_sandbox,
+    will_retry,
     with_local_provider_note,
 )
 from core.layers.codex.layer import CodexCLIExecutionLayer
 from core.layers.codex.local_model_catalog import (
     LOCAL_MODEL_ROWS_ENV, local_model_catalog_json, parse_local_model_rows,
 )
-from core.layers.codex.session import CodexEvent
+from core.layers.codex.session import _TOOL_ITEM_TYPES, CodexEvent
 from core.layers.codex.translator import CodexEventTranslator
+from core.layers.cli.remote import _lost_events, _satellite_error_events
 from core.session import session_kind
 
 if TYPE_CHECKING:
@@ -87,6 +90,10 @@ _LOCAL_MODEL_START_TIMEOUT_S = 180.0
 # this long (a lost terminal must not hold the registry forever).
 _BG_SUBAGENT_CEILING_S = 600.0
 
+# How long the turn loop waits for a notification before it checks the
+# turn's life against its silence ceiling (turn_life).
+_SILENCE_SLICE_S = 60.0
+
 
 @dataclass
 class CodexRemoteState:
@@ -102,6 +109,18 @@ class CodexRemoteState:
     # Self-pacing for the bg-command drain: at most one codex_bg_terminals RPC
     # per second (the monitor retries every 0.3 s).
     last_bg_terminals_list: float = 0.0
+    # The live turn's open tool items: its life while the stream is silent
+    # (core/events/turn_life), read by the turn loop and by ``steer``.
+    open_items: set = field(default_factory=set)
+
+
+def _silence_ends(info: "RemoteSessionInfo", open_items: set) -> bool:
+    """Whether the remote Codex turn's silence (since its own last stream
+    event) ends it now, with its open tool items as its life."""
+    return turn_life.ends(
+        info.session_id, tools_open=bool(open_items),
+        silent_for=time.monotonic() - info.last_event_at, task=info.task_turn,
+    )
 
 
 class CodexRemoteAdapter(RemoteEngineAdapter):
@@ -267,7 +286,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                         target_os=ctx.target_os, session_id=ctx.session_id,
                         proxy_api_key=ctx.proxy_api_key,
                         secret_bundle_keys=ctx.secret_bundle_keys,
-                        bearer_swap_keys=ctx.bearer_swap_keys,
+                        gateway=ctx.gateway, gateway_mode=ctx.gateway_mode,
                     )
             except Exception:
                 logger.exception("Codex MCP TOML build failed")
@@ -303,6 +322,9 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         server_to_name = _server_to_manifest_name()
         return {server_to_name.get(key, key) for key in keys}
 
+    # Codex reads its instructions from AGENTS.md, built from the prompt.
+    prompt_payload_keys = ("system_prompt", "agents_md_content")
+
     def without_mcps(self, payload: dict, excluded: set[str]) -> dict:
         toml = payload.get(MCP_CONFIG_PAYLOAD_KEY) or ""
         drop_keys = {
@@ -323,11 +345,35 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         Mirrors the LOCAL layer's ``supervised_bg=True`` session; every
         satellite that can connect forwards bg-thread events past the main
         turn (that landed in 0.5.18, far below ``MIN_SATELLITE_VERSION``)."""
+        self._build_state(info, config.model, cm)
+
+    def adopt_state(self, info: "RemoteSessionInfo", cm) -> None:
+        """An idle session the satellite kept across a proxy restart: the
+        same state a start builds, on the model and the thread the adoption
+        put on ``info``. What ran in the old process's background is not
+        known to the new state (its registries died with that process). The
+        session's mode and model go to the satellite again: its sandbox
+        follows the mode and the machine's file policy as they are now, not
+        at spawn, and the model is the one the adoption chose. The MCP server
+        keys the satellite reported become manifest names, as a start's are."""
+        server_to_name = _server_to_manifest_name()
+        info.used_mcps = {server_to_name.get(key, key) for key in info.used_mcps}
+        self._build_state(info, info.model, cm)
+        if info.mode:
+            asyncio.create_task(self.control_request(
+                info, cm, "set_permission_mode", mode=info.mode))
+        if info.model:
+            asyncio.create_task(self.control_request(
+                info, cm, "set_model", model=info.model))
+
+    def _build_state(self, info: "RemoteSessionInfo", model: str, cm) -> None:
         state = CodexRemoteState(translator=CodexEventTranslator(
-            model=config.model, supervised_bg=True,
+            model=model, supervised_bg=True,
             session_id=info.session_id, supervised_bg_commands=True,
         ))
         info.engine_state = state
+        state.translator.retried_errors_end_turn = not cm.satellite_supports_codex_retry_read(
+            info.machine_id)
         state.router_task = asyncio.create_task(
             self._route_notifications(info),
             name=f"remote-codex-router-{info.session_id[:8]}",
@@ -430,35 +476,56 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
 
         q = state.default_consumer
         assert q is not None  # invariant: begin_turn registered the consumer
+        open_items = state.open_items
+        open_items.clear()
+        completed = False
         while True:
             try:
-                raw = await asyncio.wait_for(q.get(), timeout=300.0)
+                raw = await asyncio.wait_for(q.get(), timeout=_SILENCE_SLICE_S)
             except asyncio.TimeoutError:
-                # Tell the satellite to kill the orphaned codex turn process
-                # (the CLI path sends stop_turn on its own timeout; codex had
-                # no equivalent, leaking the process + its late output into the
-                # next turn). The satellite's killpg now targets only the turn
-                # group thanks to start_new_session.
+                # Silence: the turn keeps its life (an open tool item, a
+                # prompt on a person, background work, a recent hook) or ends
+                # typed past the ceiling. The satellite kills the orphaned
+                # codex turn process (its killpg targets only the turn
+                # group), so its late output never leaks into the next turn.
+                # During the reconnect grace the turn may still arrive.
+                silent_for = time.monotonic() - info.last_event_at
+                if (cm.is_session_in_grace(info.machine_id, info.session_id)
+                        or not _silence_ends(info, open_items)):
+                    continue
+                logger.warning(
+                    "Remote session %s: no notification for %.0fs with nothing running — "
+                    "ending the turn (codex)", info.session_id[:8], silent_for,
+                )
                 try:
                     await cm.send_fire_and_forget(info.machine_id, {
                         "type": "abort", "session_id": info.session_id,
                     })
                 except Exception:
                     logger.warning(
-                        "codex turn-timeout abort send failed for %s", info.session_id[:8],
+                        "codex silence abort send failed for %s", info.session_id[:8],
                     )
-                yield CommonEvent(type=ERROR, data={"message": "Remote session timeout"})
+                ending = turn_ending.TurnEnding(
+                    reason=turn_ending.SILENT, detail=f"no output for {int(silent_for)} s",
+                )
+                yield CommonEvent(type=ERROR, data={"message": ending.line(),
+                                                    "ending": ending.as_dict()})
                 yield CommonEvent(type=DONE)
                 return
 
             if raw is None:
-                yield CommonEvent(type=DONE)
+                if info.proxy_killed:
+                    yield CommonEvent(type=DONE)
+                    return
+                info.cli_dead = True   # the next send re-warms the session
+                for event in _lost_events("the machine ended the session mid-turn"):
+                    yield event
                 return
 
             rtype = raw.get("type", "")
             if rtype == "error":
-                yield CommonEvent(type=ERROR, data=raw)
-                yield CommonEvent(type=DONE)
+                for event in _satellite_error_events(raw):
+                    yield event
                 return
             if rtype == "_turn_ended":
                 # A turn_ended from a PREVIOUS turn (the satellite's late
@@ -472,11 +539,27 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                         info.session_id[:8], expected_cmd_id[:8], ended_cmd_id[:8],
                     )
                     continue
+                if not completed and not info.proxy_killed:
+                    # The satellite closed the turn before turn/completed:
+                    # its process went mid-turn.
+                    info.cli_dead = True
+                    for event in _lost_events("the machine ended the turn before its result"):
+                        yield event
+                    return
                 card = _plan_card()
                 if card:
                     yield card
                 yield CommonEvent(type=DONE)
                 return
+
+            _m = raw.get("method", "")
+            if _m == "turn/completed":
+                completed = True
+            elif _m in ("item/started", "item/completed"):
+                _item = (raw.get("params") or {}).get("item") or {}
+                _iid = _item.get("id") or ""
+                if _iid and _item.get("type") in _TOOL_ITEM_TYPES:
+                    (open_items.add if _m == "item/started" else open_items.discard)(_iid)
 
             # Plan-mode capture (mirrors codex/layer.py): the last agentMessage
             # is the plan; a `turn/completed` interrupted status suppresses the
@@ -491,7 +574,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     if ((raw.get("params") or {}).get("turn") or {}).get("status") == "interrupted":
                         turn_interrupted = True
 
-            info.last_activity = time.monotonic()
+            info.last_activity = info.last_event_at = time.monotonic()
             for event in self._translate(info, raw):
                 # Codex doesn't report turn duration — measure it proxy-side
                 # and stamp it onto the METADATA event (mirrors codex/layer.py;
@@ -502,6 +585,9 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     card = _plan_card()
                     if card:
                         yield card
+                    # A revive on a new thread announced it during this turn.
+                    for ev in state.translator.thread_id_metadata(info.resume_handle):
+                        yield ev
                 yield event
                 if event.type == DONE:
                     return
@@ -599,6 +685,10 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         fallback. ``steered`` in the ack is strict (True only on daemon accept)
         — the exactly-once contract the steer-vs-queue branch depends on."""
         if not text:
+            return False
+        state: CodexRemoteState | None = info.engine_state
+        if state is not None and info.turn_active and _silence_ends(info, state.open_items):
+            # The turn is about to end silent: the caller queues the input.
             return False
         if not cm.supports_codex_thread_ops(info.machine_id):
             logger.info(
@@ -702,8 +792,13 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     # forwarding it to a (still-None) turn. The chat row is
                     # written on the first turn (_stream_main_turn's METADATA
                     # event) — the chat is not bound to the session yet here.
+                    # A revive that had to open a new thread sends it again:
+                    # the next turn's METADATA then writes the new one.
                     from core.remote.remote_turn import record_resume_handle
-                    record_resume_handle(info, raw.get("handle", ""))
+                    handle = raw.get("handle", "")
+                    if handle and info.resume_handle and handle != info.resume_handle:
+                        state.translator._emitted_thread_id = False
+                    record_resume_handle(info, handle)
                     continue
                 # Other markers (_turn_ended / satellite error) → the active turn.
                 if state.default_consumer is not None:
@@ -818,10 +913,8 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 method = raw.get("method", "") if isinstance(raw, dict) else ""
                 if method == "turn/completed":
                     break
-                if method == "error":
-                    err = (raw.get("params") or {}).get("error", {}) if isinstance(raw, dict) else {}
-                    if not err.get("willRetry"):
-                        break
+                if method == "error" and not will_retry(raw.get("params") if isinstance(raw, dict) else None):
+                    break
             else:
                 if q is not None:
                     logger.warning(

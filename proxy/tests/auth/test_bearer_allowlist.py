@@ -143,6 +143,22 @@ class TestManifestValidator:
                 {"transport": "stdio"},
             )
 
+    def test_bearer_required_with_sse_transport_rejected(self):
+        # The credential gateway confines every forward to the one declared
+        # path; an SSE endpoint event names another one.
+        with pytest.raises(ValueError, match="streamable-HTTP") as info:
+            mcp_registry._validate_oauth_services(
+                {
+                    "provider_id": "slack",
+                    "flows": ["authorization_code"],
+                    "bearer_required": True,
+                    "proposed_hosts": ["mcp.slack.com"],
+                },
+                "slack-mcp",
+                {"transport": "sse"},
+            )
+        assert "declared path" in str(info.value)
+
     def test_bearer_required_with_http_transport_accepted(self):
         # Should not raise.
         mcp_registry._validate_oauth_services(
@@ -170,84 +186,8 @@ class TestManifestValidator:
             )
 
 
-# ---------------------------------------------------------------------------
-# Runtime injector — maybe_inject_bearer_header
-# ---------------------------------------------------------------------------
-
-
-class TestRuntimeInjector:
-    def test_stdio_entry_unchanged(self):
-        # bearer_required is irrelevant for stdio (no URL to check)
-        # because the entry has no `url` key.
-        from services.mcp.mcp_registry import (
-            maybe_inject_bearer_header,
-        )
-        m = _make_manifest(
-            transport="stdio",
-            oauth={
-                "provider_id": "slack",
-                "flows": ["authorization_code"],
-                "bearer_required": True,
-                "proposed_hosts": ["mcp.slack.com"],
-            },
-        )
-        entry = {"type": "stdio", "command": "x", "args": []}
-        result = maybe_inject_bearer_header(
-            entry, m, user_sub="u", agent_name="a", task_scope="user",
-        )
-        # No url → no header injection (stdio case).
-        assert "headers" not in result
-
-    def test_off_allowlist_host_skipped_with_warning(self, caplog):
-        from services.mcp.mcp_registry import maybe_inject_bearer_header
-        m = _make_manifest(
-            transport="http",
-            url_template="https://attacker.example.com/mcp",
-            oauth={
-                "provider_id": "slack",
-                "flows": ["authorization_code"],
-                "bearer_required": True,
-                "proposed_hosts": ["attacker.example.com"],
-            },
-        )
-        entry = {"type": "sse", "url": "https://attacker.example.com/mcp/sse"}
-        with caplog.at_level("WARNING"):
-            result = maybe_inject_bearer_header(
-                entry, m, user_sub="u", agent_name="a", task_scope="user",
-            )
-        assert "headers" not in result
-        assert any(
-            "Bearer-header skipped" in r.message for r in caplog.records
-        )
-
-    def test_bearer_not_required_no_header(self):
-        from services.mcp.mcp_registry import maybe_inject_bearer_header
-        m = _make_manifest(
-            transport="http",
-            url_template="https://mcp.example.com",
-            oauth={"provider_id": "google", "bearer_required": False},
-        )
-        entry = {"type": "sse", "url": "https://mcp.example.com/sse"}
-        result = maybe_inject_bearer_header(
-            entry, m, user_sub="u", agent_name="a", task_scope="user",
-        )
-        assert "headers" not in result
-
-
-# Helper for constructing minimal manifests in tests.
-def _make_manifest(*, transport: str, url_template: str = "", oauth: dict):
-    from services.mcp.mcp_registry import (
-        McpManifest, ServerConfig, CredentialConfig,
-    )
-    return McpManifest(
-        name="x", label="x", description="", version="0", category="custom",
-        server=ServerConfig(
-            runtime="python", transport=transport,
-            url_template=url_template,
-        ),
-        credentials=CredentialConfig(type="per_user", oauth=oauth),
-        config=[], env={}, agent_env={}, exclude_from=[], skills=[],
-    )
+# The runtime side (the gateway entry a bearer manifest gets, the refusal of
+# an unapproved host) is tests/mcp/test_gateway_entry.py.
 
 
 # ---------------------------------------------------------------------------
@@ -298,3 +238,35 @@ class TestVendorHostSeeds:
         entries = bearer_allowlist.list_allowed()
         hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
         assert ("postiz", "api.postiz.com") in hosts
+
+    def test_github_hosted_server_seeded(self):
+        """GitHub's hosted MCP server, reached through the credential
+        gateway with the person's own token."""
+        entries = bearer_allowlist.list_allowed()
+        hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
+        assert ("github", "api.githubcopilot.com") in hosts
+
+    def test_a_deleted_default_stays_deleted_across_the_seed(self):
+        """The seed inserts each default once (the ledger remembers it), so
+        an admin's deletion survives a restart; "Restore defaults" is the
+        way back."""
+        from storage.pg import get_conn
+        row = [e for e in bearer_allowlist.list_allowed()
+               if (e["provider_id"], e["host_pattern"]) == ("github", "api.githubcopilot.com")][0]
+        assert bearer_allowlist.delete_allowed(row["id"])
+        with get_conn() as conn:
+            bearer_allowlist.seed_defaults(conn)
+            conn.commit()
+        hosts = {(e["provider_id"], e["host_pattern"]) for e in bearer_allowlist.list_allowed()}
+        assert ("github", "api.githubcopilot.com") not in hosts
+        bearer_allowlist.restore_defaults()
+        hosts = {(e["provider_id"], e["host_pattern"]) for e in bearer_allowlist.list_allowed()}
+        assert ("github", "api.githubcopilot.com") in hosts
+
+    def test_every_change_moves_the_generation(self):
+        g0 = bearer_allowlist.generation()
+        row = bearer_allowlist.add_allowed(f"gen-{uuid.uuid4().hex[:6]}", "h.example.com", "test")
+        g1 = bearer_allowlist.generation()
+        assert g1 > g0
+        bearer_allowlist.delete_allowed(row)
+        assert bearer_allowlist.generation() > g1

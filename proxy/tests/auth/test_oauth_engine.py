@@ -194,6 +194,8 @@ class TestS2SPersistSite:
         admin = MagicMock()
         admin.role = "admin"
         admin.sub = "admin-1"
+        admin.is_api_key = False
+        admin.is_admin = True
 
         with patch(
             "api.auth.oauth._validate_provider_for_mcp",
@@ -247,6 +249,8 @@ class TestS2SPersistSite:
         admin = MagicMock()
         admin.role = "admin"
         admin.sub = "admin-1"
+        admin.is_api_key = False
+        admin.is_admin = True
 
         with patch(
             "api.auth.oauth._validate_provider_for_mcp",

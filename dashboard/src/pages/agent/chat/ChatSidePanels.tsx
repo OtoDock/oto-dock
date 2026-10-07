@@ -1,11 +1,13 @@
 /**
  * ChatSidePanels — AgentChat's two floating panel stacks: the right stack
  * (task metadata, plan, goal) and the left stack (meeting, todo, workflow,
- * artifact dock). Presentational: every value is computed by the page.
+ * artifact dock with the minimized document pane's chips). Presentational:
+ * every value is computed by the page.
  */
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useWorkspaceState } from '../../../hooks/useWorkspaceState'
 import type { useArtifactWindows } from '../../../hooks/useArtifactWindows'
+import type { useDocumentChips } from './ChatDocumentPane'
 import type { useRunByChat } from '../../../api/runs'
 import TaskMetadata from '../../../components/chat/TaskMetadata'
 import PlanPanel from '../../../components/chat/plan/PlanPanel'
@@ -31,12 +33,14 @@ interface Props {
   currentTodos: Stream['currentTodos']
   workflows: Stream['workflows']
   artifacts: ReturnType<typeof useArtifactWindows>
+  /** The minimized document pane's chips, null while it is not minimized. */
+  documentChips: ReturnType<typeof useDocumentChips>
 }
 
 export default function ChatSidePanels({
   workspace, isTaskChat, taskRun, costBilled, sessionPlans, currentGoal,
   meetingActive, meetingParticipants, meetingSpeaker, meetingLeftParticipants,
-  currentTodos, workflows, artifacts,
+  currentTodos, workflows, artifacts, documentChips,
 }: Props) {
   return (
     <>
@@ -63,12 +67,14 @@ export default function ChatSidePanels({
           )}
           <TodoPanel todos={currentTodos} />
           <WorkflowPanel workflows={workflows} />
-          {/* Minimized interactive-CLI artifact windows dock here. */}
+          {/* Minimized interactive-CLI artifact windows and the minimized
+              document pane dock here. */}
           <ArtifactDock
             windows={artifacts.windows}
             minimized={artifacts.minimized}
             onRestore={artifacts.restore}
             onClose={artifacts.close}
+            documents={documentChips}
           />
         </div>
       )}

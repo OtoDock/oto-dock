@@ -1,7 +1,9 @@
-import { useState } from 'react'
-import { useAdminMcps, useCheckMcpUpdates, McpServer } from '../../api/mcps'
+import { useEffect, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { useAdminMcps, useCheckMcpUpdates, useMcpUpdateState, isUpdateOffer, McpServer } from '../../api/mcps'
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
 import McpCategoryFilter, { matchesMcpCategory, type McpCategoryFilterValue } from '../../components/McpCategoryFilter'
+import { formatRelativeTime } from '../../lib/format'
 import { McpRow } from './McpServersPage.row'
 import { InstallModal } from './McpServersPage.installModal'
 
@@ -18,8 +20,17 @@ export default function McpServersPage() {
   const [showBrowse, setShowBrowse] = useState(false)
   const [query, setQuery] = useState('')
   const [categoryFilter, setCategoryFilter] = useState<McpCategoryFilterValue>('all')
-  const { data: updateData, refetch: checkUpdates, isFetching: checkingUpdates } = useCheckMcpUpdates()
-  const updates = updateData?.updates || {}
+  // The last check as the proxy persisted it is what the page shows; a check
+  // run from this page (or the Skills page, which shares the check query)
+  // answers in the same shape and replaces it.
+  const qc = useQueryClient()
+  const { data: updateState } = useMcpUpdateState()
+  const { data: checkData, refetch: checkUpdates, isFetching: checkingUpdates, dataUpdatedAt } = useCheckMcpUpdates()
+  useEffect(() => {
+    if (checkData) qc.setQueryData(['mcp-update-state'], checkData)
+  }, [checkData, dataUpdatedAt, qc])
+  const updates = updateState?.updates || {}
+  const checkedAt = updateState?.checked_at || ''
 
   // Standalone skill packages (category "skill") live on the admin Skills
   // page — filtered out here so they don't double-list as servers.
@@ -50,8 +61,9 @@ export default function McpServersPage() {
   const categories = Object.keys(grouped).sort((a, b) => (CATEGORY_ORDER[a] ?? 3) - (CATEGORY_ORDER[b] ?? 3))
 
   const enabled = mcps.filter(m => m.enabled).length
-  // Skill-package updates surface on the Skills page, not here.
-  const updateCount = mcps.filter(m => updates[m.name]).length
+  // Skill-package updates surface on the Skills page, not here. A finished
+  // switch and an install ahead of the catalog are not offers.
+  const updateCount = mcps.filter(m => isUpdateOffer(updates[m.name])).length
 
   return (
     <div>
@@ -64,6 +76,11 @@ export default function McpServersPage() {
         {updateCount > 0 && (
           <span className="text-xs px-2 py-0.5 rounded-lg bg-brand/10 dark:bg-brand/20 text-brand font-medium">
             {updateCount} update{updateCount > 1 ? 's' : ''}
+          </span>
+        )}
+        {checkedAt && !checkingUpdates && (
+          <span className="hidden sm:inline text-[11px] text-p-text-light" title={checkedAt}>
+            checked {formatRelativeTime(checkedAt)}
           </span>
         )}
         <button

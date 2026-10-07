@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import {
-  useSetBrowserMode, useSetBrowserToken,
+  useSetBrowserMode, useSetBrowserToken, useSetBrowserUnattended,
   type MachineScope, type RemoteMachine,
 } from '../api/remoteMachines'
 
@@ -26,8 +26,8 @@ export const browserModeDesc = (mode: BrowserMode): string =>
 // machines and by User Settings → My Machines for the caller's own. Same
 // consent register as the grant: switching to own mode asks for
 // confirmation. The extension token (what lets sessions connect without a
-// click — scheduled tasks, calls and meetings need it) is entered here and
-// never shown again.
+// click) is entered here and never shown again; a separate box lets
+// unattended sessions (scheduled tasks, calls, meetings) use it too.
 export function BrowserModeSelect({
   machine, scope,
 }: { machine: RemoteMachine; scope: MachineScope }) {
@@ -40,9 +40,9 @@ export function BrowserModeSelect({
       `Use your own browser on ${machine.name}?\n\n` +
       'Agents on this machine will work inside the browser you are signed into, in ' +
       'their own tab group: your logins, cookies and open tabs are reachable to them. ' +
-      'With the extension token saved, scheduled tasks, triggers, calls and meetings on this ' +
-      'machine use this browser with nobody watching, and browser actions are not asked ' +
-      'about; only the tools the browser MCP marks high-risk still need a person.\n\n' +
+      'If you also let unattended runs use the saved token, scheduled tasks, triggers, ' +
+      'calls and meetings on this machine use this browser with nobody watching, and ' +
+      'browser actions are not asked about.\n\n' +
       'Install the Playwright Extension in that browser first. Sessions already running ' +
       'switch when they next start.',
     )) return
@@ -72,6 +72,7 @@ export function BrowserTokenField({
   machine, scope,
 }: { machine: RemoteMachine; scope: MachineScope }) {
   const setToken = useSetBrowserToken(scope)
+  const setUnattended = useSetBrowserUnattended(scope)
   const [draft, setDraft] = useState('')
   if (browserModeOf(machine) !== 'own') return null
   const tokenSet = machine.browser_extension_token_set === true
@@ -97,7 +98,7 @@ export function BrowserTokenField({
           Get extension <span aria-hidden>↗</span>
         </a>
         <span>then copy the token from its page and paste it here.</span>
-        <span>Saving it lets scheduled tasks, triggers, calls and meetings use this browser unattended.</span>
+        <span>Saving it lets the sessions you drive connect without a click.</span>
       </p>
       <div className="flex items-center gap-2 flex-wrap">
         <input
@@ -135,8 +136,31 @@ export function BrowserTokenField({
           </button>
         )}
       </div>
-      {setToken.error && (
-        <p className="text-[10px] text-red-600">{setToken.error.message}</p>
+      {tokenSet && (
+        <label className="flex items-start gap-1.5 text-[10px] leading-relaxed text-p-text-light">
+          <input
+            type="checkbox"
+            checked={machine.browser_unattended === true}
+            disabled={setUnattended.isPending}
+            onChange={e => {
+              const enabled = e.target.checked
+              if (enabled && !window.confirm(
+                `Let unattended runs use your browser on ${machine.name}?\n\n` +
+                'Scheduled tasks, triggers, calls and meetings will drive the browser you are ' +
+                'signed into with nobody watching, and browser actions are not asked about.',
+              )) return
+              setUnattended.mutate({ machineId: machine.id, enabled })
+            }}
+            className="mt-0.5"
+          />
+          <span>
+            Also let unattended runs (scheduled tasks, triggers, calls, meetings) use this
+            browser. Off, they cannot use it at all.
+          </span>
+        </label>
+      )}
+      {(setToken.error || setUnattended.error) && (
+        <p className="text-[10px] text-red-600">{(setToken.error || setUnattended.error)?.message}</p>
       )}
     </div>
   )

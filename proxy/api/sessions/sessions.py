@@ -1,14 +1,17 @@
 """Session management endpoints -- models, helpers, health, file serving, plan files,
 warmup, and session control (mode/model/thinking/permission).
 
-Also exports `verify_api_key` and `verify_session_match` for use by the `api.hooks` pieces.
+Also exports `verify_api_key_async` and `verify_session_match_async` for use by the
+`api.hooks` pieces.
 """
 
 import asyncio
 import hmac
 import logging
-import time
+import os
+import stat
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -17,8 +20,8 @@ from pydantic import BaseModel
 import config
 from auth.providers import UserContext, get_current_user, require_admin
 from storage.agents import agent_store
-from storage.pg import run_db_fast
-from services.infra.path_confinement import PathOutsideRoot, join_under, resolve_under
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
+from storage.pg import run_db
 from core.session.session_state import (
     set_session_mode,
     get_pending_result,
@@ -31,7 +34,6 @@ from core.layers.cli import (
     interrupt_persistent_session,
 )
 from core.layers.direct import create_direct_session, close_direct_session
-from core import layout
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -41,93 +43,9 @@ router = APIRouter()
 
 # A session token names the person it was minted for (``user_sub``); that
 # person may be gone, or their credentials changed, since the mint. The
-# routes here judge that on the fast lane through the async twins below.
-# The synchronous verifiers never read the store themselves: they stand by
-# the last answer reached for the token's holder, and a miss passes and
-# starts the check on the fast lane, so a token whose person is gone is
-# refused once that check has answered. A pass stands for HOLDER_TTL_S;
-# a refusal for the token's life (the same token never becomes current
-# again), and a full table drops passes before refusals. A person's
-# sessions are closed by the offboarding closer, so a stale token rarely
-# outlives them.
-HOLDER_TTL_S = 60.0
-_HOLDER_ANSWERS_MAX = 4096
-_holder_answers: dict[tuple[str, int], tuple[bool, float]] = {}
-# The holder checks a synchronous miss started, by key, and their tasks.
-_holder_pending: set[tuple[str, int]] = set()
-_holder_checks: set[asyncio.Task] = set()
-
-
-def _holder_key(payload: dict) -> tuple[str, int] | None:
-    sub = payload.get("user_sub") or ""
-    if not sub:
-        return None
-    iat = payload.get("iat")
-    return (sub, iat if isinstance(iat, int) else 0)
-
-
-def _check_holder_soon(payload: dict, key: tuple[str, int]) -> None:
-    """Start the holder check of a synchronous miss on the running loop
-    (none outside one); one at a time per key."""
-    if key in _holder_pending:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    _holder_pending.add(key)
-    task = loop.create_task(_holder_ok(payload))
-    _holder_checks.add(task)
-
-    def _done(done: asyncio.Task) -> None:
-        _holder_checks.discard(done)
-        _holder_pending.discard(key)
-        if not done.cancelled() and done.exception() is not None:
-            logger.warning("session token holder check failed: %s", done.exception())
-
-    task.add_done_callback(_done)
-
-
-def _holder_cached(payload: dict) -> bool:
-    key = _holder_key(payload)
-    if key is None:
-        return True
-    hit = _holder_answers.get(key)
-    if hit is None or hit[1] < time.monotonic():
-        _check_holder_soon(payload, key)
-        return True
-    return hit[0]
-
-
-def _remember(key: tuple[str, int], ok: bool, payload: dict, now: float) -> None:
-    """Record an answer: a pass for HOLDER_TTL_S, a refusal until the token
-    expires. A full table drops expired answers, then passes; it is cleared
-    only when refusals alone fill it."""
-    if len(_holder_answers) >= _HOLDER_ANSWERS_MAX:
-        for k in [k for k, (good, until) in _holder_answers.items() if good or until < now]:
-            del _holder_answers[k]
-        if len(_holder_answers) >= _HOLDER_ANSWERS_MAX:
-            _holder_answers.clear()
-    if ok:
-        _holder_answers[key] = (True, now + HOLDER_TTL_S)
-        return
-    exp = payload.get("exp")
-    left = (exp - time.time()) if isinstance(exp, (int, float)) else 0.0
-    _holder_answers[key] = (False, now + max(HOLDER_TTL_S, left))
-
-
-async def _holder_ok(payload: dict) -> bool:
-    key = _holder_key(payload)
-    if key is None:
-        return True
-    now = time.monotonic()
-    hit = _holder_answers.get(key)
-    if hit is not None and hit[1] >= now:
-        return hit[0]
-    from auth.providers import session_token_holder_ok
-    ok = bool(await run_db_fast(session_token_holder_ok, payload))
-    _remember(key, ok, payload, time.monotonic())
-    return ok
+# routes here judge that on the fast lane through ``auth.token_holder``,
+# whose answer cache the hook routes and the satellite tunnel share.
+from auth import token_holder
 
 
 def _bearer_payload(authorization: str | None) -> dict | None:
@@ -149,18 +67,11 @@ def _bearer_payload(authorization: str | None) -> dict | None:
     return payload
 
 
-def verify_api_key(authorization: str | None = Header(None)) -> None:
-    """Validate a Bearer token: the master API key or a session JWT."""
-    payload = _bearer_payload(authorization)
-    if payload is not None and not _holder_cached(payload):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-
 async def verify_api_key_async(authorization: str | None) -> None:
-    """``verify_api_key`` that also asks the store whether the token's
-    person still exists and the token is current."""
+    """Validate a Bearer token: the master API key, or a session JWT whose
+    person still exists and which is current."""
     payload = _bearer_payload(authorization)
-    if payload is not None and not await _holder_ok(payload):
+    if payload is not None and not await token_holder.holder_ok(payload):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -199,40 +110,32 @@ def _session_payload(authorization: str | None, session_id: str) -> dict | None:
     return payload
 
 
-def verify_session_match(authorization: str | None, session_id: str) -> None:
-    """Validate token AND cross-check its embedded session_id against the
-    caller-supplied session_id. Used by hook endpoints where the request body
-    carries a session_id — prevents an MCP/satellite holding a token for
-    session A from requesting resources for session B.
-
-    Master API key bypasses the check (service-to-service: Docker MCPs on
-    platform, phone server, standalone scheduler).
-    """
-    payload = _session_payload(authorization, session_id)
-    if payload is not None and not _holder_cached(payload):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-
 async def verify_session_match_async(authorization: str | None, session_id: str) -> None:
-    """``verify_session_match`` that also asks the store whether the token's
-    person still exists and the token is current."""
+    """Validate the token, cross-check its embedded session_id against the
+    caller-supplied one (a hook endpoint's body carries a session_id: an
+    MCP or a satellite holding a token for session A must not request
+    resources for session B) and judge its holder. The master API key
+    bypasses the check (service-to-service: Docker MCPs on the platform,
+    the phone server, the standalone scheduler)."""
     payload = _session_payload(authorization, session_id)
-    if payload is not None and not await _holder_ok(payload):
+    if payload is not None and not await token_holder.holder_ok(payload):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 # --- Endpoints ---
 
 
-@router.get("/health")
+@router.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     # The public liveness: the Docker healthcheck reads the status code, the
     # dashboard's stale-bundle check reads ``build`` (a page without a
     # dashboard socket asks here when it returns to the foreground and
     # reloads once if its own stamp differs; read per request, cached on the
     # file's mtime/size, so a dashboard-only rebuild is seen without a
-    # restart). Nothing else: versions, pins and the loop's telemetry are an
-    # admin's to read (``/v1/admin/health``), not an anonymous caller's.
+    # restart). HEAD, for uptime probes, gets the GET's status and headers
+    # with no body (the server drops it). Nothing else: versions, pins and
+    # the loop's telemetry are an admin's to read (``/v1/admin/health``), not
+    # an anonymous caller's.
     from static_assets import dashboard_build_id
     return {"status": "ok", "service": "otodock", "build": dashboard_build_id()}
 
@@ -370,7 +273,7 @@ async def change_session_mode(
 
 
 class ModelChangeRequest(BaseModel):
-    model: str  # e.g., "claude-sonnet-5", "claude-opus-5-5"
+    model: str  # e.g., "claude-sonnet-5-5", "claude-opus-5-5"
 
 
 @router.patch("/v1/sessions/{session_id}/model")
@@ -441,25 +344,26 @@ async def native_permission_response(
 
 # --- Plan file endpoints ---
 
+# A plan is a markdown document: a larger file in a plans folder is refused
+# (413) instead of read whole into the answer.
+PLAN_MAX_BYTES = 1024 * 1024
+
+
+class _PlanTooLarge(Exception):
+    pass
+
 
 def _get_plans_dir(session_id: str | None) -> Path | None:
-    """The plans directory of a session: its persistent .claude/ dir's
-    ``plans`` (sandbox-aware), or for a remote session the local cache dir
-    (filled on demand by ``_ensure_remote_plan_cached``). None when the
-    session has none: no session, a session that registered no claude dir,
-    or one whose plans folder does not exist yet. The proxy account's own
-    home belongs to no session and is never answered."""
+    """The plans folder of a local session: its persistent .claude/ dir's
+    ``plans`` (sandbox-aware), made yet or not; None for no session or a
+    session that registered no claude dir. No filesystem call: the routes
+    look in a worker thread. The proxy account's own home belongs to no
+    session and is never answered."""
     if not session_id:
         return None
     from core.session.session_state import get_session_claude_dir
     claude_dir = get_session_claude_dir(session_id)
-    if claude_dir:
-        plans = Path(claude_dir) / "plans"
-        if plans.is_dir():
-            return plans
-    if _get_remote_session_info(session_id) is not None:
-        return _remote_plans_cache_dir(session_id)
-    return None
+    return Path(claude_dir) / "plans" if claude_dir else None
 
 
 def _get_remote_session_info(session_id: str):
@@ -474,109 +378,76 @@ def _get_remote_session_info(session_id: str):
         return None
 
 
-def _remote_plans_cache_dir(session_id: str) -> Path:
-    """Local cache directory for remote plan files (1h TTL — see purge logic)."""
-    import config as app_config
-    cache = join_under(Path(app_config.SESSIONS_DIR) / "remote-plans", session_id)
-    cache.mkdir(parents=True, exist_ok=True)
-    return cache
-
-
-async def _ensure_remote_plan_cached(
-    session_id: str, filename: str,
-) -> Path | None:
-    """Pull a single plan file from the satellite into the local cache.
-
-    Returns the cached path, or None if the pull failed.  Existing cached
-    files newer than 1 hour are returned without re-pulling.
-    """
-    import time as _time
-    info = _get_remote_session_info(session_id)
-    if info is None:
-        return None
-    cache_dir = _remote_plans_cache_dir(session_id)
-    # filename came from the satellite manifest — keep the write inside the
-    # plans cache dir (pull_file_to_path trusts its dest, no traversal check).
+def _list_local_plans(plans_dir: Path) -> list[dict]:
+    """The regular ``*.md`` files of a plans folder, newest first. Runs in a
+    worker thread; an entry that goes away during the walk is skipped."""
     try:
-        cached = resolve_under(cache_dir / filename, cache_dir)
+        with os.scandir(plans_dir) as it:
+            entries = list(it)
+    except OSError:
+        return []
+    plans = []
+    for entry in entries:
+        if not entry.name.endswith(".md"):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            plans.append({"filename": entry.name, "modified": st.st_mtime, "size": st.st_size})
+    plans.sort(key=lambda p: p["modified"], reverse=True)
+    return plans
+
+
+def _read_local_plan(plans_dir: Path, filename: str) -> str | None:
+    """A plan file's text, read in a worker thread: None when the name is
+    not a regular ``.md`` file inside the folder, ``_PlanTooLarge`` past
+    ``PLAN_MAX_BYTES``."""
+    try:
+        path = resolve_under(plans_dir / filename, plans_dir)
     except PathOutsideRoot:
         return None
-    if cached.exists() and (_time.time() - cached.stat().st_mtime) < 3600:
-        return cached
-
-    # Determine the remote-relative path. Plans live inside the session's
-    # .claude/ dir, which the satellite roots at agents/{agent}/{cwd}/.claude/.
-    # The ExecutionLayer doesn't expose that path, but the satellite's
-    # file_pull handler roots paths at agents/{agent_slug}/, so we need the
-    # per-user or workspace relative path. Derive it from the session's
-    # security_context + path resolution logic.
-    from core.session.session_state import _session_security
-    ctx = _session_security.get(session_id)
-    username = getattr(ctx, "username", "") if ctx else ""
-    if username:
-        rel_path = f"{layout.user_rel(username)}/.claude/plans/{filename}"
-    else:
-        rel_path = f"{layout.WORKSPACE}/.claude/plans/{filename}"
-
-    from core.remote.satellite_connection import get_connection_manager
-    from services.path_policy_v2 import PathRef
-    cm = get_connection_manager()
-    ok = await cm.pull_file_to_path(
-        info.machine_id,
-        PathRef("agent_tree", rel_path),
-        cached,
-        agent_slug=info.agent_name,
-    )
-    return cached if ok else None
-
-
-async def _list_remote_plans(session_id: str) -> list[dict]:
-    """Ask the satellite for its plans manifest entries.
-
-    Walks the satellite's manifest (via request_manifest) and returns any
-    entries inside ``.claude/plans/`` as {filename, modified, size}.
-    """
-    info = _get_remote_session_info(session_id)
-    if info is None:
-        return []
-    from core.remote.remote_workspace_sync import manifest_request
-    from core.remote.satellite_connection import get_connection_manager
-    cm = get_connection_manager()
+    if path.suffix != ".md":
+        return None
+    cap = PLAN_MAX_BYTES
     try:
-        # The manager's own command path: a paging satellite's frames are
-        # joined there before the wait resolves.
-        resp = await cm.send_command(
-            info.machine_id,
-            manifest_request(cm, info.machine_id, info.agent_name),
-            timeout=10.0,
-        )
-    except Exception:
-        return []
-    if not isinstance(resp, dict):
-        return []
+        with open(path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            if st.st_size > cap:
+                raise _PlanTooLarge
+            data = fh.read(cap + 1)
+    except OSError:
+        return None
+    if len(data) > cap:
+        raise _PlanTooLarge
+    return data.decode("utf-8", errors="replace")
 
-    # Prefix we want: users/{username}/.claude/plans/ or workspace/.claude/plans/
-    from core.session.session_state import _session_security
-    ctx = _session_security.get(session_id)
-    username = getattr(ctx, "username", "") if ctx else ""
-    prefix = (
-        f"{layout.user_rel(username)}/.claude/plans/"
-        if username else "workspace/.claude/plans/"
-    )
-    entries: list[dict] = []
-    for entry in resp.get("files", []):
-        path = entry.get("path", "")
-        if not path.startswith(prefix):
-            continue
-        filename = path[len(prefix):]
-        if "/" in filename or not filename.endswith(".md"):
-            continue
-        entries.append({
-            "filename": filename,
-            "modified": entry.get("mtime", 0.0),
-            "size": entry.get("size", 0),
-        })
-    return entries
+
+def _reviewed_plans(session_id: str) -> list[dict]:
+    """The plans the session's chat reviewed (the rows the pump writes at
+    plan review, for a remote chat as for a local one), newest first, each
+    with its text, its byte size and its review time. One store job: run it
+    with ``run_db``. A remote machine's ``.claude/plans`` never syncs, so
+    these rows are the remote session's plans."""
+    from storage import database as task_store
+    chat = task_store.get_chat_by_session(session_id)
+    if not chat:
+        return []
+    plans = []
+    for row in task_store.get_chat_plans(chat["id"]):
+        content = row.get("content") or ""
+        try:
+            modified = datetime.fromisoformat(row.get("created_at") or "").timestamp()
+        except (TypeError, ValueError):
+            modified = 0.0
+        plans.append({"filename": row["filename"], "content": content,
+                      "modified": modified, "size": len(content.encode("utf-8")),
+                      "id": row["id"]})
+    plans.sort(key=lambda p: (p["modified"], p["id"]), reverse=True)
+    return plans
 
 
 @router.get("/v1/plans")
@@ -584,29 +455,22 @@ async def list_plans(
     authorization: str | None = Header(None),
     session_id: str | None = None,
 ):
-    """List available plan files for a session.
+    """List the plan files of a session.
 
     Session-bound: a session JWT must name (and match) the session whose
-    plans it lists — plan files live in per-user session dirs.
+    plans it lists. A remote session answers the plans its chat reviewed,
+    from the database; a local session's plans folder is listed in a worker
+    thread.
     """
     await verify_session_match_async(authorization, session_id or "")
-    # Remote session: ask the satellite for its manifest
     if session_id and _get_remote_session_info(session_id) is not None:
-        plans = await _list_remote_plans(session_id)
-        return {"plans": sorted(plans, key=lambda p: p["modified"], reverse=True)}
-
+        rows = await run_db(_reviewed_plans, session_id)
+        return {"plans": [{"filename": r["filename"], "modified": r["modified"],
+                           "size": r["size"]} for r in rows]}
     plans_dir = _get_plans_dir(session_id)
-    if plans_dir is None or not plans_dir.is_dir():
+    if plans_dir is None:
         return {"plans": []}
-    plans = []
-    for f in sorted(plans_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if f.suffix == ".md" and f.is_file():
-            plans.append({
-                "filename": f.name,
-                "modified": f.stat().st_mtime,
-                "size": f.stat().st_size,
-            })
-    return {"plans": plans}
+    return {"plans": await asyncio.to_thread(_list_local_plans, plans_dir)}
 
 
 @router.get("/v1/plans/{filename}")
@@ -617,28 +481,31 @@ async def get_plan_file(
 ):
     """Read a plan file.
 
-    Session-bound like the plan list — see ``list_plans``.
+    Session-bound like the plan list (see ``list_plans``): a remote
+    session's plan is the reviewed row's text; a local plan is read in a
+    worker thread, and one past ``PLAN_MAX_BYTES`` answers 413.
     """
     await verify_session_match_async(authorization, session_id or "")
     if ".." in filename or "/" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    # Remote session: pull into local cache first
     if session_id and _get_remote_session_info(session_id) is not None:
-        cached = await _ensure_remote_plan_cached(session_id, filename)
-        if cached is None or not cached.is_file():
-            raise HTTPException(status_code=404, detail="Plan not found")
-        return {"content": cached.read_text(), "filename": filename}
-
+        for row in await run_db(_reviewed_plans, session_id):
+            if row["filename"] == filename:
+                return {"content": row["content"], "filename": filename}
+        raise HTTPException(status_code=404, detail="Plan not found")
     plans_dir = _get_plans_dir(session_id)
     if plans_dir is None:
         raise HTTPException(status_code=404, detail="Plan not found")
     try:
-        plan_path = resolve_under(plans_dir / filename, plans_dir)
-    except PathOutsideRoot:
+        content = await asyncio.to_thread(_read_local_plan, plans_dir, filename)
+    except _PlanTooLarge:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Plan file larger than the {PLAN_MAX_BYTES} byte limit",
+        ) from None
+    if content is None:
         raise HTTPException(status_code=404, detail="Plan not found")
-    if not plan_path.is_file() or plan_path.suffix != ".md":
-        raise HTTPException(status_code=404, detail="Plan not found")
-    return {"content": plan_path.read_text(), "filename": filename}
+    return {"content": content, "filename": filename}
 
 
 class WarmupRequest(BaseModel):
@@ -722,7 +589,8 @@ async def warmup_session_endpoint(req: WarmupRequest, authorization: str | None 
     if call_context:
         agent_prompt += call_context
     from services.mcp import mcp_registry
-    mcp_config_path, _, _, _, _ = mcp_registry.build_session_mcp_config(req.model, None)
+    mcp_config_path, _, _, _, _ = mcp_registry.build_session_mcp_config(
+        req.model, None, session_id=session_id)
 
     try:
         await get_or_create_persistent_session(

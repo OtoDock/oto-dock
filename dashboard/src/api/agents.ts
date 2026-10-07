@@ -226,9 +226,11 @@ export interface AgentUser {
   name: string
   email: string
   role: EffectiveRole | string
+  /** The person's platform role: an admin acts as admin whatever the row. */
+  platform_role?: string
 }
 
-export const useAgentUsers = (name: string) =>
+export const useAgentUsers = (name: string, { enabled = true }: { enabled?: boolean } = {}) =>
   useQuery({
     queryKey: ['agent-users', name],
     queryFn: async (): Promise<AgentUser[]> => {
@@ -237,7 +239,7 @@ export const useAgentUsers = (name: string) =>
       const data = await res.json()
       return data.users ?? []
     },
-    enabled: !!name,
+    enabled: !!name && enabled,
   })
 
 // Live status of the agent's effective execution target for the current
@@ -408,6 +410,18 @@ export interface BatchOpResult {
   failed: Array<{ src: string; reason: string }>
 }
 
+/** What a copy or move left undone, for the person: the server's reason per
+ * path (a cap among them), the first few named. "" when everything landed. */
+export const batchFailureMessage = (
+  verb: 'copied' | 'moved', failed: BatchOpResult['failed'] | undefined,
+): string => {
+  if (!failed?.length) return ''
+  const shown = failed.slice(0, 5).map((f) => `${f.src.split('/').pop() || f.src}: ${f.reason}`)
+  const more = failed.length > shown.length ? `\n…and ${failed.length - shown.length} more` : ''
+  const count = failed.length === 1 ? '1 item was' : `${failed.length} items were`
+  return `${count} not ${verb}:\n${shown.join('\n')}${more}`
+}
+
 export const useMoveAgentPaths = () => {
   const qc = useQueryClient()
   return useMutation({
@@ -509,12 +523,52 @@ export function useCreateAgent() {
   })
 }
 
+/** The people whose viewer or contributor assignment a switch to Shared only
+ *  removes (the 409 of `PATCH /v1/agents/{name}`, the `GET .../users` shape). */
+export interface SharedOnlySwitchRefusal {
+  code: 'shared_only_removals'
+  message: string
+  people: AgentUser[]
+}
+
+/** A refused agent update, with the status and the parsed `detail`: the
+ *  Shared-only switch's 409 carries the live list to confirm. */
+export class AgentUpdateError extends Error {
+  status: number
+  detail: unknown
+  constructor(status: number, detail: unknown) {
+    const text = typeof detail === 'string' ? detail
+      : detail && typeof detail === 'object' && typeof (detail as { message?: unknown }).message === 'string'
+        ? (detail as { message: string }).message : ''
+    super(text || 'Failed to update')
+    this.name = 'AgentUpdateError'
+    this.status = status
+    this.detail = detail
+  }
+
+  get sharedOnlyPeople(): AgentUser[] | null {
+    const d = this.detail as Partial<SharedOnlySwitchRefusal> | null
+    return d && typeof d === 'object' && d.code === 'shared_only_removals' && Array.isArray(d.people)
+      ? d.people : null
+  }
+}
+
+/** What a switch to Shared only did (the PATCH answer's `shared_only_switch`). */
+export interface SharedOnlySwitchResult {
+  removed: string[]
+  not_removed: string[]
+  default_cleared: boolean
+}
+
 export function useUpdateAgent() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ name, ...fields }: { name: string; [key: string]: any }) => {
       const res = await apiFetch(`/v1/agents/${name}`, { method: 'PATCH', body: JSON.stringify(fields) })
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to update') }
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}))
+        throw new AgentUpdateError(res.status, e.detail)
+      }
       return res.json()
     },
     onSuccess: (_, { name }) => {

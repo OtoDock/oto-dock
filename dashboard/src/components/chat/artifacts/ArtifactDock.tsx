@@ -2,7 +2,8 @@ import type { ArtifactWindow } from '@/hooks/useArtifactWindows'
 import type { MessageBlock } from '../types'
 
 /**
- * Minimized interactive-CLI artifact windows, docked as
+ * Minimized interactive-CLI artifact windows (and the minimized document
+ * pane's chips), docked as
  * icon-buttons in the page's top-left panel stack — the same idiom as PlanPanel /
  * TodoPanel / WorkflowPanel (and TaskMetadata), appearing BELOW them. Each icon
  * carries a type glyph + a small "expand" badge (signals it opens on click) +
@@ -15,6 +16,15 @@ interface Props {
   minimized: Set<number>
   onRestore: (id: number) => void
   onClose: (id: number) => void
+  /** The minimized document pane: one chip per open document (the first
+   * four, then a chip for the rest); a chip restores the pane on its file,
+   * its X closes that document. */
+  documents?: {
+    chips: { fileId: string; title: string }[]
+    more: number
+    onRestore: (fileId?: string) => void
+    onClose: (fileId: string) => void
+  } | null
 }
 
 function TypeIcon({ type }: { type: MessageBlock['type'] }) {
@@ -60,39 +70,77 @@ function TypeIcon({ type }: { type: MessageBlock['type'] }) {
   }
 }
 
-export default function ArtifactDock({ windows, minimized, onRestore, onClose }: Props) {
+function DockChip({ type, title, onRestore, onClose, label }: {
+  type: MessageBlock['type']
+  title: string
+  onRestore: () => void
+  onClose?: () => void
+  label?: string
+}) {
+  return (
+    <div className="oto-pop-in group relative">
+      <button
+        onClick={onRestore}
+        title={`Open: ${title}`}
+        className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-brand/40 bg-white/80 shadow-xs backdrop-blur-xs transition-all hover:bg-white hover:shadow-md dark:bg-gray-900/80 dark:hover:bg-p-surface"
+      >
+        {label ? <span className="text-xs font-semibold text-p-text-secondary">{label}</span> : <TypeIcon type={type} />}
+        {/* expand badge — signals "click to open" */}
+        <span className="absolute -bottom-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-brand/40 bg-white text-brand dark:bg-p-surface">
+          <svg className="h-2 w-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 14v6h6M20 10V4h-6" />
+          </svg>
+        </span>
+      </button>
+      {/* dismiss — red, top-left. Always visible on mobile (no hover); on
+          desktop it appears on hover to keep the dock clean. */}
+      {onClose && (
+        <button
+          onClick={onClose}
+          title="Close"
+          className="absolute -left-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-p-accent-red bg-p-accent-red text-white shadow-xs hover:brightness-110 md:hidden md:group-hover:flex"
+        >
+          <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      )}
+    </div>
+  )
+}
+
+export default function ArtifactDock({ windows, minimized, onRestore, onClose, documents }: Props) {
   const items = windows.filter((w) => minimized.has(w.id))
-  if (items.length === 0) return null
+  const docChips = documents?.chips ?? []
+  if (items.length === 0 && docChips.length === 0) return null
 
   return (
     <div className="flex flex-col gap-2 items-start">
+      {docChips.map((d) => (
+        <DockChip
+          key={`doc-${d.fileId}`}
+          type="document_preview"
+          title={d.title}
+          onRestore={() => documents!.onRestore(d.fileId)}
+          onClose={() => documents!.onClose(d.fileId)}
+        />
+      ))}
+      {!!documents?.more && (
+        <DockChip
+          type="document_preview"
+          title={`${documents.more} more documents`}
+          label={`+${documents.more}`}
+          onRestore={() => documents.onRestore()}
+        />
+      )}
       {items.map((w) => (
-        <div key={w.id} className="oto-pop-in group relative">
-          <button
-            onClick={() => onRestore(w.id)}
-            title={`Open: ${w.title}`}
-            className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-brand/40 bg-white/80 shadow-xs backdrop-blur-xs transition-all hover:bg-white hover:shadow-md dark:bg-gray-900/80 dark:hover:bg-p-surface"
-          >
-            <TypeIcon type={w.block.type} />
-            {/* expand badge — signals "click to open" */}
-            <span className="absolute -bottom-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-brand/40 bg-white text-brand dark:bg-p-surface">
-              <svg className="h-2 w-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 14v6h6M20 10V4h-6" />
-              </svg>
-            </span>
-          </button>
-          {/* dismiss — red, top-left. Always visible on mobile (no hover); on
-              desktop it appears on hover to keep the dock clean. */}
-          <button
-            onClick={() => onClose(w.id)}
-            title="Close"
-            className="absolute -left-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-p-accent-red bg-p-accent-red text-white shadow-xs hover:brightness-110 md:hidden md:group-hover:flex"
-          >
-            <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
+        <DockChip
+          key={w.id}
+          type={w.block.type}
+          title={w.title}
+          onRestore={() => onRestore(w.id)}
+          onClose={() => onClose(w.id)}
+        />
       ))}
     </div>
   )

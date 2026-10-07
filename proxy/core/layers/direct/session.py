@@ -27,6 +27,9 @@ from core.session.session_state import (
     get_permission_queue,
     wait_for_permission,
     get_session_user_tz,
+    has_pending_prompt,
+    mark_closing,
+    PROMPT_WAIT_S,
 )
 
 logger = logging.getLogger("direct-runner")
@@ -324,6 +327,7 @@ async def close_direct_session(session_id: str) -> bool:
         session = _direct_sessions.pop(session_id, None)
     if not session:
         return False
+    mark_closing(session_id)
 
     await mcp_pool.close_session(session_id)
     logger.info(f"Closed direct session {session_id}")
@@ -340,9 +344,10 @@ async def _reap_idle_direct_pass() -> None:
 
     async with _direct_sessions_lock:
         for sid, session in list(_direct_sessions.items()):
-            if now - session.last_activity > idle_timeout:
+            if now - session.last_activity > idle_timeout and not has_pending_prompt(sid):
                 to_reap.append(sid)
                 del _direct_sessions[sid]
+                mark_closing(sid)
 
     for sid in to_reap:
         logger.info(f"Reaping idle direct session: {sid}")
@@ -696,7 +701,7 @@ async def run_direct_stream(
                         "tool_name": tc["name"],
                         "tool_input": tc.get("input", {}),
                     })
-                    approved = await wait_for_permission(request_id, session.session_id, timeout=604800.0)
+                    approved = await wait_for_permission(request_id, session.session_id, timeout=PROMPT_WAIT_S)
                     if approved:
                         (builtin_calls if is_builtin else approved_calls).append(tc)
                     else:

@@ -248,11 +248,14 @@ def read_working_file(row: dict) -> bytes:
 def cut_release(row: dict, source: Path) -> tuple[str, str]:
     """Copy the working file into the next release slot and prune the old
     ones. Returns the agent-dir-relative path and the sha256 of the copy.
-    ``ReleaseInvalid`` when the working file is not a regular file inside
-    the agent's tree."""
+    ``ReleaseInvalid`` when the working file is over ``FILE_APP_MAX_BYTES``
+    or is not a regular file inside the agent's tree."""
     try:
         root, rel = agents_rel(source)
         data = safe_fs.read_bytes_beneath(root, rel, max_size=FILE_APP_MAX_BYTES)
+    except safe_fs.FileTooLarge as e:
+        raise ReleaseInvalid(
+            f"{source.name} is larger than {FILE_APP_MAX_BYTES // (1024 * 1024)} MB") from e
     except OSError as e:
         raise ReleaseInvalid(f"{source.name} is not a regular file in the workspace") from e
     numbers = _all_numbers(row)

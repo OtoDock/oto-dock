@@ -12,9 +12,15 @@ import type { AgentRole } from '../lib/permissions'
 // Per-route filler toggle (backchannel / thinking filler)
 export type RouteMode = 'on' | 'off'
 
+// A call's direction (a route's, a call log row's): the API's `direction`
+// words, named once here as the proxy names them in adapters/phone.py.
+export const PHONE_INBOUND = 'inbound'
+export const PHONE_OUTBOUND = 'outbound'
+export type PhoneDirection = typeof PHONE_INBOUND | typeof PHONE_OUTBOUND
+
 export interface PhoneRoute {
   id: string
-  direction: 'inbound' | 'outbound'
+  direction: PhoneDirection
   name: string
   agent: string
   language: string
@@ -74,7 +80,7 @@ export interface PhoneCallLogEntry {
   route_name: string
   phone_server_id: number | null
   agent: string
-  direction: 'inbound' | 'outbound'
+  direction: PhoneDirection
   from_number: string
   to_number: string
   transport: string
@@ -128,6 +134,11 @@ export type PhoneSettings = Record<string, string>
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+/** A route PIN as the server takes it when one is set: 6 digits. A shorter
+ * PIN stored earlier keeps working until it is changed. */
+export const PIN_DIGITS = 6
+export const isRoutePin = (value: string) => /^\d{6}$/.test(value)
 
 export function usePhoneRoutes() {
   return useQuery({

@@ -52,7 +52,9 @@ logger = logging.getLogger("claude-proxy.community-agent-updater")
 
 _agent_locks: dict[str, asyncio.Lock] = {}
 _jobs: dict[str, dict] = {}
-_last_notify_sweep = 0.0
+# A time.monotonic() stamp, which counts from boot: 0 would hold the first
+# sweep back until the host has been up a day.
+_last_notify_sweep = float("-inf")
 NOTIFY_SWEEP_S = 24 * 3600
 BESIDE_DIR = "community"   # config/community/<version>/… holds the kept pieces' new versions
 # The version names a folder under config/community: a release number (it
@@ -600,18 +602,21 @@ def _tree_unchanged(folder: Path, old: AppItem | None, template_doc: dict) -> bo
     """D6: the working tree minus app.json still hashes to the installed
     version's tree, and the manifest still reads as the template's (an app
     with fire_task buttons is compared without their targets, which the
-    seed rewrote; a record from before that baseline, on its tree alone)."""
+    seed rewrote; a record from before that baseline, on its tree alone).
+    Every file is read without following a link: a file turned into one
+    after the walk makes the tree an edited one. Blocking: a worker-thread
+    call."""
     from services.apps import releases
     if old is None:
         return False
     try:
-        files = releases.walk_tree(folder)
+        tree = template_sig.tree_sha(folder, [rel for rel, _path in releases.walk_tree(folder)])
     except Exception:
         return False
-    if template_sig.tree_sha(files) != old.tree_sha:
+    if tree != old.tree_sha:
         return False
     try:
-        local_doc = json.loads((folder / template_sig.MANIFEST_DOC).read_text(encoding="utf-8"))
+        local_doc = json.loads(template_sig.read_file(folder, template_sig.MANIFEST_DOC).decode("utf-8"))
     except (OSError, ValueError):
         local_doc = None
     fires = [a for a in ((local_doc or template_doc).get("actions") or [])
@@ -744,13 +749,14 @@ async def _layer_apps(run: _Run, new_data: dict) -> None:
                 run.report["kept"].append({"what": what, "reason": "hidden by its owner", "path": "", "new_path": ""})
                 continue
             prev_item = old_apps.get(item.slug)
-            if (prev_item is None or prev_item.sig != item.sig) and _tree_unchanged(folder, item, doc):
+            if (prev_item is None or prev_item.sig != item.sig) \
+                    and await asyncio.to_thread(_tree_unchanged, folder, item, doc):
                 # A retry after an update that failed later on: this copy
                 # took the new version already (the record still names the
                 # old one), so it is neither edited nor to be taken again.
                 run.same()
                 continue
-            if _tree_unchanged(folder, old_apps.get(item.slug), doc):
+            if await asyncio.to_thread(_tree_unchanged, folder, old_apps.get(item.slug), doc):
                 prev = old_apps.get(item.slug)
                 if prev is not None and prev.sig == item.sig:
                     run.same()
@@ -953,10 +959,15 @@ def _layer_default_for_new_users(run: _Run) -> None:
     # a gap for the update to fill.
     if run.old is not None and run.old.default_for_new_users.get("enabled"):
         return
-    row = agent_store.get_agent(run.agent) or {}
+    from services.agents import shared_only_members
+    row = shared_only_members.agent_row(run.agent) or {}
     if row.get("default_for_new_users_role"):
         return
-    if not roles.is_admin(run.by_role):
+    if not roles.is_admin(run.by_role) or (
+            not roles.allowed_on_shared_only(block["role"])
+            and shared_only_members.is_shared_only_row(row)):
+        # A creator's update cannot set it; on a Shared-only agent a
+        # default below the editor tier would attach people who open no chat.
         run.report["ignored_fields"].append("default_for_new_users")
         return
     if run.apply:

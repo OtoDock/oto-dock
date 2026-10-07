@@ -46,6 +46,21 @@ describe('useInteractiveChat toggle', () => {
   })
 })
 
+describe('useInteractiveChat and the server\'s answer to a pick', () => {
+  it('a refused switch is echoed back: the stored mode applies and "Switching…" ends', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, ''))
+    act(() => { result.current.performSwitch(true, 'pool-chat', false) })
+    expect(result.current.switching).toBe(true)
+    expect(result.current.interactiveMode).toBe(true)
+    act(() => { result.current.applyStoredExecMode('') })
+    expect(result.current.switching).toBe(false)
+    expect(result.current.interactiveMode).toBe(false)
+    act(() => { result.current.applyStoredExecMode('interactive') })
+    expect(result.current.chatExecMode).toBe('interactive')
+  })
+})
+
 describe('useInteractiveChat cold start', () => {
   it('sends the raw prompt on the warmup whatever the layer — the server stamps it', () => {
     for (const layer of ['acme-tui', 'pty-only', undefined]) {

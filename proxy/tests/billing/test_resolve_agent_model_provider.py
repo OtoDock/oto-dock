@@ -2,7 +2,7 @@
 first, then a fallback that falls DOWN the tiers from it and never up, both
 restricted to providers the platform pool can serve.
 
-Direct LLM declares ``claude-sonnet-5`` (tier 3 — the first usable tier for
+Direct LLM declares ``claude-sonnet-5-5`` (tier 3 — the first usable tier for
 real work; the operator's call, phone conversations included). Before the
 engine-contract lane the no-pin default was whatever came first in
 ``MODEL_REGISTRY`` insertion order — Haiku 4.5 here.
@@ -22,7 +22,7 @@ from storage.billing import subscription_store
 # Direct LLM's rows as the store returns them (tier is on the row since the
 # builtin sync writes it; a custom row may have none).
 _MODELS = [
-    {"model_id": "claude-sonnet-5", "provider": "anthropic", "is_builtin": True,
+    {"model_id": "claude-sonnet-5-5", "provider": "anthropic", "is_builtin": True,
      "enabled": True, "tier": 3, "created_at": "2026-01-01"},
     {"model_id": "claude-haiku-4-5", "provider": "anthropic", "is_builtin": True,
      "enabled": True, "tier": 4, "created_at": "2026-01-01"},
@@ -56,19 +56,19 @@ def _disabled(model_id):
 
 def test_anthropic_pool_lands_on_the_declared_default(monkeypatch):
     _wire(monkeypatch, ["anthropic", "openai_compatible"])
-    assert config.resolve_agent_model("caller") == "claude-sonnet-5"
+    assert config.resolve_agent_model("caller") == "claude-sonnet-5-5"
 
 
 def test_empty_pool_applies_no_filter_and_lands_on_the_declared_default(monkeypatch):
     # Personal accounts only: _pool_providers is empty, so nothing is filtered.
     _wire(monkeypatch, [])
-    assert config.resolve_agent_model("caller") == "claude-sonnet-5"
+    assert config.resolve_agent_model("caller") == "claude-sonnet-5-5"
 
 
 def test_declared_default_without_a_row_falls_back(monkeypatch):
     # An install whose admin deleted the Sonnet row: step 2 is skipped and the
     # fall-down fallback runs among what is left.
-    rows = [m for m in _MODELS if m["model_id"] != "claude-sonnet-5"]
+    rows = [m for m in _MODELS if m["model_id"] != "claude-sonnet-5-5"]
     _wire(monkeypatch, ["anthropic"], models=rows)
     assert config.resolve_agent_model("caller") == "claude-haiku-4-5"
 
@@ -76,7 +76,7 @@ def test_declared_default_without_a_row_falls_back(monkeypatch):
 # --- the fallback falls DOWN, never up -------------------------------------
 
 def test_disabled_declared_default_falls_down_a_tier(monkeypatch):
-    _wire(monkeypatch, ["anthropic"], models=_disabled("claude-sonnet-5"))
+    _wire(monkeypatch, ["anthropic"], models=_disabled("claude-sonnet-5-5"))
     assert config.resolve_agent_model("caller") == "claude-haiku-4-5"
 
 
@@ -88,11 +88,11 @@ def test_disabled_default_on_claude_lands_on_sonnet_not_fable(monkeypatch):
          "enabled": True, "tier": 1, "created_at": "2026-01-01"},
         {"model_id": "claude-opus-5-5", "provider": "anthropic", "is_builtin": True,
          "enabled": False, "tier": 2, "created_at": "2026-01-01"},
-        {"model_id": "claude-sonnet-5", "provider": "anthropic", "is_builtin": True,
+        {"model_id": "claude-sonnet-5-5", "provider": "anthropic", "is_builtin": True,
          "enabled": True, "tier": 3, "created_at": "2026-01-01"},
     ]
     _wire(monkeypatch, ["anthropic"], models=rows, layer="claude-code-cli")
-    assert config.resolve_agent_model("caller") == "claude-sonnet-5"
+    assert config.resolve_agent_model("caller") == "claude-sonnet-5-5"
 
 
 def test_disabled_default_on_codex_lands_on_terra_not_astra(monkeypatch):
@@ -114,7 +114,7 @@ def test_tier_one_is_reached_only_when_nothing_at_or_below_the_default_is_enable
          "enabled": True, "tier": 1, "created_at": "2026-01-01"},
         {"model_id": "claude-opus-5-5", "provider": "anthropic", "is_builtin": True,
          "enabled": False, "tier": 2, "created_at": "2026-01-01"},
-        {"model_id": "claude-sonnet-5", "provider": "anthropic", "is_builtin": True,
+        {"model_id": "claude-sonnet-5-5", "provider": "anthropic", "is_builtin": True,
          "enabled": False, "tier": 3, "created_at": "2026-01-01"},
     ]
     _wire(monkeypatch, ["anthropic"], models=rows, layer="claude-code-cli")
@@ -132,7 +132,7 @@ def test_pool_provider_without_an_enabled_model_ignores_the_filter(monkeypatch):
     # A groq-only pool serves none of these rows: the filter yields nothing,
     # so it is dropped and the declared default wins.
     _wire(monkeypatch, ["groq"])
-    assert config.resolve_agent_model("caller") == "claude-sonnet-5"
+    assert config.resolve_agent_model("caller") == "claude-sonnet-5-5"
 
 
 def test_openai_only_pool_falls_to_the_best_served_tier(monkeypatch):

@@ -145,7 +145,7 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
         }}
         readOnly={readOnly}
         spellCheck={false}
-        className={`flex-1 w-full p-3 font-mono text-sm text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 resize-none focus:outline-hidden ${
+        className={`flex-1 w-full p-3 font-mono text-sm pointer-coarse:text-base text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 resize-none focus:outline-hidden ${
           readOnly ? 'bg-gray-50 dark:bg-p-surface cursor-default' : ''
         }`}
       />

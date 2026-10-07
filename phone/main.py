@@ -12,20 +12,24 @@ from the proxy DB — no local .env needed except PROXY_URL/PROXY_API_KEY.
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import logging.handlers
 import re
 import signal
+import socket
+import sys
 import time
 from datetime import datetime, timezone
 
 from telephony.ami_events import AmiListenerManager
 from telephony.audio_socket import AudioSocketConnection, AudioSocketError
+from calls import pin_failures
 from calls.call_manager import CallManager, CallStatus
 from calls.call_registry import registry as call_registry
 from config_manager import ConfigManager
 from calls.http_api import OutboundCallAPI
-from proxy.client import report_call
+from proxy.client import fetch_pin_failures, report_call
 from proxy.management_ws import ManagementWSClient
 from pipeline import CallPipeline
 from pipeline.providers import prewarm_fillers
@@ -36,16 +40,112 @@ _active_calls: dict[str, asyncio.Task] = {}
 
 # Connections that have not yet sent their identifying UUID frame are
 # bounded before anything is read from them: at most PENDING_MAX across the
-# daemon and PENDING_PER_PEER_MAX per peer host, closed at once past either
-# ceiling, and released as soon as the frame is read (a resolved call is
-# ``_active_calls``'s from then on). Asterisk sends the frame immediately,
-# so the read waits two seconds at most. The soft descriptor limit is
-# raised at start so a burst of connections cannot exhaust it first.
+# daemon and PENDING_PER_PEER_MAX per peer (``_peer_key``), closed at once
+# past either ceiling, and released as soon as the frame is read (a resolved
+# call is ``_active_calls``'s from then on). The top PENDING_PBX_RESERVE of
+# PENDING_MAX is usable only by the configured PBX addresses, so peers that
+# hold the rest cannot close the PBX's own connects. Asterisk sends the
+# frame immediately, so the read waits two seconds at most. The soft
+# descriptor limit is raised at start so a burst of connections cannot
+# exhaust it first.
 PENDING_MAX = 64
 PENDING_PER_PEER_MAX = 8
+PENDING_PBX_RESERVE = 16
 UUID_READ_TIMEOUT_S = 2.0
+PBX_RESOLVE_TIMEOUT_S = 10.0
 _pending_total = 0
 _pending_by_peer: dict[str, int] = {}
+
+
+def _ip(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address ``text`` names, without its zone and with an IPv4-mapped
+    IPv6 address unwrapped to IPv4; None when it is not an address literal."""
+    try:
+        addr = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+class _PbxPeers:
+    """The addresses the configured PBX hosts resolve to.
+
+    Refreshed after each config push and never on the accept path, which
+    only reads ``addresses``. A literal address skips DNS. A host that fails
+    to resolve, or that the resolver refuses as malformed, keeps the
+    addresses it last resolved to and is logged once until it resolves
+    again. Refreshes run one at a time in push order.
+    """
+
+    def __init__(self) -> None:
+        self.addresses: frozenset[str] = frozenset()
+        self._by_host: dict[str, frozenset[str]] = {}
+        self._failing: set[str] = set()
+        self._lock = asyncio.Lock()
+
+    async def refresh(self, hosts: list[str], logger: logging.Logger) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            by_host: dict[str, frozenset[str]] = {}
+            for host in hosts:
+                literal = _ip(host)
+                if literal is not None:
+                    by_host[host] = frozenset((str(literal),))
+                    continue
+                try:
+                    infos = await asyncio.wait_for(
+                        loop.getaddrinfo(host, None, type=socket.SOCK_STREAM),
+                        PBX_RESOLVE_TIMEOUT_S,
+                    )
+                except (OSError, ValueError, asyncio.TimeoutError) as e:
+                    if host not in self._failing:
+                        self._failing.add(host)
+                        logger.warning(
+                            f"PBX host {host} did not resolve, its last addresses "
+                            f"keep the accept reserve: {e!r}")
+                    if host in self._by_host:
+                        by_host[host] = self._by_host[host]
+                    continue
+                self._failing.discard(host)
+                by_host[host] = frozenset(
+                    str(a) for a in (_ip(str(info[4][0])) for info in infos) if a)
+            self._failing &= set(hosts)
+            self._by_host = by_host
+            self.addresses = frozenset().union(*by_host.values())
+
+
+_pbx_peers = _PbxPeers()
+# The scheduled refreshes, held until done so none is collected mid-run.
+_pbx_refresh_tasks: set[asyncio.Task] = set()
+
+
+def _pbx_refresh_done(task: asyncio.Task) -> None:
+    _pbx_refresh_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logging.getLogger("phone-server").warning(
+            f"PBX address refresh failed: {task.exception()!r}")
+
+
+def _schedule_pbx_refresh(cfg: ConfigManager, logger: logging.Logger) -> None:
+    """Refresh the PBX addresses for the config just loaded, off the caller."""
+    task = asyncio.create_task(_pbx_peers.refresh(cfg.pbx_hosts(), logger))
+    _pbx_refresh_tasks.add(task)
+    task.add_done_callback(_pbx_refresh_done)
+
+
+def _peer_key(host: str) -> str:
+    """The key a peer's pending connections are counted under: a configured
+    PBX address and any IPv4 address by itself, any other IPv6 address by
+    its /64 (one host commonly holds a whole /64)."""
+    addr = _ip(host)
+    if addr is None:
+        return host
+    key = str(addr)
+    if isinstance(addr, ipaddress.IPv4Address) or key in _pbx_peers.addresses:
+        return key
+    return str(ipaddress.IPv6Network((addr, 64), strict=False))
 
 
 class _RateLimitedLog:
@@ -114,6 +214,33 @@ def _resolve_route(call_uuid: str, cfg: ConfigManager):
 
     route = cfg.resolve_inbound_route(call_uuid)
     return (route, False)
+
+
+# The history asked for: the lockout window plus room for a slow gate (a
+# refused call is stamped when it ended, the window is judged here).
+_PIN_HISTORY_S = int(pin_failures.WINDOW_S) + 600
+_pin_seed_task: asyncio.Task | None = None
+
+
+async def _seed_pin_lockout(logger: logging.Logger) -> None:
+    """Rebuild the PIN gate's lockout windows from the proxy's call log, once
+    per process: a restart would otherwise clear every cooldown."""
+    if pin_failures.store.seeded:
+        return
+    calls = await fetch_pin_failures(_PIN_HISTORY_S)
+    if calls is None or pin_failures.store.seeded:
+        return
+    replayed = pin_failures.store.seed(calls)
+    logger.info(f"PIN lockout windows restored ({replayed} recent failures)")
+
+
+def _start_pin_seed(logger: logging.Logger) -> asyncio.Task | None:
+    """One seed at a time; none once a seed landed."""
+    global _pin_seed_task
+    if pin_failures.store.seeded or (_pin_seed_task and not _pin_seed_task.done()):
+        return _pin_seed_task
+    _pin_seed_task = asyncio.create_task(_seed_pin_lockout(logger))
+    return _pin_seed_task
 
 
 def _spawn_call_report(payload: dict) -> None:
@@ -267,8 +394,12 @@ async def _handle_connection(
     global _pending_total
     peername = writer.get_extra_info("peername")
     peer_host = str(peername[0]) if peername else "unknown"
-    if (_pending_total >= PENDING_MAX
-            or _pending_by_peer.get(peer_host, 0) >= PENDING_PER_PEER_MAX):
+    peer_key = _peer_key(peer_host)
+    # A key equal to a PBX address is that PBX: other IPv6 peers key by /64.
+    ceiling = (PENDING_MAX if peer_key in _pbx_peers.addresses
+               else PENDING_MAX - PENDING_PBX_RESERVE)
+    if (_pending_total >= ceiling
+            or _pending_by_peer.get(peer_key, 0) >= PENDING_PER_PEER_MAX):
         _reject_log.warning(
             logger, "pending",
             f"Rejecting {peer_host}: too many connections awaiting their UUID "
@@ -287,7 +418,7 @@ async def _handle_connection(
     logger.info(f"New connection from {conn.peer_addr}")
 
     _pending_total += 1
-    _pending_by_peer[peer_host] = _pending_by_peer.get(peer_host, 0) + 1
+    _pending_by_peer[peer_key] = _pending_by_peer.get(peer_key, 0) + 1
     try:
         # First frame must be UUID
         call_uuid = await asyncio.wait_for(conn.read_uuid(), timeout=UUID_READ_TIMEOUT_S)
@@ -298,11 +429,11 @@ async def _handle_connection(
         return
     finally:
         _pending_total -= 1
-        left = _pending_by_peer.get(peer_host, 0) - 1
+        left = _pending_by_peer.get(peer_key, 0) - 1
         if left > 0:
-            _pending_by_peer[peer_host] = left
+            _pending_by_peer[peer_key] = left
         else:
-            _pending_by_peer.pop(peer_host, None)
+            _pending_by_peer.pop(peer_key, None)
 
     route, is_outbound = _resolve_route(call_uuid, cfg)
 
@@ -415,6 +546,13 @@ async def _run_server() -> None:
     cfg = ConfigManager()
     cfg.load(config_data)
 
+    # The PIN lockout windows, before the first call (bounded: a slow proxy
+    # never holds the start; a config push retries until one lands).
+    seed = _start_pin_seed(logger)
+    if seed is not None:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(seed), timeout=10.0)
+
     # Pre-warm each enabled route's filler clips so the first call never pays the
     # synth latency. Background — never blocks server startup; the call
     # path self-heals if a call lands first.
@@ -425,14 +563,17 @@ async def _run_server() -> None:
     # the sync WS callback can never interleave two reconciles.
     ami_manager = AmiListenerManager()
     asyncio.create_task(ami_manager.apply(cfg))
+    _schedule_pbx_refresh(cfg, logger)
 
     # 3. Register config update callback: reload config, then refresh filler clips
     # for any combos whose voice/provider/phrases changed (content-keyed → only
     # changed combos re-synth; unused combos are pruned).
     def _on_config_changed(data: dict) -> None:
         cfg.load(data)
+        _start_pin_seed(logger)
         asyncio.create_task(prewarm_fillers(cfg))
         asyncio.create_task(ami_manager.apply(cfg))
+        _schedule_pbx_refresh(cfg, logger)
 
     mgmt.on_config_changed = _on_config_changed
 
@@ -522,6 +663,10 @@ async def _run_server() -> None:
 
 
 def main() -> None:
+    refused = config.plaintext_proxy_refusal(config.PROXY_URL)
+    if refused:
+        sys.stderr.write(f"Phone Server not started: {refused}\n")
+        raise SystemExit(2)
     asyncio.run(_run_server())
 
 

@@ -360,6 +360,17 @@ def delete_push_subscription(subscription_id: str) -> bool:
         return cur.rowcount > 0
 
 
+def delete_push_subscriptions_of(user_sub: str) -> int:
+    """Every push registration of the person (a sign-out everywhere ends the
+    devices' feed with the sign-ins); a device registers again at its next
+    launch. Returns how many went."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM push_subscriptions WHERE user_sub=%s", (user_sub,)
+        )
+        return cur.rowcount
+
+
 def delete_push_subscription_by_data(
     subscription_data: str, user_sub: str | None = None,
 ) -> bool:
@@ -438,6 +449,20 @@ def resolve_sub_to_username(sub: str) -> str | None:
             "SELECT username, name FROM users WHERE sub=%s", (sub,)
         ).fetchone()
         return (row["username"] or row["name"]) if row else None
+
+
+def resolve_subs_to_usernames(subs: list[str]) -> dict[str, str]:
+    """``resolve_sub_to_username`` for many subs in one query: ``{sub:
+    username}`` for the rows that exist (the display name only for a row
+    that never got one). An empty list answers ``{}`` with no query."""
+    ids = list(dict.fromkeys(s for s in subs if s))
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT sub, username, name FROM users WHERE sub = ANY(%s)", (ids,),
+        ).fetchall()
+    return {r["sub"]: (r["username"] or r["name"]) for r in rows if (r["username"] or r["name"])}
 
 
 def resolve_sub_to_display_name(sub: str) -> str | None:
