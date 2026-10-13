@@ -22,7 +22,7 @@ from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.file-sync")
+logger = logging.getLogger("otodock.file-sync")
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".cache", ".mypy_cache", ".pytest_cache"}
 
@@ -144,9 +144,19 @@ def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
     return parent_name in INCLUDE_DOTTED_DIRS and child_name in _CLI_RUNTIME_CHILD_DIRS
 
 
+# The marker of the platform's own in-flight hook-file writes
+# (``core/sandbox/session_config_dir.WRITE_TEMP_MARKER``; the satellite's
+# ``config.WRITE_TEMP_MARKER`` is the same).
+WRITE_TEMP_MARKER = ".oto-tmp-"
+
+
 def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
     """True for CLI backup/corrupted state files directly under an engine
-    config dir (e.g. ``.claude.json.backup.<ts>``) — host-local, never synced."""
+    config dir (e.g. ``.claude.json.backup.<ts>``), and for a hook-file
+    write's temp there or in its ``bin/`` (``.<name>.oto-tmp-<hex>``) —
+    host-local, never synced."""
+    if file_name.startswith(".") and WRITE_TEMP_MARKER in file_name:
+        return parent_name in INCLUDE_DOTTED_DIRS or parent_name == "bin"
     if parent_name not in INCLUDE_DOTTED_DIRS:
         return False
     return ".backup." in file_name or ".corrupted." in file_name
@@ -491,6 +501,8 @@ class FileAction:
     capture_reason: str | None = None  # "conflict" | "deleted"
     notify_user: str | None = None     # cross-user conflict: the loser's username
                                        # slug to notify (resolved to a sub at send)
+    keep_mtime: float | None = None    # a pull that lands with this mtime (proxy
+                                       # clock), not the time of the pull
 
 
 @dataclass
@@ -1007,6 +1019,9 @@ def _resolve_merge(
     satellite_tree_present: bool = True,
     writable_libraries: frozenset[tuple[str, str]] | None = None,
     knowledge_rw: bool = False,
+    absence_unknown: bool = False,
+    held: bool = False,
+    restore_holds: bool = False,
 ) -> FileAction | None:
     """The 3-way merge for one path (after push-only / isolation filtering).
 
@@ -1015,6 +1030,13 @@ def _resolve_merge(
     or ``None`` when nothing needs doing. Every **pull** is gated by
     ``can_write_back`` — an unauthorized satellite→platform write becomes a
     no-op (leave the satellite's copy), never a clobber.
+
+    ``absence_unknown``: the satellite's manifest may leave out a file it
+    has (a Windows satellite 0.5.130–0.5.143 hashed nothing it had not
+    been sent), so a platform-only path is left alone. ``held``: the path's
+    platform copy went with the Windows hash bug (``windows-hash-hold``); it
+    is never deleted on a machine, and only a ``restore_holds`` merge (a
+    fixed Windows satellite) brings the machine's copy back.
     """
     def cwb() -> bool:
         return can_write_back(path, target_role, target_username,
@@ -1056,6 +1078,9 @@ def _resolve_merge(
         return None
 
     # --- platform only ---
+    if P is not None and S is None and absence_unknown:
+        # A base proves nothing here: the bug's own deletes cleared it.
+        return None
     if P is not None and S is None:
         # The satellite lacks a platform file. If it CONVERGED on this exact version
         # (B == P), its tree is still ALIVE (non-empty manifest — not a wipe), AND the
@@ -1090,6 +1115,16 @@ def _resolve_merge(
         return FileAction(path, "push", base_hash=P, drop_tombstone=(T is not None))
 
     # --- satellite only ---
+    if S is not None and P is None and held:
+        # Only a fixed Windows machine restores: its copy may hold edits the
+        # platform never received, which an idle machine's older bytes must
+        # not beat. The restored copy keeps that machine's mtime, so a newer
+        # copy elsewhere (another Windows machine, an edit made meanwhile)
+        # still wins the next divergence instead of losing to the pull's time.
+        if restore_holds and cwb():
+            return FileAction(path, "pull", base_hash=S, drop_tombstone=True,
+                              keep_mtime=_adjusted_satellite_mtime(Sm, clock_offset))
+        return None
     if S is not None and P is None:
         if T is not None:
             adj = _adjusted_satellite_mtime(Sm, clock_offset)
@@ -1135,6 +1170,9 @@ def diff_manifests(
     writable_libraries: frozenset[tuple[str, str]] | None = None,
     scrub_dirs: set[str] | None = None,
     knowledge_rw: bool = False,
+    absence_unknown: bool = False,
+    holds: dict[str, float] | None = None,
+    restore_holds: bool = False,
 ) -> MergePlan:
     """Resolve a 3-way merge (platform vs satellite vs last-converged base) into a
     per-file action plan — **newest-version-wins**, not proxy-always-wins.
@@ -1142,6 +1180,10 @@ def diff_manifests(
     Args:
         local: Platform manifest (``FileEntry`` with hash + mtime).
         remote: Satellite manifest (dicts with ``path``/``hash``/``mtime``).
+            An entry with ``skipped`` (0.5.145+, asked with ``report_skipped``)
+            is there but could not be read: a file, or with ``dir`` every path
+            at or under a folder (``""`` = the whole tree). Nothing is done to
+            an unknown path, and it does not make the tree count as alive.
         base: ``{rel_path: (base_hash, base_mtime)}`` from ``sync_state`` — the
             hash last converged with this machine. Empty = first sync.
         tombstones: ``{rel_path: deleted_at_mtime}`` of LIVE platform tombstones —
@@ -1176,6 +1218,14 @@ def diff_manifests(
             per-turn ``file_changed`` applier agree on knowledge/ writes
             from agent-scope task fires. Machine-pairing merges (reconnect,
             idle sweep, presync) carry no session and pass False.
+        absence_unknown: the satellite may leave out files it has (an old
+            Windows satellite): no platform-only path gets an action, but for
+            the platform-authoritative push-only paths, which are pushed.
+        holds: ``{rel_path: deleted_at_mtime}`` of the ``windows-hash-hold``
+            tombstones (left out of ``tombstones``): never a delete on a
+            machine; ``restore_holds`` (a fixed Windows satellite) pulls a
+            held file the machine has, and a held path the platform has
+            again merges as usual and drops the hold.
 
     Returns a ``MergePlan`` (per-file ``FileAction`` list + the ``to_scrub``
     isolation deletes). Pure / side-effect-free — the caller executes it.
@@ -1194,6 +1244,7 @@ def diff_manifests(
     scrub_p = scrub_dirs or set()
     base = base or {}
     tombstones = tombstones or {}
+    holds = holds or {}
     if author_of is None:
         author_of = lambda _p: None  # noqa: E731
 
@@ -1206,6 +1257,13 @@ def diff_manifests(
         base = {k: v for k, v in base.items() if not layout.is_personal(k)}
         tombstones = {k: v for k, v in tombstones.items()
                       if not layout.is_personal(k)}
+        holds = {k: v for k, v in holds.items() if not layout.is_personal(k)}
+    unknown_files = {str(r.get("path", "")) for r in remote
+                     if r.get("skipped") and not r.get("dir")}
+    unknown_dirs = tuple(
+        f"{str(r.get('path', '')).rstrip('/')}/" if str(r.get("path", "")).strip("/") else ""
+        for r in remote if r.get("skipped") and r.get("dir"))
+    remote = [r for r in remote if not r.get("skipped")]
     local_map = {e.path: e for e in local}
     remote_map = {r["path"]: r for r in remote}
     # The satellite tree is "alive" iff it reported ANY file. An EMPTY manifest with
@@ -1220,8 +1278,12 @@ def diff_manifests(
 
     # Iterate the union of all known keys so a both-absent file with only a stale
     # base/tombstone row still gets cleaned up.
-    all_paths = set(local_map) | set(remote_map) | set(base) | set(tombstones)
+    all_paths = set(local_map) | set(remote_map) | set(base) | set(tombstones) | set(holds)
     for path in all_paths:
+        # There on the machine but unread (locked, denied, past the cap, in
+        # a folder it could not list): no side may act on it this time.
+        if path in unknown_files or (unknown_dirs and path.startswith(unknown_dirs)):
+            continue
         lentry = local_map.get(path)
         rentry = remote_map.get(path)
         P = lentry.hash if lentry else None
@@ -1231,6 +1293,9 @@ def diff_manifests(
         brow = base.get(path)
         B = brow[0] if brow else None
         T = tombstones.get(path)  # deleted_at_mtime or None
+        held = path in holds and P is None
+        if path in holds and P is not None:
+            T = holds[path]  # the platform has it again: the hold is obsolete
 
         # 1. Satellite-authoritative session state (.claude/projects, .codex/
         #    sessions) — the platform owns none of it: never push/pull/delete.
@@ -1304,6 +1369,9 @@ def diff_manifests(
             satellite_tree_present=sat_tree_present,
             writable_libraries=writable_libraries,
             knowledge_rw=knowledge_rw,
+            absence_unknown=absence_unknown,
+            held=held,
+            restore_holds=restore_holds,
         )
         if action is not None:
             actions.append(action)

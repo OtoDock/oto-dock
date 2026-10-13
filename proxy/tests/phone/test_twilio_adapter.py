@@ -167,7 +167,7 @@ def test_provision_inbound_sets_voice_url(monkeypatch, caplog):
         return httpx.Response(200, json=_number(voice_url=WEBHOOK))
 
     _mock(monkeypatch, handler)
-    with caplog.at_level(logging.INFO, logger="claude-proxy"):
+    with caplog.at_level(logging.INFO, logger="otodock"):
         handle = asyncio.run(make_adapter().provision_route({
             "id": "r1", "direction": "inbound", "did": "1 (555) 111-2222"}))
     # The number is personal data: the log line names the route, not the DID.

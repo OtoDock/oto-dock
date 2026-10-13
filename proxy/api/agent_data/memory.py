@@ -64,7 +64,7 @@ from auth.providers import acting_role_of
 from core import layout
 
 
-logger = logging.getLogger("claude-proxy.memory-api")
+logger = logging.getLogger("otodock.memory-api")
 router = APIRouter(prefix="/v1/internal/memory")
 
 

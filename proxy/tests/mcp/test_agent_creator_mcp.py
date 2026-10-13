@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from tests._paths import CUSTOM_MCPS, load_mcp_server
 
 _MCP_DIR = CUSTOM_MCPS / "agent-creator-mcp"
@@ -93,3 +95,101 @@ class TestManifestSanity:
         })
         assert set(mod._TOOL_SCHEMAS.keys()) == set(mod._TOOL_HANDLERS.keys())
         assert set(mod._TOOL_SCHEMAS.keys()) == mod._ALL_TOOLS
+
+
+class TestRetries:
+    """Validate and create retry only a connection that never opened: a
+    timed-out install may still be running on the platform, and a 503 or a
+    timeout is the folder read failing or running long, which a second
+    attempt would only repeat. Other calls keep their one retry."""
+
+    def _serve(self, monkeypatch, mod, *outcomes):
+        import httpx
+        calls: list[str] = []
+        pending = list(outcomes)
+
+        async def _request(self, method, url, **kw):
+            calls.append(url)
+            outcome = pending.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            status, body = outcome
+            return httpx.Response(status, json=body, request=httpx.Request(method, url))
+
+        async def _no_wait(_s):
+            return None
+
+        monkeypatch.setattr(httpx.AsyncClient, "request", _request)
+        monkeypatch.setattr(mod.asyncio, "sleep", _no_wait)
+        return calls
+
+    def _mod(self):
+        return _load_server({
+            "OTO_AGENT_NAME": "x", "OTO_PLATFORM_ROLE": "admin", "OTO_CAN_CREATE_AGENTS": "true",
+            "PROXY_URL": "http://test", "PROXY_API_KEY": "k",
+        })
+
+    @pytest.mark.parametrize("exc", ["ReadTimeout", "WriteTimeout", "PoolTimeout",
+                                     "RemoteProtocolError", "ReadError"])
+    def test_an_install_without_an_answer_is_sent_once(self, monkeypatch, exc):
+        import asyncio
+
+        import httpx
+        mod = self._mod()
+        calls = self._serve(monkeypatch, mod, getattr(httpx, exc)("slow"), (200, {}))
+        with pytest.raises(mod._ApiError) as e:
+            asyncio.run(mod._tool_create_agent("/workspace/t", ""))
+        assert len(calls) == 1 and calls[0].endswith("/v1/agents/install-from-local-template")
+        text = str(e.value)
+        assert "may still be running" in text and "`list_building_blocks`" in text
+        assert "never install it again under a suggested slug" in text
+
+    def test_an_install_that_never_left_is_sent_again(self, monkeypatch):
+        import asyncio
+
+        import httpx
+        mod = self._mod()
+        calls = self._serve(monkeypatch, mod, httpx.ConnectError("refused"),
+                            (200, {"agent_slug": "demo", "dashboard_path": "/agents/demo"}))
+        text = asyncio.run(mod._tool_create_agent("/workspace/t", ""))
+        assert text.startswith("✅ Created agent `demo`") and len(calls) == 2
+        calls = self._serve(monkeypatch, mod, httpx.ConnectTimeout("slow"),
+                            httpx.ConnectTimeout("slow"))
+        with pytest.raises(mod._ApiError):
+            asyncio.run(mod._tool_create_agent("/workspace/t", ""))
+        assert len(calls) == 2
+
+    def test_an_install_refused_with_a_503_created_nothing(self, monkeypatch):
+        import asyncio
+        mod = self._mod()
+        detail = "'laptop' did not list the template folder, retry in a moment"
+        calls = self._serve(monkeypatch, mod, (503, {"detail": detail}), (200, {}))
+        with pytest.raises(mod._ApiError) as e:
+            asyncio.run(mod._tool_create_agent("/workspace/t", ""))
+        assert len(calls) == 1
+        assert detail in str(e.value) and "Nothing was created" in str(e.value)
+
+    def test_a_validate_is_retried_only_when_it_never_left(self, monkeypatch):
+        import asyncio
+
+        import httpx
+        mod = self._mod()
+        for first in (httpx.ReadTimeout("slow"), (503, {"detail": "retry in a moment"})):
+            calls = self._serve(monkeypatch, mod, first, (200, {"ok": True, "slug": "t"}))
+            with pytest.raises(mod._ApiError):
+                asyncio.run(mod._tool_validate_agent_template("/workspace/t"))
+            assert len(calls) == 1
+        calls = self._serve(monkeypatch, mod, httpx.ConnectError("refused"),
+                            (200, {"ok": True, "slug": "t"}))
+        assert asyncio.run(mod._tool_validate_agent_template("/workspace/t")).startswith(
+            "✅ Template is valid")
+        assert len(calls) == 2
+
+    def test_other_calls_keep_their_retry(self, monkeypatch):
+        import asyncio
+
+        import httpx
+        mod = self._mod()
+        calls = self._serve(monkeypatch, mod, httpx.ReadTimeout("slow"), (200, {"mcps": []}))
+        asyncio.run(mod._tool_list_building_blocks())
+        assert len(calls) == 2

@@ -6,8 +6,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const uploadMock = vi.fn()
+const reserveMock = vi.fn()
+const invalidateMock = vi.fn()
 vi.mock('@/lib/uploadWithProgress', () => ({
   uploadWithProgress: (...args: unknown[]) => uploadMock(...args),
+  reserveUploadFolder: (...args: unknown[]) => reserveMock(...args),
+}))
+vi.mock('@/lib/queryClient', () => ({
+  queryClient: { invalidateQueries: (...args: unknown[]) => invalidateMock(...args) },
 }))
 
 import { enqueueChatUpload, dequeueChatUpload, chatUploadQueueSize, chatUploadActive } from '@/lib/chatUploadQueue'
@@ -45,6 +51,183 @@ describe('chatUploadQueue', () => {
     useChatStore.setState({ byChat: {} })
     useTransferStore.setState({ byId: {} })
     uploadMock.mockReset()
+    reserveMock.mockReset()
+    invalidateMock.mockReset()
+  })
+
+  it('refreshes the workspace tree once a file lands, and for a folder once it exists and once it is whole', async () => {
+    uploadMock.mockImplementation((file: File) => Promise.resolve(resp('users/u/workspace/uploads/files/' + file.name, file.name, file.size, 't')))
+    const abort = addPending('chatT', 'one', makeFile('one.txt', 3))
+    enqueueChatUpload({ fileId: 'one', file: makeFile('one.txt', 3), agent: 'ag', abort })
+    for (let i = 0; i < 6; i++) await flush()
+    expect(invalidateMock.mock.calls).toEqual([[{ queryKey: ['agent-files', 'ag'] }]])
+
+    invalidateMock.mockReset()
+    reserveMock.mockResolvedValue({ path: 'users/u/workspace/uploads/files/pics', name: 'pics' })
+    const abortF = new AbortController()
+    useChatStore.getState().addPendingFiles('chatT', [{
+      id: 'fold', name: 'pics', size: 7, folder: true, fileCount: 2,
+      uploading: true, queued: true, abortController: abortF,
+    }])
+    enqueueChatUpload({
+      fileId: 'fold', agent: 'ag', abort: abortF,
+      folder: { name: 'pics', files: [
+        { file: makeFile('a.png', 3), relDir: '' },
+        { file: makeFile('b.png', 4), relDir: 'sub' },
+      ] },
+    })
+    for (let i = 0; i < 10; i++) await flush()
+    // The reserved (empty) folder shows at once; the whole folder once more at the end.
+    expect(invalidateMock.mock.calls).toEqual([[{ queryKey: ['agent-files', 'ag'] }]])
+  })
+
+  it('refreshes nothing for an upload that failed before anything landed', async () => {
+    uploadMock.mockRejectedValue(new Error('Network error during upload'))
+    const abort = addPending('chatU', 'bad', makeFile('bad.txt', 3))
+    enqueueChatUpload({ fileId: 'bad', file: makeFile('bad.txt', 3), agent: 'ag', abort })
+    for (let i = 0; i < 6; i++) await flush()
+    expect(invalidateMock).not.toHaveBeenCalled()
+  })
+
+  it('uploads a folder into a reserved folder, each file in its place', async () => {
+    reserveMock.mockResolvedValue({ path: 'users/u/workspace/uploads/files/mesitis_1', name: 'mesitis_1' })
+    uploadMock.mockImplementation((file: File) => Promise.resolve(resp('x', file.name, file.size, 't')))
+    const abort = new AbortController()
+    useChatStore.getState().addPendingFiles('chatF', [{
+      id: 'fold', name: 'mesitis', size: 7, folder: true, fileCount: 2,
+      uploading: true, queued: true, abortController: abort,
+    }])
+    enqueueChatUpload({
+      fileId: 'fold', agent: 'ag', abort,
+      folder: { name: 'mesitis', files: [
+        { file: makeFile('agent.json', 3), relDir: '' },
+        { file: makeFile('company.md', 4), relDir: 'context' },
+      ] },
+    })
+    for (let i = 0; i < 10; i++) await flush()
+    expect(reserveMock).toHaveBeenCalledWith('ag', 'mesitis', abort.signal)
+    expect(uploadMock.mock.calls.map((c) => c[2])).toEqual([
+      'users/u/workspace/uploads/files/mesitis_1',
+      'users/u/workspace/uploads/files/mesitis_1/context',
+    ])
+    const chip = useChatStore.getState().byChat['chatF'].pendingFiles[0]
+    expect(chip).toMatchObject({
+      uploading: false, uploadedPath: 'users/u/workspace/uploads/files/mesitis_1',
+      name: 'mesitis_1', folder: true,
+    })
+  })
+
+  it('names the file that failed a folder upload', async () => {
+    reserveMock.mockResolvedValue({ path: 'w/up/mesitis', name: 'mesitis' })
+    uploadMock.mockImplementation((file: File) => file.name === 'company.md'
+      ? Promise.reject(new Error('File too large (max 1 MB)'))
+      : Promise.resolve(resp('x', file.name, file.size, 't')))
+    const abort = new AbortController()
+    useChatStore.getState().addPendingFiles('chatG', [{
+      id: 'fold2', name: 'mesitis', size: 7, folder: true, fileCount: 2,
+      uploading: true, queued: true, abortController: abort,
+    }])
+    enqueueChatUpload({
+      fileId: 'fold2', agent: 'ag', abort,
+      folder: { name: 'mesitis', files: [
+        { file: makeFile('agent.json', 3), relDir: '' },
+        { file: makeFile('company.md', 4), relDir: 'context' },
+      ] },
+    })
+    for (let i = 0; i < 10; i++) await flush()
+    const chip = useChatStore.getState().byChat['chatG'].pendingFiles[0]
+    expect(chip.error).toBe('context/company.md: File too large (max 1 MB)')
+    expect(chip.uploadedPath).toBeUndefined()
+    // The reservation and the count stay on the chip for a Retry.
+    expect(chip).toMatchObject({ folderPath: 'w/up/mesitis', filesDone: 1 })
+  })
+
+  function addFolderChip(chatId: string, id: string, files: Array<{ file: File; relDir: string }>) {
+    const abort = new AbortController()
+    useChatStore.getState().addPendingFiles(chatId, [{
+      id, name: 'mesitis', size: 0, folder: true, fileCount: files.length, folderFiles: files,
+      uploading: true, queued: true, abortController: abort,
+    }])
+    return abort
+  }
+  const folderFiles = () => [
+    { file: makeFile('a.md', 3), relDir: '' },
+    { file: makeFile('b.md', 4), relDir: 'context' },
+    { file: makeFile('c.md', 5), relDir: 'context' },
+  ]
+
+  it('resumes a folder at the file that failed, in the folder reserved before', async () => {
+    reserveMock.mockResolvedValue({ path: 'w/up/mesitis', name: 'mesitis' })
+    uploadMock.mockImplementation((file: File) => file.name === 'b.md'
+      ? Promise.reject(new Error('Network error during upload'))
+      : Promise.resolve(resp('x', file.name, file.size, 't')))
+    const files = folderFiles()
+    const abort = addFolderChip('chatR', 'fr', files)
+    enqueueChatUpload({ fileId: 'fr', agent: 'ag', abort, folder: { name: 'mesitis', files } })
+    for (let i = 0; i < 10; i++) await flush()
+    const failed = useChatStore.getState().byChat['chatR'].pendingFiles[0]
+    expect(failed).toMatchObject({ error: 'context/b.md: Network error during upload', filesDone: 1 })
+
+    // The Retry the chip offers: the same reservation, from the second file.
+    uploadMock.mockClear()
+    uploadMock.mockImplementation((file: File) => Promise.resolve(resp('x', file.name, file.size, 't')))
+    const again = new AbortController()
+    enqueueChatUpload({
+      fileId: 'fr', agent: 'ag', abort: again,
+      folder: { name: failed.name, files, path: failed.folderPath, done: failed.filesDone },
+    })
+    for (let i = 0; i < 10; i++) await flush()
+    expect(reserveMock).toHaveBeenCalledTimes(1)
+    expect(uploadMock.mock.calls.map((c) => [(c[0] as File).name, c[2]])).toEqual([
+      ['b.md', 'w/up/mesitis/context'], ['c.md', 'w/up/mesitis/context'],
+    ])
+    expect(useChatStore.getState().byChat['chatR'].pendingFiles[0]).toMatchObject({
+      uploadedPath: 'w/up/mesitis', filesDone: 3, uploadSent: 12, uploadTotal: 12,
+    })
+  })
+
+  it('a reservation that fails fails the chip, uploads nothing, and is reserved again on retry', async () => {
+    reserveMock.mockRejectedValueOnce(new Error('Contributor role or above is required'))
+    const files = folderFiles()
+    const abort = addFolderChip('chatV', 'fv', files)
+    enqueueChatUpload({ fileId: 'fv', agent: 'ag', abort, folder: { name: 'mesitis', files } })
+    for (let i = 0; i < 10; i++) await flush()
+    const chip = useChatStore.getState().byChat['chatV'].pendingFiles[0]
+    expect(chip.error).toBe('Contributor role or above is required')
+    expect(chip.folderPath).toBeUndefined()
+    expect(uploadMock).not.toHaveBeenCalled()
+
+    reserveMock.mockResolvedValue({ path: 'w/up/mesitis', name: 'mesitis' })
+    uploadMock.mockImplementation((file: File) => Promise.resolve(resp('x', file.name, file.size, 't')))
+    enqueueChatUpload({
+      fileId: 'fv', agent: 'ag', abort: new AbortController(),
+      folder: { name: chip.name, files, path: chip.folderPath, done: chip.filesDone },
+    })
+    for (let i = 0; i < 10; i++) await flush()
+    expect(reserveMock).toHaveBeenCalledTimes(2)
+    expect(uploadMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('a folder removed mid-upload stops there, keeps what landed, writes no error', async () => {
+    reserveMock.mockResolvedValue({ path: 'w/up/mesitis', name: 'mesitis' })
+    let release!: () => void
+    uploadMock.mockImplementation((file: File, _a: string, _t: string, _p: unknown, signal: AbortSignal) =>
+      file.name === 'a.md'
+        ? Promise.resolve(resp('x', file.name, file.size, 't'))
+        : new Promise((_res, rej) => {
+          release = () => rej(new DOMException('Upload aborted', 'AbortError'))
+          signal.addEventListener('abort', () => release())
+        }))
+    const files = folderFiles()
+    const abort = addFolderChip('chatA', 'fa2', files)
+    enqueueChatUpload({ fileId: 'fa2', agent: 'ag', abort, folder: { name: 'mesitis', files } })
+    for (let i = 0; i < 10; i++) await flush()
+    expect(uploadMock).toHaveBeenCalledTimes(2)
+    abort.abort()
+    useChatStore.getState().removePendingFile('chatA', 'fa2')
+    for (let i = 0; i < 10; i++) await flush()
+    expect(uploadMock).toHaveBeenCalledTimes(2) // c.md never started
+    expect(chatUploadActive()).toBe(false)
   })
 
   it('reports an upload as active while its only entry is on the wire', async () => {

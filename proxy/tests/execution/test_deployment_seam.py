@@ -152,14 +152,25 @@ def registry():
     return mcp_registry
 
 
+def _installed_container(registry, nm):
+    """The manifest when ``nm`` is installed as a container, else None.
+
+    community/* manifests are gitignored, installed from the separate
+    community-mcps catalog, which may move an entry off a container (a hosted
+    server is not proxy-local); the in-repo file-tools manifest must ALWAYS
+    resolve."""
+    from services.mcp import mcp_manifest_types as _mt
+    m = registry.get_manifest(nm)
+    if m is None:
+        assert nm != "file-tools", "in-repo file-tools manifest must exist"
+        return None
+    return m if _mt.is_container(m.server) else None
+
+
 def test_resolve_server_config_localhost_in_t1(t1, registry):
-    # community/* manifests (github-mcp, …) are gitignored — shipped from the
-    # separate community-mcps repo — so assert them only when present; the
-    # in-repo file-tools manifest must ALWAYS resolve.
-    for nm, suffix in (("file-tools", "/mcp/"), ("github-mcp", "/mcp")):
-        m = registry.get_manifest(nm)
+    for nm, suffix in (("file-tools", "/mcp/"), ("m365-mcp", "/mcp")):
+        m = _installed_container(registry, nm)
         if m is None:
-            assert nm != "file-tools", "in-repo file-tools manifest must exist"
             continue
         e = registry.resolve_server_config(m, "a", mcp_config_format="json")
         assert e["url"] == f"http://localhost:{m.server.port}{suffix}", nm
@@ -169,13 +180,11 @@ def test_resolve_server_config_service_dns_in_t2(t2, registry):
     cases = {
         "file-tools": "http://file-tools:8932/mcp/",
         "camoufox": "http://camoufox:8931/mcp/",
-        "github-mcp": "http://github-mcp:8935/mcp",
         "m365-mcp": "http://m365-mcp:3000/mcp",
     }
     for nm, expected in cases.items():
-        m = registry.get_manifest(nm)
+        m = _installed_container(registry, nm)
         if m is None:
-            assert nm != "file-tools", "in-repo file-tools manifest must exist"
             continue
         e = registry.resolve_server_config(m, "a", mcp_config_format="json")
         assert e["url"] == expected, nm

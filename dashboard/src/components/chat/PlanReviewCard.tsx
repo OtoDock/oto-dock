@@ -122,7 +122,7 @@ export default function PlanReviewCard({
             onPaste={pasteGuard.onPaste}
             onBlur={pasteGuard.onBlur}
             placeholder="Describe what to change in the plan..."
-            className="w-full px-3 py-2 text-sm pointer-coarse:text-base border border-brand/30 rounded-lg resize-none
+            className="w-full px-3 py-2 text-sm border border-brand/30 rounded-lg resize-none
                        bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light
                        focus:outline-hidden focus:ring-1 focus:ring-brand"
             rows={3}

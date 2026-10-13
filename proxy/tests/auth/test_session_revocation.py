@@ -298,3 +298,28 @@ class TestDeletion:
                           headers={"Cookie": f"session={_cookie()}"})
         assert r.status_code == 200, r.text
         assert key not in token_holder._answers
+
+
+def test_a_holder_read_in_flight_at_a_forget_caches_nothing(monkeypatch):
+    """A read that began before a password change and ends after its
+    ``forget`` answers its caller but leaves no pass in the cache."""
+    import asyncio
+
+    import storage.pg
+
+    payload = {"user_sub": "user-race", "iat": 1}
+
+    async def _read(fn, *a):
+        token_holder.forget("user-race")
+        return True
+    monkeypatch.setattr(storage.pg, "run_db_fast", _read)
+    token_holder.reset_for_tests()
+    assert asyncio.run(token_holder.holder_ok(payload)) is True
+    assert ("user-race", 1) not in token_holder._answers
+
+    async def _plain(fn, *a):
+        return True
+    monkeypatch.setattr(storage.pg, "run_db_fast", _plain)
+    assert asyncio.run(token_holder.holder_ok(payload)) is True
+    assert token_holder._answers[("user-race", 1)][0] is True
+    token_holder.reset_for_tests()

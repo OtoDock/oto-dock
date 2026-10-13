@@ -162,6 +162,7 @@ class TestPermissionMatrix:
 
         async def fake_request(self, method, url, **kw):
             seen["method"], seen["url"], seen["json"] = method, url, kw.get("json")
+            seen["timeout"] = kw.get("timeout")
             return _mock_response({
                 "ok": False,
                 "errors": ["lib/.env: a .env file is refused at install"],
@@ -172,6 +173,9 @@ class TestPermissionMatrix:
         text = asyncio.run(m.call_tool("validate_mcp_package", {"path": "/workspace/weather-tools"}))[0].text
         assert seen["method"] == "POST" and seen["url"].endswith("/v1/mcps/local-package/validate")
         assert seen["json"] == {"path": "/workspace/weather-tools"}
+        # A remote session's folder is read from its machine first, under
+        # the platform's 60 s deadline: the call outwaits it and the check.
+        assert seen["timeout"] == 120.0
         assert text.startswith("❌ Package is not valid yet")
         assert "lib/.env" in text and "README.md is missing" in text
 
@@ -186,6 +190,53 @@ class TestPermissionMatrix:
         assert text.startswith("✅ Package `weather-tools` is valid (node, npm:weather)")
         assert "weather-usage" in text and "Admin → MCP Servers → Install" in text
         assert "path is required" in asyncio.run(m.call_tool("validate_mcp_package", {}))[0].text
+
+    def test_validate_package_retries_only_a_connection_that_never_opened(self, monkeypatch):
+        """A timeout or a 5xx is the folder read failing or running long: a
+        second attempt would only repeat it. Another tool keeps its retry."""
+        m = _load_server({
+            "OTO_AGENT_NAME": "pa", "OTO_SCOPE": "user",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
+            "PROXY_URL": "http://test", "PROXY_API_KEY": "k",
+        })
+        verdict = {"ok": True, "errors": [], "warnings": [], "summary": {"name": "weather-tools"}}
+        calls: list[str] = []
+
+        def _serve(*outcomes):
+            pending = list(outcomes)
+            calls.clear()
+
+            async def fake_request(self, method, url, **kw):
+                calls.append(url)
+                outcome = pending.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return _mock_response(*outcome)
+            monkeypatch.setattr(httpx.AsyncClient, "request", fake_request)
+
+        async def _no_wait(_s):
+            return None
+        monkeypatch.setattr(m.asyncio, "sleep", _no_wait)
+
+        def _validate():
+            return asyncio.run(m.call_tool(
+                "validate_mcp_package", {"path": "/workspace/weather-tools"}))[0].text
+
+        _serve(httpx.ReadTimeout("slow"), (verdict,))
+        assert _validate().startswith("❌ Error: network:") and len(calls) == 1
+        _serve(({"detail": "'laptop' did not list the package folder, retry in a moment"}, 503),
+               (verdict,))
+        text = _validate()
+        assert text.startswith("❌ Error: HTTP 503: 'laptop' did not list") and len(calls) == 1
+        _serve(httpx.ConnectError("refused"), (verdict,))
+        assert _validate().startswith("✅ Package `weather-tools` is valid") and len(calls) == 2
+
+        _serve(({"detail": "busy"}, 503), ({"id": 7, "status": "cancelled"},))
+        out = asyncio.run(m.call_tool("cancel_my_request", {"request_id": 7}))[0].text
+        assert "#7 cancelled" in out and len(calls) == 2
+        _serve(httpx.ReadTimeout("slow"), ({"id": 7, "status": "cancelled"},))
+        out = asyncio.run(m.call_tool("cancel_my_request", {"request_id": 7}))[0].text
+        assert "#7 cancelled" in out and len(calls) == 2
 
     def test_list_tools_filters_to_enabled(self):
         m = _load_server({

@@ -86,7 +86,7 @@ def _process(row: dict, body: dict, monkeypatch, *, triggers=None, fired_log=Non
     monkeypatch.setattr(
         trigger_store, "list_triggers", lambda **kw: triggers or [])
 
-    async def fake_fan_out(*, triggers, body, event, trigger_source):
+    async def fake_fan_out(*, triggers, body, event, trigger_source, event_id=""):
         if fired_log is not None:
             fired_log.append((event.event_type, [t.get("id") for t in triggers]))
         return (len(triggers), [])
@@ -715,7 +715,7 @@ def test_zoom_handshake_signs_nothing_the_dispatcher_fires(monkeypatch):
         {"id": "t-1", "subscription_id": sub, "event_filter": "{}"}])
     fired: list = []
 
-    async def fake_fan_out(*, triggers, body, event, trigger_source):
+    async def fake_fan_out(*, triggers, body, event, trigger_source, event_id=""):
         fired.append(body)
         return (len(triggers), [])
     monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
@@ -829,7 +829,7 @@ def test_batch_scans_the_subscription_triggers_once(monkeypatch):
     monkeypatch.setattr(trigger_store, "list_triggers", fake_list)
     fired: list[int] = []
 
-    async def fake_fan_out(*, triggers, body, event, trigger_source):
+    async def fake_fan_out(*, triggers, body, event, trigger_source, event_id=""):
         fired.append(len(triggers))
         return (len(triggers), [])
     monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
@@ -886,7 +886,7 @@ def test_receive_store_work_leaves_the_loop(temp_db, loop_db_guard, monkeypatch)
                                  event_filter={})
     fired: list[str] = []
 
-    async def fake_fan_out(*, triggers, body, event, trigger_source):
+    async def fake_fan_out(*, triggers, body, event, trigger_source, event_id=""):
         fired.extend(t["id"] for t in triggers)
         return (len(triggers), [])
     monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
@@ -1371,3 +1371,70 @@ def test_a_body_with_no_declared_length_reserves_its_cap(_receivers, monkeypatch
     webhooks, _calls = _receivers
     r = asyncio.run(webhooks.receive_relay_webhook("slack", _receive_request([b"{}"])))
     assert r.status_code == 503  # 2 MB reserved > the small tier's 1 MB half
+
+
+# ─── One event id per vendor event ──────────────────────────────────────────
+# Two subscriptions that see one event (a repository hook and its
+# organization's hook, two accounts, relay fan-in) deliver it twice with the
+# same vendor id; the key the fan-out passes is the same for both and names
+# the provider, so the action it wakes runs once.
+
+def test_the_fan_out_gets_the_vendors_own_id_keyed_by_provider(monkeypatch):
+    seen: list[str] = []
+
+    async def fake_fan_out(*, triggers, body, event, trigger_source, event_id=""):
+        seen.append(event_id)
+        return (len(triggers), [])
+
+    monkeypatch.setattr(webhook_subscription_store, "record_event_received", lambda sid: None)
+    monkeypatch.setattr(trigger_store, "list_triggers",
+                        lambda **kw: [{"id": "t-1", "event_filter": "{}"}])
+    monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
+    for sub in ("sub-repo", "sub-org"):
+        asyncio.run(webhook_dispatcher._process_subscription_events(
+            row={**_row(sub, []), "provider_id": "slack"},
+            provider=GenericWebhookProvider(provider_id="slack"),
+            webhooks_block=_WEBHOOKS_BLOCK,
+            parsed_body=_slack_body("reaction_added", event_id="Ev77"), headers_lc={},
+        ))
+    assert seen == ["slack:Ev77", "slack:Ev77"]
+
+
+def test_a_vendor_key_names_its_provider_and_stays_short():
+    from services.webhooks.event_normalizer import vendor_event_key
+    assert vendor_event_key("github", "a1b2-c3") == "github:a1b2-c3"
+    assert vendor_event_key("linear", "a1b2-c3") != vendor_event_key("github", "a1b2-c3")
+    assert vendor_event_key("github", "") == "" and vendor_event_key("", "x") == ""
+    long_id = "AAMkAGI2" * 40
+    key = vendor_event_key("microsoft", long_id)
+    assert key.startswith("microsoft:sha256:") and len(key) < 100
+    assert key == vendor_event_key("microsoft", long_id)        # stable on a redelivery
+
+
+def test_a_derived_microsoft_key_never_becomes_the_events_own_id():
+    # Graph items carry no per-notification id as a rule; the ring keys it
+    # derives repeat for every later change of the item, so the durable
+    # handler dedupe must never see them.
+    from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
+    provider = MicrosoftWebhookProvider()
+    items = [{"subscriptionId": "s1", "changeType": "updated",
+              "resourceData": {"id": "evt-1"}},
+             {"subscriptionId": "s1", "changeType": "created", "id": "n-9"}]
+    events = provider.normalize_payload_batch(body={"value": items}, headers={},
+                                              manifest_block={})
+    assert [e.vendor_event_id for e in events] == ["evt-1:updated", "n-9"]
+    assert [e.global_event_id for e in events] == ["", "n-9"]
+
+
+def test_a_duplicate_is_counted_as_one_not_as_fired(monkeypatch):
+    from services.scheduler import trigger_manager
+
+    async def fake_fire(row, body, **kw):
+        return {"status": "ok", "actions": ["duplicate"] if row["id"] == "t-2" else ["app"]}
+
+    monkeypatch.setattr(trigger_manager, "fire_trigger", fake_fire)
+    from auth.webhook_providers.base import NormalizedEvent
+    fired, errors = asyncio.run(webhook_dispatcher._fan_out_fire(
+        triggers=[{"id": "t-1"}, {"id": "t-2"}], body={}, event=NormalizedEvent(),
+        trigger_source="webhook:x", event_id="github:g1"))
+    assert (fired, errors) == (1, [])

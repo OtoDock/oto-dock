@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../../api/auth'
-import { useAuth } from '../../contexts/AuthContext'
-import { useTitleGeneration, useSaveTitleGeneration } from '../../api/titleGeneration'
+import { useFlag } from '../../hooks/useFlag'
+import { useTitleGeneration, useSaveTitleGeneration, useCheckTitleGeneration } from '../../api/titleGeneration'
 import { useMcpAutoUpdateLog, type McpAutoUpdateRow } from '../../api/mcps'
 import { useMemorySettings, useUpdateMemorySettings } from '../../api/memory'
 import {
@@ -279,9 +279,10 @@ function StorageQuotasCard({
 // Chat-title generation — provider/model sourced from the Direct LLM execution
 // layer (replaces the old per-key OpenAI title path). Toggle + model dropdown +
 // Active/Inactive badge, mirroring the phone Turn-Classifier card.
-function ChatTitleGenerationCard() {
+export function ChatTitleGenerationCard() {
   const { data: tg, isLoading } = useTitleGeneration()
   const saveMutation = useSaveTitleGeneration()
+  const check = useCheckTitleGeneration()
 
   if (isLoading || !tg) {
     return (
@@ -294,17 +295,22 @@ function ChatTitleGenerationCard() {
   const autoLabel = (!tg.selected_model && tg.active_model)
     ? `Auto — ${tg.active_model}`
     : 'Auto (first configured provider)'
+  // Configured is not working: the last title (or Check) says which it is.
+  const failing = tg.active && tg.last_attempt?.ok === false
+  const badge = !tg.active ? 'Inactive' : failing ? 'Not working' : 'Active'
 
   return (
     <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-5 space-y-4">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold text-p-text">Chat Title Generation</h3>
         <span className={`text-xs px-2 py-0.5 rounded-full ${
-          tg.active
-            ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-            : 'bg-p-bg text-p-text-light border border-p-border-light'
+          failing
+            ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'
+            : tg.active
+              ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+              : 'bg-p-bg text-p-text-light border border-p-border-light'
         }`}>
-          {tg.active ? 'Active' : 'Inactive'}
+          {badge}
         </span>
       </div>
       <p className="text-xs text-p-text-light">
@@ -349,10 +355,41 @@ function ChatTitleGenerationCard() {
         </select>
       </div>
 
+      {tg.unlisted_pin && (
+        <p className="text-xs text-amber-700 dark:text-amber-400" data-testid="title-gen-unlisted">
+          The pinned model {tg.unlisted_pin} is no longer offered; titles use Auto.
+        </p>
+      )}
+
       {!tg.active && tg.enabled && (
         <p className="text-xs text-amber-700 dark:text-amber-400">
           No Direct LLM provider configured — add one under AI Engines → Direct LLM to activate.
         </p>
+      )}
+
+      {tg.active && (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="min-w-0 flex-1 text-xs text-p-text-light" data-testid="title-gen-last">
+            {failing
+              ? <span className="text-amber-700 dark:text-amber-400">Titles are not being made: {tg.last_attempt?.reason}.</span>
+              : tg.last_attempt?.ok
+                ? tg.last_attempt.kind === 'credential'
+                  ? 'The credential resolves. No title made since the server started.'
+                  : 'The last title came through.'
+                : 'No title tried since the server started. Check makes sure the credential resolves.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => check.mutate()}
+            disabled={check.isPending}
+            className="shrink-0 rounded-lg border border-p-border-light px-2.5 py-1 text-xs text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-50"
+          >
+            {check.isPending ? 'Checking…' : 'Check'}
+          </button>
+        </div>
+      )}
+      {check.isError && (
+        <p className="text-xs text-red-600 dark:text-red-400" role="alert">{(check.error as Error).message}</p>
       )}
     </div>
   )
@@ -446,12 +483,11 @@ function McpAutoUpdateCard({ enabled, forced, saved, onToggle }: {
 // ---------------------------------------------------------------------------
 
 export default function SystemSettingsTab() {
-  const { user } = useAuth()
   const { data, isLoading } = usePlatformSettings()
   const saveMutation = useSavePlatformSettings()
   // Hide the remote-machine policy rows when this build ships without the
   // feature (settings for an absent feature are dead controls).
-  const remoteMachinesAvailable = user?.feature_flags?.remote_machines_available !== false
+  const remoteMachinesAvailable = useFlag('remote_machines_available')
   const { data: stats } = useConcurrencyStats()
   const { data: memory } = useMemorySettings()
   const saveMemory = useUpdateMemorySettings()

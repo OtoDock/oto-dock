@@ -48,9 +48,28 @@ def get_prefs(user_sub: str) -> dict:
 _MERGED_PREFS_MAX_BYTES = 64 * 1024
 
 
+def mark_release_seen(user_sub: str, version: str) -> None:
+    """``last_seen_version`` set in place (``data || {...}`` in one
+    statement): atomic, so a second tab's read-then-write merge cannot drop
+    it, and outside the merged-bag cap (one short key)."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO user_ui_prefs (user_sub, data, updated_at)
+               VALUES (%s, %s::jsonb, %s)
+               ON CONFLICT (user_sub) DO UPDATE SET
+                   data = user_ui_prefs.data || EXCLUDED.data,
+                   updated_at = EXCLUDED.updated_at""",
+            (user_sub, json.dumps({"last_seen_version": version}), _now()),
+        )
+        conn.commit()
+
+
 def upsert_prefs(user_sub: str, data: dict) -> dict:
     """Insert or update the user's prefs bag. Shallow merge: the provided
-    top-level keys overwrite the stored ones; every other stored key is kept."""
+    top-level keys overwrite the stored ones; every other stored key is kept.
+    The merge happens in the statement (``data || EXCLUDED.data``), so two
+    tabs writing different keys never drop each other's; the cap is judged on
+    the bag as read, a race across it is a few bytes."""
     merged = {**get_prefs(user_sub), **data}
     if len(json.dumps(merged)) > _MERGED_PREFS_MAX_BYTES:
         raise ValueError(
@@ -61,12 +80,12 @@ def upsert_prefs(user_sub: str, data: dict) -> dict:
     with get_conn() as conn:
         row = conn.execute(
             """INSERT INTO user_ui_prefs (user_sub, data, updated_at)
-               VALUES (%s, %s, %s)
+               VALUES (%s, %s::jsonb, %s)
                ON CONFLICT (user_sub) DO UPDATE SET
-                   data = EXCLUDED.data,
+                   data = user_ui_prefs.data || EXCLUDED.data,
                    updated_at = EXCLUDED.updated_at
                RETURNING data""",
-            (user_sub, json.dumps(merged), now),
+            (user_sub, json.dumps(data), now),
         ).fetchone()
         conn.commit()
         return _json_field(row["data"])

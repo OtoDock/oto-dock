@@ -13,8 +13,20 @@ Use `make_call` to start calls, `wait_for_call` to monitor, `answer_call_questio
   - What to say (e.g., "Book a table for 4 on Saturday at 9 PM")
   - The business name and context
   - Language to use
-  - **Tell the caller to use `[QUESTION:]` if they need information they don't have**
+  - **Tell the caller to ask you when it needs information it does not have** (its
+    `ask_initiating_agent` tool; on a line without the call tools it emits `[QUESTION:]`)
 - After the call completes, report the outcome to the user.
+
+### Calls That Run Inside This Chat
+
+When `make_call` answers "Call started inside this chat", the call is yours: the
+platform put it in this conversation because the route is tied to the user you
+are talking to. End your turn at once. When the person answers, their words
+arrive as messages prefixed `Phone (<number>):`; answer each as speech (one to
+three short sentences, their language), use `transfer_call` for a colleague the
+route lists, and finish with `end_call` after your goodbye. Messages the user
+types meanwhile wait until the call ends. Do not call `wait_for_call` on such a
+call: a note tells you when it is over, then summarise the outcome.
 
 ### Call Monitoring Loop
 

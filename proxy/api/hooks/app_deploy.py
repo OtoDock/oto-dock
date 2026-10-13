@@ -28,7 +28,7 @@ from storage import database as task_store
 from storage import db_apps
 from core import layout
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 
@@ -233,13 +233,13 @@ async def hook_app_screenshot(req: HookAppScreenshotRequest, authorization: str 
         report = await app_render.render_live(row, approved=approved)
     else:
         username, _owner, rel_dir = await _folder_source(ctx, slug, req.visibility)
+        source = _scoped(ctx, username, rel_dir)
         from core.remote import remote_file_flow
         if remote_file_flow.is_remote_session(req.session_id):
             try:
                 await app_deploy.pull_folder(req.session_id, rel_dir)
             except app_deploy.DeployError as e:
                 raise HTTPException(status_code=400, detail=str(e))
-        source = _scoped(ctx, username, rel_dir)
         if not source.is_dir():
             raise HTTPException(status_code=400, detail=f"no folder at apps/{slug} in your scope")
         try:
@@ -271,13 +271,13 @@ async def hook_app_preview(req: HookAppDeployRequest, authorization: str | None 
     _vis, row = await _find_app_row(ctx, slug, req.visibility)
     if not db_apps.app_kind_of(row).serves_tree:
         raise HTTPException(status_code=400, detail="preview is for folder apps")
+    source = _scoped(ctx, username, rel_dir)
     from core.remote import remote_file_flow
     if remote_file_flow.is_remote_session(req.session_id):
         try:
             await app_deploy.pull_folder(req.session_id, rel_dir)
         except app_deploy.DeployError as e:
             raise HTTPException(status_code=400, detail=str(e))
-    source = _scoped(ctx, username, rel_dir)
     try:
         sha = await app_deploy.cut_preview(row, source)
     except app_deploy.DeployError as e:
@@ -472,17 +472,19 @@ async def hook_app_import(req: HookImportRequest, authorization: str | None = He
         raise HTTPException(status_code=403, detail="another user's files are not readable here")
     else:
         full_rel = f"{scope_root}/{rel}"
-    from core.remote import remote_file_flow
-    if remote_file_flow.is_remote_session(req.session_id):
-        await remote_file_flow.pull_through(req.session_id, full_rel)
     _scoped(ctx, "" if full_rel.startswith(f"{layout.WORKSPACE}/") else ctx.username, full_rel)
+    from core.remote import remote_file_flow
+    held: list[str] = []
+    if remote_file_flow.is_remote_session(req.session_id):
+        await remote_file_flow.pull_through(req.session_id, full_rel, held=held)
     # The bundle is read as a regular file beneath the agent's tree, never
     # through a link.
     try:
         data = await asyncio.to_thread(safe_fs.read_bytes_beneath, config.AGENTS_DIR,
                                        f"{ctx.agent}/{full_rel}", max_size=app_blueprints.MAX_BUNDLE_BYTES)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"no file at {full_rel}")
+        raise HTTPException(status_code=404, detail=(
+            remote_file_flow.held_reason(full_rel) if held else f"no file at {full_rel}"))
     except safe_fs.FileTooLarge:
         raise HTTPException(status_code=400, detail="the bundle is larger than 40 MB")
     except OSError:

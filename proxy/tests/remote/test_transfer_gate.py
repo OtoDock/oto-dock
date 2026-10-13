@@ -106,7 +106,7 @@ async def test_threshold_bypass_while_slots_held(monkeypatch):
 async def test_queued_then_active_and_single_info_log(caplog, monkeypatch):
     monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
     tg.reset_for_tests()
-    caplog.set_level("INFO", logger="claude-proxy.transfer-gate")
+    caplog.set_level("INFO", logger="otodock.transfer-gate")
     order: list[str] = []
     parked = asyncio.Event()
     release = asyncio.Event()

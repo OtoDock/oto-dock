@@ -53,6 +53,7 @@ def layer():
     lay._cm.satellite_supports_local_model_provider.return_value = True
     lay._cm.satellite_supports_local_model_catalog.return_value = True
     lay._cm.satellite_supports_codex_hooks_floor.return_value = True
+    lay._cm.satellite_supports_codex_attended_floor.return_value = True
     lay._cm.satellite_version.return_value = "0.5.118"
     lay._cm.satellite_name.return_value = "drill-sat"
     return lay
@@ -107,9 +108,81 @@ class TestCodexHooksFloorPayload:
         assert "no PreToolUse permission floor" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_old_satellite_attended_chat_is_silent(self, layer, caplog):
+    async def test_old_satellite_attended_chat_names_no_unattended_floor(self, layer, caplog):
         layer._cm.satellite_supports_codex_hooks_floor.return_value = False
         with caplog.at_level(logging.WARNING, logger="remote-layer"):
             payload = await _build(layer, _config(client_type="dashboard", permission_mode="default"))
         assert payload["codex_hooks_floor"] is False
-        assert "permission floor" not in caplog.text
+        assert "no PreToolUse permission floor" not in caplog.text
+
+
+class TestCodexAttendedFloorPayload:
+    """An attended chat (satellite 0.5.143): ``codex_attended_floor`` makes
+    the satellite trust the hook on every thread with the bridged env, and the
+    live ``permission_mode`` lets it derive the approval policy by mode."""
+
+    @pytest.mark.asyncio
+    async def test_an_attended_chat_carries_the_field_and_its_mode(self, layer, caplog):
+        with caplog.at_level(logging.WARNING, logger="remote-layer"):
+            payload = await _build(layer, _config(client_type="dashboard", permission_mode="dontAsk"))
+        assert payload["codex_attended_floor"] is True and payload["codex_hooks_floor"] is False
+        assert payload["permission_mode"] == "dontAsk"
+        assert "until it updates" not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("client_type", _UNATTENDED)
+    async def test_unattended_sessions_and_the_tui_take_no_attended_floor(self, layer, client_type):
+        payload = await _build(layer, _config(client_type=client_type))
+        assert payload["codex_attended_floor"] is False
+        payload = await _build(layer, _config(client_type="dashboard", interactive=True))
+        assert payload["codex_attended_floor"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_older_satellite_gets_no_live_mode_and_one_warning(self, layer, caplog):
+        layer._cm.satellite_supports_codex_attended_floor.return_value = False
+        layer._cm.satellite_version.return_value = "0.5.142"
+        with caplog.at_level(logging.WARNING, logger="remote-layer"):
+            payload = await _build(layer, _config(client_type="dashboard", permission_mode="default"))
+        assert payload["codex_attended_floor"] is True  # ignored by that satellite
+        assert payload["permission_mode"] == ""          # its plan mode would freeze
+        assert caplog.text.count("(< 0.5.143)") == 1
+        assert "drill-sat runs satellite 0.5.142" in caplog.text
+        # A task on it: no attended-floor warning (its floor is 0.5.118's).
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="remote-layer"):
+            await _build(layer, _config(client_type="task"))
+        assert "0.5.143" not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("supported", [True, False])
+    async def test_a_mode_change_carries_the_platform_mode_from_0_5_143(self, supported):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from core.layers.codex.remote import CodexRemoteAdapter
+        from core.remote.remote_session_info import RemoteSessionInfo
+        cm = MagicMock()
+        cm.send_fire_and_forget = AsyncMock()
+        cm.satellite_supports_codex_attended_floor.return_value = supported
+        info = RemoteSessionInfo(session_id="sess-1", machine_id="machine-1",
+                                 agent_name="a", execution_path="codex-cli",
+                                 event_queue=asyncio.Queue(), allow_full_fs=True)
+        assert await CodexRemoteAdapter(None).control_request(
+            info, cm, "set_permission_mode", mode="default")
+        frame = cm.send_fire_and_forget.call_args.args[1]
+        assert frame["kwargs"]["sandbox_mode"] == "danger-full-access"
+        if supported:
+            assert frame["kwargs"]["permission_mode"] == "default"
+        else:
+            assert "permission_mode" not in frame["kwargs"]
+
+
+def test_every_capability_floor_is_a_shipped_satellite_version():
+    # A gate above the satellite this tree ships would leave its feature off
+    # on every machine (the 0.5.143 floor waits on the closing version bump).
+    from core.remote import satellite_connection as sc
+    from ws.satellite import SATELLITE_VERSION_LATEST
+    latest = tuple(int(x) for x in SATELLITE_VERSION_LATEST.split("."))
+    floors = {name: value for name, value in vars(sc).items()
+              if name.startswith("_") and name.endswith("_MIN_VERSION") and isinstance(value, tuple)}
+    assert "_CODEX_ATTENDED_FLOOR_MIN_VERSION" in floors
+    assert {name: v for name, v in floors.items() if v > latest} == {}

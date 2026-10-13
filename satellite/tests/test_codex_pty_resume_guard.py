@@ -18,6 +18,7 @@ if sys.platform == "win32":  # pragma: no cover - unix backend under test
     pytest.skip("unix pty backend", allow_module_level=True)
 
 from satellite.terminal.codex_pty_session import CodexPtySession
+from satellite._vendored.terminal_queries import PasteModeTracker
 from satellite.terminal.pty_relay import PtyProcess
 
 
@@ -84,6 +85,7 @@ class TestInjectOutput:
         p._scrollback = deque()
         p._scrollback_len = 0
         p._scrollback_limit = 65536
+        p._paste_mode = PasteModeTracker()
         p._on_output = out.append
         p._loop = asyncio.get_event_loop()
         p.inject_output(b"\x1b[2mnotice\x1b[0m\r\n")
@@ -101,6 +103,7 @@ class TestInjectOutput:
         p._scrollback = deque()
         p._scrollback_len = 0
         p._scrollback_limit = 65536
+        p._paste_mode = PasteModeTracker()
         p._on_output = _sink
         p._loop = asyncio.get_event_loop()
         p.inject_output(b"x")

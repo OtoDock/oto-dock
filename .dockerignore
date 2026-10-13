@@ -12,6 +12,8 @@ proxy/config/fcm-service-account.json
 agents/
 # recover-bin holds DELETED USER FILE CONTENTS — a hard no for image history.
 recover-bin/
+# backup.sh's run directories hold the env file (every secret) and the trees.
+backups/
 host-media-cache/
 
 # ── Runtime state / caches ──

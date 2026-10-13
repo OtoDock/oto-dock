@@ -40,7 +40,7 @@ from fastapi import Request
 import config
 from auth.lan_check import client_address
 
-logger = logging.getLogger("claude-proxy.api.webhooks")
+logger = logging.getLogger("otodock.api.webhooks")
 
 #: The scope key a route sets to lift the middleware's cap (``lift``).
 SCOPE_KEY = "otodock.webhook_body_cap"

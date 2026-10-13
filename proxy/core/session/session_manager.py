@@ -19,7 +19,7 @@ from core.layers.codex import CodexCLIExecutionLayer
 if TYPE_CHECKING:
     from core.remote.remote_execution import RemoteExecutionLayer
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +107,15 @@ def find_layer_for_session(session_id: str) -> ExecutionLayer | None:
         if layer.owns_session(session_id):
             return layer
     return None
+
+
+def layer_for_prewarm(session_id: str, execution_path: str) -> ExecutionLayer | None:
+    """The layer to close a pre-warmed session on: the one holding it, else
+    the pre-warm's own engine. A pool drops a dead entry on any lookup, so
+    "nobody holds it" still needs the close that frees its seat and slot
+    (``close_session`` is safe on an id no pool holds). Pre-warms are always
+    local: remote targets and interactive sessions are never pre-warmed."""
+    return find_layer_for_session(session_id) or _LAYERS.get(execution_path)
 
 
 def engine_layer_for_session(session_id: str) -> ExecutionLayer | None:
@@ -212,7 +221,7 @@ def get_execution_layer(
             # `not user_sub` (NOT `is None`) — `pick_account` treats both None
             # AND "" as service-scope, so a service-account session with an empty
             # user_sub must also be refused here, else its service-account
-            # credentials (GH_TOKEN, MCP bearer, …) would land on a user-owned
+            # credentials (a GitHub token, an MCP bearer, …) would land on a user-owned
             # disk. Fail-closed: a real user-scope session always has a truthy sub.
             if not user_sub:
                 raise RuntimeError(

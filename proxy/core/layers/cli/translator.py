@@ -141,6 +141,7 @@ class ClaudeCLIEventTranslator:
         "block_types",
         "active_tool",
         "open_tools",
+        "interrupted",
         "has_emitted_text",
         "_tool_inputs",
         "_tool_input_names",
@@ -168,6 +169,10 @@ class ClaudeCLIEventTranslator:
         # ``tool_result``): the turn's life while it streams nothing
         # (core/events/turn_life.py reads it through the session loops).
         self.open_tools: set[str] = set()
+        # The session asked the CLI to interrupt this turn (stop-and-send, a
+        # graceful abort): its "[ede_diagnostic]" error result is that
+        # interrupt landing, not an engine error.
+        self.interrupted: bool = False
         self.has_emitted_text: bool = False
         self._tool_inputs: dict[int, list[str]] = {}
         self._tool_input_names: dict[int, str] = {}
@@ -885,6 +890,8 @@ class ClaudeCLIEventTranslator:
                 error_text = "; ".join(str(e) for e in errors_list)
         if is_error and self.ending_emitted:
             pass  # the typed ending already said it
+        elif is_error and self.interrupted and error_text.lstrip().startswith("[ede_diagnostic]"):
+            pass  # the interrupt this turn was asked for ended it
         elif is_error and (self._limit_notice or turn_ending.is_limit_text(error_text)):
             chunks.extend(self._ending_chunks(turn_ending.TurnEnding(
                 reason=turn_ending.LIMIT,

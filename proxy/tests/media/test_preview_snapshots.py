@@ -18,6 +18,19 @@ from fastapi.testclient import TestClient
 from storage import database as task_store
 
 
+
+@pytest.fixture(autouse=True)
+def _wopi_persons_hold(monkeypatch):
+    """The WOPI routes judge the person a token names (the users row, the
+    credential timeline, the forced change): these tests mint tokens for
+    subs with no row, so the person holds unless a test asks otherwise
+    (``_REAL_PERSON_HOLDS``)."""
+    from api.media import wopi
+    monkeypatch.setattr(wopi, "_person_holds_now", lambda sub, iat: True)
+    wopi._holder_answers.clear()
+    yield
+    wopi._holder_answers.clear()
+
 @pytest.fixture
 def snap_root(tmp_path, monkeypatch):
     import config
@@ -583,10 +596,16 @@ def test_preview_remint_404s(temp_db, tmp_path, monkeypatch):
 def test_preview_remint_host_cache_is_session_scoped(temp_db, tmp_path, monkeypatch):
     import config
     from api.media.wopi import encode_file_id
+    from types import SimpleNamespace
     task_store.create_chat("chat-1", "user-a", "test-agent")
     task_store.update_chat("chat-1", session_id="sess-1")
+    # The live session runs as user-a: the file on its machine is theirs.
+    monkeypatch.setattr("storage.database.get_username_by_sub",
+                        lambda sub: {"user-a": "alice", "user-b": "bob"}.get(sub, ""))
+    monkeypatch.setattr("core.session.session_state.get_session_security",
+                        lambda sid: SimpleNamespace(username="alice") if sid == "sess-1" else None)
     client = _mint_app(monkeypatch, tmp_path)  # manager role
-    # A mirror in the CHAT'S OWN session cache → edit for write-capable roles.
+    # A mirror in the CHAT'S OWN session cache → edit for the session's person.
     own_rel = ".remote-host-cache/sess-1/d1/notes.docx"
     (config.AGENTS_DIR / own_rel).parent.mkdir(parents=True, exist_ok=True)
     (config.AGENTS_DIR / own_rel).write_bytes(b"host bytes")
@@ -594,6 +613,10 @@ def test_preview_remint_host_cache_is_session_scoped(temp_db, tmp_path, monkeypa
     _add_preview_row("chat-1", own_fid, "")
     body = _remint(client, "chat-1", own_fid).json()
     assert body["permissions"] == "edit"
+    # A teammate who opens the chat (here an admin) views the file on
+    # another person's machine.
+    teammate = _mint_app(monkeypatch, tmp_path, sub="user-b", is_admin=True)
+    assert _remint(teammate, "chat-1", own_fid).json()["permissions"] == "view"
     # ANOTHER session's cache: still readable through the chat's live event,
     # but never editable — write-back is scoped to the chat's own session.
     other_rel = ".remote-host-cache/sess-other/d2/notes.docx"

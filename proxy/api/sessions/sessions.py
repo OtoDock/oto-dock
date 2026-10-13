@@ -35,7 +35,7 @@ from core.layers.cli import (
 )
 from core.layers.direct import create_direct_session, close_direct_session
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 

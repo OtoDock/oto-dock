@@ -26,7 +26,7 @@ from core.session import visibility as _vis
 from core import layout
 
 
-logger = logging.getLogger("claude-proxy.git-history-api")
+logger = logging.getLogger("otodock.git-history-api")
 router = APIRouter(prefix="/v1/internal/git")
 
 

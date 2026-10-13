@@ -33,7 +33,7 @@ import httpx
 
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under
 
-logger = logging.getLogger("claude-proxy.community-agents-catalog")
+logger = logging.getLogger("otodock.community-agents-catalog")
 
 
 # Env-overridable for DEV/TEST only (staging catalog / local static server).

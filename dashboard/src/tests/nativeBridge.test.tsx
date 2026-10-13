@@ -5,13 +5,13 @@
  * call posts on the channel, and nothing reads the retired `window.Android`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import ts from 'typescript'
 import { act, render } from '@testing-library/react'
 import {
-  askNative, callNative, hasNativeBridge, saveNativeFile, setNativeAuthInProgress,
-  setNativeSwitchBusy,
+  APP_PRIVACY_POLICY_URL, askNative, callNative, hasNativeBridge, saveNativeFile,
+  setNativeAuthInProgress, setNativeSwitchBusy,
 } from '@/lib/nativeBridge'
 import { installFakeNativeChannel, watchRetiredAndroidName } from './fixtures/nativeChannel'
 
@@ -130,5 +130,47 @@ describe('the source', () => {
       })
       .map((path) => relative(SRC, path))
     expect(offenders).toEqual([])
+  })
+})
+
+describe('the setup page', () => {
+  // The app's bundled first-run page (public/setup.html) loads nothing from
+  // another host: its fonts are the build's own copies under setup-fonts/.
+  const ROOT = join(__dirname, '..', '..')
+  const page = readFileSync(join(ROOT, 'public', 'setup.html'), 'utf8')
+
+  it('loads no resource from another host', () => {
+    expect(page).not.toMatch(/(?:src|href)\s*=\s*["']?\s*(?:https?:)?\/\//i)
+    expect(page).not.toMatch(/url\(\s*["']?\s*(?:https?:)?\/\//i)
+    expect(page).not.toMatch(/@import/i)
+  })
+
+  it('names only fonts the build copies beside it', () => {
+    const fonts = [...page.matchAll(/url\(setup-fonts\/([\w-]+\.woff2)\)/g)].map((m) => m[1])
+    expect(fonts.length).toBeGreaterThan(0)
+    expect(page).not.toMatch(/url\((?!setup-fonts\/)/)
+    const config = readFileSync(join(ROOT, 'vite.config.ts'), 'utf8')
+    const glob = config.match(/src: 'node_modules\/@fontsource\/comfortaa\/files\/comfortaa-\{([\w,]+)\}-\{([\d,]+)\}-normal\.woff2',\s*dest: 'setup-fonts'/)
+    expect(glob).not.toBeNull()
+    const [subsets, weights] = [glob![1].split(','), glob![2].split(',')]
+    for (const font of fonts) {
+      const [, subset, weight] = font.match(/^comfortaa-(\w+)-(\d+)-normal\.woff2$/)!
+      expect(subsets, font).toContain(subset)
+      expect(weights, font).toContain(weight)
+    }
+  })
+
+  it('shows the privacy link only when the app offers to open it', () => {
+    expect(page).toMatch(/typeof Android\.openPrivacyPolicy === 'function'/)
+    expect(page).toMatch(/id="privacy-link"[^>]*class="privacy-link"/)
+    expect(page).toMatch(/\.privacy-link \{\s*display: none;/)
+  })
+
+  // The native constant is checked only where the Android tree is present: the
+  // public cut stages it out with the mobile apps.
+  const policyPath = join(ROOT, 'android', 'app', 'src', 'main', 'java', 'com', 'otodock', 'NativeBridgePolicy.java')
+  it.skipIf(!existsSync(policyPath))('names the same privacy policy as the app', () => {
+    const policy = readFileSync(policyPath, 'utf8')
+    expect(policy).toContain(`PRIVACY_POLICY_URL = "${APP_PRIVACY_POLICY_URL}";`)
   })
 })

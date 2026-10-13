@@ -23,9 +23,42 @@ SUPPORTED_LANGUAGES: list[tuple[str, str]] = [
 ]
 
 
+#: The stored dictation preference for "let the engine identify the language"
+#: (the dashboard's Automatic row). The STT providers take it as their own
+#: detection sentinel (``multi``) through :func:`stt_language_param`.
+AUTO = "auto"
+
+
+def is_auto(tag: str | None) -> bool:
+    return (tag or "").strip().lower() == AUTO
+
+
+def stt_language_param(tag: str | None) -> str:
+    """The ``language`` a streaming STT ``start`` takes for a stored pick:
+    ``multi`` (the providers' detection sentinel) for ``auto`` or an empty
+    pick, else the tag as stored."""
+    if not tag or is_auto(tag):
+        return "multi"
+    return tag
+
+
 def base_lang(tag: str) -> str:
     """BCP-47 → base subtag, lowercased (``en-US`` → ``en``, ``el-GR`` → ``el``)."""
     return (tag or "").split("-", 1)[0].lower()
+
+
+def pcm16_to_wav(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
+    """A WAV container around raw 16-bit PCM — the shape every batch
+    transcription endpoint takes (a call's buffered utterance is raw)."""
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 
 # High-frequency function words per Latin language we ship. A match-count scorer

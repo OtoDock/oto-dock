@@ -20,6 +20,10 @@
  *   reported via setStreaming.
  */
 
+import { Capacitor } from '@capacitor/core'
+
+import { openExternalUrl } from './openExternal'
+
 export type NativeMethod =
   | 'dashboardReady'
   | 'setStreaming'
@@ -35,6 +39,7 @@ export type NativeMethod =
   | 'setFavorite'
   | 'renameInstallation'
   | 'disconnectServer'
+  | 'openPrivacyPolicy'
 
 export type NativeQuery = 'getInstallations' | 'switchToInstall' | 'openAuthBrowser'
 
@@ -63,6 +68,23 @@ function channel(): NativeChannel | null {
 /** True inside the Android app, on the page the app scoped its channel to. */
 export function hasNativeBridge(): boolean {
   return channel() !== null
+}
+
+/** True inside an app shell: the Android app's channel, or a Capacitor
+ *  native platform without it (the iOS app). */
+export function inAppShell(): boolean {
+  return hasNativeBridge() || Capacitor.isNativePlatform()
+}
+
+/** OtoDock's privacy policy for the apps; the stores require a link to it
+ *  inside the app. The Android app opens its own copy of the address. */
+export const APP_PRIVACY_POLICY_URL = 'https://otodock.io/legal/privacy'
+
+/** Open the privacy policy: the Android app hands it to the system browser,
+ *  a shell without the channel (a future iOS app) opens it as any outside
+ *  link. An app older than the method drops it. */
+export function openPrivacyPolicy(): void {
+  if (!callNative('openPrivacyPolicy')) void openExternalUrl(APP_PRIVACY_POLICY_URL)
 }
 
 function post(c: NativeChannel, header: object, body?: string): boolean {

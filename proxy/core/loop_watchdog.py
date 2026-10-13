@@ -48,7 +48,7 @@ import sys
 import threading
 import time
 
-logger = logging.getLogger("claude-proxy.loop-watchdog")
+logger = logging.getLogger("otodock.loop-watchdog")
 
 _TICK_S = 0.05
 _WATCH_S = 0.025

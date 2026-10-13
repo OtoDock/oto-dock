@@ -67,7 +67,7 @@ def _run(event, *, block, monkeypatch, responder, token="xoxp-tok", check=None):
     real_client = httpx.AsyncClient
     transport = httpx.MockTransport(responder)
     monkeypatch.setattr(
-        event_enrichment.httpx, "AsyncClient",
+        event_enrichment.vendor_http.httpx, "AsyncClient",
         lambda **kw: real_client(transport=transport,
                                  timeout=kw.get("timeout")),
     )
@@ -164,7 +164,7 @@ def test_enrichment_cache_hit_avoids_second_call(monkeypatch):
     real_client = httpx.AsyncClient
     transport = httpx.MockTransport(responder)
     monkeypatch.setattr(
-        event_enrichment.httpx, "AsyncClient",
+        event_enrichment.vendor_http.httpx, "AsyncClient",
         lambda **kw: real_client(transport=transport, timeout=kw.get("timeout")))
 
     ev1, ev2 = _event(), _event()

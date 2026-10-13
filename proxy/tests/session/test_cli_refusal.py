@@ -140,6 +140,20 @@ def test_any_other_error_result_is_the_error_ending():
     assert [c.is_error for c in chunks if c.text] == [True]
 
 
+def test_the_marker_of_an_interrupt_the_session_asked_for_is_no_error_ending():
+    # A graceful interrupt (stop-and-send) landing before the turn's first
+    # output closes it with an "[ede_diagnostic]" error result: the turn was
+    # interrupted as asked, so its queued message drains next. The same
+    # marker with no interrupt asked for stays the error ending.
+    marker = "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"
+    tr = ClaudeCLIEventTranslator("sess-1")
+    tr.interrupted = True
+    assert _endings(tr.feed(_error_result(marker))) == []
+    tr = ClaudeCLIEventTranslator("sess-1")
+    [ending] = _endings(tr.feed(_error_result(marker)))
+    assert ending.reason == turn_ending.ERROR
+
+
 def test_normal_message_delta_stays_silent():
     tr = ClaudeCLIEventTranslator("sess-1")
     assert tr.feed(_delta_event({"stop_reason": "end_turn"})) == []
@@ -150,11 +164,18 @@ def test_the_limit_matcher_knows_both_engines_notices():
     for text in (_LIMIT_TEXT, "You've hit your session limit · resets 3pm (UTC)",
                  "You've hit your usage limit. Upgrade to Pro or try again at 4:55 PM.",
                  "Claude AI usage limit reached|1790000000",
-                 # The usage-credits wording of the same notice (first met live 2026-10-04).
+                 # The usage-credits wording of the same notice (first met live 2026-10-04),
+                 # its 2.1.296 form and the org's wording on a Team or Enterprise login.
                  "You're out of usage credits. Switch to another model, or manage usage "
-                 "credits at claude.ai/settings/usage, to continue."):
+                 "credits at claude.ai/settings/usage, to continue.",
+                 "You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
+                 "or /model to switch models.",
+                 "Your org is out of usage · add funds to continue",
+                 "Your org is out of usage · contact your admin"):
         assert turn_ending.is_limit_text(text), text
-    for text in ("Not logged in", "Prompt is too long", "rate limit exceeded, retrying"):
+    for text in ("Not logged in", "Prompt is too long", "rate limit exceeded, retrying",
+                 # A plan fact, not a limit: resting the account would not help.
+                 "Your seat type doesn't include usage credits"):
         assert not turn_ending.is_limit_text(text), text
 
 

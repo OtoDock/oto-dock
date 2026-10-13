@@ -30,10 +30,10 @@ from core.events.stream_pump import ChatStreamPump
 def _seed_models():
     from storage.billing import subscription_store
     subscription_store.sync_builtin_models("claude-code-cli", [
-        {"value": "claude-sonnet-5", "label": "Sonnet 5", "provider": "anthropic"},
+        {"value": "claude-sonnet-5-5", "label": "Sonnet 5.5", "provider": "anthropic"},
     ])
     subscription_store.sync_builtin_models("codex-cli", [
-        {"value": "gpt-6-sol", "label": "GPT-6 Sol", "provider": "openai"},
+        {"value": "gpt-6.1-sol", "label": "GPT-6.1 Sol", "provider": "openai"},
     ])
 
 
@@ -42,7 +42,7 @@ def _make_agent(slug: str = "coherence-agent") -> str:
     agent_store.create_agent(
         slug, "Coherence",
         execution_path="claude-code-cli",
-        default_model="claude-sonnet-5",
+        default_model="claude-sonnet-5-5",
     )
     return slug
 
@@ -51,12 +51,12 @@ def test_layer_override_skips_foreign_default_model(temp_db):
     _seed_models()
     slug = _make_agent()
     # Historical behavior unchanged without a layer:
-    assert config.resolve_agent_model(slug) == "claude-sonnet-5"
+    assert config.resolve_agent_model(slug) == "claude-sonnet-5-5"
     # Same layer → default honored:
-    assert config.resolve_agent_model(slug, layer="claude-code-cli") == "claude-sonnet-5"
+    assert config.resolve_agent_model(slug, layer="claude-code-cli") == "claude-sonnet-5-5"
     # FOREIGN layer → the default is skipped, the layer's own first enabled
     # model is used (the W1-B1 fix — never a claude model on a codex turn):
-    assert config.resolve_agent_model(slug, layer="codex-cli") == "gpt-6-sol"
+    assert config.resolve_agent_model(slug, layer="codex-cli") == "gpt-6.1-sol"
 
 
 def test_scheduler_chat_stamp_is_layer_aware(temp_db):
@@ -64,8 +64,8 @@ def test_scheduler_chat_stamp_is_layer_aware(temp_db):
     # match the wire resolution for an overridden run.
     _seed_models()
     slug = _make_agent("coherence-agent-2")
-    assert config.get_cli_model(slug, layer="codex-cli") == "gpt-6-sol"
-    assert config.get_cli_model(slug, layer=None) == "claude-sonnet-5"
+    assert config.get_cli_model(slug, layer="codex-cli") == "gpt-6.1-sol"
+    assert config.get_cli_model(slug, layer=None) == "claude-sonnet-5-5"
 
 
 def test_pump_records_terminal_engine_error(temp_db):
@@ -75,7 +75,7 @@ def test_pump_records_terminal_engine_error(temp_db):
     from storage import database as task_store
     cid = "chat-coherence-err"
     task_store.create_chat(cid, "user-admin", "coherence-agent", "default",
-                           model="claude-sonnet-5",
+                           model="claude-sonnet-5-5",
                            execution_path="codex-cli")
 
     async def run():
@@ -102,7 +102,7 @@ def test_pump_last_error_empty_on_clean_run(temp_db):
     from storage import database as task_store
     cid = "chat-coherence-clean"
     task_store.create_chat(cid, "user-admin", "coherence-agent", "default",
-                           model="claude-sonnet-5",
+                           model="claude-sonnet-5-5",
                            execution_path="claude-code-cli")
 
     async def run():
@@ -133,8 +133,8 @@ def test_delegation_continue_drops_poisoned_model_pin(temp_db):
         _model_served_by_layer,
     )
     _seed_models()
-    assert _model_served_by_layer("claude-sonnet-5", "claude-code-cli") is True
-    assert _model_served_by_layer("claude-sonnet-5", "codex-cli") is False
-    assert _model_is_cross_layer_poison("claude-sonnet-5", "codex-cli") is True
-    assert _model_is_cross_layer_poison("claude-sonnet-5", "claude-code-cli") is False
+    assert _model_served_by_layer("claude-sonnet-5-5", "claude-code-cli") is True
+    assert _model_served_by_layer("claude-sonnet-5-5", "codex-cli") is False
+    assert _model_is_cross_layer_poison("claude-sonnet-5-5", "codex-cli") is True
+    assert _model_is_cross_layer_poison("claude-sonnet-5-5", "claude-code-cli") is False
     assert _model_is_cross_layer_poison("claude-opus-unknown", "claude-code-cli") is False

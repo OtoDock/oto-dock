@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
 import {
   ADMIN_SHARE_KIND, GRANTEE_KIND, SHARE_SCOPE, SHARE_STANDING, SHARE_TARGET,
   useAdminShares, usePatchShare, type AdminShare, type AdminShareKind, type ShareStanding,
@@ -63,6 +63,14 @@ function revokeConsequence(s: AdminShare): string {
   const who = recipient(s) || 'The person it went to'
   if (s.target_kind === SHARE_TARGET.CHAT) return `${who} loses the shared copy of “${title}”.`
   return `${who} loses access to “${title}”.`
+}
+
+/** What a link's revoke ends: whoever holds the URL loses it now, or, while
+ * its app is unpinned, the link does not come back with the app. */
+function linkRevokeConsequence(s: AdminShare): string {
+  const title = s.title || targetWord(s)
+  if (s.standing === SHARE_STANDING.PAUSED) return `The link to “${title}” will not come back when the app is pinned again.`
+  return `Anyone with the link to “${title}” loses it at once.`
 }
 
 /** A declined or expired share gives no access: its revoke only clears the row. */
@@ -198,7 +206,8 @@ export default function SharesPage() {
                     </thead>
                     <tbody className="divide-y divide-p-border-light/60">
                       {links.map((s) => (
-                        <tr key={s.id} className="text-p-text">
+                        <Fragment key={s.id}>
+                        <tr className="text-p-text">
                           <td className="px-3 py-2">
                             <span className="font-medium">{s.title || 'an app'}</span>
                             <span className="ml-1 text-xs text-p-text-light">{s.target_kind}</span>
@@ -217,11 +226,17 @@ export default function SharesPage() {
                           </td>
                           <td className="px-3 py-2 text-xs text-p-text-secondary">{s.expires_at ? formatExpiry(s.expires_at) : 'never'}</td>
                           <td className="px-3 py-2 text-right">
-                            <button type="button" onClick={() => revoke(s)} className={revokeButton}>
+                            <button type="button" onClick={() => (asksFirst(s) ? setConfirmId(s.id) : revoke(s))}
+                              className={revokeButton} aria-expanded={asksFirst(s) ? confirmId === s.id : undefined}>
                               Revoke
                             </button>
                           </td>
                         </tr>
+                        {confirmId === s.id && (
+                          <RevokeConfirm colSpan={8} text={linkRevokeConsequence(s)} label="Revoke the link"
+                            onConfirm={() => revoke(s)} onCancel={() => setConfirmId(null)} />
+                        )}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>
@@ -259,24 +274,34 @@ function InternalRow({ s, agentName, confirming, asks, onRevoke, onConfirm, onCa
         </td>
       </tr>
       {confirming && (
-        <tr>
-          <td colSpan={8} className="px-3 pb-2.5">
-            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs" data-testid="admin-revoke-confirm">
-              <span className="text-p-text">{revokeConsequence(s)} Nobody is notified.</span>
-              <div className="ml-auto flex shrink-0 items-center gap-2">
-                <button type="button" onClick={onConfirm}
-                  className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700">
-                  Revoke the share
-                </button>
-                <button type="button" onClick={onCancel}
-                  className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          </td>
-        </tr>
+        <RevokeConfirm colSpan={8} text={revokeConsequence(s)} label="Revoke the share"
+          onConfirm={onConfirm} onCancel={onCancel} />
       )}
     </>
+  )
+}
+
+/** The inline confirm under a row: what the revoke ends, and that nobody is told. */
+function RevokeConfirm({ colSpan, text, label, onConfirm, onCancel }: {
+  colSpan: number; text: string; label: string; onConfirm: () => void; onCancel: () => void
+}) {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="px-3 pb-2.5">
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs" data-testid="admin-revoke-confirm">
+          <span className="text-p-text">{text} Nobody is notified.</span>
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <button type="button" onClick={onConfirm}
+              className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700">
+              {label}
+            </button>
+            <button type="button" onClick={onCancel}
+              className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover">
+              Cancel
+            </button>
+          </div>
+        </div>
+      </td>
+    </tr>
   )
 }

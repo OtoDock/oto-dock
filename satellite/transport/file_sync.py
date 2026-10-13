@@ -16,6 +16,7 @@ from collections import OrderedDict
 from pathlib import Path
 from stat import S_ISREG
 
+from .. import config
 from .._vendored import layout
 
 logger = logging.getLogger("satellite")
@@ -367,7 +368,7 @@ def _effective_ignore_matcher() -> "_IgnoreMatcher | None":
     return matcher
 
 
-def _walk_sync_tree(agent_dir: Path):
+def _walk_sync_tree(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None = None):
     """The ONE dir-walk for every sync surface (snapshot / fingerprint /
     request-manifest): yields ``(root_path, files)`` for each INCLUDED dir
     after all dir-level exclusions — SKIP_DIRS, real venvs, hidden dirs,
@@ -381,10 +382,33 @@ def _walk_sync_tree(agent_dir: Path):
     parent's visit (sibling evidence = parent's ``files``); the exclusion
     decision happens at the dir's OWN visit, where its listing provides
     marker + veto evidence. Excluded → ``dirs[:] = []`` and nothing
-    yielded, so the subtree below its top level is never even scanned."""
+    yielded, so the subtree below its top level is never even scanned.
+
+    A folder the walk cannot list, and on Windows a junction (``os.walk``
+    follows one: ``islink`` is False for it), hold files whose state is
+    unknown, not absent: ``skipped_dirs`` collects them as ``(rel,
+    "unreadable_dir" | "link")``, ``""`` for the agent folder itself."""
     matcher = _effective_ignore_matcher()
     candidates: set[str] = set()
-    for root, dirs, files in os.walk(agent_dir):
+    link_like = None
+    # A POSIX ``os.walk`` never descends a symlinked folder; Windows' follows
+    # a junction (``islink`` is False for one), so there each child folder
+    # is checked for a name surrogate.
+    if not config.HOST.posix:
+        from ..host.safe_fs import is_link_like as link_like
+
+    def _unlistable(err: OSError) -> None:
+        # A folder removed under the walk is gone, not unknown.
+        if (skipped_dirs is None or not err.filename
+                or isinstance(err, (FileNotFoundError, NotADirectoryError))):
+            return
+        try:
+            rel_dir = Path(err.filename).relative_to(agent_dir).as_posix()
+        except ValueError:
+            return
+        skipped_dirs.append(("" if rel_dir == "." else rel_dir, "unreadable_dir"))
+
+    for root, dirs, files in os.walk(agent_dir, onerror=_unlistable):
         root_path = Path(root)
         rel = root_path.relative_to(agent_dir)
         rel_posix = rel.as_posix()
@@ -409,6 +433,20 @@ def _walk_sync_tree(agent_dir: Path):
             and (not d.startswith(".") or d in INCLUDE_DOTTED_DIRS)
             and not _is_cli_runtime_child(root_path.name, d)
         ]
+        if link_like is not None:
+            links = [d for d in dirs if link_like(root_path / d)]
+            if links:
+                dirs[:] = [d for d in dirs if d not in links]
+                for d in links:
+                    rel_link = (rel / d).as_posix()
+                    if skipped_dirs is not None:
+                        skipped_dirs.append((rel_link, "link"))
+                    if (rel_link not in _logged_rule_skips
+                            and len(_logged_rule_skips) < _LOGGED_RULE_SKIPS_MAX):
+                        _logged_rule_skips.add(rel_link)
+                        logger.info(
+                            "sync: not following the junction %s (its files stay "
+                            "where the platform has them)", rel_link)
         if matcher is not None:
             for d in dirs:
                 if matcher.named_match(d, files):
@@ -456,7 +494,10 @@ def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
 
 def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
     """True for CLI backup/corrupted state files directly under an engine
-    config dir — host-local, never synced."""
+    config dir, and for a hook-file write's temp there or in its ``bin/``
+    (``config.WRITE_TEMP_MARKER``) — host-local, never synced."""
+    if file_name.startswith(".") and config.WRITE_TEMP_MARKER in file_name:
+        return parent_name in INCLUDE_DOTTED_DIRS or parent_name == "bin"
     if parent_name not in INCLUDE_DOTTED_DIRS:
         return False
     return ".backup." in file_name or ".corrupted." in file_name
@@ -477,12 +518,18 @@ def _hash_file(path: Path) -> str:
     Only a regular file is read: the open never blocks (``O_NONBLOCK``) and the
     descriptor's type is checked before the first read, so a named pipe in a
     workspace raises ``NotARegularFile`` (an OSError every caller skips)
-    instead of stalling the open until a writer appears."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    instead of stalling the open until a writer appears.
+
+    Windows has neither ``O_NONBLOCK`` nor a FIFO in a folder, and its
+    ``os.set_blocking`` (Python 3.12+) accepts only a pipe: on a regular file
+    it raises, which skipped every file. The switch back to blocking follows
+    the flag that needed it."""
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, os.O_RDONLY | nonblock | getattr(os, "O_BINARY", 0))
     try:
         if not S_ISREG(os.fstat(fd).st_mode):
             raise NotARegularFile(errno.EINVAL, "not a regular file", str(path))
-        if hasattr(os, "set_blocking"):
+        if nonblock:
             os.set_blocking(fd, True)
         f = os.fdopen(fd, "rb")
     except BaseException:
@@ -568,6 +615,58 @@ def _hash_file_cached(path: Path, st: os.stat_result) -> str:
     return file_hash
 
 
+class _SkipTally:
+    """What one walk could not read (a file another program locks, an ACL,
+    a folder it cannot list, a file past the size cap), counted so the walk
+    can say so once. A file that vanished under the walk and a non-regular
+    file are expected and never counted."""
+
+    __slots__ = ("hashed", "skipped", "first")
+
+    def __init__(self) -> None:
+        self.hashed = 0
+        self.skipped = 0
+        self.first: tuple[str, str] | None = None
+
+    def note(self, path, why) -> bool:
+        """Count a skip; False for a skip that is not a read failure."""
+        if isinstance(why, (FileNotFoundError, NotARegularFile)):
+            return False
+        self.skipped += 1
+        if self.first is None:
+            self.first = (str(path), str(why))
+        return True
+
+
+# A skip is invisible on the platform, so each walk sums its skips up, and the
+# summary is logged when it differs from the last one for the same walk kind
+# and agent folder (a file locked for hours logs once, not every turn).
+_last_skip_summary: "OrderedDict[tuple[str, str], tuple[int, str]]" = OrderedDict()
+_SKIP_SUMMARY_KEYS_MAX = 64
+
+
+def _report_skips(kind: str, agent_dir: Path, tally: _SkipTally) -> None:
+    key = (kind, str(agent_dir))
+    summary = (tally.skipped, tally.first[0] if tally.first else "")
+    with _hash_cache_lock:
+        last = _last_skip_summary.get(key)
+        if last == summary or (last is None and not tally.skipped):
+            return
+        _last_skip_summary[key] = summary
+        _last_skip_summary.move_to_end(key)
+        while len(_last_skip_summary) > _SKIP_SUMMARY_KEYS_MAX:
+            _last_skip_summary.popitem(last=False)
+    if not tally.skipped:
+        logger.info("sync %s reads every file in %s again", kind, agent_dir)
+        return
+    path, why = tally.first or ("", "")
+    logger.log(
+        logging.ERROR if not tally.hashed else logging.WARNING,
+        "sync %s skipped %d of %d files in %s it could not read, e.g. %s (%s)",
+        kind, tally.skipped, tally.skipped + tally.hashed, agent_dir, path, why,
+    )
+
+
 def prime_hash_cache(path: Path, file_hash: str) -> None:
     """Record a KNOWN-good hash for a file just written (e.g. a committed
     platform push whose sha256 was verified) so the next snapshot never
@@ -584,27 +683,27 @@ def prime_hash_cache(path: Path, file_hash: str) -> None:
         _hash_cache_put(str(path), st.st_size, st.st_mtime_ns, digest)
 
 
-def snapshot_agent_dir(agent_dir: Path) -> dict[str, str]:
-    """Compute sha256 hashes for all files in agent dir.
-
-    Returns {relative_path: "sha256:<hex>"}.
-    """
-    result = {}
-    if not agent_dir.is_dir():
-        return result
-
+def _listed_files(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None = None):
+    """``(path, rel)`` of every file the sync surfaces consider, after the
+    shared walk's folder rules and the per-file rules every surface applies
+    alike (snapshot, fingerprint, manifest): the one place they live."""
     # Dir-level pruning (skip-dirs, venvs, hidden, CLI runtime, sync-ignore
     # rules) lives in the shared walker — see _walk_sync_tree.
-    for root_path, files in _walk_sync_tree(agent_dir):
+    for root_path, files in _walk_sync_tree(agent_dir, skipped_dirs):
         for fname in files:
             f = root_path / fname
             # Skip symlinks — they can't round-trip via base64 content and would
             # silently become regular files on the platform. Must match the
             # proxy's compute_manifest (proxy/core/remote/file_sync.py), which skips them
             # too; otherwise a symlink is satellite-only and the merge materializes
-            # its target as a regular file on the platform.
-            if f.is_symlink():
-                continue
+            # its target as a regular file on the platform. A folder that can be
+            # listed but not entered fails the check: the file goes on to the
+            # caller, whose stat fails it as unreadable (never a walk abort).
+            try:
+                if f.is_symlink():
+                    continue
+            except OSError:
+                pass
             # Use as_posix() so dict keys are forward-slash on both platforms
             # (proxy-side manifests use forward slashes too). Without this,
             # Windows backslash keys cause every file to look "new" relative
@@ -624,21 +723,41 @@ def snapshot_agent_dir(agent_dir: Path) -> dict[str, str]:
             # propagated). Excluded symmetrically in proxy/core/remote/file_sync.py.
             if fname.endswith(".partial"):
                 continue
-            try:
-                st = f.stat()
-                cap = max_file_size()
-                if st.st_size > cap:
-                    logger.warning(
-                        "Skipping oversized file (>%dMB) from manifest: %s",
-                        cap // (1024 * 1024), f,
-                    )
-                    continue
-                # Streamed + cached — never reads an unchanged file, never
-                # holds a whole file in memory.
-                result[rel] = _hash_file_cached(f, st)
-            except (OSError, PermissionError):
-                continue
+            yield f, rel
 
+
+def _over_cap(cap: int) -> str:
+    return f"over the {cap // (1024 * 1024)} MB sync cap"
+
+
+def snapshot_agent_dir(agent_dir: Path) -> dict[str, str]:
+    """Compute sha256 hashes for all files in agent dir.
+
+    Returns {relative_path: "sha256:<hex>"}.
+    """
+    result: dict[str, str] = {}
+    if not agent_dir.is_dir():
+        return result
+
+    tally = _SkipTally()
+    skipped_dirs: list[tuple[str, str]] = []
+    cap = max_file_size()
+    for f, rel in _listed_files(agent_dir, skipped_dirs):
+        try:
+            st = f.stat()
+            if st.st_size > cap:
+                tally.note(f, _over_cap(cap))
+                continue
+            # Streamed + cached — never reads an unchanged file, never
+            # holds a whole file in memory.
+            result[rel] = _hash_file_cached(f, st)
+            tally.hashed += 1
+        except OSError as exc:
+            tally.note(f, exc)
+    for rel_dir, why in skipped_dirs:
+        if why == "unreadable_dir":
+            tally.note(agent_dir / rel_dir, "the folder could not be listed")
+    _report_skips("snapshot", agent_dir, tally)
     return result
 
 
@@ -656,35 +775,23 @@ def compute_fingerprint(agent_dir: Path) -> str:
     preserves BOTH size and mtime — acceptable for a backstop (the authoritative
     merge, once triggered, uses content hashes).
 
-    NOTE: the dir-prune + file-exclude logic below MUST stay identical to
-    ``snapshot_agent_dir`` (and ``compute_manifest``) — a drift only degrades the
-    backstop's trigger quality (spurious or missed sweeps), never correctness, since
-    the merge re-validates with real hashes.
+    The walk and the file rules are ``_listed_files``, shared with
+    ``snapshot_agent_dir`` and ``compute_manifest`` (a drift would only degrade
+    the backstop's trigger quality, never correctness: the merge re-validates
+    with real hashes).
     """
     if not agent_dir.is_dir():
         return ""
     entries: list[tuple[str, int, int]] = []
-    for root_path, files in _walk_sync_tree(agent_dir):
-        for fname in files:
-            f = root_path / fname
-            if f.is_symlink():
-                continue
-            rel = f.relative_to(agent_dir).as_posix()
-            if _is_codex_runtime_state(rel):
-                continue
-            if _is_claude_runtime_state(rel):
-                continue
-            if _is_cli_runtime_cruft_file(root_path.name, fname):
-                continue
-            if fname.endswith(".partial"):
-                continue
-            try:
-                st = f.stat()
-            except (OSError, PermissionError):
-                continue
-            if st.st_size > max_file_size():
-                continue
-            entries.append((rel, st.st_size, st.st_mtime_ns))
+    cap = max_file_size()
+    for f, rel in _listed_files(agent_dir):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if st.st_size > cap:
+            continue
+        entries.append((rel, st.st_size, st.st_mtime_ns))
     if not entries:
         return ""  # missing dir, or no sync-relevant files → nothing to fingerprint
     h = hashlib.sha256()
@@ -722,7 +829,7 @@ def detect_changes(
     changes: list[dict] = []
 
     # New or modified files
-    for rel_path, cur_hash in current.items():
+    for rel_path, cur_hash in list(current.items()):
         old_hash = snapshot.get(rel_path)
         if old_hash == cur_hash:
             continue
@@ -747,26 +854,38 @@ def detect_changes(
                     "hash": cur_hash,
                     "size": size,
                 })
-        except (OSError, PermissionError):
-            continue
+        except OSError:
+            # Hashed but not read (locked in between): the baseline keeps
+            # what the platform last heard, so the next turn reports it.
+            if old_hash is None:
+                current.pop(rel_path, None)
+            else:
+                current[rel_path] = old_hash
 
-    # Deleted files. A path can vanish from ``current`` for TWO reasons:
-    # actually deleted, or newly EXCLUDED (a sync-ignore rule table arriving
+    # Deleted files. A path can vanish from ``current`` for THREE reasons:
+    # actually deleted; newly EXCLUDED (a sync-ignore rule table arriving
     # mid-session via auth_result — live sessions survive proxy restarts, so
-    # their baseline predates the rules). Only a path that is GONE from disk
-    # is a delete; a still-present file was excluded → purge it from the
-    # baseline silently and emit NOTHING. Emitting deletes here would let a
+    # their baseline predates the rules), locked or past the size cap; or
+    # out of reach (a folder above it that can no longer be listed). Only a
+    # path that is GONE from disk is a delete. A file still there leaves the
+    # baseline silently and emits NOTHING: emitting deletes here would let a
     # proxy-side config change delete the platform copies AND record
     # tombstones that could later delete REAL satellite files if the rule is
-    # ever retracted (tombstone mtimes would outrank the files'). One stat
+    # ever retracted (tombstone mtimes would outrank the files'). A path that
+    # cannot be stat'ed keeps its baseline entry, emitting nothing. One stat
     # per candidate delete — rare outside rule-change turns.
-    for rel_path in snapshot:
-        if rel_path not in current:
-            try:
-                if (agent_dir / rel_path).is_file():
-                    continue  # excluded, not deleted — drop from baseline only
-            except OSError:
-                pass  # unstatable → treat as deleted (pre-guard behavior)
+    for rel_path, old_hash in snapshot.items():
+        if rel_path in current:
+            continue
+        try:
+            st = os.stat(agent_dir / rel_path)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                changes.append({"path": rel_path, "action": "delete"})
+            else:
+                current[rel_path] = old_hash
+            continue
+        if not S_ISREG(st.st_mode):
             changes.append({"path": rel_path, "action": "delete"})
 
     # Refresh the snapshot so the next call's baseline is *this* moment,
@@ -980,56 +1099,56 @@ def apply_file_push(
         prime_hash_cache(target, new_hash)
 
 
-def compute_manifest(agent_dir: Path) -> list[dict]:
+def compute_manifest(agent_dir: Path, *, report_skipped: bool = False) -> list[dict]:
     """Compute full file manifest for manifest request.
 
     Returns [{path, hash, size, mtime}].
+
+    ``report_skipped`` (asked by a 0.5.145+ proxy) also lists what is there
+    but could not be hashed, so the merge never reads it as deleted: a file
+    as ``{path, skipped: "unreadable" | "too_large", size, mtime}`` (no
+    ``hash``; size and mtime 0 when even the stat failed), a folder the walk
+    could not list or a junction it did not follow as ``{path, skipped:
+    "unreadable_dir" | "link", dir: True}`` (``""`` for the agent folder).
     """
     if not agent_dir.is_dir():
         return []
 
-    entries = []
-    # Dir-level pruning is the shared walker's (mirror snapshot_agent_dir) —
-    # the request-manifest path never reports venv internals, rule-excluded
-    # build dirs, or oversized files the snapshot/detect path excludes.
-    for root_path, files in _walk_sync_tree(agent_dir):
-        for fname in files:
-            f = root_path / fname
-            # Skip symlinks to match the proxy's compute_manifest (see
-            # snapshot_agent_dir above) — keeps both manifests symmetric so the
-            # 3-way merge never materializes a symlink target as a regular file.
-            if f.is_symlink():
+    entries: list[dict] = []
+    tally = _SkipTally()
+    skipped_dirs: list[tuple[str, str]] = []
+    cap = max_file_size()
+    # The walk and the file rules are the snapshot's (``_listed_files``): the
+    # manifest never reports venv internals, rule-excluded build dirs, or
+    # anything else the snapshot/detect path excludes.
+    for f, rel in _listed_files(agent_dir, skipped_dirs):
+        stat = None
+        try:
+            stat = f.stat()
+            if stat.st_size > cap:
+                tally.note(f, _over_cap(cap))
+                if report_skipped:
+                    entries.append({"path": rel, "skipped": "too_large",
+                                    "size": stat.st_size, "mtime": stat.st_mtime})
                 continue
-            # Codex per-machine SQLite runtime never syncs (see helper above).
-            if _is_codex_runtime_state(f.relative_to(agent_dir).as_posix()):
-                continue
-            if _is_claude_runtime_state(f.relative_to(agent_dir).as_posix()):
-                continue
-            # CLI backup/corrupted state files (.claude.json.backup.* etc.) — cruft.
-            if _is_cli_runtime_cruft_file(root_path.name, fname):
-                continue
-            # Transient staging files from an in-flight / aborted chunked push or
-            # pull — never synced (mirror of snapshot_agent_dir + the proxy).
-            if fname.endswith(".partial"):
-                continue
-            try:
-                stat = f.stat()
-                cap = max_file_size()
-                if stat.st_size > cap:
-                    logger.warning(
-                        "Skipping oversized file (>%dMB) from manifest: %s",
-                        cap // (1024 * 1024), f,
-                    )
-                    continue
-                # Streamed + cached (see _hash_file_cached) — memory-bounded
-                # and no re-hash of unchanged files.
-                entries.append({
-                    "path": f.relative_to(agent_dir).as_posix(),
-                    "hash": _hash_file_cached(f, stat),
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                })
-            except (OSError, PermissionError):
-                continue
-
+            # Streamed + cached (see _hash_file_cached) — memory-bounded
+            # and no re-hash of unchanged files.
+            entries.append({
+                "path": rel,
+                "hash": _hash_file_cached(f, stat),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            })
+            tally.hashed += 1
+        except OSError as exc:
+            if tally.note(f, exc) and report_skipped:
+                entries.append({"path": rel, "skipped": "unreadable",
+                                "size": stat.st_size if stat else 0,
+                                "mtime": stat.st_mtime if stat else 0})
+    for rel_dir, why in skipped_dirs:
+        if why == "unreadable_dir":
+            tally.note(agent_dir / rel_dir, "the folder could not be listed")
+        if report_skipped:
+            entries.append({"path": rel_dir, "skipped": why, "dir": True})
+    _report_skips("manifest", agent_dir, tally)
     return entries

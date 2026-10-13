@@ -9,6 +9,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { apiJson } from '../lib/http/apiJson'
 import type { AgentRole } from '../lib/permissions'
 import type { DepartmentMode, DepartmentReach } from '../lib/kinds/department'
 
@@ -72,16 +73,15 @@ export const useDepartments = () =>
     refetchInterval: 60_000,
   })
 
-/** Heat + live pulse. Polled faster than the structural feeds — the pulse is
- * the "right now" signal on the map. */
+/** Heat + live pulse, as this viewer may see them (the server's Active-now
+ * gates: never another person's personal chat). Polled faster than the
+ * structural feeds — the pulse is the "right now" signal on the map; the
+ * agents page holds no dashboard socket to keep it live otherwise. */
 export const useAgentsActivity = (enabled = true) =>
   useQuery({
     queryKey: ['agents-activity'],
-    queryFn: async (): Promise<AgentActivity[]> => {
-      const res = await apiFetch('/v1/agents/activity')
-      if (!res.ok) throw new Error('Failed to fetch agent activity')
-      return (await res.json()).agents ?? []
-    },
+    queryFn: async (): Promise<AgentActivity[]> =>
+      (await apiJson<{ agents?: AgentActivity[] }>('/v1/agents/activity', {}, 'Failed to fetch agent activity')).agents ?? [],
     refetchInterval: 15_000,
     enabled,
   })

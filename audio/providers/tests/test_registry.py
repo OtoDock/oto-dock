@@ -60,6 +60,29 @@ def test_stub_flag_marks_unimplemented_providers():
     assert registry.get_provider_class("stt", "elevenlabs").is_stub is False
 
 
+def test_a_retired_model_id_resolves_to_its_chain_end_at_build_time():
+    from audio.providers.model_succession import DEFAULT_MODELS, FORMER_DEFAULTS, MODEL_SUCCESSORS, successor_of
+    assert successor_of({"a": "b", "b": "c"}, "a") == "c"
+    assert successor_of({"a": "b", "b": "a"}, "a") in ("a", "b")       # cycle-safe
+    assert successor_of({}, "x") == "x" and successor_of({}, "") == ""
+    cartesia = registry.get_provider_class("tts", "cartesia")
+    assert cartesia.live_model_id("sonic-turbo") == DEFAULT_MODELS[("tts", "cartesia")]["model_id"]
+    assert cartesia.live_model_id("sonic-3.5") == "sonic-3.5"            # a former default, not retired
+    assert cartesia.live_model_id(None) == ""
+    tts = registry.build_provider(
+        {"provider_type": "tts", "provider_name": "cartesia", "credential_key": "k",
+         "voices": {}, "advanced": {"model_id": "sonic-2"}},
+        lambda key: "fake-key",
+    )
+    assert tts._model_id == "sonic-3.6"
+    # Every provider names its defaults as placeholders and stores none of them.
+    for kind, defaults in DEFAULT_MODELS.items():
+        cls = registry.get_provider_class(*kind)
+        assert cls.default_model_ids() == defaults
+        assert not set(cls.default_advanced_settings()) & {"model_id", "batch_model_id"}
+    assert set(FORMER_DEFAULTS) <= set(DEFAULT_MODELS) and set(MODEL_SUCCESSORS) <= set(DEFAULT_MODELS)
+
+
 def test_elevenlabs_builds_from_row():
     tts = registry.build_provider(
         {"provider_type": "tts", "provider_name": "elevenlabs",

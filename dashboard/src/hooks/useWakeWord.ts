@@ -19,8 +19,8 @@
 //
 // Dev harnesses: `?wakeDebug=<slug>` on any page triggers the full wake
 // action without mic/worker/secure-context — the live-verify path for
-// plain-HTTP installs where getUserMedia does not exist. `?wakeDiag=1` (or
-// the settings button) switches the diagnostics recorder on
+// plain-HTTP installs where getUserMedia does not exist. `?wakeDiag=1` on
+// `/user-settings` (or the settings button) switches the diagnostics recorder on
 // (audio/wakeDiag.ts): the last 30 s of what the spotter hears plus an
 // event log, saved locally on request.
 
@@ -151,10 +151,12 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
   useEffect(() => {
     if (!authed) return
     const params = new URLSearchParams(location.search)
-    if (params.get('wakeDiag') === '1') setWakeDiag(true)
+    // Only on the settings page that holds the recorder's own button: a
+    // link to any other page must not switch a person's recorder on.
+    if (params.get('wakeDiag') === '1' && location.pathname === '/user-settings') setWakeDiag(true)
     const slug = params.get('wakeDebug')
     if (slug) wakeRef.current(slug)
-  }, [location.search, authed])
+  }, [location.search, location.pathname, authed])
 
   // Engine vs capture are SEPARATE lifecycles: the wasm spotter boots in
   // seconds on a phone, so it persists across mic pauses (duplex/dictation)

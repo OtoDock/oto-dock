@@ -28,7 +28,7 @@ def test_noop_on_bare_metal(monkeypatch, caplog):
     # urlopen must never be called on T1
     monkeypatch.setattr(nsc.urllib.request, "urlopen",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("called on T1")))
-    with caplog.at_level(logging.INFO, logger="claude-proxy.network-selfcheck"):
+    with caplog.at_level(logging.INFO, logger="otodock.network-selfcheck"):
         nsc.network_selfcheck()
     assert "skipped" in caplog.text
     assert "attached to the shared" not in caplog.text
@@ -42,7 +42,7 @@ def test_positive_detection_logs_error(monkeypatch, caplog):
         _container("otodock-postgres", ["otodock-data", "otodock"]),   # LEAK
     ]
     monkeypatch.setattr(nsc.urllib.request, "urlopen", _fake_urlopen(payload))
-    with caplog.at_level(logging.ERROR, logger="claude-proxy.network-selfcheck"):
+    with caplog.at_level(logging.ERROR, logger="otodock.network-selfcheck"):
         nsc.network_selfcheck()
     assert "otodock-postgres" in caplog.text
     assert "attached to the shared" in caplog.text
@@ -60,7 +60,7 @@ def test_clean_when_control_planes_isolated(monkeypatch, caplog):
         _container("some-community-mcp", ["otodock"]),
     ]
     monkeypatch.setattr(nsc.urllib.request, "urlopen", _fake_urlopen(payload))
-    with caplog.at_level(logging.INFO, logger="claude-proxy.network-selfcheck"):
+    with caplog.at_level(logging.INFO, logger="otodock.network-selfcheck"):
         nsc.network_selfcheck()
     assert "control planes are off" in caplog.text
     assert "attached to the shared" not in caplog.text
@@ -72,7 +72,7 @@ def test_inconclusive_api_error_warns_not_raises(monkeypatch, caplog):
     def _boom(url, timeout=None):
         raise OSError("connection refused")
     monkeypatch.setattr(nsc.urllib.request, "urlopen", _boom)
-    with caplog.at_level(logging.WARNING, logger="claude-proxy.network-selfcheck"):
+    with caplog.at_level(logging.WARNING, logger="otodock.network-selfcheck"):
         nsc.network_selfcheck()  # must not raise
     assert "could not query" in caplog.text
 
@@ -99,7 +99,7 @@ def _run(monkeypatch, caplog, payload):
     monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_SOCKPROX)
     monkeypatch.setattr(config, "OTODOCK_NETWORK", "otodock")
     monkeypatch.setattr(nsc.urllib.request, "urlopen", _fake_urlopen(payload))
-    with caplog.at_level(logging.INFO, logger="claude-proxy.network-selfcheck"):
+    with caplog.at_level(logging.INFO, logger="otodock.network-selfcheck"):
         nsc.network_selfcheck()
     return caplog.text
 

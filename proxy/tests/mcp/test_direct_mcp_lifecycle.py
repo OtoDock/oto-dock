@@ -224,6 +224,34 @@ async def test_a_server_that_forgot_the_session_is_dead():
 
 
 @pytest.mark.asyncio
+async def test_a_results_pictures_and_blobs_ride_beside_its_text():
+    """``call_tool_blocks`` keeps an MCP result's image blocks and embedded
+    resources (MCP JSON) for the result-files service; ``call_tool`` still
+    answers the text alone, the picture as ``[binary data: …]``."""
+    from mcp.types import (BlobResourceContents, CallToolResult, EmbeddedResource,
+                           ImageContent, TextContent)
+
+    class _Pictures:
+        async def call_tool(self, name, arguments):
+            return CallToolResult(content=[
+                ImageContent(type="image", data="iVBORw0KGgo=", mimeType="image/png"),
+                TextContent(type="text", text="Route: 12 km"),
+                EmbeddedResource(type="resource", resource=BlobResourceContents(
+                    uri="gdrive://f/report.pdf", mimeType="application/pdf", blob="JVBERg==")),
+            ])
+
+    conn = mcpmod.MCPServerConnection("maps", {"type": "http", "url": "http://x/mcp"})
+    conn.session = _Pictures()
+    text, blocks = await conn.call_tool_blocks("static_map", {})
+    assert text == "[binary data: image/png]\nRoute: 12 km"
+    assert blocks[0] == {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}
+    assert blocks[1]["type"] == "resource"
+    assert blocks[1]["resource"]["uri"] == "gdrive://f/report.pdf"
+    assert blocks[1]["resource"]["blob"] == "JVBERg=="
+    assert await conn.call_tool("static_map", {}) == text
+
+
+@pytest.mark.asyncio
 async def test_stdio_servers_start_below_the_proxys_priority(monkeypatch):
     """A Direct-LLM session's stdio MCPs run at the session priority,
     like every session process, so a busy MCP never starves the proxy."""

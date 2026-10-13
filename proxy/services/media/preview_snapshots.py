@@ -41,7 +41,7 @@ import config
 import contextlib
 from services.infra import safe_fs
 
-logger = logging.getLogger("claude-proxy.media")
+logger = logging.getLogger("otodock.media")
 
 # chat_id as used in paths: uuid-ish / "task-run-…" / "meeting-…" shapes.
 # Strict allowlist — these values become path segments under the cache dir.

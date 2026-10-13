@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 import config
 
-logger = logging.getLogger("claude-proxy.phone")
+logger = logging.getLogger("otodock.phone")
 
 _TTL_S = 60.0
 _RESOLVE_TIMEOUT_S = 3.0

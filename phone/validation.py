@@ -16,7 +16,8 @@ import re
 # Optional leading '+', then 2–20 digits. Matches phone-mcp's
 # "+302101234567" and bare national numbers; rejects AMI/dialplan
 # metacharacters (@ / & , ; | and CR/LF) by construction.
-_PHONE_RE = re.compile(r"^\+?\d{2,20}$")
+# ASCII digits only: Python's ``\d`` takes every Unicode digit.
+_PHONE_RE = re.compile(r"^\+?[0-9]{2,20}$")
 
 # Lenient identifier: hex/alphanumeric + dash/underscore, 8–64 chars. Covers
 # a standard uuid4 (with dashes) and any driver-specific id the dialplan
@@ -27,6 +28,10 @@ _MAX_TASK = 4000
 _MAX_INSTRUCTIONS = 8000
 _MAX_SHORT = 128            # phone / did / source / route_id
 _MAX_DIAL_EVENT_BYTES = 8192
+
+# The proxy's grant for a call that runs inside the caller's chat
+# (``in_session``): url-safe token characters, 16–128 of them.
+_GRANT_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 class ValidationError(ValueError):
@@ -64,12 +69,26 @@ def validate_outbound_call(body: dict) -> dict:
             or not _no_control(route_id)):
         raise ValidationError("route_id is required")
 
-    return {
+    out = {
         "phone_number": phone,
         "task_description": task,
         "instructions": instructions,
         "route_id": route_id,
     }
+    # The relay's word that the call runs inside the caller's chat: the
+    # chat's session id and the grant the per-call warmup presents.
+    in_session = body.get("in_session")
+    if in_session is not None:
+        if not isinstance(in_session, dict):
+            raise ValidationError("in_session must be an object")
+        sid = in_session.get("session_id")
+        grant = in_session.get("grant")
+        if not isinstance(sid, str) or not _UUID_RE.match(sid):
+            raise ValidationError("in_session.session_id is invalid")
+        if not isinstance(grant, str) or not _GRANT_RE.match(grant):
+            raise ValidationError("in_session.grant is invalid")
+        out["in_session"] = {"session_id": sid, "grant": grant}
+    return out
 
 
 def validate_register(body: dict) -> dict:

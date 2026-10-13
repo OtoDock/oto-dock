@@ -1,6 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiFetch } from './auth'
+import { ApiError, apiJson, raiseApiError } from '../lib/http/apiJson'
 import type { AgentRole } from '../lib/permissions'
 
 // Shares of apps and chats (SHARING.md): a share names a person, an agent or
@@ -86,16 +87,13 @@ export interface ShareDirectory {
   departments: DirectoryDepartment[]
 }
 
-const detailOf = async (res: Response, fallback: string) =>
-  (await res.json().catch(() => null))?.detail || fallback
-
 export const useShares = (targetKind: 'app' | 'chat', targetId: string | undefined) =>
   useQuery({
     queryKey: ['shares', targetKind, targetId],
     queryFn: async (): Promise<Share[]> => {
-      const res = await apiFetch(`/v1/shares?target_kind=${targetKind}&target=${encodeURIComponent(targetId ?? '')}`)
-      if (!res.ok) throw new Error(await detailOf(res, 'Could not load shares'))
-      return (await res.json()).shares ?? []
+      const body = await apiJson<{ shares?: Share[] }>(
+        `/v1/shares?target_kind=${targetKind}&target=${encodeURIComponent(targetId ?? '')}`, {}, 'Could not load shares')
+      return body.shares ?? []
     },
     enabled: !!targetId,
     staleTime: 10_000,
@@ -105,9 +103,7 @@ export const useUserDirectory = (enabled = true) =>
   useQuery({
     queryKey: ['users', 'directory'],
     queryFn: async (): Promise<ShareDirectory> => {
-      const res = await apiFetch('/v1/users/directory')
-      if (!res.ok) throw new Error(await detailOf(res, 'Could not load the directory'))
-      const body = await res.json()
+      const body = await apiJson<Partial<ShareDirectory>>('/v1/users/directory', {}, 'Could not load the directory')
       return { users: body.users ?? null, agents: body.agents ?? [], departments: body.departments ?? [] }
     },
     enabled,
@@ -127,11 +123,8 @@ export interface SharingSettings {
 export const useSharingSettings = (enabled = true) =>
   useQuery({
     queryKey: ['sharing', 'settings'],
-    queryFn: async (): Promise<SharingSettings> => {
-      const res = await apiFetch('/v1/sharing/settings')
-      if (!res.ok) throw new Error(await detailOf(res, 'Could not load the sharing settings'))
-      return res.json()
-    },
+    queryFn: (): Promise<SharingSettings> =>
+      apiJson<SharingSettings>('/v1/sharing/settings', {}, 'Could not load the sharing settings'),
     enabled,
     staleTime: 60_000,
   })
@@ -174,35 +167,40 @@ export interface CreateShareResult {
 /** The server asks for a confirm (428): which method it takes. `oidc` is a
  * round trip to the identity provider, named by `provider`. */
 export type ConfirmMethod = 'password' | 'passkey' | 'oidc' | 'none'
-export class ConfirmRequired extends Error {
+export class ConfirmRequired extends ApiError {
   method: ConfirmMethod
   provider?: string
-  constructor(method: ConfirmMethod, message: string, provider?: string) {
-    super(message)
+  constructor(method: ConfirmMethod, message: string, provider?: string, detail: unknown = null) {
+    super(428, message, detail, null)
+    this.name = 'ConfirmRequired'
     this.method = method
     this.provider = provider
   }
 }
 
-async function raiseFor(res: Response, fallback: string): Promise<never> {
-  const body = await res.json().catch(() => null) as { detail?: unknown } | null
-  const detail = body?.detail
-  if (res.status === 428 && detail && typeof detail === 'object') {
-    const d = detail as { method?: string; message?: string; provider?: string }
-    const method: ConfirmMethod = d.method === 'password' || d.method === 'passkey' || d.method === 'oidc' ? d.method : 'none'
-    throw new ConfirmRequired(method, d.message || 'Confirmation required', d.provider)
+/** A share write as JSON: a 428 asks for the confirm (ConfirmRequired, its
+ * method read from the detail), any other refusal is an ApiError. */
+async function shareWrite<T>(path: string, method: string, body: unknown, fallback: string): Promise<T> {
+  try {
+    return await apiJson<T>(path, { method, json: body }, fallback)
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 428 && e.detail && typeof e.detail === 'object') {
+      const d = e.detail as { method?: string; message?: string; provider?: string }
+      const m: ConfirmMethod = d.method === 'password' || d.method === 'passkey' || d.method === 'oidc' ? d.method : 'none'
+      throw new ConfirmRequired(m, d.message || 'Confirmation required', d.provider, e.detail)
+    }
+    throw e
   }
-  throw new Error(typeof detail === 'string' ? detail : fallback)
 }
 
 export const useCreateShare = () => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (input: CreateShareInput): Promise<CreateShareResult> => {
-      const res = await apiFetch('/v1/shares', { method: 'POST', body: JSON.stringify(input) })
-      if (!res.ok) await raiseFor(res, 'Could not share')
-      return res.json()
-    },
+    mutationFn: (input: CreateShareInput): Promise<CreateShareResult> =>
+      shareWrite('/v1/shares', 'POST', input, 'Could not share'),
+    // A refusal may be a cap the admin set after the form read the settings
+    // (cached for a minute): the form's choices follow the next read.
+    onError: () => qc.invalidateQueries({ queryKey: ['sharing', 'settings'] }),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['shares'] })
       qc.invalidateQueries({ queryKey: ['apps'] })
@@ -225,11 +223,8 @@ export interface PatchShareInput {
 export const usePatchShare = () => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ id, ...body }: PatchShareInput): Promise<Share> => {
-      const res = await apiFetch(`/v1/shares/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
-      if (!res.ok) await raiseFor(res, 'Could not change the share')
-      return res.json()
-    },
+    mutationFn: ({ id, ...body }: PatchShareInput): Promise<Share> =>
+      shareWrite(`/v1/shares/${id}`, 'PATCH', body, 'Could not change the share'),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['shares'] })
       qc.invalidateQueries({ queryKey: ['apps'] })
@@ -274,9 +269,7 @@ export const useShareInbox = (enabled = true) =>
   useQuery({
     queryKey: INBOX_KEY,
     queryFn: async (): Promise<ShareInbox> => {
-      const res = await apiFetch('/v1/shares/inbox')
-      if (!res.ok) throw new Error(await detailOf(res, 'Could not load what was shared with you'))
-      const body = await res.json()
+      const body = await apiJson<Partial<ShareInbox>>('/v1/shares/inbox', {}, 'Could not load what was shared with you')
       return { items: body.items ?? [], pending: body.pending ?? 0 }
     },
     enabled,
@@ -289,10 +282,8 @@ const settleShare = (qc: ReturnType<typeof useQueryClient>, agent?: string) => {
   qc.invalidateQueries({ queryKey: ['app'] })
 }
 
-async function postShare(id: string, verb: string, body: Record<string, unknown>, fallback: string) {
-  const res = await apiFetch(`/v1/shares/${id}/${verb}`, { method: 'POST', body: JSON.stringify(body) })
-  if (!res.ok) await raiseFor(res, fallback)
-  return res.json()
+function postShare(id: string, verb: string, body: Record<string, unknown>, fallback: string) {
+  return shareWrite<{ status: string; share?: Share }>(`/v1/shares/${id}/${verb}`, 'POST', body, fallback)
 }
 
 /** Accept an app into one of the viewer's agents (the server refuses one
@@ -361,9 +352,10 @@ export const useChatSnapshot = (shareId: string | undefined) =>
   useQuery({
     queryKey: ['shares', 'snapshot', shareId],
     queryFn: async (): Promise<ChatSnapshot | null> => {
+      // A missing or withdrawn share answers 404: the page says so.
       const res = await apiFetch(`/v1/shares/${shareId}/snapshot`)
       if (res.status === 404) return null
-      if (!res.ok) throw new Error(await detailOf(res, 'Could not load the shared chat'))
+      if (!res.ok) await raiseApiError(res, 'Could not load the shared chat')
       return res.json()
     },
     enabled: !!shareId,
@@ -413,9 +405,7 @@ export const useAdminShares = ({ kind = ADMIN_SHARE_KIND.ALL, agent = '', standi
       const q = new URLSearchParams({ kind })
       if (agent) q.set('agent', agent)
       if (standing) q.set('standing', standing)
-      const res = await apiFetch(`/v1/admin/shares?${q}`)
-      if (!res.ok) throw new Error(await detailOf(res, 'Could not load the shares'))
-      const body = await res.json()
+      const body = await apiJson<Partial<AdminShareList>>(`/v1/admin/shares?${q}`, {}, 'Could not load the shares')
       return { shares: body.shares ?? [], truncated: body.truncated ?? {} }
     },
     enabled,

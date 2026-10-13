@@ -6,6 +6,7 @@ import { useSwipeGesture } from '../hooks/useSwipeGesture'
 import { canManageAgent, roleBadge } from '../lib/permissions'
 import ResponsiveDrawer from './ui/ResponsiveDrawer'
 import NavGroup from './ui/NavGroup'
+import { PageBoundary } from './RouteBoundary'
 
 export default function AgentLayout() {
   const { name } = useParams<{ name: string }>()
@@ -141,7 +142,9 @@ export default function AgentLayout() {
         </div>
 
         <main className="flex-1 overflow-auto p-4 md:p-6">
-          <Outlet />
+          <PageBoundary>
+            <Outlet />
+          </PageBoundary>
         </main>
       </div>
     </div>

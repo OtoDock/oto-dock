@@ -47,7 +47,7 @@ from storage.identity import credential_store
 from storage import database as task_store
 from storage.automation import webhook_subscription_store
 
-logger = logging.getLogger("claude-proxy.subscription-manager")
+logger = logging.getLogger("otodock.subscription-manager")
 
 
 class SubscriptionError(Exception):
@@ -871,7 +871,7 @@ async def _call_vendor(
         body_data = {**body_data, **body_overrides}
     expected = set(call_block.get("expected_status", [200]))
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with vendor_http.client(url, timeout=30) as client:
         try:
             req = client.build_request(
                 method, url,

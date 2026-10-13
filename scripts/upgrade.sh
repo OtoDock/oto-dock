@@ -24,10 +24,14 @@
 #      phone overlay must be listed on it. No other line of .env is written; the
 #      names of the settings new in the release are printed for you to review in
 #      config.env.example.
-#   5. Pulls every image, runs docker compose up -d --remove-orphans and waits
-#      for the server to report healthy: up to OTODOCK_UPGRADE_WAIT_S seconds
-#      (300 by default; a release's first boot builds its tool environments
-#      and migrates the database, minutes on a small host).
+#   5. Pulls every image. When the target release keeps the recover bin (the
+#      deleted files the dashboard can restore for 7 days) on its own volume
+#      and the running server still holds it inside its container, copies it
+#      into that volume first, so the upgrade does not drop it. Then runs
+#      docker compose up -d --remove-orphans and waits for the server to
+#      report healthy: up to OTODOCK_UPGRADE_WAIT_S seconds (300 by default;
+#      a release's first boot builds its tool environments and migrates the
+#      database, minutes on a small host).
 #
 # Two failure regimes. A step that fails BEFORE docker compose up (a download,
 # the file check, the pull) puts .env and the compose files back from the copy:
@@ -209,16 +213,80 @@ host_holds_ipv4() { # host_holds_ipv4 <address>
     printf '%s\n' "$addrs" | awk '{ sub(/\/.*/, "", $4); print $4 }' | grep -qxF -- "$1"
 }
 
-# Is A an older release than B? The -rcN suffix is ignored.
+# Is A an older release than B? The one version rule the server and
+# restore.sh apply: X.Y.Z-rcN is older than X.Y.Z, X.Y.Z-dev older than every rc.
+version_key() { # version_key <version>: "major minor patch pre n"
+    local v="${1#v}" nums pre=0 n=0
+    nums="${v%%-*}"
+    case "$v" in
+        *-dev) pre=-2 ;;
+        *-rc*) pre=-1; n="${v##*-rc}" ;;
+    esac
+    printf '%s %s %s\n' "${nums//./ }" "$pre" "$n"
+}
 version_lt() { # version_lt <A> <B>
     local a b i
-    IFS=. read -r -a a <<< "${1%%-*}"
-    IFS=. read -r -a b <<< "${2%%-*}"
-    for i in 0 1 2; do
+    read -r -a a <<< "$(version_key "$1")"
+    read -r -a b <<< "$(version_key "$2")"
+    for i in 0 1 2 3 4; do
         [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 0
         [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 1
     done
     return 1
+}
+
+# The running server container that still keeps the recover bin in its own
+# writable layer, when the target release mounts a volume there: printed, or
+# nothing when there is nothing to carry. The bin is safe to carry again
+# into a volume that already holds part of it (entry names are unique), so
+# only the server's own mount decides, never whether the volume exists (a
+# run stopped mid-copy, or an up that failed before the server, leaves one).
+bin_to_carry() {
+    local vols old mounts
+    vols="$(compose_check "${CHECK_ARGS[@]}" config --volumes 2>/dev/null)" || return 0
+    printf '%s\n' "$vols" | grep -qxF "$BIN_VOLUME" || return 0
+    old="$(platform_container otodock-proxy -a)" || return 0
+    [ -n "$old" ] || return 0
+    mounts="$(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$old" 2>/dev/null)" || return 0
+    if printf '%s\n' "$mounts" | grep -qxF "$BIN_DIR"; then
+        return 0
+    fi
+    # Into a file first: the diff of a server container runs to tens of
+    # thousands of lines, and grep -q leaving the pipe early would fail the
+    # pipeline under pipefail.
+    docker diff "$old" > "$TMP/server.diff" 2>/dev/null || return 0
+    grep -qxE "[AC] $BIN_DIR" "$TMP/server.diff" || return 0
+    printf '%s' "$old"
+}
+
+# Copy the recover bin out of the old server container into the volume the
+# target release mounts, through the target's own one-shot init service
+# (root, no network), which owns it for the server afterwards. Never fatal:
+# the bin is a safety net, and the database and the agents do not depend on
+# it.
+carry_recover_bin() { # carry_recover_bin <old server container>
+    local old="$1" need_k="" bytes free_k root
+    if [ "$(docker inspect -f '{{.State.Status}}' "$old" 2>/dev/null || true)" = running ]; then
+        need_k="$(docker exec "$old" du -sk "$BIN_DIR" 2>/dev/null | awk '{print $1}' || true)"
+    else
+        bytes="$(docker inspect --size -f '{{.SizeRw}}' "$old" 2>/dev/null || true)"
+        [[ "$bytes" =~ ^[0-9]+$ ]] && need_k=$((bytes / 1024))
+    fi
+    root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
+    free_k=""
+    [ -n "$root" ] && free_k="$(df -Pk "$root" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
+    if [[ "$need_k" =~ ^[0-9]+$ ]] && [[ "$free_k" =~ ^[0-9]+$ ]] \
+            && [ $((need_k + 2 * 1024 * 1024)) -gt "$free_k" ]; then
+        warn "not enough free disk to copy the recover bin ($((need_k / 1024)) MB, $((free_k / 1024)) MB free):
+  the files deleted in the last 7 days cannot be restored after this upgrade."
+        return 0
+    fi
+    say "copying the recover bin (files deleted in the last 7 days) into the $BIN_VOLUME volume"
+    if ! docker cp "$old:$BIN_DIR" - | docker compose run --rm --no-deps -T otodock-agents-init \
+            sh -c "mountpoint -q $BIN_DIR || exit 3; tar -x -C $BIN_DIR --strip-components=1 && chown -R 1000:1000 $BIN_DIR && chmod 0700 $BIN_DIR"; then
+        warn "could not copy the recover bin: some files deleted in the last 7 days may not
+  be restorable after the upgrade. The upgrade goes on."
+    fi
 }
 
 # --- cleanup and restore on exit ----------------------------------------------
@@ -230,6 +298,9 @@ TMP=""
 SNAP=""
 DUMP=""
 CONFIG_FILES=(.env docker-compose.yml docker-compose.phone.yml docker-compose.override.yml)
+# The recover bin: the server's copies of deleted and overwritten files.
+BIN_DIR=/opt/otodock/recover-bin
+BIN_VOLUME=otodock-recover-bin
 
 # Replace a compose file atomically, keeping the mode of the one it replaces.
 put_file() { # put_file <source> <dest>
@@ -288,8 +359,8 @@ on_exit() {
       bash upgrade.sh --to $TARGET"
             if [ -n "$DUMP" ]; then
                 warn "To go back to ${FROM:-the old release} instead: put back the files from $SNAP,
-  then restore the database from $DUMP
-  with restore.sh ($DOCS#restoring-from-a-backup)."
+  then restore the database with restore.sh $SNAP
+  ($DOCS#restoring-from-a-backup)."
             else
                 warn "No dump was taken (--no-db-backup): going back to ${FROM:-the old release} needs
   your own backup of the database, restored with restore.sh."
@@ -322,6 +393,31 @@ if [ -n "$FROM" ] && version_lt "$TARGET" "$FROM"; then
     fail "this install runs $FROM; refusing to move it back to $TARGET: database
   migrations only run forward. To go back, restore a backup taken on $TARGET."
 fi
+
+# The database records the release that last migrated it (schema_meta, since
+# 1.8.0): a row newer than the target is a downgrade whatever .env says, and
+# one newer than .env's version (a hand-edited .env, a restore) is the real
+# starting point for the notes. Read-only; absent on a 1.7.1 database or a
+# stopped stack.
+DB_VERSION=""
+_pg="$(platform_container otodock-postgres || true)"
+if [ -n "$_pg" ]; then
+    DB_VERSION="$(docker exec "$_pg" psql -U otodock -d otodock -tAc \
+        "SELECT last_migrated_by FROM schema_meta WHERE id = 1" 2>/dev/null | head -n1 || true)"
+    [[ "$DB_VERSION" =~ $VERSION_RE ]] || DB_VERSION=""
+    DB_VERSION="${DB_VERSION#v}"
+fi
+if [ -n "$DB_VERSION" ]; then
+    if version_lt "$TARGET" "$DB_VERSION"; then
+        fail "the database was last migrated by OtoDock $DB_VERSION: moving the images to $TARGET
+  is a downgrade, and migrations only run forward. To go back, restore a backup
+  taken on $TARGET with restore.sh."
+    fi
+    if [ -z "$FROM" ] || version_lt "$FROM" "$DB_VERSION"; then
+        say "the database says it was last migrated by $DB_VERSION (.env says ${FROM:-nothing}): upgrading from there"
+        FROM="$DB_VERSION"
+    fi
+fi
 if [ "$FROM" = "$TARGET" ]; then
     say "this install is set to $TARGET already: its compose files and .env lines
   are brought in line with $TARGET again"
@@ -342,9 +438,9 @@ fetch() { # fetch <url> <dest>
 if [ -n "$COMPOSE_DIR" ]; then
     say "reading the $TARGET compose files from $COMPOSE_DIR (release candidate)"
     cp "$COMPOSE_DIR/docker-compose.yml" "$COMPOSE_DIR/docker-compose.phone.yml" "$NEW/"
-    if [ -f "$COMPOSE_DIR/config.env.example" ]; then
-        cp "$COMPOSE_DIR/config.env.example" "$NEW/"
-    fi
+    for f in config.env.example CHANGELOG.md; do
+        [ -f "$COMPOSE_DIR/$f" ] && cp "$COMPOSE_DIR/$f" "$NEW/"
+    done
 else
     say "downloading the $TARGET compose files"
     for f in docker-compose.yml docker-compose.phone.yml; do
@@ -352,7 +448,59 @@ else
             || fail "could not download $f of $TARGET ($RAW/v$TARGET/$f): check the version and your network."
     done
     fetch "$RAW/v$TARGET/config.env.example" "$NEW/config.env.example" 2>/dev/null || true
+    fetch "$RAW/v$TARGET/CHANGELOG.md" "$NEW/CHANGELOG.md" 2>/dev/null || true
 fi
+
+# The Upgrade notes of every release this upgrade crosses (FROM < X <= TARGET;
+# the target's alone when FROM is unknown), from the target's CHANGELOG.md:
+# the entries under a "### Upgrade notes" heading and those whose bold lead
+# is "Upgrade note:". Printed before anything changes, in the dry run and
+# the real run.
+print_notes() {
+    local notes
+    if [ ! -f "$NEW/CHANGELOG.md" ]; then
+        say "no CHANGELOG.md for $TARGET could be read; the release notes: https://github.com/${REPO}/releases/tag/v$TARGET"
+        return 0
+    fi
+    notes="$(awk -v from="${FROM:-}" -v target="$TARGET" '
+        function key(v,   a, n, pre, num) {
+            # the one version rule: X.Y.Z; -rcN older than the release; -dev older than every rc
+            pre = 0; num = 0
+            if (v ~ /-dev$/) { pre = -2; sub(/-dev$/, "", v) }
+            else if (v ~ /-rc[0-9]+$/) { pre = -1; num = v; sub(/.*-rc/, "", num); sub(/-rc[0-9]+$/, "", v) }
+            n = split(v, a, ".")
+            return sprintf("%06d%06d%06d%03d%06d", a[1], a[2], a[3], pre + 10, num)
+        }
+        function flush() {
+            if (entry != "" && (heading ~ /^[Uu]pgrade notes/ || entry ~ /^\*\*[Uu]pgrade note/)) {
+                gsub(/\*\*/, "", entry); gsub(/[ \t]+/, " ", entry)
+                print "  - " entry
+            }
+            entry = ""
+        }
+        /^## \[[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?\]/ {
+            flush(); heading = ""
+            v = $0; sub(/^## \[/, "", v); sub(/\].*/, "", v)
+            take = (key(v) <= key(target)) && (from == "" ? v == target : key(v) > key(from))
+            if (take) print "" v ":"
+            next
+        }
+        /^## / { flush(); take = 0; next }
+        !take { next }
+        /^### / { flush(); heading = substr($0, 5); next }
+        /^- / { flush(); entry = substr($0, 3); next }
+        /^[ \t]+[^ \t]/ && entry != "" { line = $0; sub(/^[ \t]+/, "", line); entry = entry " " line; next }
+        { flush() }
+        END { flush() }
+    ' "$NEW/CHANGELOG.md")"
+    if printf '%s\n' "$notes" | grep -q '^  - '; then
+        say "upgrade notes from ${FROM:-the current release} to $TARGET (the entries that change a running install):"
+        printf '%s\n' "$notes" | grep -v '^$' | sed 's/^/    /' | fold -s -w 96
+        echo
+    else
+        say "no upgrade notes for $TARGET in its CHANGELOG.md; the release notes: https://github.com/${REPO}/releases/tag/v$TARGET"
+    fi
+}
 
 # --- which compose files the upgraded stack loads -----------------------------
 # Compose loads docker-compose.override.yml by itself only while COMPOSE_FILE
@@ -446,6 +594,58 @@ if $PHONE && [ -z "$(env_value OTO_PHONE_BIND .env || true)" ]; then
     fi
 fi
 
+# Since 1.8.0 every yes/no key takes 1/true/yes/on and 0/false/no/off, and
+# another word stops the server at start, where older releases read it as
+# off. Two lists before anything changes, when the target is 1.8.0 or later:
+# the values the new server refuses (the dry run warns, the real run stops,
+# since the upgraded proxy would exit in a loop), and the values that flip
+# from off to on at this upgrade: the keys releases before 1.8.0 read as on
+# for the word "true" alone (TRUE_ONLY_KEYS: 1, yes and on were off there;
+# MCP_AUTO_INSTALL_SYSTEM_DEPS took 1 and yes, not on), so an operator who
+# wrote OTODOCK_CLOUD=1 for "off" learns it before the server reads it as on.
+# tests/config/test_config_keys.py keeps YESNO_KEYS equal to config.py's
+# _cfg_bool keys.
+YESNO_KEYS="OIDC_ENABLED OTODOCK_AIR_GAPPED OTODOCK_CLOUD DASHBOARD_ENABLED AUTH_PROVIDER_BYPASS
+  OIDC_CONFIRM_FRESH_LOGIN OIDC_CONFIRM_REQUIRE_AUTH_TIME MCP_AUTO_INSTALL_SYSTEM_DEPS
+  OTODOCK_MCP_BUILD_LOCAL OTODOCK_RELEASE_CHECK OTODOCK_ALLOW_NEWER_DATABASE COOKIE_SECURE
+  OTODOCK_LOCAL_PBX_ENABLED RUNNING_IN_DOCKER"
+TRUE_ONLY_KEYS="DASHBOARD_ENABLED OTODOCK_CLOUD OTODOCK_AIR_GAPPED AUTH_PROVIDER_BYPASS OIDC_ENABLED
+  OIDC_CONFIRM_FRESH_LOGIN OIDC_CONFIRM_REQUIRE_AUTH_TIME"
+_bad_yesno=""
+_now_on=""
+yesno_value() { # yesno_value <KEY>: .env's value, lower case, trimmed
+    env_value "$1" .env 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true
+}
+if ! version_lt "$TARGET" "1.8.0"; then
+    for _k in $YESNO_KEYS; do
+        _v="$(yesno_value "$_k")"
+        case "$_v" in
+            ""|1|true|yes|on|0|false|no|off) ;;
+            auto) case "$_k" in COOKIE_SECURE|RUNNING_IN_DOCKER|OTODOCK_LOCAL_PBX_ENABLED) ;; *) _bad_yesno="$_bad_yesno $_k=$_v" ;; esac ;;
+            *) _bad_yesno="$_bad_yesno $_k=$_v" ;;
+        esac
+    done
+    if [ -z "$FROM" ] || version_lt "$FROM" "1.8.0"; then
+        for _k in $TRUE_ONLY_KEYS; do
+            _v="$(yesno_value "$_k")"
+            case "$_v" in 1|yes|on) _now_on="$_now_on $_k=$_v" ;; esac
+        done
+        _v="$(yesno_value MCP_AUTO_INSTALL_SYSTEM_DEPS)"
+        [ "$_v" != on ] || _now_on="$_now_on MCP_AUTO_INSTALL_SYSTEM_DEPS=on"
+    fi
+fi
+if [ -n "$_now_on" ]; then
+    say "these .env values were read as OFF by releases before 1.8.0 and count as ON from
+  1.8.0 (1, yes and on are yes words now):$_now_on. Set each to false if off is what
+  you want, before the upgrade."
+fi
+if [ -n "$_bad_yesno" ]; then
+    _msg="these .env values are not yes/no words (true/false, 1/0, yes/no, on/off):$_bad_yesno.
+  OtoDock 1.8.0 and later refuse to start on them (older releases read them as off):
+  set each to true or false, then run the upgrade again."
+    if $DRY_RUN; then warn "$_msg (the real run stops here)"; else fail "$_msg"; fi
+fi
+
 # Settings the target release documents that the old one did not and that
 # .env does not carry in any form. Only the names are printed; nothing is written.
 NEW_KEYS=""
@@ -478,6 +678,8 @@ while [ -e "$SNAP" ]; do
     SNAP="$BACKUP_ROOT/upgrade-$TS-$_n"
 done
 
+print_notes
+
 if $DRY_RUN; then
     say "dry run: nothing is changed. The upgrade would:"
     if $DB_BACKUP; then
@@ -498,7 +700,12 @@ if $DRY_RUN; then
     else
         echo "  - leave COMPOSE_FILE in .env as it is"
     fi
-    echo "  - run docker compose pull, then docker compose up -d --remove-orphans"
+    echo "  - run docker compose pull"
+    _old="$(bin_to_carry)"
+    if [ -n "$_old" ]; then
+        echo "  - copy the recover bin out of $_old into the $BIN_VOLUME volume"
+    fi
+    echo "  - run docker compose up -d --remove-orphans"
     print_keys
     exit 0
 fi
@@ -526,6 +733,32 @@ for f in "${CONFIG_FILES[@]}"; do
         cmp -s "$f" "$SNAP/$f" || fail "the copy of $f in $SNAP does not match it."
     fi
 done
+# The snapshot is a restore.sh run directory (the database and the env copy,
+# no trees): its manifest carries the release and the credential key
+# fingerprints, so a rollback through restore.sh gets the same checks.
+if [ -n "$DUMP" ]; then
+    _keys="$(docker exec "$PG" psql -U otodock -d otodock -tAc \
+        "SELECT value FROM platform_settings WHERE key = 'credential_key_fingerprints'" 2>/dev/null | head -n1 || true)"
+    # A 1.7.1 database has no fingerprint row yet; its secret floor record
+    # lets restore.sh check the rollback's keys the way backup.sh's manifest does.
+    _floor="$(docker exec "$PG" psql -U otodock -d otodock -tAc \
+        "SELECT value FROM platform_settings WHERE key = 'secret_floor_fingerprints'" 2>/dev/null | head -n1 || true)"
+    {
+        echo "otodock_version=${FROM:-unknown}"
+        echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "topology=docker"
+        echo "project=otodock"
+        echo "database=otodock"
+        echo "db=$(basename "$DUMP")"
+        echo "env=1"
+        echo "agents=skipped"
+        echo "ssh_keys=skipped"
+        case "$_keys" in \{*\}) echo "credential_keys=$_keys" ;; esac
+        case "$_floor" in \{*\}) echo "credential_keys_floor=$_floor" ;; esac
+        echo "errors=0"
+        echo "complete=1"
+    } > "$SNAP/manifest"
+fi
 STAGE=armed
 
 # --- 4. The new files and the two .env lines ----------------------------------
@@ -561,6 +794,11 @@ if [ -n "$COMPOSE_DIR" ]; then
 else
     say "pulling the $TARGET images (the running stack keeps serving meanwhile)"
     docker compose pull
+fi
+
+_old="$(bin_to_carry)"
+if [ -n "$_old" ]; then
+    carry_recover_bin "$_old"
 fi
 
 STAGE=up

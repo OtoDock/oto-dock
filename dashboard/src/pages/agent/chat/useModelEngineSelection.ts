@@ -19,7 +19,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { AgentSummary, LayerCapabilities } from '../../../api/agents'
 import { useUserExecutionLayers } from '../../../api/executionLayers'
-import { computeModelGroups, visibleAgentPaths } from '../../../lib/modelGroups'
+import { computeModelGroups, pickSeedModel, visibleAgentPaths } from '../../../lib/modelGroups'
 import { useAgentPrefsStore } from '../../../store/agentPrefsStore'
 
 type Stream = ReturnType<typeof useChatStream>
@@ -104,7 +104,7 @@ export function useModelEngineSelection({ agentExecutionPaths, agentExecutionPat
 export function useModelEngineReconcile({
   layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model,
   setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError, chatId, agentName, sessionId, setProcessAlive,
-  urlChatId, agentDefaultModel, setModel, setMode, selectedLayer, setSelectedLayer, currentAgent, parseModelValue,
+  urlChatId, agentDefaultModel, setModel, setMode, selectedLayer, setSelectedLayer, currentAgent,
 }: {
   layers: Record<string, LayerCapabilities> | undefined
   agentExecutionPaths: string[]
@@ -128,7 +128,6 @@ export function useModelEngineReconcile({
   selectedLayer: Selection['selectedLayer']
   setSelectedLayer: Selection['setSelectedLayer']
   currentAgent: AgentSummary | undefined
-  parseModelValue: Selection['parseModelValue']
 }) {
   // Model dropdown groups — locked to the chat's engine while its session
   // process is alive/streaming/warming; a DEAD chat's dropdown adds the
@@ -231,18 +230,20 @@ export function useModelEngineReconcile({
       return
     }
 
-    // No group owns the current model — the agent has no default_model, or its
-    // default belongs to a disabled layer. Pick the first available so the
-    // dropdown has a valid selection, but do NOT persist it as the sticky pref:
-    // this is an automatic reconciliation, not a user choice (handleModelChange
-    // is the only place a pick becomes sticky). Persisting here is G1 poisoning.
-    const firstGroup = modelGroups[0]
-    const firstOption = firstGroup?.models[0]
-    if (!firstOption) return
-    const { layer, model: modelId } = parseModelValue(firstOption.value)
-    setModel(modelId)
-    setSelectedLayer(layer)
-  }, [urlChatId, chatActiveLayer, selectedLayer, modelGroups, model, agentName, agentDefaultModel, currentAgent, parseModelValue])
+    // No group owns the current model — the agent has no default_model, its
+    // default belongs to a disabled layer, or the sticky pick or the default
+    // names a model the engine stopped offering (a retired id). Pick the
+    // offered model it runs as today, else the agent's default, else the
+    // engine's own default (pickSeedModel), but do NOT persist it as the
+    // sticky pref: this is an automatic reconciliation, not a user choice
+    // (handleModelChange is the only place a pick becomes sticky), and the
+    // person's pick applies again once it is offered again. Persisting here
+    // is G1 poisoning.
+    const seed = pickSeedModel(modelGroups, layers, [model, agentDefaultModel])
+    if (!seed) return
+    setModel(seed.model)
+    setSelectedLayer(seed.layer)
+  }, [urlChatId, chatActiveLayer, selectedLayer, modelGroups, model, agentName, agentDefaultModel, currentAgent, layers])
 
   return { modelGroups }
 }

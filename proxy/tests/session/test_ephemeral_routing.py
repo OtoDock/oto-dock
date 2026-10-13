@@ -76,6 +76,33 @@ async def test_pump_browser_origin_pings_that_conn_only(routing):
     assert routing["fcm"] == []
 
 
+async def test_a_mid_turn_ping_rides_the_origin_live_queue(routing):
+    """A prompt's "needs your input" fires while the origin socket streams
+    the chat: its notification queue drains only after the turn, the live
+    queue during it."""
+    c_origin = nm.ConnectionInfo(connection_id="c1", queue=asyncio.Queue(), active=False,
+                                 platform="web", live_queue=nm.LiveQueue())
+    nm._user_connections["u"] = [c_origin]
+    nm._chat_turn_origin["chat-1"] = ("c1", "web")
+    await nm.fire_ephemeral("u", "T", "B", chat_id="chat-1", mid_turn=True)
+    assert _frames(c_origin) == []
+    assert c_origin.live_queue.get_nowait()["type"] == "turn_complete"
+    assert routing["fcm"] == []
+    # Away: the frame still rides the live queue, and the phone hears it.
+    c_origin.away = True
+    await nm.fire_ephemeral("u", "T", "B", chat_id="chat-1", mid_turn=True)
+    assert c_origin.live_queue.get_nowait()["type"] == "turn_complete"
+    assert len(routing["fcm"]) == 1
+
+
+async def test_a_mid_turn_ping_without_a_live_queue_takes_the_notification_queue(routing):
+    c_origin = _conn("c1", active=False)
+    nm._user_connections["u"] = [c_origin]
+    nm._chat_turn_origin["chat-1"] = ("c1", "web")
+    await nm.fire_ephemeral("u", "T", "B", chat_id="chat-1", mid_turn=True)
+    assert [f["type"] for f in _frames(c_origin)] == ["turn_complete"]
+
+
 async def test_pump_browser_origin_away_pushes_too(routing):
     # Dashboard visibly open but input-idle: the frame still plays the local
     # toast/sound AND the FCM leg runs — the user stepped away from the screen.

@@ -25,10 +25,13 @@ from .._vendored.app_server_client import (
     AppServerClient, AppServerError, mcp_server_names_from_toml, wait_for_mcp_startup,
 )
 from .._vendored.codex_approvals import (
-    UNTRUSTED_POLICY, approval_for_sandbox, build_sandbox_policy,
-    is_untrusted_policy_rejection, make_server_request_handler,
+    UNTRUSTED_POLICY, approval_policy, build_sandbox_policy,
+    is_untrusted_policy_rejection, make_server_request_handler, untrusted_fallback,
 )
-from ..config import codex_hook_command, otodock_dir, reap_descendants, snapshot_descendants
+from ..config import (
+    codex_hook_command, otodock_dir, reap_descendants, session_tools_env,
+    snapshot_descendants, write_command_wrappers, write_if_changed,
+)
 import contextlib
 from .. import config
 from .._vendored import layout
@@ -70,9 +73,10 @@ def _write_codex_hooks(codex_dir: Path) -> None:
     Codex TUI (``--dangerously-bypass-hook-trust``) and, from 0.5.118, the
     ``-p`` app-server for UNATTENDED sessions (``codex_hooks_floor`` in the
     start payload → thread-level ``bypass_hook_trust``; see
-    ``CodexSession._thread_overrides``). Attended dashboard chats leave the
-    file dormant (a user-layer hook runs only when trusted) and gate through
-    the JSON-RPC approval bridge. Uses ``codex_hook_command()`` — on Windows a
+    ``CodexSession._thread_overrides``); from 0.5.143 attended dashboard
+    chats too (``codex_attended_floor``), whose gate judges the turns Codex
+    runs under ``never`` and leaves the others to the JSON-RPC approval
+    bridge. Uses ``codex_hook_command()`` — on Windows a
     quote-free .cmd wrapper, because Codex's cmd.exe /C hook runner cannot
     re-parse the quoted two-token form (exit-1 on every call otherwise)."""
     def _hook(script: str, timeout: int) -> dict:
@@ -98,7 +102,7 @@ def _write_codex_hooks(codex_dir: Path) -> None:
             "Stop": [_hook("stop_tracker.py", config.HOOK_WAIT_S)],
         },
     }
-    (codex_dir / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
+    write_if_changed(codex_dir / "hooks.json", (json.dumps(hooks, indent=2) + "\n").encode("utf-8"))
 
 
 def _inject_display_env_toml(toml_content: str) -> str:
@@ -209,8 +213,8 @@ def features_table(hooks_floor: bool, mcp_toml: str) -> "tuple[str, str]":
     Returns ``(features_block, mcp_toml_rest)``. The block always carries
     ``plugins = false`` (lean start, see ``CODEX_HEADLESS_ROOT_KEYS``), adds
     ``hooks = true`` when this session runs the PreToolUse permission floor
-    (``codex_hooks_floor`` in the start payload — the key is default-on
-    upstream, explicit on purpose), and keeps every key of a ``[features]``
+    (``codex_hooks_floor`` or ``codex_attended_floor`` in the start payload —
+    the key is default-on upstream, explicit on purpose), and keeps every key of a ``[features]``
     block the proxy prepends to the MCP TOML (``default_mode_request_user_input``
     for headless dashboard chats). Merging is what keeps the file valid: two
     ``[features]`` tables are a duplicate key Codex rejects, after which the
@@ -342,16 +346,15 @@ def chmod_private(path: Path) -> None:
 
 
 def _write_codex_hook_scripts(codex_dir: Path, scripts: dict[str, str]) -> None:
-    """Write hook scripts sent by the proxy into the .codex/ dir."""
+    """Write hook scripts sent by the proxy into the .codex/ dir (an
+    unchanged one left alone, a changed one replaced whole:
+    ``config.write_if_changed``)."""
     if not scripts:
         return
     for filename, content in scripts.items():
         if not content:
             continue
-        path = codex_dir / filename
-        path.write_text(content)
-        if config.HOST.posix:
-            path.chmod(0o755)
+        write_if_changed(codex_dir / filename, content.encode("utf-8"), 0o755)
 
 
 class CodexSession:
@@ -426,13 +429,24 @@ class CodexSession:
         # user-layer hook only when trusted — the operative switch on a shared
         # CODEX_HOME), and the deny-only / no-forward hook env below.
         self._hooks_floor: bool = bool(config.get("codex_hooks_floor"))
+        # An ATTENDED chat (0.5.143, ``codex_attended_floor``) runs the same
+        # three pieces plus OTO_HOOK_BRIDGED: its gate judges only the turns
+        # Codex runs under `never` (Don't Ask, auto), and stands aside while
+        # the bridge asks the person. Read from the payload, never from this
+        # satellite's own version: a proxy that does not send it ships a gate
+        # without the bridged branch.
+        self._attended_floor: bool = bool(config.get("codex_attended_floor"))
         # An ATTENDED chat (no floor — a person answers the bridge) sends the
-        # "untrusted" approval policy so every command and patch reaches the
-        # proxy's decide_tool_permission, like Claude's hook (proxy HOOKS.md
-        # "Attended Codex chats"); a daemon that rejects it drops the session
-        # to on-request once, logged. Twin of the proxy session's
-        # _note_untrusted_rejection.
+        # "untrusted" approval policy in every mode that asks, so every command
+        # and patch reaches the proxy's decide_tool_permission, like Claude's
+        # hook (proxy HOOKS.md "Attended Codex chats"); a daemon that rejects
+        # it drops the session to the fallback once, logged. Twin of the proxy
+        # session's _note_untrusted_rejection.
         self._untrusted_rejected = False
+
+    @property
+    def _hooks_on(self) -> bool:
+        return self._hooks_floor or self._attended_floor
 
     def _plan_mode(self, sandbox_mode: str) -> bool:
         """The plan collaboration mode follows the platform's ``permission_mode``
@@ -444,9 +458,17 @@ class CodexSession:
         return sandbox_mode == "read-only"
 
     def _approval_policy(self) -> str:
-        sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
-        attended = not self._hooks_floor and not self._untrusted_rejected
-        return approval_for_sandbox(sandbox_mode, attended=attended)
+        """``codex_approvals.approval_policy`` from the shipped platform mode
+        (0.5.143; a proxy that ships none leaves the sandbox to decide, as
+        before), with ``untrusted_fallback`` once ``untrusted`` was rejected."""
+        policy = approval_policy(
+            self.config.get("permission_mode") or "",
+            self.config.get("sandbox_mode", "workspace-write"),
+            attended=not self._hooks_floor,
+        )
+        if policy == UNTRUSTED_POLICY and self._untrusted_rejected:
+            return untrusted_fallback(self.config.get("sandbox_mode", "workspace-write"))
+        return policy
 
     def _note_untrusted_rejection(self, error: Exception) -> bool:
         if self._approval_policy() != UNTRUSTED_POLICY or not is_untrusted_policy_rejection(error):
@@ -485,6 +507,7 @@ class CodexSession:
 
         # --- write the .codex/ config tree (unchanged from the exec model) ---
         _write_codex_hook_scripts(self._codex_dir, self.config.get("hook_scripts", {}))
+        write_command_wrappers(self._codex_dir, self.config.get("command_wrappers", {}))
         (self._codex_dir / "AGENTS.md").write_text(
             self.config.get("agents_md_content", self.config.get("system_prompt", ""))
         )
@@ -523,7 +546,7 @@ class CodexSession:
         # provider table last (none of the MCP transforms sees it).
         local_provider = self.config.get("local_model_provider")
         root_line, provider_table = local_provider_toml(local_provider, self._codex_dir)
-        features, mcp_sections = features_table(self._hooks_floor, toml_content.strip())
+        features, mcp_sections = features_table(self._hooks_on, toml_content.strip())
         parts = [p for p in (
             CODEX_HEADLESS_ROOT_KEYS, root_line, CODEX_TOOLS_TABLE, CODEX_MEMORIES_TABLE,
             features, mcp_sections, provider_table,
@@ -557,7 +580,7 @@ class CodexSession:
         env["OTO_SESSION_ID"] = self.session_id
         # Interpreter for the Windows .cmd hook wrappers (codex_hook_command).
         env["OTO_HOOK_PY"] = sys.executable
-        if self._hooks_floor:
+        if self._hooks_on:
             # The hook processes inherit the daemon env. Codex's PreToolUse
             # hook rejects permissionDecision:"allow", so permission_gate.py
             # emits JSON only to DENY; the PostToolUse forwarder stays quiet
@@ -567,6 +590,12 @@ class CodexSession:
             # layer's _build_env; the interactive TUI path sets DENY_ONLY too.
             env["OTO_HOOK_DENY_ONLY"] = "1"
             env["OTO_HOOK_NO_FORWARD"] = "1"
+        if self._attended_floor and not self._hooks_floor:
+            # A person answers this chat's bridge: the gate judges only the
+            # turns Codex reports as "bypassPermissions" (approvalPolicy never).
+            env["OTO_HOOK_BRIDGED"] = "1"
+        else:
+            env.pop("OTO_HOOK_BRIDGED", None)
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         # Per-session secret files (SSH keys + OAuth token files) — see
@@ -583,6 +612,7 @@ class CodexSession:
             session_id=self.session_id,
             multi_value_envs=self.config.get("multi_value_envs") or {},
         )
+        env = session_tools_env(env, self._codex_dir)
         # The native-approval bridge posts to the proxy's /v1/hooks/permission
         # over this loopback tunnel (translate_env rewrote PROXY_URL to it).
         self._proxy_url = env.get("PROXY_URL", "")
@@ -592,12 +622,15 @@ class CodexSession:
 
         overrides = self._thread_overrides()
         if self.thread_id:
+            # ``excludeTurns``: the history stays in the rollout, unread here
+            # (Codex deprecates hydrating it into the answer).
+            resume = {"threadId": self.thread_id, "excludeTurns": True}
             try:
-                await self._client.request("thread/resume", {"threadId": self.thread_id, **overrides})
+                await self._client.request("thread/resume", {**resume, **overrides})
             except AppServerError as e:
                 if self._note_untrusted_rejection(e):
                     overrides = self._thread_overrides()
-                    await self._client.request("thread/resume", {"threadId": self.thread_id, **overrides})
+                    await self._client.request("thread/resume", {**resume, **overrides})
                 else:
                     logger.warning(f"Codex resume failed ({e}); starting new thread")
                     self.thread_id = None
@@ -960,6 +993,10 @@ class CodexSession:
             self.config["model"] = kwargs["model"]
         elif subtype == "set_permission_mode" and "sandbox_mode" in kwargs:
             self.config["sandbox_mode"] = kwargs["sandbox_mode"]
+            # The platform mode (a 0.5.143 proxy): the approval policy and the
+            # plan collaboration mode follow it on the next turn/start.
+            if "permission_mode" in kwargs:
+                self.config["permission_mode"] = kwargs["permission_mode"]
 
     def detect_file_changes(self) -> list[dict]:
         return file_sync.detect_changes(self.agent_dir, self._file_snapshot)
@@ -986,14 +1023,16 @@ class CodexSession:
     # ------------------------------------------------------------------
 
     def _thread_overrides(self) -> dict:
-        # Approval policy is derived from the sandbox mode: danger-full-
-        # access → never; else on-request, so a sandbox escape fires an approval
-        # we route — over the loopback tunnel → /v1/hooks/permission — through
-        # the proxy's decide_tool_permission. turn/start re-asserts these per
-        # turn with the structured sandboxPolicy. (No bwrap on the satellite;
-        # Codex's own sandbox is the FS boundary.) Under `never` nothing fires,
-        # so unattended sessions run the PreToolUse hook floor instead — the
-        # hook posts to the same endpoint over the same tunnel.
+        # Approval policy (_approval_policy): an attended chat asks through
+        # the bridge in every mode that asks, an unattended session by the
+        # sandbox (on-request unless danger-full-access), so a request fires
+        # an approval we route — over the loopback tunnel →
+        # /v1/hooks/permission — through the proxy's decide_tool_permission.
+        # turn/start re-asserts these per turn with the structured
+        # sandboxPolicy. (No bwrap on the satellite; Codex's own sandbox is
+        # the FS boundary.) Under `never` nothing fires, so the PreToolUse
+        # hook floor judges instead — the hook posts to the same endpoint
+        # over the same tunnel.
         sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
         overrides: dict = {
             "approvalPolicy": self._approval_policy(),
@@ -1004,7 +1043,7 @@ class CodexSession:
             overrides["model"] = self.config["model"]
         if self.config.get("effort"):
             overrides["effort"] = self.config["effort"]
-        if self._hooks_floor:
+        if self._hooks_on:
             # Codex runs a user-layer hooks.json only when trusted; the
             # app-server has no CLI flag for it (the TUI's
             # --dangerously-bypass-hook-trust), the per-thread `config` map is

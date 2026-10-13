@@ -24,8 +24,9 @@ from core.execution_layer import ExecutionLayer
 from core.session.session_state import get_subagent_registry
 from core.events.bg_command_state import get_bg_command_registry
 from core.events.pump_bg_monitors import format_job_list, hold_bg_monitors, ride_out_grace
+from core.session.session_state import has_pending_prompt
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,7 @@ async def task_produce(
     bg_sub_ceiling: float = 1800.0,
     bg_stall_nudge: float = 120.0,
     bg_max_rounds: int = 10,
+    inject_time: bool = False,
 ) -> None:
     """Producer for task execution — sends prompt through ExecutionLayer, routes to pump.
 
@@ -111,6 +113,9 @@ async def task_produce(
             long, nudge what completed instead of waiting out a stuck sibling.
         bg_max_rounds: Runaway belt on review rounds (each round requires new
             completions or new spawns; real workflows use 1-3).
+        inject_time: Stamp the main turn's prompt with the time and the
+            parallel-activity lines at the engine's own turn site (a run's
+            first prompt; the review nudges go out as they are).
     """
     bg_count = 0
 
@@ -128,7 +133,12 @@ async def task_produce(
         # owns bg-completion handling, and a dashboard viewer detaching mid-run
         # would otherwise arm a monitor on the task session that races the
         # drains below and double-nudges.
-        with hold_bg_monitors(session_id):
+        # The run's ceilings bound the settle read and the wait below as ONE
+        # deadline (the settle's start is where both count from).
+        from core.layers.cli import settle as cli_settle
+        from core.session import session_events
+        with hold_bg_monitors(session_id), cli_settle.run_ceilings(
+                session_id, cmd=bg_cmd_ceiling, sub=bg_sub_ceiling) as ceilings:
             # Main turn with settle (waits for background agents at CLI level).
             # The lock is taken PER send — never across the whole flow: the
             # post-turn drains below timeout-acquire this same lock inside the
@@ -139,8 +149,13 @@ async def task_produce(
             # task-notification into the live turn), which is why the
             # registry's per-turn reset clearing `unsurfaced` is correct here.
             async with layer.session_lock(session_id):
+                # The run's turns begin here, under the lock: a Stop on
+                # another turn of this session while the lock was held is
+                # not this run's.
+                started = time.monotonic()
                 async for event in layer.send_message(
                     session_id, prompt, settle_after_result=settle_timeout,
+                    **({"inject_time": True} if inject_time else {}),
                 ):
                     await event_queue.put(event)
                     await _broadcast(event)
@@ -153,6 +168,20 @@ async def task_produce(
                     if (event.type == SUBAGENT_START
                             and event.data.get("run_in_background")):
                         bg_count += 1
+
+            def _stopped() -> bool:
+                """The person stopped the run (``session_events.note_stop``
+                since its turns began): no review of its background work, in
+                any round — what still runs stays with the session, as past
+                the ceiling, and the run ends with the output so far."""
+                return session_events.stopped_since(session_id, started)
+
+            if _stopped():
+                logger.info(
+                    f"Task {run_id[:8]}: the person stopped the run — no review "
+                    f"of its background work"
+                )
+                return
 
             # Background work — the delegation contract REQUIRES a delegated
             # agent's result return only after its bg sub-agents AND bg shell
@@ -189,14 +218,24 @@ async def task_produce(
             # Per-type give-up horizons, re-armed on ANY observed completion
             # and after each nudge turn. Once a type exceeds its ceiling it is
             # abandoned: dropped from the cohort so the loop can't re-wait it.
+            # They count from the settle read's start: that read already
+            # waited on the same work.
             now = time.monotonic()
-            sub_deadline = now + bg_sub_ceiling
-            cmd_deadline = now + bg_cmd_ceiling
+            base = ceilings.started if ceilings.started is not None else now
+            sub_deadline = base + bg_sub_ceiling
+            cmd_deadline = base + bg_cmd_ceiling
             abandoned_subs = False
             abandoned_cmds = False
             session_gone = False
             rounds = 0
             while cohort > 0:
+                if _stopped():
+                    # A Stop during a review turn, or while this loop waited.
+                    logger.info(
+                        f"Task {run_id[:8]}: the person stopped the run — no "
+                        f"further review of its background work"
+                    )
+                    break
                 rounds += 1
                 if rounds > bg_max_rounds:
                     logger.warning(
@@ -218,9 +257,15 @@ async def task_produce(
                 while True:
                     subs_pending = 0 if abandoned_subs else reg.pending_count
                     cmds_pending = 0 if abandoned_cmds else bgreg.pending_count
-                    if not subs_pending and not cmds_pending:
+                    if (not subs_pending and not cmds_pending) or _stopped():
                         break
                     now = time.monotonic()
+                    if has_pending_prompt(session_id):
+                        # A person decides on a card (an engine prompt, a
+                        # hook card): progress; the prompt's own bound ends it.
+                        last_progress = now
+                        sub_deadline = now + bg_sub_ceiling
+                        cmd_deadline = now + bg_cmd_ceiling
                     if subs_pending and now >= sub_deadline:
                         abandoned_subs = True
                         logger.warning(
@@ -247,6 +292,12 @@ async def task_produce(
                         session_gone = True
                         break
                     if subs_pending:
+                        if not cmds_pending:
+                            # Read stdout too: a subagent's permission request
+                            # arrives there (core/session/engine_prompts).
+                            await layer.drain_bg_commands(
+                                session_id, budget=min(0.5, bg_poll),
+                            )
                         # Hook-driven — observable while the CLI is idle.
                         await layer.wait_for_bg_subagents(
                             session_id, timeout=bg_poll,
@@ -280,6 +331,8 @@ async def task_produce(
                         break
                 if session_gone:
                     break
+                if _stopped():
+                    continue  # the loop's top logs and leaves
 
                 bits = []
                 # Agents join the nudge only once EVERY one of them finished

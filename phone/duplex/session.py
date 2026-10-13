@@ -30,12 +30,11 @@ import time
 import config
 from audio.providers.vad.silero import SileroVad
 from pipeline.vad_serial import SerializedVad
-from audio.providers.turn.dispatcher import build_dispatcher
 from audio.streaming.lang import base_lang
 from config_manager import ConfigManager, PhoneRoute, RouteSettings
 from fillers import filler_cache
 from pipeline.core import CallPipeline
-from pipeline.providers import build_stt, build_tts, filler_key_for
+from pipeline.providers import build_stt, build_tts, build_turn_classifier, filler_key_for
 from pipeline.state import CallState
 from transport.base import TransportError
 
@@ -135,6 +134,9 @@ class DuplexSession(CallPipeline):
             self.cfg.smart_turn_audio_window_s * self._rate_in * config.SAMPLE_WIDTH
         )
         self.state = CallState()
+        # A person dictating in "Automatic": the speaker's language is
+        # identified on the first utterance, as on a route that detects.
+        self.state._language_locked = not bool(session_cfg.get("language_detect"))
         # Absolute-schedule pacing with catch-up (R5): the browser player
         # buffers a jitter lead, so late frames must burst-refill it — the
         # telephony default (0 = re-anchor on any lateness) let event-loop
@@ -346,16 +348,9 @@ class DuplexSession(CallPipeline):
             except Exception as e:
                 logger.warning(f"[{self.conn.peer_addr}] Filler init failed: {e}")
 
-            self._turn_clf = build_dispatcher(
-                smart_turn_enabled=self.cfg.smart_turn_enabled,
-                smart_turn_threshold=self.cfg.smart_turn_threshold,
-                smart_turn_onnx_threads=self.cfg.smart_turn_onnx_threads,
-                smart_turn_audio_window_s=self.cfg.smart_turn_audio_window_s,
-                groq_api_key=self.cfg.groq_api_key,
-                groq_base_url=self.cfg.groq_base_url,
-                lang_map=self.cfg.lang_backend_map,
-                default_backend=self.cfg.turn_classifier_default_backend,
-            )
+            # Built in the background, the Smart Turn load off the loop
+            # (TurnMixin._turn_classifier waits for it, bounded).
+            self.state._turn_clf_task = asyncio.create_task(build_turn_classifier(self.cfg))
             if self.stt.needs_pre_connect:
                 try:
                     await self.stt.start(

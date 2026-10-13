@@ -205,3 +205,52 @@ def test_replay_strips_osc52_clipboard_write(tmp_path):
     # Live tee still passes the copy feature through raw.
     session.relay_out(b"live\x1b]52;c;bGl2ZQ==\x07bytes")
     assert conn.outputs[-1] == b"live\x1b]52;c;bGl2ZQ==\x07bytes"
+
+
+# ---------------------------------------------------------------------------
+# bracketed paste across a trimmed replay
+# ---------------------------------------------------------------------------
+
+def test_the_local_terminal_replay_carries_the_paste_mode_a_trimmed_ring_dropped(tmp_path):
+    """The ring's replay starts with the program's bracketed-paste mode once
+    the ring dropped its toggle, and the strips keep it: the local terminal
+    then brackets a paste instead of submitting its first line."""
+    import asyncio
+    import sys
+    if sys.platform == "win32":  # pragma: no cover - unix backend under test
+        return
+    from satellite.terminal.pty_relay import spawn_pty
+
+    async def run() -> bytes:
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+        proc = spawn_pty(
+            ["sh", "-c", "printf '\\033[?2004h'; i=0; while [ $i -lt 40 ]; do "
+                         "printf '0123456789ABCDEF\\n'; i=$((i+1)); done; sleep 2"],
+            env={"TERM": "xterm-256color", "PATH": "/usr/bin:/bin"},
+            on_output=lambda _b: None,
+            on_exit=lambda _c: done.done() or done.set_result(None),
+            scrollback_limit=64,
+        )
+        try:
+            await asyncio.sleep(0.6)
+            return proc.scrollback()
+        finally:
+            proc.terminate()
+            await asyncio.wait_for(done, 5)
+
+    ring = asyncio.run(run())
+    assert ring.startswith(b"\x1b[?2004h") and b"\x1b[?2004h" not in ring[8:]
+    session = _FakeSession(ring)
+    conn = _FakeConn()
+    _sm(tmp_path, session).attach_local_conn("s1", conn, attach=True)
+    assert conn.outputs[0].startswith(b"\x1b[?2004h")
+
+
+def test_the_tracker_twin_keeps_an_explicit_off():
+    from satellite._vendored.terminal_queries import PasteModeTracker
+    t = PasteModeTracker()
+    t.feed(b"\x1b[?2004h")
+    t.trimmed = True
+    t.feed(b"\x1b[?2004l")
+    assert t.replay_prefix() == b""

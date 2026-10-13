@@ -5,6 +5,7 @@ the DirectSession machinery (core/layers/direct/session.py) — wraps it.
 """
 
 import asyncio
+import functools
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -34,7 +35,7 @@ from core.layers.direct.session import (
 )
 from core.session import session_kind
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,16 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
 )
 
 
+def declared_effort_scale(provider: str) -> list[str]:
+    """The effort levels this engine's descriptor says ``provider``'s API
+    takes (its ``providers[]`` entry), or ``[]`` for a provider it does not
+    declare. The provider adapters fold a level onto it."""
+    for entry in _DIRECT_CAPABILITIES.providers or []:
+        if entry.get("id") == provider:
+            return list(entry.get("effort_scale") or [])
+    return []
+
+
 # ---------------------------------------------------------------------------
 # DirectLLMExecutionLayer
 # ---------------------------------------------------------------------------
@@ -262,7 +273,8 @@ def _text_only_history(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> None:
+def _rebuild_history_from_db(session, session_id: str, chat_id: str = "", *,
+                             skip_row: int = 0) -> None:
     """Reconstruct conversation history from DB chat_messages.
 
     Direct LLM sessions are in-memory only — lost on proxy restart or idle
@@ -271,24 +283,35 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> Non
 
     If *chat_id* is provided, look up the chat directly (works after restart
     when the session_id in the DB was just updated to a new value).
+
+    ``skip_row``: a task session resumed for its next round. Its
+    conversation is the rounds of the runs on it, each in its own chat, in
+    the order they started; the round's own prompt row (this turn's message)
+    is left out by its id.
     """
     from storage import database as task_store
-    # Prefer chat_id lookup (works after restart when session_id changed)
-    if chat_id:
-        chat = task_store.get_chat(chat_id)
-    else:
-        chat = task_store.get_chat_by_session(session_id)
-    if not chat:
-        logger.info(f"Direct session resume: no chat found for session {session_id}")
-        return
+    chats: list[dict] = []
+    if skip_row:
+        chats = [c for c in (task_store.get_chat(cid)
+                             for cid in task_store.round_chats_of_session(session_id)) if c]
+    if not chats:
+        # Prefer chat_id lookup (works after restart when session_id changed)
+        chat = (task_store.get_chat(chat_id) if chat_id
+                else task_store.get_chat_by_session(session_id))
+        if not chat:
+            logger.info(f"Direct session resume: no chat found for session {session_id}")
+            return
+        chats = [chat]
 
-    messages_db = task_store.get_chat_messages(chat["id"])
+    messages_db: list[dict] = []
     rebuilt: list[dict] = []
-    for m in messages_db:
-        role = m.get("role", "")
-        content = m.get("content", "")
-        if role in ("user", "assistant") and content:
-            rebuilt.append({"role": role, "content": content})
+    for chat in chats:
+        rows = task_store.get_chat_messages(chat["id"])
+        messages_db.extend(rows)
+        rebuilt.extend(_aborted_trimmed(chat, [
+            {"role": m["role"], "content": m["content"]} for m in rows
+            if m.get("role", "") in ("user", "assistant") and m.get("content", "")
+            and not (skip_row and m.get("id") == skip_row)]))
 
     # Deferred tools the model already discovered in this chat: re-load them
     # so it can keep calling them without another tool_search. A tool call
@@ -315,27 +338,8 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> Non
             gone = [n for n in used if n not in catalog.deferred and n not in resident]
             logger.info(
                 f"Direct session resume: re-loaded {len(new_defs)} deferred tool(s) "
-                f"from chat {chat['id'][:8]}"
+                f"from chat {chats[-1]['id'][:8]}"
                 + (f"; {len(gone)} no longer available: {gone}" if gone else "")
-            )
-
-    # If the previous turn was aborted, drop trailing aborted messages
-    # (the aborted user message + any partial assistant responses saved
-    # by the pump during streaming). The dashboard will re-inject the
-    # cancelled turn context as part of the next user message — if we
-    # kept those messages here, the LLM would see them twice.
-    if chat.get("last_turn_aborted") and rebuilt:
-        last_user_idx = -1
-        for i in range(len(rebuilt) - 1, -1, -1):
-            if rebuilt[i]["role"] == "user":
-                last_user_idx = i
-                break
-        if last_user_idx >= 0:
-            dropped = len(rebuilt) - last_user_idx
-            rebuilt = rebuilt[:last_user_idx]
-            logger.info(
-                f"Direct session resume: dropped {dropped} message(s) from "
-                f"aborted turn (will be re-injected as cancelled context)"
             )
 
     if rebuilt:
@@ -356,8 +360,25 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> Non
         session.messages = rebuilt
         logger.info(
             f"Direct session resume: rebuilt {len(rebuilt)} messages "
-            f"from chat {chat['id'][:8]} for session {session_id[:8]}"
+            f"from {len(chats)} chat(s) for session {session_id[:8]}"
         )
+
+
+def _aborted_trimmed(chat: dict, rebuilt: list[dict]) -> list[dict]:
+    """A chat whose last turn was aborted: its trailing aborted messages go
+    (the aborted user message and any partial answer the pump saved). The
+    dashboard re-injects the cancelled turn's context into the next user
+    message; kept here, the LLM would see it twice."""
+    if not (chat.get("last_turn_aborted") and rebuilt):
+        return rebuilt
+    for i in range(len(rebuilt) - 1, -1, -1):
+        if rebuilt[i]["role"] == "user":
+            logger.info(
+                f"Direct session resume: dropped {len(rebuilt) - i} message(s) from "
+                f"the aborted turn of chat {chat['id'][:8]}"
+            )
+            return rebuilt[:i]
+    return rebuilt
 
 
 def direct_mcp_policy(client_type: str) -> tuple[bool, int]:
@@ -492,6 +513,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             sandbox_builder = SandboxBuilder(sandbox_cfg)
 
         enable_http, tool_timeout = direct_mcp_policy(config.client_type)
+        from services.phone.call_control import ASK_BACK_ENV, CALL_TOOLS_ENV
         session = await create_direct_session(
             session_id=session_id,
             agent_name=config.agent_name,
@@ -505,6 +527,8 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             enable_http_transport=enable_http,
             tool_timeout=tool_timeout,
             external=external,
+            call_tools=bool(extra.get(CALL_TOOLS_ENV)),
+            call_ask_back=bool(extra.get(ASK_BACK_ENV)),
         )
         # The builtin file tools resolve against this session's mount table
         # (the same decisions the MCP subprocesses get from bwrap).
@@ -528,7 +552,9 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         # (direct sessions are in-memory — lost on proxy restart, idle reap, etc.)
         # Also rebuild when chat_id is provided (restart with new session_id).
         if config.resume or config.chat_id:
-            _rebuild_history_from_db(session, session_id, chat_id=config.chat_id)
+            await asyncio.to_thread(functools.partial(
+                _rebuild_history_from_db, session, session_id, chat_id=config.chat_id,
+                skip_row=int(extra.get("_RESUME_SKIP_ROW") or 0)))
         # Bind subscription for pool cleanup
         if config.subscription_id:
             from services.engines.subscription_pool import bind_session

@@ -1,16 +1,18 @@
 """Agents-map activity endpoint — heat + live pulse in one round trip.
 
-ONE viewer-scoped aggregate (the bulk-count discipline of ``GET /v1/agents``
-and the in-memory composition of ``GET /v1/chats/active``): two GROUP-BY
-queries independent of agent count, plus a scan of the in-memory session
-registries. Heat rides ``usage_records`` (rollup rows, indexed) + ``task_runs``
-(indexed) — NEVER ``chat_messages`` (highest-cardinality table, no timestamp
-index).
+ONE viewer-scoped aggregate (the bulk-count discipline of ``GET /v1/agents``):
+two GROUP-BY queries independent of agent count, plus the viewer's
+Active-now rows. Heat rides ``usage_records`` (rollup rows, indexed) +
+``task_runs`` (indexed) — NEVER ``chat_messages`` (highest-cardinality table,
+no timestamp index).
 
 Scoping: only agents the viewer can access appear — an inaccessible (grayed)
-agent on the map renders colorless, so no activity leaks through it.
-``live`` = a session process exists for the agent right now (soft glow);
-``streaming`` = an open turn is running right now (the hard pulse).
+agent on the map renders colorless, so no activity leaks through it. Inside
+them the viewer sees what the Active-now list shows them and nothing else:
+another person's personal chat or user-scope task never warms or lights an
+agent (``api/agents/chats.py`` ``viewer_active_rows``, the same gates).
+``live`` = a chat the viewer may see is warming or streaming right now (soft
+glow); ``streaming`` = one has an open turn right now (the hard pulse).
 """
 
 import asyncio
@@ -21,6 +23,7 @@ from fastapi import Depends
 from auth.providers import UserContext, get_current_user, require_auth
 from storage.agents import agent_store
 from storage import database as task_store
+from ws import chat_phase
 
 from api.agents._router import router
 
@@ -35,36 +38,25 @@ async def agents_activity(user: UserContext | None = Depends(get_current_user)):
     start = (now - timedelta(days=_WINDOW_DAYS)).isoformat()
     end = now.isoformat()
 
-    usage_counts = await asyncio.to_thread(
-        task_store.get_agent_activity_counts, start, end
-    )
-    run_counts = await asyncio.to_thread(
-        task_store.count_recent_runs_by_agent, start, u.sub
-    )
+    def _counts() -> tuple[dict, dict]:
+        from core.session.visibility import is_shared_only
+        shared = [a for a in (u.agents or ()) if is_shared_only(a)]
+        return (task_store.get_agent_activity_counts(start, end, u.sub, shared),
+                task_store.count_recent_runs_by_agent(start, u.sub))
 
-    # Live pulse — pure in-memory, no I/O. Union of every session registry.
-    from core.layers.cli import session as cli_session
-    from core.layers.codex import session as codex_session
-    from core.layers.direct import session as direct_session
-    from core.session import interactive_session
-    from core.session.session_state import streaming_chat_ids as pump_streaming
+    usage_counts, run_counts = await asyncio.to_thread(_counts)
 
+    # The pulse: the viewer's own Active-now rows (open turns and warmups),
+    # never the process-wide session registries.
+    from api.agents.chats import viewer_active_rows
     live: set[str] = set()
-    live |= await cli_session.active_agent_names()
-    live |= await codex_session.active_agent_names()
-    live |= await direct_session.active_agent_names()
-    live |= interactive_session.live_agent_names()
-
-    # Streaming = open turn right now; chat→agent via one get_chat per active
-    # id (same cost profile as /v1/chats/active — both sets are tiny).
     streaming: set[str] = set()
-    active_ids = set(pump_streaming()) | interactive_session.streaming_chat_ids()
-    for cid in active_ids:
-        if not cid:
-            continue
-        chat = await asyncio.to_thread(task_store.get_chat, cid)
-        if chat and chat.get("agent"):
-            streaming.add(chat["agent"])
+    for row in await viewer_active_rows(u):
+        if row["status"] == chat_phase.STREAMING:
+            streaming.add(row["agent"])
+            live.add(row["agent"])
+        elif row["status"] == chat_phase.WARMING:
+            live.add(row["agent"])
 
     agents = []
     for name in sorted(agent_store.get_agent_slugs()):

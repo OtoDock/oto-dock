@@ -22,7 +22,7 @@ from .twilio import TwilioAdapter
 
 # adapter_type → class. Asterisk (manual + FreePBX over AMI) and Twilio are
 # real; 3CX stays a graceful stub until its automation ships.
-logger = logging.getLogger("claude-proxy.phone.adapters")
+logger = logging.getLogger("otodock.phone.adapters")
 
 ADAPTER_CLASSES: dict[str, type[PhoneServerAdapter]] = {
     "asterisk_manual": ManualAsteriskAdapter,

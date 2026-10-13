@@ -55,7 +55,7 @@ from core.session.visibility import nouser_read_targets
 from auth import roles
 from core.session import visibility as _vis
 
-logger = logging.getLogger("claude-proxy.triggers")
+logger = logging.getLogger("otodock.triggers")
 router = APIRouter()
 
 

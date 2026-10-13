@@ -20,7 +20,7 @@ from storage.agents import agent_store
 from storage.automation import run_status
 from services.scheduler import task_kinds
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 
 def _running_delegate_run(chat_id: str) -> dict | None:

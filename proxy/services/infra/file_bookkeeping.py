@@ -36,8 +36,9 @@ import config
 from core import layout
 from services.infra import safe_fs
 from storage.pg import run_db
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.agents")
+logger = logging.getLogger("otodock.agents")
 
 
 def _rel_of(agent_dir: Path, path: Path) -> str | None:
@@ -139,17 +140,17 @@ def schedule_library_projection(agent_slug: str, rel_path: str, *, deleted: bool
         if not sub_rel:
             return
         if deleted:
-            asyncio.create_task(
-                library_projector.propagate_mirror_delete(agent_slug, src, sub_rel))
+            spawn(library_projector.propagate_mirror_delete(agent_slug, src, sub_rel),
+                  name="propagate_mirror_delete", owner="file_bookkeeping")
         else:
-            asyncio.create_task(
-                library_projector.propagate_mirror_write(agent_slug, src, sub_rel))
+            spawn(library_projector.propagate_mirror_write(agent_slug, src, sub_rel),
+                  name="propagate_mirror_write", owner="file_bookkeeping")
         return
     knowledge_rel = rel_path[len("knowledge/"):]
     if knowledge_rel:
-        asyncio.create_task(
-            library_projector.propagate_source_write(
-                agent_slug, knowledge_rel, deleted=deleted))
+        spawn(library_projector.propagate_source_write(
+                agent_slug, knowledge_rel, deleted=deleted),
+              name="propagate_source_write", owner="file_bookkeeping")
 
 
 def tombstone_subtree_sync(agent_slug: str, agent_dir: Path, rel: str) -> list[str]:

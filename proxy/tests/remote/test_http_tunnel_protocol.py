@@ -69,6 +69,11 @@ def test_allowlist_accepts_known_hook_paths():
     for path in ("/v1/hooks/stop", "/v1/hooks/codex-question", "/v1/hooks/subagent",
                  "/v1/hooks/permission", "/v1/hooks/tool-result"):
         assert _sat_allowed(path), path
+    # The command-line credential git and gh fetch per command (satellite
+    # 0.5.139): both lists admit the exact path and nothing beside it.
+    assert _is_allowed_path("/v1/hooks/cli-credential") and _sat_allowed("/v1/hooks/cli-credential")
+    assert not _is_allowed_path("/v1/hooks/cli-credentials")
+    assert not _sat_allowed("/v1/hooks/cli-credential/x")
 
 
 def test_allowlist_accepts_the_checks_routes():

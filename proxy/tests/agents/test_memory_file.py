@@ -202,6 +202,46 @@ def test_insert_invalid_line_verbatim(root):
         memory_file.op_insert(root, "a.md", 9, "x")
 
 
+def test_an_empty_insert_is_refused_and_writes_nothing(root):
+    _create(root, "a.md", "l1\n")
+    before = (root / "a.md").stat().st_mtime_ns
+    with pytest.raises(MemoryOpError, match="`insert_text` must be non-empty"):
+        memory_file.op_insert(root, "a.md", 1, "")
+    assert (root / "a.md").read_text() == "l1\n"
+    assert (root / "a.md").stat().st_mtime_ns == before
+
+
+def test_an_insert_of_control_characters_alone_is_refused(root):
+    _create(root, "a.md", "l1\n")
+    with pytest.raises(MemoryOpError, match="`insert_text` must be non-empty"):
+        memory_file.op_insert(root, "a.md", 1, "\x01\x02")
+    assert (root / "a.md").read_text() == "l1\n"
+
+
+def test_a_blank_line_still_inserts(root):
+    _create(root, "a.md", "l1\nl2\n")
+    memory_file.op_insert(root, "a.md", 1, "\n")
+    assert (root / "a.md").read_text() == "l1\n\nl2\n"
+
+
+def test_an_insert_past_the_soft_limit_lands_with_the_warning(root):
+    big = "\n".join(f"- line {i} " + "x" * 60 for i in range(300)) + "\n"
+    assert len(big) > memory_file.TOPIC_SOFT_WARN_BYTES
+    _create(root, "big.md", big)
+    r = memory_file.op_insert(root, "big.md", 150, "- the new line")
+    assert r.output == "The file big.md has been edited."
+    assert any("soft limit" in w for w in r.warnings)
+    assert (root / "big.md").read_text().splitlines()[150] == "- the new line"
+
+
+def test_an_insert_past_the_hard_cap_is_refused_and_writes_nothing(root):
+    near = "x" * (memory_file.TOPIC_HARD_CAP_BYTES - 10) + "\n"
+    _create(root, "full.md", near)
+    with pytest.raises(MemoryOpError, match="per-file cap"):
+        memory_file.op_insert(root, "full.md", 1, "y" * 64)
+    assert (root / "full.md").read_text() == near
+
+
 # ---------------------------------------------------------------------------
 # delete + rename
 # ---------------------------------------------------------------------------

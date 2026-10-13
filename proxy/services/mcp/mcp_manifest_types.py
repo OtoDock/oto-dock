@@ -340,6 +340,16 @@ class OutputRelocationDef:
 
 
 @dataclass
+class ResultFilesDecl:
+    """The tools whose results the platform keeps: each picture (an MCP
+    ``image`` block) and each embedded resource blob of such a result is
+    saved under ``subdir`` of the session's workspace and shown in the chat
+    (``services/mcp/result_files.py``). Opt-in per tool, never a glob."""
+    tools: list[str]
+    subdir: str
+
+
+@dataclass
 class InstanceFieldDef:
     """Declares a field for an MCP instance (e.g., host, port, API key)."""
     key: str
@@ -437,10 +447,12 @@ class ToolFilterConfig:
     ``mcp_state.tool_filter_regex`` (dashboard UI).
 
     Currently wired for **Docker MCPs only**: the framework writes the filter
-    into the container's ``.env`` via the env var named by ``env_var_name``
-    (default ``ENABLED_TOOLS_FLAG``) and the Dockerfile's ENTRYPOINT expands it
-    into the binary's CLI args. The stdio spawn path does NOT yet apply this —
-    declaring the block on a stdio MCP is a no-op until that delivery is wired.
+    into the container's ``.env`` twice, the bare regex in
+    ``regex_env_var_name`` (default ``ENABLED_TOOLS_REGEX``, for a server that
+    reads it from its env or an entrypoint that passes it quoted) and the
+    composed flag in ``env_var_name`` (default ``ENABLED_TOOLS_FLAG``). The
+    stdio spawn path does NOT yet apply this — declaring the block on a stdio
+    MCP is a no-op until that delivery is wired.
     Semantics are whatever the upstream flag does — every supported flag
     (m365 ``--enabled-tools``, workspace ``--tools``) is an allowlist / include.
 
@@ -450,6 +462,7 @@ class ToolFilterConfig:
     """
     arg_name: str                # e.g. "--enabled-tools" or "--tools"
     env_var_name: str = "ENABLED_TOOLS_FLAG"  # Docker MCPs only; ignored for stdio
+    regex_env_var_name: str = "ENABLED_TOOLS_REGEX"  # the bare regex; Docker only
 
 
 @dataclass
@@ -663,6 +676,7 @@ class McpManifest:
     hosted: HostedConfig | None = None
     system_requirements: SystemRequirements = field(default_factory=SystemRequirements)
     outputs: list[OutputRelocationDef] = field(default_factory=list)
+    result_files: ResultFilesDecl | None = None
     path_env: dict[str, PathEnvDecl] = field(default_factory=dict)
     # Tool-arg path declarations. Flat list keyed by tool +
     # JSONPath for direct iteration by the satellite stdio interceptor;

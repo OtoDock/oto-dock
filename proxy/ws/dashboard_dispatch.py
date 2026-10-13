@@ -21,7 +21,7 @@ import contextlib
 import base64
 import functools
 import logging
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import config
 from core import placement
@@ -46,7 +46,12 @@ from core.session import session_kind, visibility as _vis, interactive_session
 from auth import roles
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 
 class StreamCtx(NamedTuple):
@@ -77,7 +82,7 @@ def _question_answers_to_text(answers: dict) -> str:
     return "\n".join(lines)
 
 
-class ClientMessageDispatcher:
+class ClientMessageDispatcher(_Host):
     """The client-message handlers, one per inbound name, reached through
     ``wire.INBOUND`` by both socket loops."""
 
@@ -200,8 +205,14 @@ class ClientMessageDispatcher:
             # (Claude's stdin frame, Codex turn/steer) gets it now, delivered
             # exactly once on accept, so it never also enters the queue. Its
             # row is recorded by the pump in stream order (``record_steer``).
+            # Never ahead of the same person's earlier waiting messages: it
+            # queues behind them (stop-and-send drains them in order). A
+            # message typed while the chat got ready (``queue_only``) follows
+            # its first turn: never steered into it, never stopping it.
+            queue_only = bool(msg.get("queue_only"))
             steered = False
-            if self._steer_possible(pump):
+            if (not queue_only and self._steer_possible(pump)
+                    and not q.of(self.user_sub or "")):
                 steered = bool(await self.layer.steer(self.session_id, item.cli_text))
             # Queued behind the turn, the message cuts it: a check round that
             # started before it is cancelled and the turn is not continued
@@ -231,7 +242,7 @@ class ClientMessageDispatcher:
                 input_queue.announce_queued(qi, idx)
             if pump.is_done:
                 input_queue.arm(pump.chat_id)
-            elif status == input_queue.QUEUED:
+            elif status == input_queue.QUEUED and not queue_only:
                 # Stop-and-send (Claude CLI headless): a graceful-only
                 # interrupt, so the producer's drain delivers this message as
                 # the next turn in seconds, not at the turn's end.
@@ -303,6 +314,8 @@ class ClientMessageDispatcher:
             return None
         if stream is not None and await self._deny_task_continue(cid):
             return None
+        if stream is None and cid != self.chat_id and not await self._may_reach_chat(cid):
+            return None
         q = await input_queue.loaded(cid)
         qid = str(msg.get("queue_id") or "")
         idx = msg.get("index", -1)
@@ -332,10 +345,25 @@ class ClientMessageDispatcher:
             if await self._deny_task_continue(cid):
                 return None
             stream.pump.cancel_all_artifacts()
+        elif cid and cid != self.chat_id and not await self._may_reach_chat(cid):
+            return None
         if cid:
             self._cancel_artifacts(cid)
             await input_queue.cancel_own(cid, self.user_sub or "")
         return None
+
+    async def _may_reach_chat(self, cid: str) -> bool:
+        """A frame that names a chat other than the viewed one (checked at
+        its resume) loads nothing for a chat the person may not open: the
+        chat read once, the REST rule asked."""
+        if cid == self.chat_id:
+            return True
+        from api.agents.chats import can_access_chat
+        chat = await run_db(task_store.get_chat, cid)
+        if chat and await run_db(can_access_chat, self._viewer_context(), chat):
+            return True
+        await self._send_error("This chat is not one you can open.")
+        return False
 
     async def _on_abort(self, msg: dict, *, stream: StreamCtx | None = None):
         # Stopping a task run's turn advances the run: the continue-gate
@@ -353,17 +381,31 @@ class ClientMessageDispatcher:
             # layer's watchdog falls back to killpg if the turn
             # doesn't close. Hard path keeps today's cancel order.
             # Stop means stop: a graceful abort still ends the turn with
-            # its DONE, and no check may judge it and start a fix round
-            # (noted first: the turn can close while the abort awaits).
+            # its DONE, no check may judge it and start a fix round, a task
+            # turn's settle ends on it and the task producer reviews no
+            # background work after it (noted first: the turn can close
+            # while the abort awaits).
             if pump.session_id:
                 from core.session import session_events
-                session_events.note_user_message(pump.session_id)
+                session_events.note_stop(pump.session_id)
             graceful = False
             # Stop means stop: the pump owns no failure to return later,
             # what waits in the chat's queue goes back to its authors now
             # (a message sent after the Stop goes out as the next turn), and
             # the queued interactions go.
             pump.stopped = True
+            # The cancelled turn is marked BEFORE the abort: the scheduler
+            # reads `last_turn_aborted` as user_interrupted the moment its
+            # pump ends, and a hard kill can end the pump before this handler
+            # resumes. The graceful flag follows once the abort's path is
+            # known (below).
+            if self.chat_id:
+                await chat_writer.submit(
+                    self.chat_id,
+                    functools.partial(task_store.update_chat, self.chat_id,
+                                      last_turn_aborted=True, last_abort_graceful=False),
+                    label="abort_flags",
+                )
             if self.session_id and self.layer:
                 graceful = bool(await self.layer.abort(self.session_id))
             pump.cancel_all_artifacts()
@@ -378,20 +420,16 @@ class ClientMessageDispatcher:
             if self.session_id:
                 _pending_permissions.pop(self.session_id, None)
             self.implementing_plan = ""
-            # Mark the cancelled turn: the scheduler/delegate layer
-            # derives user_interrupted from last_turn_aborted on
-            # EVERY abort path; the graceful flag additionally
-            # suppresses the next turn's cancelled-context
-            # injection (the engine's own history has the partial
-            # turn).
+            # The graceful flag suppresses the next turn's cancelled-context
+            # injection (the engine's own history has the partial turn); the
+            # abort flag itself went out before the abort.
             if self.chat_id:
                 _abort_cid = self.chat_id
 
                 def _abort_job(_g=graceful) -> dict | None:
                     # Flag write then the row read, one lane job.
-                    task_store.update_chat(_abort_cid,
-                                           last_turn_aborted=True,
-                                           last_abort_graceful=_g)
+                    if _g:
+                        task_store.update_chat(_abort_cid, last_abort_graceful=True)
                     return task_store.get_chat(_abort_cid)
 
                 _abort_chat = await chat_writer.submit(
@@ -422,6 +460,10 @@ class ClientMessageDispatcher:
         # Tell the client to drop "Getting ready" now.
         if self._warmup_task and not self._warmup_task.done():
             self._warmup_abort_chat = self.chat_id
+            # Stop means stop: what this person sent while the chat got ready
+            # goes back to their composer instead of running later.
+            if self.chat_id:
+                await self._return_warmup_sends(self.chat_id, "stopped")
             await self._send({"type": wire.ABORTED, "chat_id": self.chat_id or ""})
             return None
         # Interactive PTY chat: the layer/pump machinery below is
@@ -450,9 +492,17 @@ class ClientMessageDispatcher:
         pump = _active_pumps.get(self.chat_id)
         if pump and not pump.is_done:
             pump.stopped = True
+        # last_turn_aborted feeds the scheduler's user_interrupted on every
+        # abort path, written BEFORE the abort (a hard kill can end the
+        # detached pump before this handler resumes); the graceful flag
+        # follows and suppresses only the next turn's cancelled-context
+        # injection (engine history kept the partial turn).
+        if self.chat_id:
+            task_store.update_chat(self.chat_id, last_turn_aborted=True,
+                                   last_abort_graceful=False)
         if self.session_id and self.layer:
             from core.session import session_events
-            session_events.note_user_message(self.session_id)
+            session_events.note_stop(self.session_id)
             graceful = bool(await self.layer.abort(self.session_id))
         if pump and not pump.is_done:
             pump.cancel_all_artifacts()
@@ -466,12 +516,9 @@ class ClientMessageDispatcher:
             await input_queue.return_all(self.chat_id, "stopped")
         if self.session_id:
             _pending_permissions.pop(self.session_id, None)
-        # last_turn_aborted feeds the scheduler's user_interrupted on every
-        # abort path; the graceful flag suppresses only the next turn's
-        # cancelled-context injection (engine history kept the partial turn).
         if self.chat_id:
-            task_store.update_chat(self.chat_id, last_turn_aborted=True,
-                                   last_abort_graceful=graceful)
+            if graceful:
+                task_store.update_chat(self.chat_id, last_abort_graceful=True)
             # A hard Claude CLI Stop kills the whole process group —
             # background agents/commands died with it and can never emit
             # their own clears. Graceful keeps the process alive; a Codex

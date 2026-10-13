@@ -30,8 +30,37 @@ _SEARCHED_ROLES = ("user", "assistant")
 # --- Chat Search (tsvector) ---
 
 
+# The most text one chat's search row indexes, its newest. Postgres refuses
+# a tsvector past 1 MB (counted in unique lexemes, not characters), and a
+# refused rebuild would leave the row stale for good, its new words never
+# found: two million characters of prose stay far below it (the internal
+# install's largest chat, 1.2 M characters, makes a 140 kB vector), and text
+# dense in unique tokens (pasted paths, hashes) that still passes it is
+# indexed again on a halved window, down to the floor.
+_SEARCH_CONTENT_MAX = 2_000_000
+_SEARCH_CONTENT_FLOOR = 20_000
+
+
+def _newest_text(contents: list[str], window: int) -> str:
+    """The newest ``window`` characters of a chat's texts (``contents``
+    newest first), in reading order; a text bigger than the window keeps
+    its tail."""
+    newest: list[str] = []
+    size = 0
+    for text in contents:
+        size += len(text) + 1
+        if size > window:
+            if not newest:
+                newest.append(text[-window:])
+            break
+        newest.append(text)
+    return "\n".join(reversed(newest))
+
+
 def _rebuild_chat_search_row(conn, chat_id: str) -> None:
-    """Rebuild the search row for a single chat from its messages + title.
+    """Rebuild the search row for a single chat from its messages + title:
+    the newest ``_SEARCH_CONTENT_MAX`` characters of its text, in order (a
+    vector Postgres refuses is built again from half the window).
 
     Must be called with an open connection (caller manages commit).
     """
@@ -40,33 +69,79 @@ def _rebuild_chat_search_row(conn, chat_id: str) -> None:
     ).fetchone()
     if not chat:
         return
-    messages = conn.execute(
-        "SELECT content FROM chat_messages WHERE chat_id=%s AND role IN ('user','assistant') AND content != ''",
+    contents = [m["content"] for m in conn.execute(
+        "SELECT content FROM chat_messages WHERE chat_id=%s AND role IN ('user','assistant') "
+        "AND content != '' ORDER BY id DESC",
         (chat_id,),
+    ).fetchall()]
+    window = _SEARCH_CONTENT_MAX
+    while True:
+        try:
+            # A savepoint: a refused vector costs only this try.
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO chat_search (chat_id, user_sub, agent, title, content)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (chat_id) DO UPDATE SET
+                           title = EXCLUDED.title, content = EXCLUDED.content""",
+                    (chat_id, chat["user_sub"], chat["agent"], chat["title"] or "",
+                     _newest_text(contents, window)),
+                )
+            return
+        except psycopg.errors.ProgramLimitExceeded:
+            if window <= _SEARCH_CONTENT_FLOOR:
+                raise
+            window //= 2
+
+
+# The longest query text the searches parse: a longer paste is cut, not
+# refused.
+SEARCH_QUERY_MAX = 200
+
+
+def _tsquery_lexeme(lexeme: str) -> str:
+    """One lexeme as a quoted tsquery operand with prefix matching: inside the
+    quotes a quote is doubled and a backslash escaped, so any lexeme the
+    parser yields (a path, an address, an email) stays one operand."""
+    return "'" + lexeme.replace("\\", "\\\\").replace("'", "''") + "':*"
+
+
+def _prefix_tsquery(conn, query: str) -> str:
+    """The query as the index reads text: each word parsed by the same parser
+    and dictionary as ``chat_search.search_vector`` (english), every lexeme a
+    prefix, every word required. ``config.env``, ``1.8.0`` or ``chats.py``
+    stay the one token the index holds; a word the parser splits
+    (``dashboard_warmup``) also matches as the start of one token
+    (``dashboard_warmup.py``); a stop word drops out; a query with no lexeme
+    at all answers "" (no rows)."""
+    text = (query or "").strip()
+    if len(text) > SEARCH_QUERY_MAX:
+        # Cut at a word boundary: a word cut short would stem to something
+        # that is no prefix of the indexed word.
+        cut = text[:SEARCH_QUERY_MAX]
+        text = cut if text[SEARCH_QUERY_MAX].isspace() else cut.rsplit(None, 1)[0] if " " in cut.strip() else cut
+    words = text.split()
+    if not words:
+        return ""
+    rows = conn.execute(
+        """SELECT w.i, l.lexeme
+             FROM unnest(%s::text[]) WITH ORDINALITY AS w(word, i),
+                  LATERAL ts_debug('english', w.word) d,
+                  LATERAL unnest(d.lexemes) AS l(lexeme)""",
+        (words,),
     ).fetchall()
-    combined = "\n".join(m["content"] for m in messages)
-    conn.execute(
-        """INSERT INTO chat_search (chat_id, user_sub, agent, title, content)
-           VALUES (%s, %s, %s, %s, %s)
-           ON CONFLICT (chat_id) DO UPDATE SET
-               title = EXCLUDED.title, content = EXCLUDED.content""",
-        (chat_id, chat["user_sub"], chat["agent"], chat["title"] or "", combined),
-    )
-
-
-def _sanitize_fts_query(query: str) -> str:
-    """Convert user query to tsquery format with prefix matching."""
-    tokens = query.strip().split()
-    if not tokens:
-        return ""
-    clean_tokens = []
-    for t in tokens:
-        cleaned = "".join(c for c in t if c.isalnum() or c in "-_")
-        if cleaned:
-            clean_tokens.append(cleaned)
-    if not clean_tokens:
-        return ""
-    return " & ".join(f"{t}:*" for t in clean_tokens)
+    by_word: dict[int, list[str]] = {}
+    for r in rows:
+        if r["lexeme"]:
+            by_word.setdefault(r["i"], []).append(r["lexeme"])
+    operands: list[str] = []
+    for i, lexemes in sorted(by_word.items()):
+        parts = " & ".join(_tsquery_lexeme(lx) for lx in dict.fromkeys(lexemes))
+        whole = words[i - 1].lower().strip(".,;:!?()[]{}<>\"'`")
+        if len(lexemes) > 1 and whole and whole not in lexemes:
+            parts = f"({_tsquery_lexeme(whole)} | ({parts}))"
+        operands.append(parts)
+    return " & ".join(operands)
 
 
 # The task kind's ``source_type`` spellings — what chat mode excludes and
@@ -79,30 +154,40 @@ _NOT_TASK_ROW = "NOT (c.source_type = ANY(%s)) AND c.id NOT LIKE 'task-%%'"
 _TASK_ROW = "(c.source_type = ANY(%s) OR c.id LIKE 'task-%%')"
 
 
+def _search_failed(kind: str, query: str, exc: Exception) -> list[dict]:
+    # The type alone: a tsquery error's message would carry the query text.
+    logger.warning("chat search (%s) failed for a %d-character query: %s", kind,
+                   len(query or ""), type(exc).__name__)
+    return []
+
+
 def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list[dict]:
-    """Search chats by title or content using tsvector. Returns matching chat rows.
+    """Chats whose title or text holds every word of ``query`` (each as a
+    prefix), newest first: the sidebar groups the answer by day, and a
+    recent chat that names a word once must not lose its place to an old
+    one that names it often.
 
     Chat mode only — task-run chats are excluded (a user-scoped task chat
     carries the creator's sub, so the owner filter alone would leak it here);
     task mode searches through ``search_task_chats``."""
-    tsquery = _sanitize_fts_query(query)
-    if not tsquery:
-        return []
     with get_conn() as conn:
         try:
+            tsquery = _prefix_tsquery(conn, query)
+            if not tsquery:
+                return []
             rows = conn.execute(
                 f"""SELECT c.* FROM chat_search s
                    JOIN chats c ON c.id = s.chat_id
                    WHERE s.user_sub = %s AND s.agent = %s
                    AND {_NOT_TASK_ROW}
-                   AND s.search_vector @@ to_tsquery('english', %s)
-                   ORDER BY ts_rank(s.search_vector, to_tsquery('english', %s)) DESC
+                   AND s.search_vector @@ %s::tsquery
+                   ORDER BY c.updated_at DESC
                    LIMIT %s""",
-                (user_sub, agent, _TASK_SOURCE_TYPES, tsquery, tsquery, limit),
+                (user_sub, agent, _TASK_SOURCE_TYPES, tsquery, limit),
             ).fetchall()
             return [dict(r) for r in rows]
-        except Exception:
-            return []
+        except Exception as e:
+            return _search_failed("chats", query, e)
 
 
 # Latest-run join for task-run chats: multi-round continues share one chat, so
@@ -198,32 +283,32 @@ def list_task_chats(agent: str, scope_user_sub: str | None = None,
 def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
                       limit: int = 50) -> list[dict]:
     """Task-mode FTS: task-run chats of one agent, gated by the same run rules
-    as ``list_task_chats``. The search row's ``user_sub`` is the chat's
-    synthetic owner (``task::``/creator), so scoping joins the run instead."""
-    tsquery = _sanitize_fts_query(query)
-    if not tsquery:
-        return []
-    conditions = ["s.agent = %s", _TASK_ROW,
-                  "s.search_vector @@ to_tsquery('english', %s)"]
-    params: list[Any] = [agent, _TASK_SOURCE_TYPES, tsquery]
-    if scope_user_sub is not None:
-        conditions.append(_TASK_SCOPE_COND)
-        params.append(scope_user_sub)
-    params.extend([tsquery, limit])
+    as ``list_task_chats``, newest first like the chat mode. The search row's
+    ``user_sub`` is the chat's synthetic owner (``task::``/creator), so
+    scoping joins the run instead."""
     with get_conn() as conn:
         try:
+            tsquery = _prefix_tsquery(conn, query)
+            if not tsquery:
+                return []
+            conditions = ["s.agent = %s", _TASK_ROW, "s.search_vector @@ %s::tsquery"]
+            params: list[Any] = [agent, _TASK_SOURCE_TYPES, tsquery]
+            if scope_user_sub is not None:
+                conditions.append(_TASK_SCOPE_COND)
+                params.append(scope_user_sub)
+            params.append(limit)
             rows = conn.execute(
                 f"""SELECT c.*, {_TASK_RUN_COLS}
                       FROM chat_search s
                       JOIN chats c ON c.id = s.chat_id {_TASK_RUN_JOIN}
                      WHERE {' AND '.join(conditions)}
-                  ORDER BY ts_rank(s.search_vector, to_tsquery('english', %s)) DESC
+                  ORDER BY c.updated_at DESC
                      LIMIT %s""",
                 params,
             ).fetchall()
             return [dict(r) for r in rows]
-        except Exception:
-            return []
+        except Exception as e:
+            return _search_failed("tasks", query, e)
 
 
 # --- Chat CRUD ---
@@ -1138,6 +1223,18 @@ def enqueue_chat_input(chat_id: str, queue_id: str, author_sub: str, *, text: st
         ).fetchone()
         conn.commit()
     return dict(row) if row else None
+
+
+def queued_chats_of(author_sub: str) -> list[dict]:
+    """The chats holding messages ``author_sub`` queued: ``id``, ``agent``,
+    ``user_sub`` (the owner)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT c.id, c.agent, c.user_sub FROM chat_input_queue q "
+            "JOIN chats c ON c.id = q.chat_id WHERE q.author_sub = %s",
+            (author_sub,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def list_chat_input_queue(chat_id: str) -> list[dict]:

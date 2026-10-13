@@ -108,6 +108,36 @@ def test_should_exit_on_silence_settles_at_pending_ceiling():
     assert s.should_exit_on_silence(5.0) is True
 
 
+def test_a_stop_since_the_turn_began_settles_with_work_pending():
+    """The person stopped the turn: the settle has nothing to wait for (the
+    background work stays with the session), whatever is pending."""
+    from core.session import session_events
+    _, s = _mk(settle_after_result=30, pending=1)
+    s._turn_started -= 1.0  # the turn began before the Stop
+    s.enter_settle()
+    try:
+        assert s.should_exit_on_silence(5.0) is False
+        session_events.note_stop(_SID)
+        assert s.stopped() is True
+        assert s.should_exit_on_silence(5.0) is True
+        assert get_subagent_registry(_SID).has_pending  # untouched
+    finally:
+        session_events.cleanup_session(_SID)
+
+
+def test_a_stop_before_the_turn_began_is_not_this_turns():
+    from core.session import session_events
+    session_events.note_stop(_SID)
+    try:
+        _, s = _mk(settle_after_result=30, pending=1)
+        s._turn_started += 1.0
+        s.enter_settle()
+        assert s.stopped() is False
+        assert s.should_exit_on_silence(5.0) is False
+    finally:
+        session_events.cleanup_session(_SID)
+
+
 def test_enter_settle_triggers_translator_reset_for_settle():
     t, s = _mk(settle_after_result=10)
     t.agents_spawned = 5
@@ -319,3 +349,41 @@ def test_a_task_turn_ends_with_done_on_settle_silence_and_on_eof():
     import asyncio
     assert asyncio.run(_task_turn(eof=False)) == 1
     assert asyncio.run(_task_turn(eof=True)) == 1
+
+
+def test_settle_keeps_reading_to_the_runs_own_ceilings():
+    """A run's producer registers its ceilings: a background command keeps the
+    settle read open past the 600 s backstop, up to the run's own bound."""
+    from core.events.bg_command_state import get_bg_command_registry
+    from core.layers.cli import settle as cli_settle
+    _, s = _mk(settle_after_result=30)
+    bg = get_bg_command_registry(_SID)
+    bg.register_spawn("cmd-run", "tu-run")
+    try:
+        with cli_settle.run_ceilings(_SID, cmd=1800.0, sub=1800.0) as ceilings:
+            s.enter_settle()
+            assert ceilings.started == s._settle_start
+            s._settle_start = time.monotonic() - 700
+            assert s.should_exit_on_silence(5.0) is False
+            s._settle_start = time.monotonic() - 1900
+            assert s.should_exit_on_silence(5.0) is True
+        assert _SID not in cli_settle._run_ceilings
+    finally:
+        bg.mark_done("cmd-run")
+
+
+def test_settle_waits_while_a_person_decides():
+    """A pending prompt (a subagent's permission request) is progress: the
+    settle read does not run out while a person decides."""
+    from core.session import session_state
+    _, s = _mk(settle_after_result=30, pending=1)
+    s.enter_settle()
+    s._settle_start = time.monotonic() - 10_000
+    session_state.open_permission_wait("rid-settle", _SID)
+    try:
+        assert s.should_exit_on_silence(5.0) is False
+        assert time.monotonic() - s._settle_start < 5
+    finally:
+        session_state._permission_events.pop("rid-settle", None)
+        session_state._session_permission_requests.pop(_SID, None)
+        session_state._permission_request_sessions.pop("rid-settle", None)

@@ -12,6 +12,8 @@ Contracts mirrored here:
   - ProxyClient LLM backend / outbound CallManager + call object
 """
 
+import asyncio
+
 
 class FakeConn:
     """Stand-in for AudioSocketConnection.
@@ -75,8 +77,6 @@ class FakeConn:
         return self._closed
 
     async def read_frame(self):
-        import asyncio
-
         from telephony.audio_socket import AudioSocketError
         if self._frames:
             return self._frames.pop(0)
@@ -91,6 +91,7 @@ class FakeTTS:
     def __init__(self, api_key="", **kw):
         self.voice_id = ""
         self.voices = {}
+        self.voice_pin = ""
         self.connected = False
         self.cancelled = False
         self.contexts_started = 0
@@ -126,14 +127,31 @@ class FakeTTS:
     def cancel(self):
         self.cancelled = True
 
+    def pin_voice(self, voice_id):
+        self.voice_pin = (voice_id or "").strip()
+        if self.voice_pin:
+            self.voice_id = self.voice_pin
+
     def select_voice(self, language):
-        # Mirror TTSProvider.select_voice: per-language voice, English fallback.
+        # Mirror TTSProvider.select_voice: a pinned voice, else the
+        # per-language voice with the English fallback.
+        if self.voice_pin:
+            self.voice_id = self.voice_pin
+            return self.voice_id
         self.voice_id = self.voices.get(language) or self.voices.get("en") or self.voice_id
         return self.voice_id
+
+    def has_voice_for(self, language):
+        return language in self.voices
 
 
 class FakeSTT:
     """Stand-in for DeepgramSTT (final-only call surface)."""
+
+    @classmethod
+    def live_model_id(cls, model_id):
+        # Mirror STTProvider.live_model_id: no retired ids on the fake.
+        return model_id or ""
 
     def __init__(self, **kw):
         self.vad_silence_padding_ms = 550
@@ -149,6 +167,13 @@ class FakeSTT:
         self.last_result_monotonic = 0.0      # bumped by tests to simulate results
         self._transcripts = []                # queued finalized transcripts (full-run tests)
         self.latest_interim = ""              # settable (real provider: polled property)
+        self.guess = None                     # identify_language() answer (LanguageGuess or None)
+        self.identify_delay_s = 0.0           # how long identify_language() takes
+        self.identified = []                  # WAV bytes identify_language() saw
+        self.restarted = []                   # languages restart() saw
+        self.restart_ok = True
+        self.streamable = None                # streams_language(): None = every language
+        self.sent = []                        # payloads send_audio() saw
 
     @property
     def has_pending_finals(self):
@@ -160,7 +185,22 @@ class FakeSTT:
         self.started.append(language)
 
     async def send_audio(self, audio):
-        pass
+        self.sent.append(bytes(audio))
+
+    async def identify_language(self, audio_wav):
+        self.identified.append(audio_wav)
+        if self.identify_delay_s:
+            await asyncio.sleep(self.identify_delay_s)
+        return self.guess
+
+    def streams_language(self, language):
+        return self.streamable is None or language in self.streamable
+
+    async def restart(self, language):
+        self.restarted.append(language)
+        if self.restart_ok:
+            self.started.append(language)
+        return self.restart_ok
 
     def drain_transcript(self):
         return self._transcripts.pop(0) if self._transcripts else None
@@ -245,9 +285,13 @@ class FakeLLM:
         self.aborts = 0
         self.on_token = None
         self._responses = list(responses or [])
-        # Mirrors ProxyClient._ws_connected: proxy-mode abort exists only
-        # while the WS channel is up (HTTP fallback = run-to-completion).
+        # Mirrors ProxyClient._ws_connected: an abort exists only while the
+        # WS channel is up.
         self._ws_connected = ws_connected
+        # Mirrors ProxyClient.proxy_lost / on_proxy_lost: the socket is gone
+        # and the pipeline ends the call.
+        self.proxy_lost = False
+        self.on_proxy_lost = None
         # Mirrors ProxyClient.turn_in_flight — gates _cancel_tts's upstream
         # abort (a post-turn commit must not fire a session-scoped abort).
         self.turn_in_flight = True
@@ -260,9 +304,8 @@ class FakeLLM:
 
     @property
     def supports_abort(self):
-        # Same rule as ProxyClient: direct always; proxy only over the WS.
-        return self.llm_mode == "direct" or (
-            self.llm_mode == "proxy" and self._ws_connected)
+        # Same rule as ProxyClient: over the socket, in both modes.
+        return self._ws_connected
 
     @property
     def abort_erases_turn(self):
@@ -310,9 +353,16 @@ class FakeCallManager:
         self._call = call
         self.transcript = []
         self.status = None
+        self.outcome = None
+        self.error = None
 
     def get_call(self, call_id):
         return self._call
+
+    def update_status(self, call_id, status, *, outcome=None, error=None):
+        self.status, self.outcome, self.error = status, outcome, error
+        if self._call is not None:
+            self._call.status = status
 
     def add_transcript_entry(self, call_id, role, text):
         self.transcript.append((role, text))

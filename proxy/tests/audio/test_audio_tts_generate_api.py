@@ -196,7 +196,7 @@ def test_generate_provider_resolution_errors(harness):
     client = _make_client(harness)
 
     def boom(**kwargs):
-        raise audio_service.AudioUnavailableError("No tts provider with id 99")
+        raise audio_service._no_provider("tts", 99)
 
     harness_build = harness.build
     try:
@@ -206,12 +206,30 @@ def test_generate_provider_resolution_errors(harness):
         ).status_code == 404
 
         def no_default(**kwargs):
-            raise audio_service.AudioUnavailableError("No default TTS provider configured")
+            raise audio_service._no_provider("tts")
 
         audio_service.build_generate_provider = no_default
         assert client.post("/v1/audio/tts/generate", json={"text": "hi"}).status_code == 503
     finally:
         audio_service.build_generate_provider = harness_build
+
+
+@pytest.mark.parametrize("builder, kind", [
+    ("build_generate_provider", "tts"), ("build_chat_provider", "stt"), ("build_chat_provider", "tts"),
+])
+def test_a_missing_provider_says_where_to_pick_one(monkeypatch, builder, kind):
+    from storage.prefs import audio_provider_store
+
+    monkeypatch.setattr(audio_provider_store, "get_provider", lambda provider_id: None)
+    monkeypatch.setattr(audio_provider_store, "get_default_provider", lambda *a, **k: None)
+    args = (kind,) if builder == "build_chat_provider" else ()
+    with pytest.raises(audio_service.AudioUnavailableError) as stale:
+        getattr(audio_service, builder)(*args, provider_id=1)
+    assert str(stale.value) == (
+        f"No {kind.upper()} provider with id 1 is configured: select one in Admin, Audio.")
+    with pytest.raises(audio_service.AudioUnavailableError) as none:
+        getattr(audio_service, builder)(*args)
+    assert str(none.value) == f"No {kind.upper()} provider configured: select one in Admin, Audio."
 
 
 def test_generate_empty_audio_is_502(client, harness):

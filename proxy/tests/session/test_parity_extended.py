@@ -267,6 +267,35 @@ def test_codex_translator_mcp_result_and_error_bodies():
     }))
     res = [e for e in out if e.type == "tool_result"][0]
     assert "result_content" not in res.data
+    assert "result_blocks" not in res.data
+
+
+def test_codex_translator_mcp_result_carries_its_pictures_and_blobs():
+    """A completed `mcpToolCall`'s image blocks and embedded resources ride
+    as `result_blocks` (the pump hands them to the result-files service and
+    pops them); a failed call carries none."""
+    from core.layers.codex import CodexEventTranslator, CodexEvent
+
+    image = {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}
+    blob = {"type": "resource", "resource": {"uri": "gdrive://f.pdf", "mimeType": "application/pdf",
+                                             "blob": "JVBERg=="}}
+    t = CodexEventTranslator()
+    out = t.translate(CodexEvent(type="item/completed", data={
+        "item": {"id": "m4", "type": "mcpToolCall", "server": "maps", "tool": "static_map",
+                 "status": "completed",
+                 "result": {"content": [image, {"type": "text", "text": "Route"}, blob]}},
+    }))
+    res = [e for e in out if e.type == "tool_result"][0]
+    assert res.data["result_blocks"] == [image, blob]
+    assert res.data["result_content"] == "Route"
+
+    out = t.translate(CodexEvent(type="item/completed", data={
+        "item": {"id": "m5", "type": "mcpToolCall", "server": "maps", "tool": "static_map",
+                 "status": "failed", "error": {"message": "no"},
+                 "result": {"content": [image]}},
+    }))
+    res = [e for e in out if e.type == "tool_result"][0]
+    assert "result_blocks" not in res.data
 
 
 def test_codex_translator_plan_updated_to_todo_update():
@@ -398,6 +427,34 @@ def test_codex_translator_turn_completed_metadata_and_done():
     assert md["output_tokens"] == 15
     assert md["context_used"] == 11551 and md["context_max"] == 258400
     assert md["duration_ms"] == 1234
+
+
+def test_codex_translator_prices_a_prompt_past_272k_at_the_tier():
+    """A Codex turn is priced through the registry's long-context tier: OpenAI
+    bills the whole request at 2x input / 1.5x output once its input passes
+    272K, which a 500K live window reaches with no platform override."""
+    from core.layers.codex import CodexEventTranslator, CodexEvent
+
+    def cost_of(input_tokens: int, cached: int) -> float:
+        t = CodexEventTranslator(model="gpt-6.1-sol")
+        t.translate(CodexEvent(type="thread/tokenUsage/updated", data={
+            "tokenUsage": {
+                "last": {"inputTokens": input_tokens, "cachedInputTokens": cached,
+                         "outputTokens": 1_000},
+                "modelContextWindow": 475_000,
+            },
+        }))
+        out = t.translate(CodexEvent(type="turn/completed", data={
+            "turn": {"status": "completed"},
+        }))
+        return out[0].data["cost_usd"]
+
+    # Sol: $2 / $10 / $2.50 / $0.10 per 1M. Under the line the base rates.
+    under = (150_000 * 2.0 + 50_000 * 0.10 + 1_000 * 10.0) / 1_000_000
+    assert abs(cost_of(200_000, 50_000) - under) < 1e-12
+    # Past it (300K input, cached included) every rate at its multiplier.
+    over = (250_000 * 4.0 + 50_000 * 0.20 + 1_000 * 15.0) / 1_000_000
+    assert abs(cost_of(300_000, 50_000) - over) < 1e-12
 
 
 def test_codex_translator_turn_failed_to_error():

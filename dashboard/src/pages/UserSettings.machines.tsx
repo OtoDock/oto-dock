@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { useFlag } from '../hooks/useFlag'
 import { roleBadge, type AgentRole } from '../lib/permissions'
 import { useMyRemoteMachines, usePairMyMachine, useDeleteMyMachine, useSetMyRemoteTarget, useRemoveMyRemoteTarget, useSetMyAllowFullFs, useSetMyDeviceGrants, DEVICE_CAPABILITY_INFO, type PairResult } from '../api/remoteMachines'
 import { PAIRING_SCOPE } from '../lib/placement'
@@ -39,7 +40,7 @@ export function MyMachinesSection() {
   // section with a clear "disabled by admin" message so the user doesn't see
   // ghost pair/select controls that'd just 403. Evaluated AFTER the hooks above
   // (it gates the render, not the hook calls) so hook order stays stable.
-  const allowed = user?.feature_flags?.allow_user_paired_machines !== false
+  const allowed = useFlag('allow_user_paired_machines')
 
   const machines = data?.machines ?? []
   const targets = data?.targets ?? []

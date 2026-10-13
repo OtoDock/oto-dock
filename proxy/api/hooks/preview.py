@@ -25,10 +25,9 @@ from core.session.session_state import (
     get_session_security,
 )
 from api.hooks import paths, routing
-from auth import roles
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 
@@ -56,6 +55,18 @@ def note_pushed_generation(file_id: str, generation: int, digest: str = "") -> N
     _pushed_generations.move_to_end(file_id)
     while len(_pushed_generations) > _PUSHED_GENERATIONS_MAX:
         _pushed_generations.popitem(last=False)
+
+
+def note_next_generation(file_id: str, digest: str) -> int:
+    """Note a new document generation for a file whose bytes changed (past
+    the noted one and the time in ms), with the sha256 of its bytes now;
+    returns it. The ``file-written`` hook notes it before it announces the
+    write, so a load that mints on that ``file_updated`` already opens the
+    document of the push that follows (which then reuses it: the file holds
+    the noted bytes)."""
+    generation = max(int(time.time() * 1000), pushed_generation(file_id) + 1)
+    note_pushed_generation(file_id, generation, digest)
+    return generation
 
 
 def pushed_generation(file_id: str) -> int:
@@ -106,7 +117,8 @@ def unchanged_since_push(file_id: str, rel_path: str, digest: str) -> bool:
     return base == digest if base is not None else noted[1] == digest
 
 
-def _person_claims(sub: str, tree_rel: str, host_cache: bool, agent: str) -> tuple[str, str]:
+def _person_claims(sub: str, tree_rel: str, host_cache: bool, agent: str,
+                   session_person: str = "") -> tuple[str, str]:
     """``(user_name, permissions)`` of a pushed token minted for a person:
     the name a dashboard mint gives them and the live mint's write decision
     for their own role on the agent. Store reads: call it on the DB
@@ -117,7 +129,7 @@ def _person_claims(sub: str, tree_rel: str, host_cache: bool, agent: str) -> tup
     username = task_store.get_username_by_sub(sub) or ""
     name = user.get("name") or user.get("display_name") or username or "User"
     return name, live_permissions(tree_rel, acting_role_of(sub, agent), username, agent,
-                                  host_cache=host_cache)
+                                  host_cache=host_cache, session_person=session_person)
 
 
 class HookDocumentPreviewRequest(BaseModel):
@@ -196,11 +208,13 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     permissions = "view"
     # Host-cache doc (a Desktop/Downloads file pulled through THIS session's
     # cache): the agent-tree write matrix doesn't apply — the platform copy is
-    # a mirror of a file on the session's own machine. Grant edit to
-    # write-capable roles; PutFile pushes the bytes back to the real file
-    # (wopi.wopi_put_file), where the satellite's own host write policy is the
-    # second, authoritative gate. Session-scoped: only THIS session's cache
-    # root qualifies, so another session's cached files stay view-only here.
+    # a mirror of a file on the session's own machine. Only the session's own
+    # person edits it (the person branch below), PutFile pushing the bytes
+    # back to the real file (wopi.wopi_put_file), where the satellite's own
+    # host write policy is the next gate; a token with no person (a task run,
+    # a wake, a meeting) reaches whoever opens the chat and views it.
+    # Session-scoped: only THIS session's cache root qualifies, so another
+    # session's cached files stay view-only here.
     _is_host_cache = False
     if sec is not None:
         from core.remote import remote_file_flow
@@ -210,10 +224,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
             )
         except OSError:
             _is_host_cache = False
-    if _is_host_cache:
-        if roles.can_write_workspace(getattr(sec, "role", "") or ""):
-            permissions = "edit"
-    elif sec is not None:
+    if sec is not None and not _is_host_cache:
         from core.remote.file_sync import library_mirror_source
         _wl = None
         if library_mirror_source(tree_rel) is not None:
@@ -249,27 +260,29 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     if person:
         user_name, permissions = await run_db(
             _person_claims, person, tree_rel, _is_host_cache, getattr(sec, "agent", "") or "",
+            getattr(sec, "username", "") or "",
         )
         user_sub = person
 
-    # Reuse a WOPI token while it is still valid (the WOPISrc, not the
-    # token, decides which Collabora document a load joins). Keyed by
+    # Reuse a WOPI token while it is still valid and opens this push's
+    # document (a token opens one document generation: a push that made a
+    # new one mints, and its entry replaces the old). Keyed by
     # permission too, so a viewer never receives a
     # cached edit token — or vice-versa — for the same shared file_id, and by
     # chat, so a token never carries another chat's claim.
     cache_key = (file_id, permissions, chat_id or "", user_sub)
     cached = _wopi_token_cache.get(cache_key)
-    if cached and cached["expires"] > now:
+    if cached and cached["expires"] > now and cached["generation"] == document_generation:
         wopi_token, token_ttl = cached["token"], cached["ttl"]
     else:
         wopi_token, token_ttl = create_wopi_token(
             rel_path, user_sub, user_name, permissions, session_meta.get("agent", ""),
-            chat_id=chat_id or "",
+            chat_id=chat_id or "", generation=document_generation,
         )
         for key in [k for k, v in _wopi_token_cache.items() if v["expires"] <= now]:
             del _wopi_token_cache[key]
         _wopi_token_cache[cache_key] = {
-            "token": wopi_token, "ttl": token_ttl,
+            "token": wopi_token, "ttl": token_ttl, "generation": document_generation,
             "expires": now + 12600,  # cache for 3.5 hours (token lasts 4 hours)
         }
 

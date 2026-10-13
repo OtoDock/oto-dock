@@ -151,6 +151,11 @@ def test_a_link_never_expires_only_while_no_admin_cap_is_set():
     r = client.patch(f"/v1/shares/{capped}", json={"expires_in": "never"})
     assert r.status_code == 400 and r.json()["detail"] == "an admin capped share expiry at 30 days"
     assert share_store.get_share(capped)["expires_at"] is not None
+    # A cap shorter than the 30-day default: a link with no expiry gets the cap.
+    task_store.set_platform_setting("sharing_max_expiry_days", "7")
+    short = share_store.get_share(_link(row["id"], expires_in="")["share"]["id"])
+    left = datetime.fromisoformat(short["expires_at"]) - datetime.now(timezone.utc)
+    assert timedelta(days=6) < left <= timedelta(days=7)
 
 
 def test_platform_switches_gate_links_and_public_links():
@@ -187,6 +192,9 @@ def test_unknown_expired_and_revoked_links_render_the_same_404():
     live = client.get(f"/s/{token}")
     assert live.status_code == 200 and '"needs_password": true' in live.text
     assert "/ui-kit/share-host.js" in live.text and "Schedule" in live.text
+    # The zoom cap that keeps iOS out of a framed app's field (the host
+    # script drops it on other devices).
+    assert 'content="width=device-width, initial-scale=1, maximum-scale=1"' in live.text
     client.patch(f"/v1/shares/{out['share']['id']}", json={"revoke": True})
     revoked = client.get(f"/s/{token}")
     assert revoked.status_code == 404 and revoked.text == unknown.text
@@ -257,6 +265,32 @@ def test_unlock_refuses_cross_site_posts_and_counts_failures():
         assert _unlock(token, "bad-2").status_code == 403
         assert _unlock(token, out["password"]).status_code == 429
     # Successful unlocks are never counted: the bucket sees failures only.
+
+
+def test_a_right_password_gives_back_only_its_own_links_failures():
+    """The client's count is per address across every link; a right
+    password on one link gives back that link's wrong attempts only, so the
+    ones on another link stay counted until their window lapses."""
+    from auth import rate_limiter
+    row = _app()
+    a, b = _link(row["id"]), _link(row["id"])
+    ta, tb = _token(a["link"]), _token(b["link"])
+    for pw in ("bad-b1", "bad-b2"):
+        assert _unlock(tb, pw).status_code == 403
+    assert _unlock(ta, "bad-a1").status_code == 403
+
+    def client_count() -> int:
+        (entry,) = [d for (bucket, _), d in rate_limiter._attempts.items()
+                    if bucket == "share_unlock_ip"]
+        return entry["count"]
+    assert client_count() == 3
+    assert _unlock(ta, a["password"]).status_code == 200
+    assert client_count() == 2
+    # Again on the same link gives back nothing more.
+    assert _unlock(ta, a["password"]).status_code == 200
+    assert client_count() == 2
+    assert _unlock(tb, b["password"]).status_code == 200
+    assert client_count() == 0
 
 
 def test_the_page_pins_its_frames_and_its_config_carries_no_markup():

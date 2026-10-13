@@ -33,7 +33,7 @@ import httpx
 import config
 from auth.oauth_providers.base import OAuthTokenError, TokenSet, UserInfo
 
-logger = logging.getLogger("claude-proxy.mcp-authorization")
+logger = logging.getLogger("otodock.mcp-authorization")
 
 # One vendor call (httpx's timeout is per read, so a slow drip needs a
 # total deadline) and the most bytes a metadata document may carry.

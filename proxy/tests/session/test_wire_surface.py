@@ -95,7 +95,7 @@ KNOWN_SENDER_LITERALS: dict[str, dict[str, int]] = {
     "proxy/core/remote/satellite_connection.py": {"pong": 1},
     # The vendor APIs' content blocks (``text`` / ``tool_result``) and the
     # Codex app-server's input items (``text``).
-    "proxy/core/layers/providers/anthropic_adapter.py": {"text": 2, "tool_result": 1},
+    "proxy/core/layers/providers/anthropic_adapter.py": {"text": 3, "tool_result": 1},
     "proxy/core/layers/codex/session.py": {"text": 2},
     # The file tree's entry kind (``file`` / ``dir``), not the artifact frame.
     "proxy/api/agents/files.py": {"file": 2},

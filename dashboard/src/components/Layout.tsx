@@ -1,12 +1,16 @@
 import { Suspense, useState, useRef } from 'react'
 import { Outlet, NavLink, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { useFlag } from '../hooks/useFlag'
 import { isAdmin as isPlatformAdmin, roleBadge } from '../lib/permissions'
 import { useSwipeGesture } from '../hooks/useSwipeGesture'
 import ResponsiveDrawer from './ui/ResponsiveDrawer'
 import NavGroup from './ui/NavGroup'
 import { SetupBanner } from './PlatformSetupGuard'
+import { PageBoundary } from './RouteBoundary'
 import { ForwardingBanner } from './admin/ForwardingBanner'
+import { ReleaseBanner } from './admin/ReleaseBanner'
+import { ReleaseDialog } from './ReleaseDialog'
 import { useAdminMcpRequests } from '../api/community'
 
 const navItems = [
@@ -32,6 +36,7 @@ const monitoringItems = [
 
 export default function Layout() {
   const { user, logout } = useAuth()
+  const remoteMachinesAvailable = useFlag('remote_machines_available')
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768)
   // Pending-count badge for the MCP Requests nav item. Only admins poll;
   // managers reach the queue via their own agent pages.
@@ -70,7 +75,7 @@ export default function Layout() {
             {navItems.filter((item) =>
               // Hidden when this build ships without the remote-machines feature.
               item.path !== '/admin/remote-machines'
-              || user?.feature_flags?.remote_machines_available !== false
+              || remoteMachinesAvailable
             ).map((item) => {
               const count = item.badge ? badgeCounts[item.badge] : 0
               return (
@@ -162,13 +167,17 @@ export default function Layout() {
 
         <SetupBanner />
         <ForwardingBanner />
+        <ReleaseBanner />
+        <ReleaseDialog />
         <main className="flex-1 overflow-auto p-4 md:p-6">
           {/* The admin pages are lazy routes. Router navigations run as
               transitions, so the current page stays until the next chunk
               resolves; this fallback shows only on a cold direct load. */}
-          <Suspense fallback={<div className="min-h-[40vh]" />}>
-            <Outlet />
-          </Suspense>
+          <PageBoundary>
+            <Suspense fallback={<div className="min-h-[40vh]" />}>
+              <Outlet />
+            </Suspense>
+          </PageBoundary>
         </main>
       </div>
     </div>

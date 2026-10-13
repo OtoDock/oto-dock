@@ -40,6 +40,7 @@ from storage import db_app_deliveries as deliveries
 from storage.automation import run_status
 from services.scheduler import task_kinds
 from storage.pg import run_db
+from core.background import spawn
 
 #: A delivery's verdict as the run row it carries reads it (APPS.md
 #: "Handlers"): the one mapping between the two machines.
@@ -48,7 +49,7 @@ RUN_STATUS_OF = {deliveries.DONE: run_status.COMPLETED, deliveries.DEAD: run_sta
 #: approval instead of dying; a reason word, not a delivery status.
 HOLD_UNAPPROVED = "unapproved"
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 HANDLER_TIMEOUT_S = 60.0
 RESULT_KEEP_BYTES = 32 * 1024
@@ -179,8 +180,8 @@ def on_feed_delta(users, agent: str, feed: str, delta: dict, shared: bool | None
     if not agent or not has_subscribers(agent):
         return
     try:
-        asyncio.get_running_loop().create_task(
-            _dispatch(list(users), agent, feed, event, dict(delta), shared))
+        spawn(_dispatch(list(users), agent, feed, event, dict(delta), shared),
+              name="dispatch", owner="app_handlers")
     except RuntimeError:
         logger.debug("handler dispatch skipped: no running loop")
 

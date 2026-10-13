@@ -35,14 +35,15 @@ import httpx
 import config
 from auth.request_path import has_traversal
 
-logger = logging.getLogger("claude-proxy.satellite-tunnel")
+logger = logging.getLogger("otodock.satellite-tunnel")
 
 
 # Allowlist mirrored from satellite/http_tunnel.py. Both sides must agree.
 _ALLOWLIST_REGEXES = [
     re.compile(
         r"^/v1/hooks/(resolve-path|resolve-tool-arg-paths|permission|"
-        r"mcp-credentials|session-files|"
+        # The command-line credential (git and gh, satellite 0.5.139).
+        r"mcp-credentials|session-files|cli-credential|"
         r"images|image-generating|image-gen-failed|url|file|media|ui|"
         r"document-preview|tool-result|file-written|subagent|"
         # The Stop hook (turn end, both engines) and the Codex question

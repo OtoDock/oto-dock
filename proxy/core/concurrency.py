@@ -85,8 +85,9 @@ import config
 from core import placement
 from core.session import background_leash
 from core.sandbox import host_resources
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.concurrency")
+logger = logging.getLogger("otodock.concurrency")
 
 # Surface kinds tracked in _sessions (phone = live phone calls).
 _SURFACES = ("chat", "task", "meeting", "phone")
@@ -433,11 +434,11 @@ def _schedule_notify() -> None:
     Done UNCONDITIONALLY whenever a slot frees (gating on 'are there waiters?'
     without the lock races a task mid-suspend in wait_for and loses the wakeup)."""
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         logger.debug("concurrency: release outside a running loop; notify skipped")
         return
-    loop.create_task(_notify_waiters())
+    spawn(_notify_waiters(), name="notify_waiters", owner="concurrency")
 
 
 # ---------------------------------------------------------------------------

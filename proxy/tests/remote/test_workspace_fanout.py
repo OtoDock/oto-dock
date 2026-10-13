@@ -32,6 +32,23 @@ def _no_platform_ahead_marks():
     remote_file_flow._platform_ahead.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_save_fan_out_left():
+    # A save's fan-out runs after the save answered: each test that starts
+    # one waits for it (``drain_save_fan_outs``); none may leave its queue
+    # behind for the next test.
+    # A contended path or fan-out lock binds to its test's event loop.
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout as wf
+    remote_file_flow._global_path_locks.clear()
+    remote_file_flow._fanout_locks.clear()
+    yield
+    assert not wf._save_fan_out_tasks, "a test left a save's fan-out running"
+    wf._queued_save_fan_outs.clear()
+    remote_file_flow._global_path_locks.clear()
+    remote_file_flow._fanout_locks.clear()
+
+
 # ---------------------------------------------------------------------------
 # fanout_targets — selection + isolation
 # ---------------------------------------------------------------------------
@@ -383,26 +400,58 @@ async def test_fan_out_write_no_targets_is_noop(temp_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_propagate_write_persists_and_fans_out(temp_db, tmp_path, monkeypatch):
-    """propagate_write atomically writes the bytes to the agent tree AND fans
-    them out (source machine excluded), under the global per-(agent,path) lock."""
+async def test_propagate_write_persists_and_fans_out_after_the_answer(temp_db, tmp_path, monkeypatch):
+    """propagate_write atomically writes the bytes to the agent tree, marks
+    the targets in flight before it returns, and fans the platform copy out
+    after it returned (source machine excluded)."""
     import config
+    from core.remote import remote_file_flow
     from services.remote import workspace_fanout as wf
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    _setup_layer(monkeypatch, {"s1": _FakeInfo("mA", "agent-1"), "s2": _FakeInfo("mSrc", "agent-1")},
+                 {"s1": _sec("", "manager"), "s2": _sec("", "manager")})
 
     fo = AsyncMock()
     monkeypatch.setattr(wf, "fan_out_write", fo)
 
-    await wf.propagate_write(
+    assert await wf.propagate_write(
         "agent-1", "workspace/x.md", b"hello", exclude_machine_id="mSrc",
-    )
+    ) is True
 
     # Authoritative atomic write landed on the platform disk.
-    assert (tmp_path / "agent-1" / "workspace" / "x.md").read_bytes() == b"hello"
-    # Fanned out with the source machine excluded.
+    target = tmp_path / "agent-1" / "workspace" / "x.md"
+    assert target.read_bytes() == b"hello"
+    # The target is marked in flight when the save answers; the fan-out has
+    # not run yet.
+    st = target.stat()
+    mark = remote_file_flow._platform_ahead[("mA", "agent-1", "workspace/x.md")]
+    assert (mark["size"], mark["mtime_ns"]) == (st.st_size, st.st_mtime_ns)
+    assert mark["in_flight_until"] > 0
+    assert ("mSrc", "agent-1", "workspace/x.md") not in remote_file_flow._platform_ahead
+    fo.assert_not_awaited()
+
+    await wf.drain_save_fan_outs()
     fo.assert_awaited_once()
-    assert fo.await_args.args[:3] == ("agent-1", "workspace/x.md", b"hello")
+    # The platform copy as a Path (opened when the fan-out runs), with the
+    # marks it must settle.
+    assert fo.await_args.args[:2] == ("agent-1", "workspace/x.md")
+    assert fo.await_args.args[2] == tmp_path / "agent-1" / "workspace" / "x.md"
     assert fo.await_args.kwargs.get("exclude_machine_id") == "mSrc"
+    assert fo.await_args.kwargs.get("marked") == {"mA": (st.st_size, st.st_mtime_ns)}
+
+
+@pytest.mark.asyncio
+async def test_a_save_with_no_target_schedules_nothing(temp_db, tmp_path, monkeypatch):
+    import config
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    _setup_layer(monkeypatch, {}, {})
+    fo = AsyncMock()
+    monkeypatch.setattr(wf, "fan_out_write", fo)
+    assert await wf.propagate_write("agent-1", "workspace/x.md", b"hello") is True
+    assert not wf._save_fan_out_tasks and not wf._queued_save_fan_outs
+    await wf.drain_save_fan_outs()
+    fo.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -577,6 +626,42 @@ async def test_apply_same_user_no_conflict(temp_db, tmp_path, monkeypatch):
     assert file_author_store.get(agent, rel) == "bob"
     entries = recover_bin_store.list_for(agent, "admin", True, True, True)
     assert [e for e in entries if e["reason"] == "conflict"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_applier_marks_its_targets_inside_the_path_lock(temp_db, tmp_path, monkeypatch):
+    """The applier pushes after it released the path lock: its targets are
+    marked in flight before that, and the fan-out settles the marks."""
+    import config
+    from core.remote import remote_file_flow
+    from core.remote.satellite_connection import SatelliteConnectionManager
+    from services.remote import workspace_fanout as wf
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    agent, rel = "agent-1", "workspace/shared.md"
+    (tmp_path / agent / "workspace").mkdir(parents=True)
+    cm = SatelliteConnectionManager()
+    _patch_apply_deps(
+        monkeypatch,
+        sec=SimpleNamespace(placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mBob"), role="editor", username="bob", agent=agent, display_name="Bob"),
+        loser_sub_for=lambda u: "user-bob",
+        notifs=[],
+    )
+    monkeypatch.setattr(
+        wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None, shared_only=None: ["mAlice"])
+    seen = {}
+
+    async def _mark(agent_slug, rel_path, *, exclude_machine_id=None):
+        seen["path_lock_held"] = remote_file_flow._global_path_locks[(agent_slug, rel_path)].locked()
+        seen["exclude"] = exclude_machine_id
+        return {"mAlice": (4, 2)}
+
+    fo = AsyncMock()
+    monkeypatch.setattr(wf, "mark_fan_out_targets", _mark)
+    monkeypatch.setattr(wf, "fan_out_write", fo)
+    await cm._apply_file_changed("mBob", _write_msg(agent, rel, b"v2 by bob", "sess-bob"))
+    assert seen == {"path_lock_held": True, "exclude": "mBob"}
+    assert fo.await_args.kwargs["marked"] == {"mAlice": (4, 2)}
 
 
 @pytest.mark.asyncio
@@ -965,11 +1050,12 @@ async def test_fan_out_write_refuses_a_source_that_is_not_the_platform_copy(temp
 
 
 @pytest.mark.asyncio
-async def test_propagate_write_holds_the_fan_out_lock_inside_the_path_lock(temp_db, tmp_path, monkeypatch):
+async def test_a_saves_fan_out_holds_the_fan_out_lock_and_never_the_path_lock(temp_db, tmp_path, monkeypatch):
     import config
     from core.remote import remote_file_flow
     from services.remote import workspace_fanout as wf
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    _setup_layer(monkeypatch, {"s1": _FakeInfo("mA", "agent-1")}, {"s1": _sec("", "manager")})
     seen = {}
 
     async def _fan_out(agent_slug, rel_path, source, **kw):
@@ -980,7 +1066,180 @@ async def test_propagate_write_holds_the_fan_out_lock_inside_the_path_lock(temp_
 
     monkeypatch.setattr(wf, "fan_out_write", _fan_out)
     await wf.propagate_write("agent-1", "workspace/x.md", b"hello")
-    assert seen == {"path": True, "fanout": True}
+    await wf.drain_save_fan_outs()
+    assert seen == {"path": False, "fanout": True}
+
+
+@pytest.mark.asyncio
+async def test_a_save_answers_while_a_target_never_answers(temp_db, tmp_path, monkeypatch):
+    """A machine that stalls (its socket drops only after 30 s) no longer
+    holds the save: propagate_write returns while the push still waits."""
+    import asyncio
+    import config
+    from core.remote import satellite_connection as sc
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    _setup_layer(monkeypatch, {"s1": _FakeInfo("mStalled", "agent-1")}, {"s1": _sec("", "manager")})
+    stalled = asyncio.Event()
+    release = asyncio.Event()
+    pushed = []
+
+    async def _push(machine_id, ref, source, **kw):
+        pushed.append(open(source, "rb").read())
+        stalled.set()
+        await release.wait()
+        return False
+
+    cm = MagicMock()
+    cm.push_file = AsyncMock(side_effect=_push)
+    cm.satellite_supports_file_stat = MagicMock(return_value=False)
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: cm)
+
+    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v1"), timeout=2)
+    await asyncio.wait_for(stalled.wait(), timeout=2)
+    # A second save while the first's fan-out is stuck: it answers too, and
+    # one more fan-out queues behind the running one.
+    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v2"), timeout=2)
+    await asyncio.wait_for(wf.propagate_write("agent-1", "workspace/x.md", b"v3"), timeout=2)
+    assert len(wf._save_fan_out_tasks) == 2
+    release.set()
+    await wf.drain_save_fan_outs()
+    # The queued fan-out pushed the newest copy, once.
+    assert pushed == [b"v1", b"v3"]
+
+
+@pytest.mark.asyncio
+async def test_a_save_after_the_fan_out_started_schedules_its_own(temp_db, tmp_path, monkeypatch):
+    """The queued mark is dropped as the fan-out takes its lock, before it
+    opens the platform copy: a save after that point is pushed again."""
+    import asyncio
+    import config
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    _setup_layer(monkeypatch, {"s1": _FakeInfo("mA", "agent-1")}, {"s1": _sec("", "manager")})
+    started = asyncio.Event()
+    release = asyncio.Event()
+    sources = []
+
+    async def _fan_out(agent_slug, rel_path, source, **kw):
+        sources.append(source.read_bytes())
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(wf, "fan_out_write", _fan_out)
+    await wf.propagate_write("agent-1", "workspace/x.md", b"v1")
+    await asyncio.wait_for(started.wait(), timeout=2)
+    assert not wf._queued_save_fan_outs
+    await wf.propagate_write("agent-1", "workspace/x.md", b"v2")
+    assert len(wf._queued_save_fan_outs) == 1
+    release.set()
+    await wf.drain_save_fan_outs()
+    assert sources == [b"v1", b"v2"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_save_writes_marks_and_schedules_nothing(temp_db, tmp_path, monkeypatch):
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    _setup_layer(monkeypatch, {"s1": _FakeInfo("mA", "agent-1")}, {"s1": _sec("", "manager")})
+    fo = AsyncMock()
+    monkeypatch.setattr(wf, "fan_out_write", fo)
+
+    async def _no():
+        return False
+
+    assert await wf.propagate_write("agent-1", "workspace/x.md", b"v1", precheck=_no) is False
+    assert not (tmp_path / "agent-1" / "workspace" / "x.md").exists()
+    assert not remote_file_flow._platform_ahead and not wf._save_fan_out_tasks
+    fo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bookkeeping_and_marks_never_fail_a_landed_save(temp_db, tmp_path, monkeypatch, caplog):
+    """A 500 after the bytes landed would have Collabora retry into a
+    refusal of its own save: what follows the write logs and goes on."""
+    import config
+    from services.remote import workspace_fanout as wf
+    from storage.files import file_tombstones_store
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(file_tombstones_store, "drop", _boom)
+    monkeypatch.setattr(wf, "shared_only_of", AsyncMock(side_effect=RuntimeError("store down")))
+    fo = AsyncMock()
+    monkeypatch.setattr(wf, "fan_out_write", fo)
+    with caplog.at_level("WARNING", logger="otodock.workspace-fanout"):
+        assert await wf.propagate_write("agent-1", "users/u/workspace/x.md", b"v1") is True
+    assert (tmp_path / "agent-1" / "users" / "u" / "workspace" / "x.md").read_bytes() == b"v1"
+    assert "bookkeeping of a save" in caplog.text
+    assert "marking the fan-out targets" in caplog.text
+    # The marks failed, the fan-out still runs (it marks its targets itself),
+    # bound for no known machine: it holds every machine's turn.
+    from core.remote import upload_inflight
+    (task,) = wf._save_fan_out_tasks
+    assert task not in upload_inflight._bound_for
+    await wf.drain_save_fan_outs()
+    fo.assert_awaited_once()
+    assert fo.await_args.kwargs["marked"] == {}
+
+
+@pytest.mark.asyncio
+async def test_a_save_whose_marks_failed_unbinds_the_queued_fan_out(temp_db, tmp_path, monkeypatch):
+    import asyncio
+    import config
+    from core.remote import upload_inflight
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    release = asyncio.Event()
+
+    async def _fan_out(*a, **kw):
+        await release.wait()
+
+    monkeypatch.setattr(wf, "fan_out_write", _fan_out)
+    answers = iter([{"mA": (1, 1)}, {"mA": (2, 2)}, None])
+    monkeypatch.setattr(wf, "mark_fan_out_targets", AsyncMock(side_effect=lambda *a, **kw: next(answers)))
+    await wf.propagate_write("agent-1", "workspace/x.md", b"v1")    # runs, holds the lock
+    await asyncio.sleep(0)
+    await wf.propagate_write("agent-1", "workspace/x.md", b"v2")    # queued, bound for mA
+    queued = next(iter(wf._queued_save_fan_outs.values()))
+    assert upload_inflight._bound_for[queued["task"]] == {"mA"}
+    await wf.propagate_write("agent-1", "workspace/x.md", b"v3")    # its marks failed
+    assert queued["task"] not in upload_inflight._bound_for
+    release.set()
+    await wf.drain_save_fan_outs()
+
+
+@pytest.mark.asyncio
+async def test_a_marked_machine_the_fan_out_does_not_push_gets_the_failure_rules(
+    temp_db, tmp_path, monkeypatch,
+):
+    """A machine marked in flight that the fan-out does not push to (its
+    session ended meanwhile) is no longer served as "a push is on its way"
+    for ten minutes: its mark ends its window and keeps its baseline."""
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    target = tmp_path / "agent-1" / "workspace" / "x.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"v1")
+    st = target.stat()
+    stat = (st.st_size, st.st_mtime_ns)
+    remote_file_flow._record_agent_stat(("mGone", "agent-1", "workspace/x.md"), {"exists": True, "size": 1, "mtime_ns": 1})
+    remote_file_flow.note_platform_ahead("mGone", "agent-1", "workspace/x.md", *stat, in_flight_s=600)
+    # Another copy's mark on a second machine is a later write's: untouched.
+    remote_file_flow.note_platform_ahead("mOther", "agent-1", "workspace/x.md", *stat, in_flight_s=600)
+    _setup_layer(monkeypatch, {}, {})
+    await wf.fan_out_write("agent-1", "workspace/x.md", target,
+                           marked={"mGone": stat, "mOther": (999, 999)})
+    gone = remote_file_flow._platform_ahead[("mGone", "agent-1", "workspace/x.md")]
+    assert gone["in_flight_until"] == 0.0
+    assert gone["machine"] == {"exists": True, "size": 1, "mtime_ns": 1}
+    assert remote_file_flow._platform_ahead[("mOther", "agent-1", "workspace/x.md")]["in_flight_until"] > 0
 
 
 def test_fanout_targets_takes_the_shared_only_answer_without_a_store_read(temp_db, monkeypatch):

@@ -24,6 +24,8 @@ async def create_llm_backend(
     caller_did: str = "",
     dial_event: dict | None = None,
     pin_verified: bool = False,
+    attach: dict | None = None,
+    transfer_available: bool = True,
 ) -> ProxyClient:
     """Create the LLM backend for a phone route.
 
@@ -34,8 +36,9 @@ async def create_llm_backend(
     don't have to plumb it separately. Works for both inbound and outbound.
 
     Establishes a persistent WebSocket connection to the proxy for
-    low-overhead communication across the entire call duration.
-    Falls back to HTTP SSE if WebSocket connection fails.
+    low-overhead communication across the entire call duration. A
+    connection that fails marks the client ``proxy_lost``: the pipeline
+    ends the call with the apology phrase.
 
     The caller-metadata kwargs (``audiosocket_uuid``, ``caller_phone``,
     ``caller_did``, ``dial_event``) are forwarded into the proxy's warmup
@@ -56,6 +59,8 @@ async def create_llm_backend(
         caller_did=caller_did,
         dial_event=dial_event,
         pin_verified=pin_verified,
+        attach=attach,
+        transfer_available=transfer_available,
     )
     if route.llm_mode == "direct":
         client = ProxyClient(
@@ -66,11 +71,10 @@ async def create_llm_backend(
     else:
         client = ProxyClient(**common_kwargs)
 
-    # Establish WebSocket connection (falls back to HTTP if it fails)
     ws_ok = await client.connect()
     logger.info(
         f"Created ProxyClient ({route.llm_mode} mode) for agent='{route.agent}' "
-        f"(transport={'websocket' if ws_ok else 'http'}, "
+        f"({'connected' if ws_ok else 'the proxy is unreachable'}, "
         f"trigger_payload={'yes' if audiosocket_uuid else 'no'})"
     )
     return client

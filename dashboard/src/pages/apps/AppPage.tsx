@@ -15,6 +15,7 @@ import AppLogsPanel from '../../components/apps/AppLogsPanel'
 import AppSettingsPanel from '../../components/apps/AppSettingsPanel'
 import SharePopover from '../../components/sharing/SharePopover'
 import { GRANTEE_KIND, useHideShare, usePatchShare } from '../../api/shares'
+import { toastError } from '../../lib/http/apiJson'
 
 /**
  * /apps/:appId — one app full screen. Every app has this URL: the menu's
@@ -243,7 +244,13 @@ export default function AppPage() {
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-2">
             <button
-              onClick={() => { setConfirmRemove(null); patchShare.mutate({ id: confirmRemove, revoke: true }); navigate(home) }}
+              onClick={() => {
+                setConfirmRemove(null)
+                // The page leaves at once: a refusal shows as a toast there.
+                patchShare.mutateAsync({ id: confirmRemove, revoke: true })
+                  .catch(toastError(`“${title}” was not removed`))
+                navigate(home)
+              }}
               className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
             >
               Remove for me

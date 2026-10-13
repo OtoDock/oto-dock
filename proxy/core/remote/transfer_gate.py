@@ -41,7 +41,7 @@ import asyncio
 import contextlib
 import logging
 
-logger = logging.getLogger("claude-proxy.transfer-gate")
+logger = logging.getLogger("otodock.transfer-gate")
 
 _sems: dict[str, asyncio.Semaphore] = {}   # one per machine, made on first use
 _limit: int | None = None  # None = not yet initialized from config

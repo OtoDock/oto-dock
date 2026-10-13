@@ -11,7 +11,7 @@ import { PAIRING_SCOPE } from '../../lib/placement'
 import { MACHINE_STATE, type MachineState } from '../../lib/status/machine'
 import { useAgents, useExecutionLayers } from '../../api/agents'
 import { apiFetch } from '../../api/auth'
-import { useAuth } from '../../contexts/AuthContext'
+import { useFlag } from '../../hooks/useFlag'
 import { hasAgentScope, modeOfAgent } from '../../lib/visibility'
 import { engineLabels, installedCliBinaries, runsRemote } from '../../lib/engines'
 import { cliChipInfo } from '../../lib/cliChip'
@@ -329,15 +329,16 @@ function MachineDeviceGrantsControls({ machine }: { machine: RemoteMachine }) {
 
 
 export default function RemoteMachinesPage() {
-  const { user } = useAuth()
   const { data: machines, isLoading } = useRemoteMachines()
   const { data: satelliteStats } = useSatelliteStats()
   const { data: agents } = useAgents({ all: true })
+  const { data: layers } = useExecutionLayers()
 
   // This build ships without the remote-machines feature (the nav entry is
-  // already hidden — this covers a direct URL). Evaluated after the hooks
-  // so hook order stays stable.
-  const featureAvailable = user?.feature_flags?.remote_machines_available !== false
+  // already hidden — this covers a direct URL). Every hook runs above the
+  // early return below: a user snapshot that flips the flag between two
+  // renders must not change how many hooks ran.
+  const featureAvailable = useFlag('remote_machines_available')
 
   // machine_id → live per-satellite stats (active/max sessions, cpu%/mem%).
   const statByMachine = new Map((satelliteStats ?? []).map(s => [s.machine_id, s]))
@@ -409,7 +410,6 @@ export default function RemoteMachinesPage() {
   // (agent) workspace to run in — a remote machine runs the agent scope, so
   // Personal-only agents (no shared space) are excluded. A machine that
   // advertises the engines it can run narrows the list further (below).
-  const { data: layers } = useExecutionLayers()
   const engineNames = engineLabels(layers)
   const cliBinaries = installedCliBinaries(layers)
   const eligibleAgents = (agents ?? []).filter(

@@ -9,6 +9,7 @@ import logging
 import re
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 import config
 from core.execution_layer import DEFAULT_EXECUTION_PATH  # the leaf: no cycle
@@ -666,7 +667,7 @@ def migrate_persona_filenames() -> int:
             )
             file_author_store.clear(slug, "config/prompt.md")
             file_tombstones_store.drop(slug, "config/agent.md")
-            commit_targets = [new]
+            commit_targets: list[Path | str] = [new]
             if git_writer.is_tracked(config_dir, "prompt.md"):
                 commit_targets.append(old)
             git_writer.commit_paths(

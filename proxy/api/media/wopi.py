@@ -32,11 +32,11 @@ from api.media.media import HOST_CACHE_SEGMENT, FdFileResponse
 from auth.providers import get_current_user, require_auth, UserContext
 from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under, safe_agent_dir
-from auth import roles
+from auth import roles, token_holder
 from core import layout
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter(tags=["wopi"])
 
 # ---------------------------------------------------------------------------
@@ -113,6 +113,7 @@ def create_wopi_token(
     agent: str,
     display_name: str = "",
     chat_id: str = "",
+    generation: int = 0,
 ) -> tuple[str, int]:
     """Create a JWT WOPI access token. Returns (token, expiry_ms).
 
@@ -121,7 +122,9 @@ def create_wopi_token(
     renderer from the BaseFileName extension, so snapshot tokens must carry
     the original filename. ``chat_id`` names the chat whose document pane
     the token opens the file in: a save with it refreshes the file's newest
-    version there."""
+    version there. ``generation`` is the document generation of the WOPI id
+    the token is minted for (0 for the bare id): the token opens that
+    document and no other (``_wopi_path_of``)."""
     now = int(time.time())
     exp = now + _WOPI_TOKEN_TTL
     payload = {
@@ -131,6 +134,7 @@ def create_wopi_token(
         # happens to fit (and vice versa).
         "purpose": "wopi",
         "file_path": file_path,
+        "generation": generation,
         "user_sub": user_sub,
         "user_name": user_name,
         "permissions": permissions,  # "view" or "edit"
@@ -159,6 +163,160 @@ def validate_wopi_token(token: str) -> dict | None:
     return claims
 
 
+def _wopi_path_of(file_id: str, claims: dict) -> str:
+    """The path a WOPI id names, when the token may open it: the id decodes,
+    its path is the token's ``file_path`` and its generation the token's.
+    403 "Token/file mismatch" otherwise, before any table is touched, so a
+    token opens exactly its own document and cannot make Collabora open new
+    ones of its file by varying the suffix. A token minted before 1.8.0
+    carries no generation and opens every generation of its own path, for
+    the 4 h it lasts (a document open across the upgrade keeps saving)."""
+    try:
+        rel_path, generation = decode_wopi_id(file_id)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    if claims.get("file_path") != rel_path:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    claimed = claims.get("generation")
+    if claimed is not None and claimed != generation:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    # Collabora keys a document by the id's text: another spelling of the
+    # same path and generation (leading zeros, base64's unused trailing
+    # bits) would be another document. Every id the platform hands out
+    # comes from the encoder.
+    if encode_wopi_id(rel_path, generation) != file_id:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    return rel_path
+
+
+def request_wopi_token(request: Request, access_token: str = "") -> str:
+    """The WOPI token of a request: the ``Authorization: Bearer`` header
+    (Collabora sends it on every WOPI call beside the ``access_token`` query
+    parameter, and alone for an editor frame posted with ``access_header``),
+    else the ``access_token`` query parameter."""
+    auth = request.headers.get("authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    return access_token
+
+
+# The person a WOPI token or the editor relay's cookie names, judged on the
+# HTTP routes' own rules (``auth.providers``): the users row, the credential
+# timeline (a password set, a sign out everywhere, the row re-created) on
+# the token's issue time, and the forced password change and 2FA
+# enrolment. One store read per (person, issue time) per ``_HOLDER_TTL_S``
+# at most, shared by the requests that ask meanwhile (a cold editor load
+# sends dozens at once); every answer expires (the forced change can clear
+# with the same cookie), and a store failure refuses the request it serves
+# and is not kept.
+_HOLDER_TTL_S = 10.0
+_HOLDERS_MAX = 4096
+_holder_answers: OrderedDict[tuple[str, int], tuple[bool, float]] = OrderedDict()
+_holder_reads: dict[tuple[str, int], asyncio.Task] = {}
+# Bumped by ``forget_person``: a store read that began before it may predate
+# the change that caused the forget, so it keeps nothing (token_holder's rule).
+_holder_generation: dict[str, int] = {}
+_holder_failure_logged = 0.0
+# The subs of the principals that are no person: the agent's own token (a
+# push of a turn with no person) and the master key's, a no-user session's,
+# a render principal's. Judged as no person only when no users row bears
+# the sub (an identity provider's raw sub could spell one of them).
+_NO_PERSON_SUBS = frozenset({"agent", "api-key"})
+
+
+def _no_person(sub: str) -> bool:
+    from auth.providers import SESSION_SUB_PREFIX
+    from auth.render_principal import SUB_PREFIX as RENDER_SUB_PREFIX
+    return sub in _NO_PERSON_SUBS or sub.startswith((SESSION_SUB_PREFIX, RENDER_SUB_PREFIX))
+
+
+def _person_holds_now(sub: str, iat: int) -> bool:
+    """Store reads: call it on the DB executor."""
+    from auth.providers import auth_gate, session_cookie_current
+    from storage import database as task_store
+    user = task_store.get_user(sub)
+    if not user:
+        return _no_person(sub)
+    return session_cookie_current(user, {"iat": iat}) and not auth_gate(user)
+
+
+async def _read_holder(key: tuple[str, int]) -> bool | None:
+    global _holder_failure_logged
+    from storage.pg import run_db_fast
+    generation = _holder_generation.get(key[0], 0)
+    try:
+        ok = bool(await run_db_fast(_person_holds_now, *key))
+    except Exception as exc:
+        now = time.monotonic()
+        if now - _holder_failure_logged >= 60.0:
+            _holder_failure_logged = now
+            logger.warning("WOPI: the person behind a token could not be read (%s)",
+                           type(exc).__name__)
+        return None
+    finally:
+        # A forget meanwhile registered a fresh read under this key: that one
+        # stays.
+        if _holder_reads.get(key) is asyncio.current_task():
+            _holder_reads.pop(key, None)
+    if _holder_generation.get(key[0], 0) != generation:
+        return ok
+    _holder_answers[key] = (ok, time.monotonic() + _HOLDER_TTL_S)
+    _holder_answers.move_to_end(key)
+    while len(_holder_answers) > _HOLDERS_MAX:
+        _holder_answers.popitem(last=False)
+    return ok
+
+
+def forget_person(sub: str) -> None:
+    """Drop the kept answers of ``sub``: their next WOPI call or editor
+    request reads the store (their token epoch moved), a read in flight
+    keeps nothing, and a request arriving now starts its own read instead of
+    sharing the old one. Called through ``token_holder.forget`` by every
+    site that bumps an epoch."""
+    _holder_generation[sub] = _holder_generation.get(sub, 0) + 1
+    for key in [k for k in _holder_answers if k[0] == sub]:
+        _holder_answers.pop(key, None)
+    for key in [k for k in _holder_reads if k[0] == sub]:
+        _holder_reads.pop(key, None)
+
+
+token_holder.on_forget(forget_person)
+
+
+async def person_standing(sub: str, iat) -> bool | None:
+    """Whether the person ``sub`` names may still use a credential issued at
+    ``iat``: True, False, or None when the store could not be read (not
+    kept). A sub with no users row is a person who is gone, unless it is a
+    principal that is no person (``_no_person``)."""
+    if not sub or not isinstance(iat, int):
+        return False
+    key = (sub, iat)
+    hit = _holder_answers.get(key)
+    if hit is not None and hit[1] >= time.monotonic():
+        return hit[0]
+    read = _holder_reads.get(key)
+    if read is None:
+        read = asyncio.get_running_loop().create_task(_read_holder(key))
+        _holder_reads[key] = read
+    return await asyncio.shield(read)
+
+
+async def person_holds(sub: str, iat) -> bool:
+    """``person_standing``, a store that could not be read refusing."""
+    return await person_standing(sub, iat) is True
+
+
+async def _wopi_claims(request: Request, access_token: str) -> dict:
+    """The claims of the request's WOPI token: valid, and its person still
+    holding (``person_holds``: a sign out everywhere ends the token too,
+    whatever reaches the WOPI host, Collabora's own exit save included).
+    401 otherwise."""
+    claims = validate_wopi_token(request_wopi_token(request, access_token))
+    if not claims or not await person_holds(claims.get("user_sub") or "", claims.get("iat")):
+        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    return claims
+
+
 class _Unreadable(Exception):
     """The file a save check reads is there but could not be read."""
 
@@ -174,12 +332,7 @@ def _open_wopi_regular(file_id: str, claims: dict, *,
     run it in a thread. The caller closes the descriptor. ``unreadable``,
     when given, is raised instead of the 404 for a file that is there but
     could not be opened (the save check fails open on it)."""
-    try:
-        rel_path, _generation = decode_wopi_id(file_id)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
-    if claims.get("file_path") != rel_path:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    rel_path = _wopi_path_of(file_id, claims)
     if rel_path.startswith(_SNAPSHOT_NS + "/"):
         from services.media import preview_snapshots
         parts = rel_path.split("/")
@@ -514,13 +667,12 @@ def _open_for_get(file_id: str, claims: dict) -> tuple[int, os.stat_result]:
 
 @router.get("/wopi/files/{file_id}")
 async def wopi_check_file_info(
+    request: Request,
     file_id: str,
-    access_token: str = Query(...),
+    access_token: str = Query(""),
 ):
     """WOPI CheckFileInfo — returns file metadata for Collabora."""
-    claims = validate_wopi_token(access_token)
-    if not claims:
-        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    claims = await _wopi_claims(request, access_token)
     st, name, last_modified = await asyncio.to_thread(_file_info, file_id, claims)
 
     can_write = claims.get("permissions") == "edit"
@@ -552,13 +704,12 @@ async def wopi_check_file_info(
 
 @router.get("/wopi/files/{file_id}/contents")
 async def wopi_get_file(
+    request: Request,
     file_id: str,
-    access_token: str = Query(...),
+    access_token: str = Query(""),
 ):
     """WOPI GetFile — returns raw file bytes."""
-    claims = validate_wopi_token(access_token)
-    if not claims:
-        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    claims = await _wopi_claims(request, access_token)
     fd, st = await asyncio.to_thread(_open_for_get, file_id, claims)
     # Streamed from the checked descriptor: Collabora re-fetches on every
     # retry, and holding a large document (a 536MB preview, once) fully in
@@ -579,7 +730,7 @@ async def wopi_get_file(
 async def wopi_put_file(
     request: Request,
     file_id: str,
-    access_token: str = Query(...),
+    access_token: str = Query(""),
 ):
     """WOPI PutFile: saves file from Collabora (user editing).
 
@@ -589,15 +740,8 @@ async def wopi_put_file(
     every write below opens that rel beneath ``AGENTS_DIR`` through
     ``safe_fs`` in a worker thread, no component followed; a token whose path
     fits neither shape is refused, never written."""
-    claims = validate_wopi_token(access_token)
-    if not claims:
-        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
-    try:
-        rel, _generation = decode_wopi_id(file_id)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
-    if claims.get("file_path") != rel:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    claims = await _wopi_claims(request, access_token)
+    rel = _wopi_path_of(file_id, claims)
     # The lock, the answered time and the document's base are this
     # document's (the raw id, one per generation). The version a save
     # refreshes is the chat's file (the bare id).
@@ -685,10 +829,11 @@ async def wopi_put_file(
         return _put_file_answer(saved)
 
     # Persist + propagate. ``propagate_write`` does the authoritative
-    # atomic write to the platform agent tree AND fans the saved bytes out to
-    # every machine running a live session of this agent, all under the global
+    # atomic write to the platform agent tree under the global
     # per-(agent, rel_path) lock, so a concurrent satellite / file-tools write
-    # can't interleave (disk and satellites converge on the same bytes).
+    # can't interleave, and fans the platform copy out to every machine
+    # running a live session of this agent after the save has answered (a
+    # stalled machine must not hold Collabora's upload).
     # Collabora already live-merged concurrent human editors, so ``body`` IS the
     # merged result → no conflict capture (see propagate_write). agent_slug +
     # agent-tree rel come from the token's AGENTS_DIR-relative file_path
@@ -760,7 +905,7 @@ def _host_cache_write(rel: str, body: bytes) -> bytes | None:
 async def wopi_lock_operations(
     request: Request,
     file_id: str,
-    access_token: str = Query(...),
+    access_token: str = Query(""),
 ):
     """WOPI Lock/Unlock/RefreshLock operations.
 
@@ -768,15 +913,8 @@ async def wopi_lock_operations(
     of a file, like Collabora's documents) and no file is opened: the check
     is the token and the path the id names (an id that does not decode, or
     that names another path, is 403 as on the read routes)."""
-    claims = validate_wopi_token(access_token)
-    if not claims:
-        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
-    try:
-        rel, _generation = decode_wopi_id(file_id)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
-    if claims.get("file_path") != rel:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    claims = await _wopi_claims(request, access_token)
+    _wopi_path_of(file_id, claims)
 
     override = request.headers.get("X-WOPI-Override", "").upper()
     lock_id = request.headers.get("X-WOPI-Lock", "")
@@ -886,16 +1024,16 @@ async def generate_wopi_url(
 
     rel_path, permissions = await run_db(_workspace_mint, req, user)
     file_id = encode_file_id(rel_path)
-    token, token_ttl = create_wopi_token(
-        rel_path, user.sub, user.name, permissions, req.agent
-    )
     # The document of the file's newest push when one was noted, so the
     # workspace tab, the path chips and the chat panes share it (a Collabora
     # save in one is already in the others). ``file_id`` stays the bare id.
     from api.hooks import preview as preview_hook
-    frame_id = encode_wopi_id(rel_path, preview_hook.pushed_generation(file_id))
-    return {**cool_frame(frame_id, token, token_ttl), "file_id": file_id,
-            "permissions": permissions}
+    generation = preview_hook.pushed_generation(file_id)
+    token, token_ttl = create_wopi_token(
+        rel_path, user.sub, user.name, permissions, req.agent, generation=generation,
+    )
+    return {**cool_frame(encode_wopi_id(rel_path, generation), token, token_ttl),
+            "file_id": file_id, "permissions": permissions}
 
 
 def _workspace_mint(req: WopiUrlRequest, user: UserContext) -> tuple[str, str]:
@@ -1066,9 +1204,10 @@ async def generate_preview_wopi_url(
     (non-dismissed) preview event for this file_id. Write capability is
     recomputed for the REQUESTER — same rules as the push-time mint: workspace
     files go through the agent-tree write matrix; a host-cache mirror (a file
-    on the remote machine's own disk) is editable by write-capable roles only
-    within the chat's own session. 404 tells the pane to use a pushed token
-    when it has one, else that the file is gone."""
+    on the remote machine's own disk) is editable only within the chat's own
+    session, by that session's person with a write-capable role
+    (``live_permissions``). 404 tells the pane to use a pushed token when it
+    has one, else that the file is gone."""
     u = require_auth(user)
 
     if not config.COLLABORA_URL:
@@ -1081,10 +1220,10 @@ async def generate_preview_wopi_url(
         _preview_mint, u, chat_id, file_id)
     from api.hooks import preview as preview_hook
     generation = preview_hook.mint_generation(file_id, row_generation)
+    # The frame opens the document of the file's newest push, and the token
+    # that document alone.
     token, token_ttl = create_wopi_token(rel_path, u.sub, u.name, permissions, agent,
-                                         chat_id=owner)
-    # The frame opens the document of the file's newest push: the token is
-    # the bare path's, which every generation of the id answers to.
+                                         chat_id=owner, generation=generation)
     return {**cool_frame(encode_wopi_id(rel_path, generation), token, token_ttl),
             "permissions": permissions}
 
@@ -1142,9 +1281,14 @@ def _preview_mint(u: UserContext, chat_id: str, file_id: str) -> tuple[str, str,
             _is_host_cache = full_path.is_relative_to(
                 remote_file_flow.host_cache_session_root(_session_id).resolve()
             )
+    _person = ""
+    if _is_host_cache:
+        from core.session.session_state import get_session_security
+        _sec = get_session_security(_session_id)
+        _person = (getattr(_sec, "username", "") or "") if _sec is not None else ""
     permissions = live_permissions(
         rel_path.partition("/")[2], u.acting_role(agent), _db.get_username_by_sub(u.sub) or "",
-        agent, host_cache=_is_host_cache,
+        agent, host_cache=_is_host_cache, session_person=_person,
     )
     return rel_path, permissions, agent, owner, generation
 
@@ -1160,16 +1304,20 @@ def _row_document_generation(event: dict) -> int:
 
 
 def live_permissions(tree_rel: str, role: str, username: str, agent: str, *,
-                     host_cache: bool) -> str:
+                     host_cache: bool, session_person: str = "") -> str:
     """``"edit"`` or ``"view"``: what one person's token for a chat's live
     document allows (the pane's mint and the push's token for the person
     the turn runs as). A host-cache mirror (a file on the session's own
-    machine) is editable by a write-capable role, PutFile pushing the bytes
-    back to the real file, where the satellite's own host write policy is
-    the authoritative gate. An agent-tree file follows the agent-tree write
-    matrix. Store reads: call it on the DB executor."""
+    machine) is editable only by the session's own person
+    (``session_person``, the session's authenticated username) with a
+    write-capable role, PutFile pushing the bytes back to the real file,
+    where the satellite's own host write policy is the next gate: anyone
+    else who can open the chat (an agent-scope run's chat opens to every
+    user of the agent) views it. An agent-tree file follows the agent-tree
+    write matrix. Store reads: call it on the DB executor."""
     if host_cache:
-        return "edit" if roles.can_write_workspace(role) else "view"
+        own = bool(username) and username == session_person
+        return "edit" if own and roles.can_write_workspace(role) else "view"
     from core.remote.file_sync import can_write_back, library_mirror_source
     writable = None
     if library_mirror_source(tree_rel) is not None:

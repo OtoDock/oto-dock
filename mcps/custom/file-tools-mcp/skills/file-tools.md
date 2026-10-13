@@ -3,8 +3,7 @@
 Use the file-tools MCP for all document and image operations. What each tool supports in detail, the Excel feature list, dpi rules, OCR and the mathematics workflow are in the skill `file-tools-guide` — load it with the Skill tool before a document, spreadsheet, PDF or image job.
 
 - **`read_document`** — text and data from PDF / DOCX / XLSX / PPTX (XLSX as a coordinate-labeled grid, range reads with start_cell/end_cell). Use it instead of pip-installing libraries.
-- **`write_docx`** / **`write_pptx`** — create or modify Word documents / PowerPoint presentations (full feature set in the guide).
-- **`write_xlsx`** — create or modify Excel workbooks with `{"op": ...}` operations; send `{"op": "help"}` once for the full catalogue. A1 notation; the result echoes a readback grid — always check it to confirm placement.
+- **`write_docx`** / **`write_pptx`** / **`write_xlsx`** — create or modify Word, PowerPoint and Excel files with `{"op": ...}` operations; send `{"op": "help"}` once for every operation's keys. Excel: A1 notation; the result echoes a readback grid — always check it to confirm placement.
 - **`write_pdf`** — PDF from HTML or Markdown (LaTeX math renders as vector equations). **`edit_pdf`** — merge, split, rotate, reorder, watermark, replace_text, redact, annotate, encrypt, compress, OCR.
 - **`screenshot_document`** — render pages as images to inspect layout (only you see these). **`pdf_to_images`**, **`images_to_pdf`**, **`convert_document`** — format conversions.
 - **`edit_image`** (resize/crop/tone/color/effects/remove_background/blur_region), **`analyze_image`** (EXIF, histogram, suggestions), **`create_chart`** (chart IMAGE for documents; prefer `display_ui` for in-chat charts when available).

@@ -12,6 +12,7 @@ from pathlib import Path
 from equations import latex_to_png
 from isolation import run_parse
 from shared import (
+    HELP_POINTER,
     _checked_resolved,
     _dropped_note,
     _normalize_operations,
@@ -21,10 +22,97 @@ from shared import (
     _resolve_path,
     _to_agents_relative,
     _WRITE_OP_ADVICE,
+    help_text,
     logger,
     cleanup_partials,
     safe_open_write,
+    split_help_ops,
 )
+
+_SLIDE = "slide_index (0-based, -1 = last)"
+_SHAPE = "shape_name (its name or its whole text) or shape_index"
+_RUN_KEYS = "font_size? (pt), bold?, italic?, underline?, color? (hex), font_name?"
+_BOX = "left?, top?, width?, height? (inches)"
+
+# What {"op": "help"} answers; one entry per operation the dispatcher in
+# _write_pptx_core knows (a test holds the two together).
+_HELP_GROUPS = (
+    ("SLIDES", (
+        ("add_slide", "layout? (title | title_and_content | section_header | two_content "
+                      "| comparison | title_only | blank, default blank)"),
+        ("delete_slide", f"{_SLIDE}"),
+        ("duplicate_slide", f"{_SLIDE} (the copy is added last)"),
+        ("move_slide", "from_index, to_index (0-based, -1 = last)"),
+        ("set_slide_dimensions", "width? (13.333), height? (7.5) in inches"),
+        ("set_core_properties", "title?, author?, subject?, keywords?, comments?"),
+    )),
+    ("TEXT", (
+        ("set_text", f"{_SLIDE}, placeholder? (title | body | its index, default title), "
+                     f"text with {_RUN_KEYS}, or runs: [{{text, {_RUN_KEYS}}}]"),
+        ("add_textbox", f"{_SLIDE}, text with {_RUN_KEYS}, or runs; {_BOX}, alignment? "
+                        "(left | center | right | justify), word_wrap? (true), auto_size?, "
+                        "margin? (inches)"),
+        ("add_bullet_points", f"{_SLIDE}, items: [text or {{text, level? (0-8)}}], "
+                              f"font_size?; target: {_SHAPE}, or placeholder? (body by default)"),
+        ("format_text", f"{_SLIDE}, find (text on the slide), {_RUN_KEYS}"),
+    )),
+    ("SHAPES", (
+        ("add_shape", f"{_SLIDE}, shape_type (rectangle, rounded_rectangle, oval, triangle, "
+                      "diamond, arrow_right / arrow_left / arrow_up / arrow_down, star, star_4, "
+                      "star_6, chevron, pentagon, hexagon, cloud, heart, lightning, plus, "
+                      "flowchart_process / flowchart_decision / flowchart_data / "
+                      f"flowchart_terminator, callout_1, callout_2), {_BOX}, text?, "
+                      "text_alignment?, font_size?, bold?, font_color?, font_name?, "
+                      "fill_color?, no_fill?, line_color?, line_width? (pt), rotation? (degrees)"),
+        ("set_shape_format", f"{_SLIDE}, {_SHAPE}, fill_color?, no_fill?, line_color?, "
+                             f"line_width?, rotation?, {_BOX}: resizes and moves a shape"),
+        ("remove_shape", f"{_SLIDE}, {_SHAPE}"),
+        ("add_group_shape", f"{_SLIDE}, name?"),
+        ("add_freeform", f"{_SLIDE}, points: [[x, y] or {{x, y}}, ...] (inches, 2 or more), "
+                         "close? (true), fill_color?, line_color?"),
+        ("add_connector", f"{_SLIDE}, start_x, start_y, end_x, end_y (inches), line_color?, "
+                          "line_width?, arrow_start?, arrow_end?"),
+    )),
+    ("TABLES", (
+        ("add_table", f"{_SLIDE}, headers, rows, {_BOX}"),
+        ("format_table_cell", f"{_SLIDE}, table_index? (0), row, col, end_row? / end_col? "
+                              f"(a range), fill_color?, alignment?, vertical_alignment? (top | "
+                              f"middle | bottom), {_RUN_KEYS}, merge_to? {{row, col}}"),
+    )),
+    ("CHARTS", (
+        ("add_chart", f"{_SLIDE}, chart_type (column_clustered, column_stacked, "
+                      "bar_clustered, bar_stacked, line, line_markers, pie, pie_exploded, "
+                      "doughnut, scatter, scatter_lines, area, area_stacked, radar), "
+                      "categories, series: [{name, values, color? (hex)}] (scatter: "
+                      "[{name, x, y}]), colors? (per slice, pie and doughnut), title?, "
+                      f"has_legend?, {_BOX}"),
+        ("update_chart_data", f"{_SLIDE}, chart_index? (0), categories, series: "
+                              "[{name, values}]"),
+    )),
+    ("IMAGES / EQUATIONS", (
+        ("add_image", f"{_SLIDE}, image_path, left?, top?, width?, height? (one of the two "
+                      "keeps the aspect ratio)"),
+        ("add_equation", f"{_SLIDE}, latex, left?, top?, height? (0.8), width? (inches): a "
+                         "high-resolution picture; amsmath subset"),
+    )),
+    ("VISUAL", (
+        ("set_background", f"{_SLIDE}, color (hex), or gradient: [{{color, position? "
+                           "(0-1)}}, ...] and angle? (270); also as set_background_color"),
+        ("set_transition", f"{_SLIDE}, transition (fade | push | wipe | split | reveal | "
+                           "cover | dissolve), duration? (ms, the effect's speed), "
+                           "advance_after? (ms: advance by itself)"),
+    )),
+    ("NOTES / LINKS / NUMBERS", (
+        ("set_speaker_notes", f"{_SLIDE}, text, append?"),
+        ("add_hyperlink", f"{_SLIDE}, {_SHAPE}, url, text? (a linked run in the shape's "
+                          "text; without it the whole shape links), color?"),
+        ("set_slide_number", "enabled: false removes the slide-number placeholders "
+                             "from the layouts"),
+    )),
+)
+_HELP_NOTES = ("UNITS: positions and sizes are INCHES (a 16:9 slide is 13.333 x 7.5), "
+               "font sizes and line widths POINTS. Style charts and shapes in the deck's "
+               "palette.")
 
 # ---------------------------------------------------------------------------
 # Shape type mapping
@@ -245,8 +333,14 @@ async def handle_write_pptx(args: dict) -> str:
     """Thin parent wrapper: path resolution and the preview push are
     session-bound and stay here; the op loop (which DOM-loads an existing
     presentation) runs in a bounded worker child."""
-    path = await _resolve_path(args["path"], writing=True)
     ops, dropped = _normalize_operations(args.get("operations"))
+    help_ops, ops = split_help_ops(ops)
+    answer = help_text("write_pptx", _HELP_GROUPS, _HELP_NOTES, help_ops,
+                       {"set_background_color": "set_background"})
+    if help_ops and not ops:
+        # A question never creates or previews a presentation.
+        return answer + _dropped_note(dropped)
+    path = await _resolve_path(args["path"], writing=True)
     await _preresolve_image_ops(ops)
     try:
         msg = await run_parse(
@@ -258,7 +352,7 @@ async def handle_write_pptx(args: dict) -> str:
         cleanup_partials(path)
         raise
     await _push_preview(path)
-    return msg
+    return msg + ("\n\n" + answer if answer else "")
 
 
 def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
@@ -341,13 +435,18 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                     pass
 
             elif ot == "move_slide":
-                from_idx = int(op.get("from_index", 0))
-                to_idx = int(op.get("to_index", 0))
                 sld_lst = prs.slides._sldIdLst
-                if 0 <= from_idx < len(sld_lst) and 0 <= to_idx < len(sld_lst):
-                    el = sld_lst[from_idx]
-                    sld_lst.remove(el)
-                    sld_lst.insert(to_idx, el)
+                n = len(sld_lst)
+                from_idx, to_idx = (
+                    i + n if i < 0 else i
+                    for i in (int(op.get("from_index", 0)), int(op.get("to_index", 0))))
+                if not (0 <= from_idx < n and 0 <= to_idx < n):
+                    errors.append(f"Op #{idx} move_slide: index out of range "
+                                  f"(have {n} slides, use 0-{n - 1} or -1 for last)")
+                    continue
+                el = sld_lst[from_idx]
+                sld_lst.remove(el)
+                sld_lst.insert(to_idx, el)
 
             elif ot == "set_slide_dimensions":
                 prs.slide_width = Inches(float(op.get("width", 13.333)))
@@ -359,7 +458,7 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
 
             elif ot == "set_text":
                 slide = _get_slide(prs, op)
-                placeholder = op.get("placeholder", "title")
+                placeholder = str(op.get("placeholder", "title"))
                 ph_idx = int(placeholder) if placeholder.isdigit() else (0 if placeholder == "title" else 1)
 
                 for shape in slide.placeholders:
@@ -747,7 +846,8 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                 ct_map = _get_chart_type_map()
                 xl_ct = ct_map.get(chart_type_name)
                 if not xl_ct:
-                    errors.append(f"Op #{idx} add_chart: unknown chart_type '{chart_type_name}'")
+                    errors.append(f"Op #{idx} add_chart: unknown chart_type '{chart_type_name}'. "
+                                  f"Available: {', '.join(ct_map)}")
                     continue
 
                 categories = op.get("categories", [])
@@ -906,8 +1006,11 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                 for e in existing:
                     slide._element.remove(e)
 
+                # duration is the effect's speed; only advance_after advances
+                # the slide by itself (advTm).
+                speed = "fast" if duration <= 500 else "med" if duration <= 1000 else "slow"
                 trans_el = parse_xml(
-                    f'<p:transition xmlns:p="{ns}" spd="med" advTm="{duration}">'
+                    f'<p:transition xmlns:p="{ns}" spd="{speed}">'
                     f'<p:{trans_tag}/>'
                     f'</p:transition>'
                 )
@@ -989,7 +1092,7 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
 
             else:
                 logger.warning(f"write_pptx: unknown operation '{ot}', skipping")
-                errors.append(f"Op #{idx}: unknown operation '{ot}'")
+                errors.append(f"Op #{idx}: unknown operation '{ot}'" + HELP_POINTER)
 
         except Exception as exc:
             errors.append(f"Op #{idx} {ot}: {exc}")

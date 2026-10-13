@@ -9,12 +9,16 @@ import { act, render } from '@testing-library/react'
 import { installFakeNativeChannel } from './fixtures/nativeChannel'
 
 type Tap = (n: { notification: { data: Record<string, unknown> } }) => unknown
-const h = vi.hoisted(() => ({ listeners: {} as Record<string, (arg: never) => unknown> }))
+const h = vi.hoisted(() => ({
+  listeners: {} as Record<string, (arg: never) => unknown>,
+  permission: 'granted',
+  registered: 0,
+}))
 vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => true } }))
 vi.mock('@capacitor/push-notifications', () => ({
   PushNotifications: {
-    requestPermissions: async () => ({ receive: 'granted' }),
-    register: async () => {},
+    requestPermissions: async () => ({ receive: h.permission }),
+    register: async () => { h.registered++ },
     addListener: async (name: string, fn: (arg: never) => unknown) => {
       h.listeners[name] = fn
       return { remove: () => {} }
@@ -41,7 +45,11 @@ async function mountAndTap(navigate: (p: string) => void) {
   return tap
 }
 
-beforeEach(() => { h.listeners = {} })
+beforeEach(() => {
+  h.listeners = {}
+  h.permission = 'granted'
+  h.registered = 0
+})
 afterEach(() => {
   delete (window as unknown as { OtoDockNative?: unknown }).OtoDockNative
   vi.useRealTimers()
@@ -74,5 +82,23 @@ describe('a notification tap in the app', () => {
     await vi.advanceTimersByTimeAsync(3000)
     await done
     expect(navigate).toHaveBeenCalledWith('/chat/pa/1')
+  })
+})
+
+describe('registering for push', () => {
+  // The app's manifest keeps Firebase from starting a token on its own;
+  // register() is what starts it, so it waits for the person's permission.
+  it('registers once notifications are allowed', async () => {
+    render(<Probe navigate={vi.fn()} />)
+    await settle()
+    expect(h.registered).toBe(1)
+  })
+
+  it('never registers when notifications are declined', async () => {
+    h.permission = 'denied'
+    render(<Probe navigate={vi.fn()} />)
+    await settle()
+    expect(h.registered).toBe(0)
+    expect(h.listeners.pushNotificationActionPerformed).toBeUndefined()
   })
 })

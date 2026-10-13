@@ -162,6 +162,7 @@ CHAT_READ = "chat_read"
 CHAT_ROWS = "chat_rows"
 CHAT_META = "chat_meta"
 CHAT_MOVED = "chat_moved"
+CHAT_VIEW_ONLY = "chat_view_only"
 ENGINE_SWITCHED = "engine_switched"
 SWITCH_ENGINE_DENIED = "switch_engine_denied"
 LIVENESS = "liveness"
@@ -318,6 +319,9 @@ FRAMES: dict[str, Frame] = {
     CHAT_ROWS: Frame(True, None),
     CHAT_META: Frame(True, None),
     CHAT_MOVED: Frame(False, None),
+    # The viewed chat is driven from outside (a phone call): sent before the
+    # read-only history of a full resume; the page re-resumes on ready.
+    CHAT_VIEW_ONLY: Frame(True, None),
     ENGINE_SWITCHED: Frame(False, None),
     SWITCH_ENGINE_DENIED: Frame(False, None),
     LIVENESS: Frame(False, None),
@@ -549,9 +553,14 @@ SUBTYPE_MEETING_FAILED = "meeting_failed"
 # written: a server kick, an interaction) while the chat's machine is still
 # reconnecting; ``message`` says to send it again.
 SUBTYPE_MACHINE_RECONNECTING = "machine_reconnecting"
+# A permission request the engine raised on its own channel that was refused
+# with no person's answer (``core/session/engine_prompts``): ``message`` names
+# the call and why (nobody answered in time, a phone call, an older
+# satellite); the turn went on.
+SUBTYPE_ENGINE_PROMPT_REFUSED = "engine_prompt_refused"
 SYSTEM_SUBTYPES: frozenset[str] = frozenset({
     SUBTYPE_SESSION_RESEEDED, SUBTYPE_UNDELIVERED_INPUT, SUBTYPE_TURN_ENDED, SUBTYPE_BG_WAKE,
-    SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING,
+    SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING, SUBTYPE_ENGINE_PROMPT_REFUSED,
     SUBTYPE_MEETING_STARTED, SUBTYPE_MEETING_TURN_START, SUBTYPE_MEETING_TURN_END,
     SUBTYPE_MEETING_CONCLUDED, SUBTYPE_MEETING_AGENT_FAILED,
     SUBTYPE_MEETING_AGENT_LEFT, SUBTYPE_MEETING_FAILED,
@@ -704,6 +713,9 @@ class DelegateResultFrame(_PerChat, total=False):
     # A failed run's newest failing check verdict (services/checks, the
     # evaluator's row), when one landed since the run started.
     verdict: dict
+    # Background work (a command, a subagent) still running when the worker's
+    # turn ended; the delegating chat's prompt names the count.
+    background_pending: int
     # The deliverables the worker attached, as they landed in the
     # delegator's tree (``{path, bytes}``, agent-tree-relative), and the
     # ones that did not land, each with its reason (``{path, reason}``).
@@ -1381,14 +1393,19 @@ PHONE_TOOL_START = TOOL_START       # {"turn", "data": {"name", "tool_use_id"}}
 PHONE_TOOL_END = TOOL_END           # {"turn", "data": {"tool_use_id", "result_preview"}}
 PHONE_DONE = DONE                   # {"turn", "data": {}}
 PHONE_ERROR = ERROR                 # PhoneErrorFrame
+# A call tool the agent called (services/phone/call_control.py): {"turn"?,
+# "data": {"request_id", "action", "reason" | "target" | "question"}}; the
+# daemon answers with the inbound ``call_control_result`` below.
+PHONE_CALL_CONTROL = "call_control"
 PHONE_FRAMES: frozenset[str] = frozenset({
     PHONE_WARMUP_READY, PHONE_SESSION, PHONE_TEXT, PHONE_TOOL_START,
-    PHONE_TOOL_END, PHONE_DONE, PHONE_ERROR,
+    PHONE_TOOL_END, PHONE_DONE, PHONE_ERROR, PHONE_CALL_CONTROL,
 })
 PHONE_IN_WARMUP = "warmup"
 PHONE_IN_CHAT = "chat"
 PHONE_IN_ABORT = "abort"
 PHONE_IN_CLOSE = "close"
+PHONE_IN_CALL_CONTROL_RESULT = "call_control_result"   # {"data": {"request_id", "ok", "message"}}
 
 
 # ---------------------------------------------------------------------------

@@ -339,11 +339,16 @@ def test_the_effort_scales_agree_with_the_adapters():
     for pid in ("openai", "ollama", "openai_compatible"):
         if pid in direct_entries:
             assert direct_entries[pid]["effort_scale"] == openai_scale, pid
-    # Groq's API documents low / medium / high (gpt-oss); the adapter still
-    # sends the inherited OpenAI map above that — the declaration states what
-    # the provider takes, and it is a strict prefix of the map's identity set.
+    # Groq's API documents low / medium / high (gpt-oss); the adapter folds
+    # the inherited OpenAI map onto that declaration, so xhigh, max and
+    # ultra go out as high.
     groq_scale = direct_entries["groq"]["effort_scale"]
     assert groq_scale == openai_scale[:len(groq_scale)] and len(groq_scale) < len(openai_scale)
+    from core.layers.providers.registry import get_adapter
+    groq = get_adapter("groq")
+    assert [groq._wire_effort(lvl) for lvl in direct.effort_levels] == [
+        "low", "medium", "high", "high", "high"]
+    assert get_adapter("openai")._wire_effort("max") == "xhigh"
     # Anthropic's rewrite is inline (anthropic_adapter.stream_response,
     # cli/session._build_persistent_cmd): every level but ultra goes through
     # as itself, xhigh only when the row supports it.
@@ -616,3 +621,22 @@ def test_to_dict_carries_the_phase_2_facts():
         assert "question_tool_holds_turn" in d["behaviour"], path
         for entry in d["providers"]:
             assert {"kind", "relay_path", "api_path"} <= set(entry), (path, entry)
+
+
+def test_every_ladder_follows_the_platform_ladder():
+    from core.execution_layer import EFFORT_LADDER
+    for path, layer in get_all_layers().items():
+        caps = layer.capabilities
+        assert _sub_sequence(caps.effort_levels, list(EFFORT_LADDER)), (path, caps.effort_levels)
+        for entry in caps.providers:
+            assert _sub_sequence(entry["effort_scale"], list(EFFORT_LADDER)), (path, entry["id"])
+
+
+def test_a_level_folds_down_onto_a_declared_scale():
+    from core.execution_layer import fold_effort
+    groq = ["low", "medium", "high"]
+    assert [fold_effort(lvl, groq) for lvl in ("low", "high", "xhigh", "max", "ultra")] == [
+        "low", "high", "high", "high", "high"]
+    assert fold_effort("xhigh", []) == "xhigh"            # nothing declared: unchanged
+    assert fold_effort("low", ["medium", "high"]) == "medium"   # nothing below: the lowest
+    assert fold_effort("none", groq) == "none"            # off the ladder: the map decides

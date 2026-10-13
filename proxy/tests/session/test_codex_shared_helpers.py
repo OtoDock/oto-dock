@@ -96,7 +96,7 @@ def test_map_effort_gpt6_astra_unlocks_max_and_ultra():
 
 
 def test_map_effort_gpt61_sol_follows_the_0_160_catalog():
-    # Codex 0.160.0's bundled catalog: GPT-6.1 Sol carries low…max + ultra
+    # Codex 0.160.0's bundled catalog (identical at 0.162.1): GPT-6.1 Sol carries low…max + ultra
     # (ultra delegates at xhigh). The unlock is the exact id: "gpt-6-sol" is
     # not a prefix of "gpt-6.1-sol", so without its own entry max and ultra
     # would clamp to xhigh.
@@ -195,12 +195,14 @@ def test_supports_ultra_flags_match_openai_manifest():
 def test_gpt6_astra_registry_entry():
     # A NEW model next to the 5.6 family (not a rename): codex-cli only until
     # the hosted relay prices it; listed right after the Sol row (GPT-6.1 Sol
-    # the tier-2 default) so it reads first; the 272k window.
+    # the tier-2 default) so it reads first; the vendor's 1.05M window with
+    # the 272k price tier (Codex reads its live window either way).
     import config as app_config
     entry = app_config.MODEL_REGISTRY["gpt-6-astra"]
     assert entry["provider"] == "openai"
     assert entry["layers"] == ["codex-cli"]
-    assert entry["context_window"] == 272_000
+    assert entry["context_window"] == 1_050_000
+    assert entry["long_context"] == (272_000, 2.0, 1.5)
     assert entry["pricing"] == (10.0, 50.0, 12.50, 1.00)
     assert entry["supports_xhigh"] and entry["supports_ultra"] and entry["supports_reasoning"]
     codex_ids = [m["value"] for m in app_config.get_layer_models("codex-cli")]

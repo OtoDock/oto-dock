@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from storage.identity.credential_store import decrypt_secret, encrypt_secret
 from storage.pg import get_conn
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 VALUE_MAX_BYTES = 8 * 1024
 

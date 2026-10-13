@@ -17,6 +17,7 @@ from typing import Any, AsyncGenerator, ClassVar
 
 from audio.capabilities import TTSCapabilities, BillingUnit
 from audio.providers.credential_resolver import CredentialResolver
+from audio.providers.model_succession import successor_of
 
 __all__ = ["TTSProvider", "VoiceInfo", "UnsupportedProviderOperation"]
 
@@ -50,14 +51,45 @@ class TTSProvider(ABC):
     # True on not-yet-implemented placeholder classes (importable, __init__ raises).
     # The admin "Add provider" menu hides stubs; flip when the implementation lands.
     is_stub: ClassVar[bool] = False
+    # Retired model ids and their successors (``audio.providers.model_succession``):
+    # a stored id resolves through ``live_model_id`` at every build, and the
+    # proxy's boot walk rewrites the rows.
+    model_successors: ClassVar[dict[str, str]] = {}
 
     voice_id: str = ""
     voices: dict[str, str]
     # Class-level fallback voices (language → voice id) consulted when the
     # admin configured none for a language. Providers ship known-good,
     # ACCOUNT-INDEPENDENT ids here (public-library / premade voices only) so
-    # TTS works out of the box; the admin's ``voices`` map always wins.
+    # TTS works out of the box; the admin's voice for a language always wins
+    # over the shipped one for it.
     default_voices: ClassVar[dict[str, str]] = {}
+    # Whether the shipped voices speak their language natively: then one
+    # outranks the admin's English voice for that language; a shipped
+    # voice with an English accent never does (``select_voice``).
+    shipped_voices_native: ClassVar[bool] = True
+
+    @classmethod
+    def live_model_id(cls, model_id: str | None) -> str:
+        """A stored model id as it runs today: the end of its successor chain,
+        else the id itself ("" when the row stores none)."""
+        return successor_of(cls.model_successors, model_id or "")
+
+    @classmethod
+    def default_model_ids(cls) -> dict[str, str]:
+        """The model ids that run when the row stores none (the admin pill's
+        placeholders). Never written to a row: ``default_advanced_settings``
+        carries no model id, so a later default moves every such row."""
+        return {}
+    # A voice pinned for the whole session (a phone route's own voice): it
+    # wins over both maps in ``select_voice``, for every language.
+    voice_pin: str = ""
+
+    def pin_voice(self, voice_id: str) -> None:
+        """Pin ``voice_id`` for every language of this session ("" unpins)."""
+        self.voice_pin = (voice_id or "").strip()
+        if self.voice_pin:
+            self.voice_id = self.voice_pin
 
     # ── Construction from an audio_providers row ───────────────────
 
@@ -93,20 +125,35 @@ class TTSProvider(ABC):
     def select_voice(self, language: str) -> str:
         """Set the active ``voice_id`` from the per-language ``voices`` map.
 
-        Resolution order: the admin's map for the language, the admin's English
-        voice (a multilingual voice still pronounces the text), then the
-        provider's built-in ``default_voices`` (same language-then-English
-        order) — so a row with no voices configured still speaks every
-        language. Falls back to the current ``voice_id`` if nothing resolves.
-        Returns the resolved voice id.
+        Resolution order: a pinned voice (``pin_voice``), the admin's voice
+        for the language, the provider's shipped voice for the language when
+        the provider's shipped voices are native speakers (a native voice
+        beats an English one speaking it), the admin's English voice (a
+        multilingual voice still pronounces the text), then the shipped
+        voice for the language and the shipped English voice — so a row with
+        no voices configured still speaks every language, and an admin's
+        chosen English voice is never outranked by a shipped voice with an
+        English accent (``shipped_voices_native`` False). Falls back to the
+        current ``voice_id`` if nothing resolves. Returns the resolved voice id.
         """
+        if self.voice_pin:
+            self.voice_id = self.voice_pin
+            return self.voice_id
+        shipped = self.default_voices.get(language)
         chosen = (
-            self.voices.get(language) or self.voices.get("en")
-            or self.default_voices.get(language) or self.default_voices.get("en")
+            self.voices.get(language) or (shipped if self.shipped_voices_native else None)
+            or self.voices.get("en") or shipped or self.default_voices.get("en")
         )
         if chosen:
             self.voice_id = chosen
         return self.voice_id
+
+    def has_voice_for(self, language: str) -> bool:
+        """A voice meant for ``language`` exists (the admin's map or the
+        provider's defaults), as opposed to the English fallback
+        ``select_voice`` takes. The language lock asks before it moves a
+        call to a language the line has no voice for."""
+        return bool(self.voices.get(language) or self.default_voices.get(language))
 
     # ── Voice discovery (optional surface) ─────────────────────────
 

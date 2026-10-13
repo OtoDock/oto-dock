@@ -49,7 +49,7 @@ x-logging: &default-logging
 services:
   # --- PostgreSQL ---
   otodock-postgres:
-    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -111,7 +111,7 @@ services:
   # read-only, a mount flag that stops nothing sent THROUGH the socket (the
   # allowlist above does); the shim is the only client that reaches it.
   docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:v0.5.0
+    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -128,7 +128,7 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.8.0}
     restart: unless-stopped
     logging: *default-logging
     # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
@@ -236,6 +236,12 @@ services:
       # Per-session runtime state (session/security index, pending permissions) —
       # a named volume keeps it across a proxy image rebuild / recreate.
       - otodock-sessions:/opt/otodock/sessions
+      # The recover bin: the bytes of deleted and overwritten workspace files,
+      # kept 7 days. Its rows live in Postgres, so the bytes need a volume too
+      # or a recreate leaves entries that can no longer be restored. Holds
+      # every person's deleted personal files: proxy-only, never mounted
+      # into a sidecar.
+      - otodock-recover-bin:/opt/otodock/recover-bin
     # Rootless bwrap inside the container needs these three relaxations — NOT
     # cap_add, NOT --privileged. seccomp → create the agent's user namespace
     # (Docker's default profile blocks clone(CLONE_NEWUSER) without CAP_SYS_ADMIN);
@@ -298,7 +304,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.8.0}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -307,13 +313,14 @@ services:
     # it off every bridge so no default network is ever created. (Also pin the
     # daemon's default-address-pools — see DOCKER-DEPLOYMENT.md host prereq.)
     network_mode: "none"
-    command: ["sh","-lc","chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions 2>/dev/null; chown 1000:1000 /opt/otodock/config.env 2>/dev/null; chmod 0755 /opt/otodock/agents; chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys 2>/dev/null; true"]
+    command: ["sh","-lc","chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions /opt/otodock/recover-bin 2>/dev/null; chown 1000:1000 /opt/otodock/config.env 2>/dev/null; chmod 0755 /opt/otodock/agents; chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/recover-bin 2>/dev/null; true"]
     volumes:
       - otodock-agents:/opt/otodock/agents
       - otodock-mcps:/opt/otodock/mcps/community
       - otodock-skills:/opt/otodock/mcps/skills
       - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
       - otodock-sessions:/opt/otodock/sessions
+      - otodock-recover-bin:/opt/otodock/recover-bin
       - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
     restart: "no"
 
@@ -330,7 +337,7 @@ services:
   # on the next start. Idempotent, injection-safe. Postgres image (ships psql):
   # no Dockerfile change. Runs before the proxy connects.
   otodock-db-init:
-    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}
     restart: "no"
     logging: *default-logging
     # Data-plane only: the TCP gate and the app-role proof reach
@@ -511,7 +518,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.7.1}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.8.0}
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document parse OOM-restarts this container instead of
@@ -545,7 +552,7 @@ services:
   # Reached internally by the proxy at http://collabora:9980; its WOPI callbacks
   # reach the proxy at http://otodock-proxy:8400 (WOPI_BASE_URL on file-tools).
   collabora:
-    image: collabora/code:25.04.10.3.1
+    image: collabora/code:25.04.10.3.1@sha256:a51dd5d1741dea5d19f49d9997de2c321bf582076015ec4015941f3f00a5f4c0
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document degrades (Collabora sheds its LRU doc)
@@ -642,3 +649,5 @@ volumes:
     name: otodock-ssh-keys
   otodock-sessions:
     name: otodock-sessions
+  otodock-recover-bin:
+    name: otodock-recover-bin

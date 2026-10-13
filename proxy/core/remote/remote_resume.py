@@ -221,7 +221,8 @@ class RemoteResumeMixin:
         # (idle reaper + /v1/session/current), the in-memory subscription
         # binding, and the rotation fan-out target — all in-memory-only, so a
         # re-adopted session would otherwise miss every future token rotation
-        # until its next full re-warm (the GH_TOKEN incident class).
+        # until its next full re-warm (a re-adopted session once lost its
+        # injected credentials this way).
         _record_session_use(session_id, client_type="", agent=agent_name)
         await asyncio.to_thread(
             self._restore_adopted_credentials, session_id, machine_id, agent_name,

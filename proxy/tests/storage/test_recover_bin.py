@@ -251,6 +251,100 @@ def test_delete_removes_row_and_bytes():
 
 
 # ---------------------------------------------------------------------------
+# prune_missing_blobs() + prune_orphan_blobs(): rows and bytes agree
+# ---------------------------------------------------------------------------
+
+def test_prune_drops_rows_whose_bytes_are_gone_or_short():
+    kept = rb.capture(AGENT, "workspace/kept.txt", b"kept", "deleted")
+    gone = rb.capture(AGENT, "workspace/gone.txt", b"gone", "deleted")
+    short = rb.capture(AGENT, "workspace/short.txt", b"0123456789", "deleted")
+    _bytes_path(AGENT, gone["entry_id"]).unlink()
+    _bytes_path(AGENT, short["entry_id"]).write_bytes(b"0123")
+    # A short file is never restored as the file, even before the sweep.
+    assert rb.read_bytes(rb.get(short["entry_id"])) is None
+
+    assert rb.prune_missing_blobs() == 2
+    assert rb.get(gone["entry_id"]) is None and rb.get(short["entry_id"]) is None
+    assert rb.read_bytes(rb.get(kept["entry_id"])) == b"kept"
+
+
+def test_prune_dry_run_counts_and_keeps():
+    e = rb.capture(AGENT, "workspace/gone.txt", b"gone", "deleted")
+    _bytes_path(AGENT, e["entry_id"]).unlink()
+    assert rb.prune_missing_blobs(dry_run=True) == 1
+    assert rb.get(e["entry_id"]) is not None
+
+
+def test_prune_never_empties_the_bin_when_its_root_is_missing_or_a_file(tmp_path, monkeypatch):
+    e = rb.capture(AGENT, "workspace/a.txt", b"a", "deleted")
+    monkeypatch.setattr(config, "RECOVER_BIN_DIR", tmp_path / "moved-away")
+    assert rb.prune_missing_blobs() == 0
+    (tmp_path / "a-file").write_text("x")
+    monkeypatch.setattr(config, "RECOVER_BIN_DIR", tmp_path / "a-file")
+    assert rb.prune_missing_blobs() == 0
+    assert rb.get(e["entry_id"]) is not None
+
+
+def test_prune_keeps_a_row_it_cannot_check(monkeypatch):
+    import errno
+    e = rb.capture(AGENT, "workspace/a.txt", b"a", "deleted")
+    real_lstat = rb.os.lstat
+
+    def denied(path, *a, **kw):
+        if str(path).endswith(e["entry_id"]):
+            raise PermissionError(errno.EACCES, "denied")
+        return real_lstat(path, *a, **kw)
+    monkeypatch.setattr(rb.os, "lstat", denied)
+    assert rb.prune_missing_blobs() == 0
+    assert rb.get(e["entry_id"]) is not None
+
+
+def test_prune_pages_and_counts_only_what_it_deleted(monkeypatch):
+    monkeypatch.setattr(rb, "_PRUNE_PAGE", 2)
+    entries = [rb.capture(AGENT, f"workspace/f{i}.txt", f"body {i}".encode(), "deleted") for i in range(5)]
+    for e in entries:
+        _bytes_path(AGENT, e["entry_id"]).unlink()
+    # A restore or a discard takes one row between the page read and the
+    # DELETE: the count is what the DELETE removed.
+    taken = entries[0]["entry_id"]
+    real_state = rb._blob_state
+
+    def racing(path, size):
+        if str(path).endswith(taken):
+            with rb.get_conn() as conn:
+                conn.execute("DELETE FROM recover_bin WHERE entry_id=%s", (taken,))
+        return real_state(path, size)
+    monkeypatch.setattr(rb, "_blob_state", racing)
+    assert rb.prune_missing_blobs() == 4
+    assert all(rb.get(e["entry_id"]) is None for e in entries)
+
+
+def test_orphan_pass_deletes_old_rowless_bytes_only():
+    import os
+    import time
+    e = rb.capture(AGENT, "workspace/a.txt", b"a", "deleted")
+    d = config.RECOVER_BIN_DIR / AGENT
+    old = d / ("f" * 32)
+    young = d / ("e" * 32)
+    old.write_bytes(b"old")
+    young.write_bytes(b"young")
+    past = time.time() - 2 * 86400
+    os.utime(old, (past, past))
+    os.utime(_bytes_path(AGENT, e["entry_id"]), (past, past))
+    leftover = config.RECOVER_BIN_DIR / "gone-agent"
+    leftover.mkdir()
+    (leftover / ("d" * 32)).write_bytes(b"x")
+    os.utime(leftover / ("d" * 32), (past, past))
+
+    assert rb.prune_orphan_blobs(dry_run=True) == 2
+    assert old.exists()
+    assert rb.prune_orphan_blobs() == 2
+    assert not old.exists() and young.exists()
+    assert rb.read_bytes(rb.get(e["entry_id"])) == b"a"   # a row's bytes are never touched
+    assert not leftover.exists()                           # an emptied agent dir goes
+
+
+# ---------------------------------------------------------------------------
 # Restore endpoint: collision, re-sync, scope re-check, consume-on-success
 # ---------------------------------------------------------------------------
 

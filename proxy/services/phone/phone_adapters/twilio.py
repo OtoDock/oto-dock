@@ -36,7 +36,7 @@ from .base import (
     RouteHandle,
 )
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _TIMEOUT_S = 15.0
 _PAGE_SIZE = 100

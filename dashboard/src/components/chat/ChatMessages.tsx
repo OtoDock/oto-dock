@@ -9,6 +9,8 @@ import BlockRenderer from './ChatBlockRenderer'
 import ActivityGroup from './ActivityGroup'
 import ErrorBoundary from '../ErrorBoundary'
 import type { QueuedMessage } from '../../store/types'
+import { QUEUE_WAITING } from '../../api/wireEvents'
+import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
 
 /** The chips of a queued or held message, from the meta the frame carried:
  * the saved photos through the agent files URL (the same URL the history
@@ -39,7 +41,7 @@ function QueuedAttachments({ item, agentName }: { item: QueuedMessage; agentName
         <div key={`qf-${i}`} className="flex items-center gap-1.5 text-xs text-white/80 bg-white/10 rounded-md px-2.5 py-1.5 w-fit">
           <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  d={f.folder ? FOLDER_ICON_PATH : FILE_ICON_PATH} />
           </svg>
           <span className="truncate max-w-[200px]">{f.name}</span>
         </div>
@@ -456,7 +458,6 @@ export default function ChatMessages({
     )
     io.observe(target)
     return () => io.disconnect()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // The prepend anchor: armed at request time, consumed exactly once when the
@@ -728,7 +729,9 @@ export default function ChatMessages({
                   <span className="text-xs opacity-75">queued</span>
                   {item.waiting && (
                     <p className="text-xs opacity-90 mt-1" data-testid="queued-waiting">
-                      The machine running this chat is reconnecting. Your message goes out when it is back.
+                      {item.waiting === QUEUE_WAITING.TERMINAL
+                        ? "A teammate's terminal is open on this chat. Your message goes out when it closes."
+                        : 'The machine running this chat is reconnecting. Your message goes out when it is back.'}
                     </p>
                   )}
                   {onCancelQueued && (mayCancelQueued?.(item) ?? true) && (

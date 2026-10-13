@@ -29,7 +29,7 @@ from api.hooks import paths, routing
 from core.session import session_kind
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 

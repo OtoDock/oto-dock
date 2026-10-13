@@ -26,6 +26,9 @@ import dataclasses
 import logging
 import os
 import platform
+import secrets
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -249,14 +252,207 @@ def codex_hook_command(hook_path: Path) -> str:
     if HOST.posix:
         return hook_command(hook_path)
     wrapper = hook_path.with_suffix(".cmd")
-    wrapper.write_text(
+    write_if_changed(wrapper, (
         '@if "%OTO_HOOK_PY%"=="" set "OTO_HOOK_PY=python"\r\n'
         f'@"%OTO_HOOK_PY%" "%~dp0{hook_path.name}"\r\n'
-        "@exit /b %errorlevel%\r\n",
-        encoding="ascii",
-        newline="",
-    )
+        "@exit /b %errorlevel%\r\n"
+    ).encode("ascii"))
     return str(wrapper)
+
+
+#: The marker in the name of an in-flight temp file of ``write_if_changed``
+#: (``.<name>.oto-tmp-<hex>`` beside its target); file sync keeps these
+#: host-local (``transport/file_sync.py``), as the proxy does with its own.
+WRITE_TEMP_MARKER = ".oto-tmp-"
+#: A temp older than this is a crashed start's; a younger one may be a
+#: concurrent start's write in flight.
+STALE_TEMP_S = 600.0
+_REPLACE_ATTEMPTS = 3
+
+
+def _holds(path: Path, data: bytes, mode: int) -> bool:
+    """Whether ``path`` is a regular file holding exactly ``data`` (and, on
+    POSIX, one link and ``mode``), judged on the opened descriptor: a link
+    at the name is not followed, a FIFO cannot block the read."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size != len(data):
+            return False
+        if HOST.posix and (st.st_nlink != 1 or stat.S_IMODE(st.st_mode) != mode):
+            return False
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            return f.read(len(data) + 1) == data
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def is_fresh_write_temp(entry: os.DirEntry, now: float | None = None) -> bool:
+    """A temp of ``write_if_changed`` young enough to be another start's
+    write in flight (a directory sweep leaves it alone)."""
+    if not entry.name.startswith(".") or WRITE_TEMP_MARKER not in entry.name:
+        return False
+    try:
+        mtime = entry.stat(follow_symlinks=False).st_mtime
+    except OSError:
+        return False
+    return (time.time() if now is None else now) - mtime < STALE_TEMP_S
+
+
+def _sweep_stale_temps(directory: Path) -> None:
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            if (not entry.name.startswith(".") or WRITE_TEMP_MARKER not in entry.name
+                    or entry.is_dir(follow_symlinks=False) or is_fresh_write_temp(entry)):
+                continue
+            with contextlib.suppress(OSError):
+                os.unlink(entry.path)
+
+
+def _write_in_place(path: Path, data: bytes, mode: int) -> None:
+    """The fallback when a rename cannot land (Windows refuses one onto a
+    file another process holds open): bytes as given, no newline change."""
+    with open(path, "wb") as f:
+        f.write(data)
+    if HOST.posix:
+        with contextlib.suppress(OSError):
+            path.chmod(mode)
+
+
+def write_if_changed(path: Path, data: bytes, mode: int = 0o644) -> bool:
+    """Make ``path`` hold ``data``; True when it was written. The twin of
+    the proxy's ``core/sandbox/session_config_dir.write_if_changed``: the
+    hook files are written at every session start while a sibling session
+    of the dir may launch a hook from them, so an unchanged file is left
+    alone and a changed one goes to a temp beside it renamed onto the name
+    (a reader sees the old file or the new one, never a part; a link at the
+    name is replaced, never followed; a directory there is removed). On
+    POSIX the name must then hold the temp's own inode or the same bytes a
+    concurrent start wrote, else the write is retried. On Windows a rename
+    onto a file another process holds open fails: three tries 50 ms apart,
+    then the file is written in place, as before."""
+    if _holds(path, data, mode):
+        return False
+    _sweep_stale_temps(path.parent)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    for _ in range(_REPLACE_ATTEMPTS):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        tmp = path.with_name(f".{path.name}{WRITE_TEMP_MARKER}{secrets.token_hex(6)}")
+        fd = os.open(tmp, flags, 0o600)
+        try:
+            if HOST.posix:
+                os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            if not HOST.posix:
+                os.close(fd)
+                fd = -1
+            for attempt in range(3):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if HOST.posix or attempt == 2:
+                        raise
+                    time.sleep(0.05)
+            if not HOST.posix:
+                return True
+            mine = os.fstat(fd)
+            try:
+                there = os.lstat(path)
+            except FileNotFoundError:
+                there = None
+            if (there is not None and (there.st_ino, there.st_dev) == (mine.st_ino, mine.st_dev)
+                    and mine.st_nlink == 1):
+                return True
+        except PermissionError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            if HOST.posix:
+                raise
+            _write_in_place(path, data, mode)
+            return True
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        finally:
+            if fd != -1:
+                os.close(fd)
+        if _holds(path, data, mode):
+            return True
+        logging.getLogger("satellite").warning(
+            "%s was replaced or linked during its write; writing it again", path,
+        )
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    raise RuntimeError(f"Refusing {path}: it was replaced during every write (possible tampering)")
+
+
+def write_command_wrappers(config_dir: Path, wrappers: dict) -> None:
+    """Write the start payload's ``command_wrappers`` (``bin/gh``,
+    ``bin/gh.cmd``: the shims that hand a command to the credential helper
+    beside them) under the session's config dir, executable on POSIX, bytes
+    as sent (the Windows one is CRLF). Their directory holds exactly them
+    afterwards, the twin of the proxy's rule for a sandbox: an entry left
+    there by anything else is removed (a subdirectory whole), a link or a
+    directory at a wrapper's name replaced. A name without a directory is
+    dropped, so the config dir itself is never cleared; a payload without
+    wrappers (an older proxy) changes nothing."""
+    wanted: dict[Path, str] = {}
+    for relpath, content in (wrappers or {}).items():
+        if not relpath or not content or not isinstance(relpath, str) or not isinstance(content, str):
+            continue
+        rel = Path(relpath)
+        if rel.is_absolute() or len(rel.parts) < 2 or ".." in rel.parts or "." in rel.parts:
+            continue
+        wanted[rel] = content
+    for parent in {rel.parent for rel in wanted}:
+        bin_dir = config_dir / parent
+        if bin_dir.is_symlink() or (bin_dir.exists() and not bin_dir.is_dir()):
+            bin_dir.unlink()
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        keep = {rel.name for rel in wanted if rel.parent == parent}
+        with os.scandir(bin_dir) as entries:
+            for entry in entries:
+                if entry.name in keep and entry.is_file(follow_symlinks=False):
+                    continue
+                if is_fresh_write_temp(entry):
+                    continue
+                # A concurrent start of the scope may remove the same entry.
+                with contextlib.suppress(FileNotFoundError):
+                    if entry.is_dir(follow_symlinks=False):
+                        shutil.rmtree(entry.path)
+                    else:
+                        os.unlink(entry.path)
+    for rel, content in wanted.items():
+        write_if_changed(config_dir / rel, content.encode("utf-8"), 0o755)
+
+
+def session_tools_env(env: dict, config_dir: Path) -> dict:
+    """The variables git's credential helper and the command wrappers expand
+    (``OTO_HOOKS_DIR`` the dir the scripts were written into, ``OTO_HOOK_PY``
+    this satellite's interpreter) and the wrappers' directory first on
+    PATH. Applied after the path translation, so a machine path stays as it
+    is; the proxy ships both variables in virtual form for a satellite that
+    lacks this function."""
+    env["OTO_HOOKS_DIR"] = str(config_dir)
+    env["OTO_HOOK_PY"] = sys.executable
+    env["PATH"] = str(config_dir / "bin") + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def kill_process_tree(pid: int, timeout: float = 5.0) -> None:
@@ -693,13 +889,13 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.138"
+SATELLITE_VERSION = "0.5.147"
 SHARED_LAYOUT_HASH = "2addd8b41902ccd73df4135667a276d215d83e635cc5d94587f764ba58d38ad9"
-SHARED_TERMINAL_QUERIES_HASH = "9d73a19b21e363dd688f4501d0376de7f5274db3cc79be863891461884bc595a"
+SHARED_TERMINAL_QUERIES_HASH = "5738e35e3d21559f82f40563b763cc8b4d591c07262fa6868b97687ebc66a5df"
 SHARED_STDIO_INTERCEPTOR_HASH = "249f4153f709bdad0dc0e9754fba2ccc1716dacf542214941bc7626a0a50f3fa"
-SHARED_CODEX_APPROVALS_HASH = "23845c21b11918b4590174e900226661f4a252c011b5cbee379f922157e908ee"
+SHARED_CODEX_APPROVALS_HASH = "aef49a7d1f92a09459848f6e3bd802ddec1c13deb44f3b4904e0c1e064502ea7"
 SHARED_APP_SERVER_CLIENT_HASH = "36ccdaed5e23751c81e26df5f3ac9c15d9bf310ed471ac27579ddcbd0cff719d"
-SHARED_MCP_INSTALLER_HASH = "bd8cd550a3edc4dd414ce269e97129c5b93fa7b2c215e64b4a98a229dd5da626"
+SHARED_MCP_INSTALLER_HASH = "88482714414a7eeb98db4eeaaf64217bd4bcfa40fcb6dba2527d279acbb2bc82"
 
 
 def _default_cli_bins() -> dict[str, str]:

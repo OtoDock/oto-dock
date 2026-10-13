@@ -43,6 +43,7 @@ vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ authConfig: h.authC
 import DocumentFrame, {
   FOCUS_AFTER_LOAD_MS, LEAVE_SAVE_TIMEOUT_MS, RELOAD_DEDUPE_MS, SEND_SAVE_TIMEOUT_MS, type DocumentFrameHandle,
 } from '@/components/chat/media/DocumentFrame'
+import { IDLE_ANSWER_TIMEOUT_MS } from '@/hooks/useCollaboraIdle'
 import type { PushedDocument } from '@/store/documentPaneStore'
 import { emitFileUpdate } from '@/lib/fileUpdates'
 
@@ -555,4 +556,101 @@ describe('DocumentFrame: a change of the file on show (the real reload hook)', (
     show(doc, rerender)
     await vi.waitFor(() => expect(loads()).toBe(2))
   })
+
+  it("a push that arrives while a file update's mint is in flight posts once, the push", async () => {
+    h.realHook = true
+    let land: (v: unknown) => void = () => {}
+    const fetchMock = vi.fn(() => new Promise((r) => { land = r }))
+    vi.stubGlobal('fetch', fetchMock)
+    const first = pushedDoc({ wopiUrl: src(1) })
+    const { rerender } = renderFrame({ pushed: first })
+    expect(loads()).toBe(1)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(Date.now() + RELOAD_DEDUPE_MS + 10)
+    disk()
+    expect(fetchMock).toHaveBeenCalledTimes(1)          // the mint is in flight
+    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: 'push-tok-2' }), rerender)
+    await vi.waitFor(() => expect(loads()).toBe(2))
+    expect(posted()).toBe('push-tok-2')
+    await act(async () => {
+      land({ ok: true, status: 200, json: async () => ({ wopi_url: src(2), access_token: 'minted' }) })
+    })
+    expect(loads()).toBe(2)
+    expect(posted()).toBe('push-tok-2')
+  })
 })
+
+describe("DocumentFrame: Collabora's idle end", () => {
+  const fromFrame = (data: object) => act(() => {
+    window.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(data), source: window }))
+  })
+  const returnTo = () => act(() => {
+    document.querySelector('[data-collabora-host]')!.dispatchEvent(new Event('pointerover', { bubbles: true }))
+  })
+  const ids = (post: { mock: { calls: unknown[][] } }) => post.mock.calls.map((c) => JSON.parse(String(c[0])).MessageId)
+
+  it('an editor that cannot resume loads again with a fresh token', async () => {
+    vi.useFakeTimers()
+    h.frameWindow = window
+    const post = vi.spyOn(window, 'postMessage').mockImplementation(() => {})
+    const fetchMock = fetchOk({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'fresh' })
+    vi.stubGlobal('fetch', fetchMock)
+    renderFrame({ pushed: pushedDoc() })
+    expect(posted()).toBe('push-tok')
+    fromFrame({ MessageId: 'User_Idle' })
+    returnTo()
+    await act(async () => { await vi.advanceTimersByTimeAsync(IDLE_ANSWER_TIMEOUT_MS + 10) })
+    expect(ids(post)).toEqual(['Get_User_State'])
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/v1/documents/preview-wopi-url')
+    await act(async () => { await vi.runOnlyPendingTimersAsync() })
+    expect(posted()).toBe('fresh')
+    post.mockRestore()
+  })
+
+  it('unsaved edits are saved before the reload; the Reload banner holds it', async () => {
+    vi.useFakeTimers()
+    h.frameWindow = window
+    h.modified = true
+    const post = vi.spyOn(window, 'postMessage').mockImplementation(() => {})
+    const fetchMock = fetchOk({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'fresh' })
+    vi.stubGlobal('fetch', fetchMock)
+    const { unmount } = renderFrame({ pushed: pushedDoc() })
+    fromFrame({ MessageId: 'Session_Closed', Values: { Reason: 'DocumentIdle' } })
+    returnTo()
+    expect(ids(post)).toEqual(['Action_Save'])
+    fromFrame({ MessageId: 'Action_Save_Resp', Values: { success: true } })
+    await act(async () => { await vi.runOnlyPendingTimersAsync() })
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/v1/documents/preview-wopi-url')
+    unmount()
+
+    fetchMock.mockClear()
+    post.mockClear()
+    h.reloadAvailable = true
+    renderFrame({ pushed: pushedDoc() })
+    fromFrame({ MessageId: 'Session_Closed', Values: { Reason: 'DocumentIdle' } })
+    returnTo()
+    await act(async () => { await vi.runOnlyPendingTimersAsync() })
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(ids(post)).toEqual([])
+    post.mockRestore()
+  })
+
+  it('a version recovers by minting its read-only frame again', async () => {
+    vi.useFakeTimers()
+    h.frameWindow = window
+    const post = vi.spyOn(window, 'postMessage').mockImplementation(() => {})
+    const fetchMock = fetchOk({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'version-tok' })
+    vi.stubGlobal('fetch', fetchMock)
+    renderFrame({ snapshotId: 'snap-1' })
+    await act(async () => { await vi.runOnlyPendingTimersAsync() })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    fromFrame({ MessageId: 'Session_Closed', Values: { Reason: 'DocumentIdle' } })
+    returnTo()
+    await act(async () => { await vi.runOnlyPendingTimersAsync() })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(String(fetchMock.mock.calls[1][0])).toContain('/v1/documents/snapshot-wopi-url')
+    expect(ids(post)).toEqual([])
+    post.mockRestore()
+  })
+})
+

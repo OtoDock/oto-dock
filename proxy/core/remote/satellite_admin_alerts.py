@@ -11,7 +11,7 @@ tests there) and are imported lazily.
 import logging
 from core import placement
 
-logger = logging.getLogger("claude-proxy.satellite")
+logger = logging.getLogger("otodock.satellite")
 
 
 class SatelliteAdminAlertsMixin:

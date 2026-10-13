@@ -220,6 +220,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
     async def _stream_turn(self, info: "RemoteSessionInfo", cm, turn: dict) -> AsyncIterator[CommonEvent]:
         from core.events import wake_capture
+        from core.session import engine_prompts
         from core.session.session_state import (
             reconcile_background_snapshot, resolve_bg_command_frame,
         )
@@ -384,6 +385,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             if (settle.settling and rtype == "system"
                     and raw.get("subtype") == "init"):
                 wake_capture.note_captured(info.session_id)
+            engine_prompts.note_frame(info.session_id, raw, in_turn=True)
             for chunk in translator.feed(raw):
                 if chunk.event_type == "rate_limit":
                     # The account's window state: for the pool, never the chat.
@@ -430,7 +432,24 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                         if nxt is not None:
                             resolve_bg_command_frame(info.session_id, nxt)
                             reconcile_background_snapshot(info.session_id, nxt)
+                            engine_prompts.note_frame(info.session_id, nxt)
                     # Interactive chat: no settle — tell satellite to stop.
+                    await send_stop_turn(cm, info)
+                    turn["closed"] = True
+                    await drain_until_turn_ended(
+                        info, timeout=2.0, expected_command_id=expected_cmd_id,
+                    )
+                    yield CommonEvent(type=DONE)
+                    return
+                if settle.stopped():
+                    # The person stopped the turn and the interrupt closed it
+                    # with this result: nothing to settle for (the background
+                    # work stays with the warm process), and the turn ends
+                    # before the interrupt watchdog could take it for stuck.
+                    logger.info(
+                        "Remote session %s: the person stopped the task turn — "
+                        "ending it at its result", info.session_id[:8],
+                    )
                     await send_stop_turn(cm, info)
                     turn["closed"] = True
                     await drain_until_turn_ended(
@@ -461,6 +480,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         try:
             from core.events import wake_capture
             from core.remote.remote_bg_commands import queue_frame_reader
+            from core.session import engine_prompts
             from core.session.session_state import (
                 reconcile_background_snapshot, resolve_bg_command_frame,
             )
@@ -488,6 +508,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 if resolve_bg_command_frame(info.session_id, raw):
                     progressed = True
                 reconcile_background_snapshot(info.session_id, raw)
+                engine_prompts.note_frame(info.session_id, raw)
         finally:
             info.lock.release()
         return progressed
@@ -496,6 +517,15 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
     def soft_interrupt_frame(self) -> str:
         return SOFT_INTERRUPT_FRAME
+
+    def note_interrupt(self, info: "RemoteSessionInfo") -> None:
+        state = info.engine_state
+        if state is not None:
+            state.translator.interrupted = True
+
+    def turn_settled(self, info: "RemoteSessionInfo") -> bool:
+        state: ClaudeRemoteState | None = info.engine_state
+        return state is not None and state.settle.settling
 
     async def control_request(self, info: "RemoteSessionInfo", cm, subtype: str, **kwargs) -> bool:
         """The CLI's stdin control channel, proxied by the satellite: the
@@ -540,7 +570,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         # A photo attached to the steer must be on the machine before the
         # CLI reads its path — the same barrier the turn dispatch runs.
         from core.remote import upload_inflight
-        await upload_inflight.wait_settled(info.agent_name)
+        await upload_inflight.wait_settled(info.agent_name, machine_id=info.machine_id)
         state.steer_pending += 1
         try:
             ack = await cm.send_command(info.machine_id, {

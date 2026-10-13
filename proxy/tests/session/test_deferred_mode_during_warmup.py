@@ -10,12 +10,22 @@ with mocked layer + session_state, verifying the contract that the helper
 honors the existing deferred_mode / deferred_model state variables.
 """
 
+import asyncio
 import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from core.session import session_state
+from tests.fixtures.ws_dashboard_harness import (
+    FakeExecutionLayer,
+    dashboard_connection,
+    drain_startup,
+    make_test_agent,
+    run_ws_scenario,
+    session_cookie,
+    stub_dashboard_seams,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -210,3 +220,81 @@ async def test_actual_mode_reconciliation_uses_session_state():
         permission_mode = actual_mode
 
     assert permission_mode == "dontAsk"
+
+
+async def _frame(ws, kind: str, timeout: float = 3.0) -> dict:
+    while True:
+        frame = await ws.next_frame(timeout)
+        if frame.get("type") == kind:
+            return frame
+
+
+def test_a_pick_made_while_the_prewarm_spawns_is_the_mode_the_chat_runs(temp_db, monkeypatch):
+    """The new-chat page pre-warms in `default`; the person picks Don't Ask
+    while that spawn is still running, then sends. The mint takes the pick
+    into the chat's row and the warmup reuses the pre-warm: the session must
+    run the pick, not the pre-warm's mode."""
+    layer = FakeExecutionLayer()
+    layer.start_gate = asyncio.Event()
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent()
+
+    out: dict = {}
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            ws.client_send({"type": "pre_warmup", "agent": slug, "permission_mode": "default"})
+            ws.client_send({"type": "mode_change", "mode": "dontAsk"})
+            assert (await _frame(ws, "mode_changed"))["mode"] == "dontAsk"
+            ws.client_send({"type": "warmup", "agent": slug})
+            chat_id = (await _frame(ws, "warmup_started"))["chat_id"]
+            layer.start_gate.set()
+            ready = await _frame(ws, "warmup_ready")
+            ws.client_send({"type": "close"})
+            out.update(chat_id=chat_id, ready=ready)
+
+    run_ws_scenario(scenario)
+    chat_id, ready = out["chat_id"], out["ready"]
+    sid = ready["session_id"]
+    # One spawn: the pre-warm, reused by the chat.
+    assert [s for s, _cfg in layer.started] == [sid]
+    assert layer.started[0][1].permission_mode == "default"
+    assert layer.mode_changes == [(sid, "dontAsk")]
+    assert session_state.get_session_mode(sid) == "dontAsk"
+    assert ready["mode"] == "dontAsk"
+    assert temp_db.get_chat(chat_id)["permission_mode"] == "dontAsk"
+
+
+def test_a_refused_engine_mode_change_still_leaves_the_pick_to_the_hooks(temp_db, monkeypatch):
+    """The engine's own control command may fail (a busy or dying process):
+    the stored mode the hooks judge by is the pick all the same, as on a live
+    pick, so the row and the chip say what the session enforces."""
+    layer = FakeExecutionLayer()
+    layer.start_gate = asyncio.Event()
+
+    async def _refuse(sid, mode):
+        raise RuntimeError("control channel closed")
+
+    layer.change_mode = _refuse
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent()
+    out: dict = {}
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            ws.client_send({"type": "pre_warmup", "agent": slug, "permission_mode": "default"})
+            ws.client_send({"type": "mode_change", "mode": "acceptEdits"})
+            await _frame(ws, "mode_changed")
+            ws.client_send({"type": "warmup", "agent": slug})
+            out["chat_id"] = (await _frame(ws, "warmup_started"))["chat_id"]
+            layer.start_gate.set()
+            out["ready"] = await _frame(ws, "warmup_ready")
+            ws.client_send({"type": "close"})
+
+    run_ws_scenario(scenario)
+    sid = out["ready"]["session_id"]
+    assert session_state.get_session_mode(sid) == "acceptEdits"
+    assert out["ready"]["mode"] == "acceptEdits"
+    assert temp_db.get_chat(out["chat_id"])["permission_mode"] == "acceptEdits"

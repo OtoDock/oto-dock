@@ -31,6 +31,15 @@ class AudioUnavailableError(Exception):
     """Raised when a requested provider can't be resolved/built."""
 
 
+def _no_provider(kind: str, provider_id: int | None = None) -> AudioUnavailableError:
+    """The refusal a tool relays as is: what is missing and where an admin
+    picks one. A stale id keeps "with id" (the TTS route answers 404 on it)."""
+    named = f" with id {provider_id} is" if provider_id is not None else ""
+    return AudioUnavailableError(
+        f"No {kind.upper()} provider{named} configured: select one in Admin, Audio."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Credential resolver + provider building
 # ---------------------------------------------------------------------------
@@ -103,18 +112,18 @@ def build_generate_provider(*, provider_id: int | None = None,
     if provider_id is not None:
         row = audio_provider_store.get_provider(provider_id)
         if not row or row["provider_type"] != "tts":
-            raise AudioUnavailableError(f"No tts provider with id {provider_id}")
+            raise _no_provider("tts", provider_id)
     else:
         row = _default_tts_row()
         if not row:
-            raise AudioUnavailableError("No default TTS provider configured")
+            raise _no_provider("tts")
     try:
         cls = registry.get_provider_class("tts", row["provider_name"])
     except (KeyError, ImportError) as e:
         raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}")
     if advanced_overrides:
         if getattr(cls.capabilities, "is_local", False):
-            logging.getLogger("claude-proxy").warning(
+            logging.getLogger("otodock").warning(
                 "TTS generate: ignoring per-call overrides for local provider %s",
                 row["provider_name"],
             )
@@ -137,11 +146,11 @@ def build_chat_provider(provider_type: str, *, provider_id: int | None = None):
     if provider_id is not None:
         row = audio_provider_store.get_provider(provider_id)
         if not row or row["provider_type"] != provider_type:
-            raise AudioUnavailableError(f"No {provider_type} provider with id {provider_id}")
+            raise _no_provider(provider_type, provider_id)
     else:
         row = audio_provider_store.get_default_provider(provider_type, "chat")
         if not row:
-            raise AudioUnavailableError(f"No default chat {provider_type} provider configured")
+            raise _no_provider(provider_type)
     try:
         inst = registry.get_or_build_provider(row, credential_resolver)
     except (KeyError, NotImplementedError, ImportError) as e:

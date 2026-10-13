@@ -48,7 +48,10 @@ def init_identity(conn) -> None:
             -- session token minted before it is refused. Stamped by a
             -- password set and by an admin "sign out everywhere"; NULL =
             -- never bumped (auth/providers.py).
-            token_epoch_at TEXT
+            token_epoch_at TEXT,
+            -- The TOTP time step the account accepted last: a code is good
+            -- only for a later step (auth/totp.py, RFC 6238 replay).
+            totp_last_step BIGINT NOT NULL DEFAULT 0
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
@@ -274,7 +277,7 @@ def init_identity(conn) -> None:
     # connects an account in their OWN user and designates it as the agent's
     # service identity; the agent-scope (service) session reads that user's
     # tokens directly. ``account_owner_sub`` is always the owning user's sub —
-    # there is no platform "service account" tier (removed for open source).
+    # there is no platform "service account" tier (removed before the public release).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS service_agent_bindings (
             id SERIAL PRIMARY KEY,

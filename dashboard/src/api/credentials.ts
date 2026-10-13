@@ -5,6 +5,8 @@ export interface CredentialField {
   key: string
   label: string
   input_type: 'text' | 'password' | 'email' | 'number'
+  // false: the field may stay empty (the manifest's "required": false).
+  required?: boolean
 }
 
 export interface OAuthService {
@@ -87,6 +89,9 @@ export interface AccountSummary {
   // leaves the MCP out of new sessions.
   needs_reconnect?: boolean
   reconnect_reason?: string
+  // Required fields the saved account lacks (a field the manifest added
+  // later): the MCP stays out of its sessions until they are filled.
+  missing_required?: string[]
 }
 
 // What the card tells the person for each reconnect reason the server

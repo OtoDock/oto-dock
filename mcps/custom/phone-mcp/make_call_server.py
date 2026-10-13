@@ -9,6 +9,7 @@ so calls work without the session machine needing LAN/DNS reachability to
 the phone daemon, and the telephony secret stays on the platform.
 """
 
+import contextlib
 import os
 import logging
 import re
@@ -85,7 +86,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Start an outbound phone call using the AI caller agent. "
                 "Returns immediately with a call_id — does NOT block until completion. "
-                "Use wait_for_call to monitor progress and handle questions."
+                "Use wait_for_call to monitor progress and handle questions, unless the "
+                "result says the call runs inside this chat: then end your turn and the "
+                "person's words arrive as your next messages."
             ),
             inputSchema={
                 "type": "object",
@@ -248,6 +251,21 @@ async def _handle_make_call(arguments: dict) -> list[TextContent]:
 
             result = resp.json()
             call_id = result.get("call_id", "unknown")
+            if result.get("in_session"):
+                # The relay put the call INSIDE this chat: the person's words
+                # arrive as the next messages, nothing is polled.
+                return [TextContent(
+                    type="text",
+                    text=(
+                        f"Call started inside this chat. **call_id:** `{call_id}`\n\n"
+                        "The call runs in this conversation: once the person answers, "
+                        "their words arrive as your next messages, prefixed "
+                        "`Phone (<number>):`. Answer each as speech (one to three short "
+                        "sentences), and end the call with the `end_call` tool after your "
+                        "goodbye. Do NOT call `wait_for_call`. **End your turn now:** the "
+                        "call starts when this turn ends, and a note tells you when it is over."
+                    ),
+                )]
             return [TextContent(
                 type="text",
                 text=(
@@ -286,6 +304,11 @@ async def _handle_wait_for_call(arguments: dict) -> list[TextContent]:
 
             if resp.status_code == 404:
                 return [TextContent(type="text", text=f"Error: call {call_id} not found.")]
+            if resp.status_code == 409:
+                detail = ""
+                with contextlib.suppress(Exception):
+                    detail = resp.json().get("detail", "")
+                return [TextContent(type="text", text=detail or "This call cannot be polled.")]
 
             result = resp.json()
             event = result.get("event", "unknown")

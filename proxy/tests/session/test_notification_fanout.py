@@ -159,6 +159,46 @@ async def test_the_window_closes_by_itself(monkeypatch):
     assert [f["rel_path"] for f in _frames(c1)] == ["workspace/a.md"]
 
 
+def _live_frames(c: _Conn) -> list[dict]:
+    out = []
+    while len(c.live_queue):
+        out.append(c.live_queue.get_nowait())
+    return out
+
+
+async def test_a_file_frame_rides_the_live_queue_of_every_connection(monkeypatch):
+    """The tree must refresh while a turn streams and on a hidden tab: the
+    frame takes the live queue (drained mid-turn, every connection), the
+    notify queue only where there is no live queue."""
+    active = _Conn("a", live_queue=nm.LiveQueue())
+    idle = _Conn("b", active=False, live_queue=nm.LiveQueue())
+    plain = _Conn("c")
+    _wire_audience(monkeypatch, {"u1": active, "u2": idle, "u3": plain})
+    await nm.broadcast_file_updated("agent-x", "workspace/a.md")
+    await nm.flush_file_updates()
+    for c in (active, idle):
+        assert [f["rel_path"] for f in _live_frames(c)] == ["workspace/a.md"]
+        assert _frames(c) == []
+    assert [f["rel_path"] for f in _frames(plain)] == ["workspace/a.md"]
+
+
+async def test_the_summary_frame_and_a_refusing_live_queue(monkeypatch):
+    from ws import wire_events as wire
+    full = _Conn("a", live_queue=nm.LiveQueue(maxsize=1))
+    assert full.live_queue.put({"type": wire.OPEN_APP, "app_id": "x"})
+    c2 = _Conn("b", live_queue=nm.LiveQueue())
+    _wire_audience(monkeypatch, {"u1": full, "u2": c2})
+    monkeypatch.setattr(nm, "_FILE_UPDATED_MAX_FRAMES", 1)
+    await nm.broadcast_file_updated("agent-x", "workspace/a.md")
+    await nm.broadcast_file_updated("agent-x", "workspace/b.md")
+    await nm.flush_file_updates()
+    # Past the cap: one per-path frame and the agent-level summary.
+    assert [f["rel_path"] for f in _live_frames(c2)] == ["workspace/a.md", ""]
+    # A live queue holding only open frames refuses: the notify queue takes them.
+    assert [f["type"] for f in _live_frames(full)] == [wire.OPEN_APP]
+    assert [f["rel_path"] for f in _frames(full)] == ["workspace/a.md", ""]
+
+
 async def test_merge_rules_disk_wins_pin_ors_and_exclusion_is_the_intersection(monkeypatch):
     saver, peer = _Conn("saver"), _Conn("peer")
     _wire_audience(monkeypatch, {"saver": saver, "peer": peer})

@@ -53,16 +53,20 @@ class RemoteAbortMixin:
         partial turn, and a watchdog falls back to the hard path if the turn
         doesn't close.
 
-        Hard path (no live turn, older satellite, send failure, or watchdog
-        escalation): the satellite kills the process (an engine whose hard
-        abort leaves its daemon warm soft-interrupts instead), and the caller
-        keeps the producer-cancel + cancelled-context injection.
+        Hard path (no live turn, a turn whose result was read and whose
+        stream only waits for background work — the task settle, where the
+        soft frame would find nothing to interrupt and only buy the
+        watchdog's detour — an older satellite, a send failure, or the
+        watchdog's escalation): the satellite kills the process (an engine
+        whose hard abort leaves its daemon warm soft-interrupts instead), and
+        the caller keeps the producer-cancel + cancelled-context injection.
         """
         info = self._sessions.get(session_id)
         if not info:
             return False
         if (
             info.turn_active
+            and not self._adapter(info).turn_settled(info)
             and self._cm.satellite_supports_soft_interrupt(info.machine_id)
         ):
             # Same release as the hard path: a pending hook/native permission
@@ -80,6 +84,7 @@ class RemoteAbortMixin:
                     "falling back to hard abort", session_id[:8], e,
                 )
             else:
+                self._adapter(info).note_interrupt(info)
                 _wd = asyncio.create_task(
                     self._soft_interrupt_watchdog(
                         session_id, info.current_send_command_id,
@@ -167,6 +172,7 @@ class RemoteAbortMixin:
                 session_id[:8], e,
             )
             return False
+        self._adapter(info).note_interrupt(info)
         resolve_session_permissions(session_id, approved=False)
         return True
 

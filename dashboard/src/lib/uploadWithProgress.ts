@@ -80,10 +80,17 @@ function uploadSingle(
         reject(new Error(String(detail)))
       }
     }
-    xhr.onerror = () => reject(new Error('Network error during upload'))
+    xhr.onerror = () => {
+      const err = new Error('Network error during upload') as Error & { transient?: boolean }
+      err.transient = true
+      reject(err)
+    }
     xhr.onabort = () => reject(new DOMException('Upload aborted', 'AbortError'))
     const fd = new FormData()
-    fd.append('file', file)
+    // The name given explicitly: a folder-picked file's multipart name is
+    // otherwise its webkitRelativePath (`folder/sub/x.md`), which the server
+    // flattens into one file name.
+    fd.append('file', file, file.name)
     fd.append('agent', agent)
     fd.append('target_dir', targetDir)
     xhr.send(fd)
@@ -261,4 +268,22 @@ async function uploadChunked(
     }).catch(() => {})
     throw e
   }
+}
+
+/** The upload never reached the server (no answer at all), as opposed to
+ * a refusal: what a dropped connection looks like to every request here. */
+export function isNetworkError(e: unknown): boolean {
+  return e instanceof TypeError || (e as { transient?: boolean } | null)?.transient === true
+}
+
+/** A fresh folder for a folder upload, named after it (`_1`, `_2`… when
+ * taken): in `targetDir`, or the chat's own upload folder when it is empty.
+ * Its files then upload into it with an explicit target dir. */
+export async function reserveUploadFolder(
+  agent: string,
+  name: string,
+  signal?: AbortSignal,
+  targetDir = '',
+): Promise<{ path: string; name: string }> {
+  return jsonRequest('POST', '/v1/upload/folder', { agent, name, target_dir: targetDir }, signal)
 }

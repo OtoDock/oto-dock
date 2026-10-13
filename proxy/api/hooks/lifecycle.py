@@ -34,7 +34,7 @@ import contextlib
 from api.hooks import routing
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 
@@ -60,12 +60,30 @@ class HookToolResultRequest(BaseModel):
     # ``command``, from which a check reads a commit, a push, a build.
     # Empty on older scripts and for every other tool.
     tool_command: str = ""
+    # The second request for a tool whose results the platform keeps (the
+    # MCP's ``result_files``): the result's image blocks and resource blobs
+    # (``services/mcp/result_files.blobs_of`` reads them), nothing else.
+    files_only: bool = False
+    result_blocks: list[dict] = []
 
 
 @router.post("/v1/hooks/tool-result")
 async def hook_tool_result(req: HookToolResultRequest, authorization: str | None = Header(None)):
-    """Called by PostToolUse hook to push a tool result summary to the chat."""
+    """Called by PostToolUse hook to push a tool result summary to the chat.
+
+    For a tool an MCP's ``result_files`` names, the answer says so
+    (``result_files: true``) and the script sends the result's pictures and
+    blobs again with ``files_only``: they are saved and shown, and the
+    answer's ``additional_context`` is the line the agent reads."""
     await verify_session_match_async(authorization, req.session_id)
+    from services.mcp import result_files
+
+    if req.files_only:
+        kept = await result_files.keep(
+            req.session_id, req.tool_name,
+            result_files.blobs_of(req.result_blocks), req.result_content,
+        )
+        return {"status": "ok", "additional_context": kept.line if kept else ""}
 
     # (Removed: the interactive allow-memory inference. It seeded
     # remember_session_tool_allow for any mcp__ tool that RAN in an
@@ -97,6 +115,8 @@ async def hook_tool_result(req: HookToolResultRequest, authorization: str | None
         "result_content": req.result_content,
         "is_error": req.is_error,
     })
+    if result_files.opted_in(req.tool_name) is not None:
+        return {"status": "ok", "result_files": True}
     return {"status": "ok"}
 
 
@@ -233,7 +253,7 @@ async def hook_file_written(
 
     On both kinds of session an agent-tree file of the session's agent then
     gets a ``file_updated(source="disk")`` unless it still holds the bytes
-    its newest push's document knows (``_announce_written``): every open
+    its newest push's document knows (``_note_written``): every open
     view of it (another device's pane, a teammate's, a workspace preview)
     reloads when clean or offers Reload over unsaved edits.
 
@@ -248,7 +268,8 @@ async def hook_file_written(
         slug = getattr(ctx, "agent", "") if ctx is not None else ""
         rel = req.path.lstrip("/")
         if slug and rel.startswith(f"{slug}/"):
-            await _announce_written(slug, rel[len(slug) + 1:])
+            await _announce_written(slug, rel[len(slug) + 1:],
+                                    await _note_written(slug, rel[len(slug) + 1:]))
         return {"ok": True, "local": True}
     # Satellite-host cache paths push back to the original
     # absolute path via the sidecar metadata instead of the agent-tree
@@ -275,24 +296,54 @@ async def hook_file_written(
         prefix = f"{slug}/"
         if slug and rel.startswith(prefix) and is_canonical_rel_path(rel[len(prefix):]):
             rel = rel[len(prefix):]
-    ok = await remote_file_flow.push_back(req.session_id, rel)
-    # The platform copy changed whatever the push answered.
+    # The push hands the platform's bytes to the session's machine, so the
+    # path must be one the session could have written there itself (the
+    # write rule, judged where the path resolves; the push then opens the
+    # path as written with no link followed, so a link swapped in since
+    # refuses it), and engine machinery and credentials never travel this
+    # way: the token alone would otherwise fetch another user's files to a
+    # paired machine.
     ctx = get_session_security(req.session_id)
     slug = getattr(ctx, "agent", "") if ctx is not None else ""
+    from auth.path_policy import check_host_path_access
+    from core.remote.file_sync import is_engine_machinery_path
+    if (ctx is None or not slug or not is_canonical_rel_path(rel)
+            or is_engine_machinery_path(rel)
+            or not check_host_path_access((config.AGENTS_DIR / slug / rel).resolve(), ctx,
+                                          writing=True).allowed):
+        # Routine, not an attack: file-tools posts this for every preview,
+        # of a read-only file too. Nothing is pushed.
+        logger.info("file-written: %r not pushed, session %s may not write it",
+                    req.path, req.session_id[:8])
+        return {"ok": False, "detail": "this session may not write that file"}
+    # The platform copy is final before the push: the next document
+    # generation is noted now, the change announced once the push answered
+    # (whatever it answered: the platform copy changed).
+    changed = True
     if slug:
-        await _announce_written(slug, rel)
+        try:
+            changed = await _note_written(slug, rel)
+        except Exception:
+            logger.warning("file-written: noting the write of %s failed", rel, exc_info=True)
+    ok = await remote_file_flow.push_back(req.session_id, rel)
+    if slug:
+        await _announce_written(slug, rel, changed)
     return {"ok": bool(ok)}
 
 
-async def _announce_written(agent_slug: str, rel: str) -> None:
-    """``file_updated(source="disk")`` for a file-tools write of an agent
-    tree file (a canonical agent-tree path only), unless the file still
-    holds the bytes its newest push's document knows (a ``preview_document``
-    of an untouched file changed nothing: a view with unsaved edits must not
-    be told otherwise)."""
+async def _note_written(agent_slug: str, rel: str) -> bool:
+    """Whether a file-tools write changed an agent tree file (a canonical
+    agent-tree path only): not when the file still holds the bytes its
+    newest push's document knows (a ``preview_document`` of an untouched
+    file changed nothing: a view with unsaved edits must not be told
+    otherwise). For a file with a noted document generation that changed,
+    the next generation is noted here, before the change is announced: a
+    load that mints on the ``file_updated`` opens the new document, and the
+    push that follows reuses it (it would open the previous push's
+    document, then load once more on the push)."""
     from core.remote.file_sync import is_canonical_rel_path
     if not is_canonical_rel_path(rel):
-        return
+        return False
     from api.hooks import preview
     from api.media.wopi import encode_file_id
     agents_rel = f"{agent_slug}/{rel}"
@@ -300,7 +351,16 @@ async def _announce_written(agent_slug: str, rel: str) -> None:
     if preview.pushed_generation(file_id):
         digest = await asyncio.to_thread(preview.file_digest, config.AGENTS_DIR / agents_rel)
         if preview.unchanged_since_push(file_id, agents_rel, digest):
-            return
+            return False
+        preview.note_next_generation(file_id, digest)
+    return True
+
+
+async def _announce_written(agent_slug: str, rel: str, changed: bool) -> None:
+    """``file_updated(source="disk")`` for a file-tools write that changed
+    an agent tree file (``_note_written``)."""
+    if not changed:
+        return
     from services.notifications import notification_manager
     await notification_manager.broadcast_file_updated(agent_slug, rel, source="disk")
 
@@ -337,6 +397,54 @@ async def permission_response(
 # --- Location bridge (MCP -> proxy -> WS -> dashboard -> WS -> proxy -> MCP) ---
 
 
+GOOGLE_MAPS_MCP = "google-maps"
+GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+
+def _maps_geocode_key(agent: str) -> str:
+    """The key the agent's Google Maps MCP runs with: the ``GOOGLE_MAPS_API_KEY``
+    field of the env-delivered instance the agent takes (assigned to it or to
+    all; ``mcp_registry.env_instance_values``), and only while that MCP is on
+    the agent (visible, enabled by its manager and on the platform). "" for
+    none. Blocking (store reads)."""
+    from services.mcp import mcp_registry
+    manifest = next((m for m in mcp_registry.get_agent_mcps_all_placements(agent)
+                     if m.name == GOOGLE_MAPS_MCP), None)
+    if manifest is None:
+        return ""
+    return mcp_registry.env_instance_values(manifest, agent).get("GOOGLE_MAPS_API_KEY", "")
+
+
+async def _address_hint(agent: str, lat, lng) -> str:
+    """A street address for a position from the Geocoding API, with the
+    agent's Maps key; "" without a key or on any failure (the hint is
+    optional). The key needs the Geocoding API enabled in its Google Cloud
+    project: Google answers ``REQUEST_DENIED`` otherwise."""
+    if not agent or lng is None:
+        return ""
+    from storage.pg import run_db
+    try:
+        api_key = await run_db(_maps_geocode_key, agent)
+        if not api_key:
+            return ""
+        async with httpx.AsyncClient(timeout=5) as gc:
+            resp = await gc.get(GEOCODE_URL, params={"latlng": f"{lat},{lng}", "key": api_key})
+        if resp.status_code != 200:
+            logger.info(f"Location address hint: Geocoding answered HTTP {resp.status_code}")
+            return ""
+        data = resp.json()
+        results = data.get("results") or []
+        if not results:
+            if data.get("status") == "REQUEST_DENIED":
+                logger.info("Location address hint: Geocoding refused the agent's Maps key "
+                            "(REQUEST_DENIED: enable the Geocoding API in its Google Cloud project)")
+            return ""
+        return str(results[0].get("formatted_address") or "")
+    except Exception as exc:
+        logger.debug(f"Reverse geocode for location address hint failed: {exc}")
+        return ""
+
+
 @router.post("/v1/location/request")
 async def request_user_location(
     authorization: str | None = Header(None),
@@ -356,7 +464,8 @@ async def request_user_location(
     # master-key caller (trusted s2s — may use the agent-name fallback below).
     from auth.session_token import validate_session_token
     _token = authorization.split(" ", 1)[1] if authorization and " " in authorization else ""
-    caller_sid = (validate_session_token(_token) or {}).get("sid", "")
+    claims = validate_session_token(_token) or {}
+    caller_sid = claims.get("sid", "")
 
     if caller_sid:
         latest_sid = caller_sid
@@ -401,24 +510,12 @@ async def request_user_location(
     # Block waiting for dashboard response
     result = await wait_for_location(request_id, timeout=30.0, session_id=latest_sid)
 
-    # Optional: reverse geocode for address hint
-    if result.get("lat") and not result.get("error"):
-        try:
-            from storage.identity import credential_store
-            maps_creds = await asyncio.to_thread(credential_store.get_infra_credentials, "google-maps")
-            api_key = (maps_creds or {}).get("GOOGLE_MAPS_API_KEY", "")
-            if api_key:
-                async with httpx.AsyncClient(timeout=5) as gc:
-                    resp = await gc.get(
-                        "https://maps.googleapis.com/maps/api/geocode/json",
-                        params={"latlng": f"{result['lat']},{result['lng']}", "key": api_key},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("results"):
-                            result["address_hint"] = data["results"][0]["formatted_address"]
-        except Exception as exc:
-            # Non-critical
-            logger.debug(f"Reverse geocode for location address hint failed: {exc}")
+    # Optional: reverse geocode for an address hint, with the Maps key of the
+    # calling session's agent (the token's agent is signed with its sid).
+    if result.get("lat") is not None and not result.get("error"):
+        agent = (claims.get("agent") if caller_sid else x_agent_name) or ""
+        hint = await _address_hint(agent, result["lat"], result.get("lng"))
+        if hint:
+            result["address_hint"] = hint
 
     return result

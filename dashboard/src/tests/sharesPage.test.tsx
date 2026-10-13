@@ -41,7 +41,7 @@ beforeEach(() => {
 })
 
 describe('Admin → Shares', () => {
-  it('lists every external link with its protection and revokes one at once', () => {
+  it('lists every external link with its protection, and a live link revokes after a confirm', () => {
     const inTenDays = new Date(Date.now() + 10 * 86_400_000 - 60_000).toISOString()
     state.shares = [
       link({ id: 'l1', public: true }),
@@ -57,7 +57,23 @@ describe('Admin → Shares', () => {
     expect(screen.getByText('expires in 10 days')).toBeTruthy()
     expect(screen.getByText('No shares to people, agents or departments.')).toBeTruthy()
     fireEvent.click(screen.getAllByRole('button', { name: 'Revoke' })[0])
+    // A live link asks first: whoever holds it loses it, nobody is told.
+    expect(state.patch).not.toHaveBeenCalled()
+    expect(screen.getByTestId('admin-revoke-confirm').textContent)
+      .toContain('Anyone with the link to “Schedule” loses it at once. Nobody is notified.')
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByTestId('admin-revoke-confirm')).toBeNull()
+    fireEvent.click(screen.getAllByRole('button', { name: 'Revoke' })[0])
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke the link' }))
     expect(state.patch).toHaveBeenCalledWith({ id: 'l1', revoke: true }, expect.anything())
+  })
+
+  it('an expired link revokes at once (it gives nothing any more)', () => {
+    state.shares = [link({ id: 'l3', standing: 'expired' })]
+    render(<SharesPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke' }))
+    expect(screen.queryByTestId('admin-revoke-confirm')).toBeNull()
+    expect(state.patch).toHaveBeenCalledWith({ id: 'l3', revoke: true }, expect.anything())
   })
 
   it('lists the shares to people, agents and departments with their recipient and standing', () => {
@@ -173,10 +189,14 @@ describe('Admin → Shares', () => {
   })
 
   it('says so when a revoke is refused', () => {
-    state.shares = [link({ id: 'l1', state: 'suspended', public: true })]
+    state.shares = [link({ id: 'l1', state: 'suspended', public: true, standing: 'paused' })]
     state.patch.mockImplementation((_v: unknown, opts: { onError?: (e: Error) => void }) => opts.onError?.(new Error('Share not found')))
     render(<SharesPage />)
     fireEvent.click(screen.getByRole('button', { name: 'Revoke' }))
+    // A paused link would come back with its app: the confirm says it will not.
+    expect(screen.getByTestId('admin-revoke-confirm').textContent)
+      .toContain('The link to “Schedule” will not come back when the app is pinned again.')
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke the link' }))
     expect(screen.getByRole('alert').textContent).toBe('Share not found')
   })
 

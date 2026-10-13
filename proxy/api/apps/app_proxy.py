@@ -49,7 +49,7 @@ from storage import db_apps
 from auth import roles
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 MAX_BODY_BYTES = 1024 * 1024

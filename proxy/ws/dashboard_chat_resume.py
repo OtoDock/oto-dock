@@ -12,6 +12,7 @@ import json
 import logging
 from datetime import datetime, timezone
 import config
+from typing import TYPE_CHECKING
 from core import placement
 from storage import database as task_store
 from storage.automation import run_status
@@ -45,7 +46,12 @@ from auth.providers import UserContext
 from ws import wire_events as wire
 from ws.dashboard_chat_text import grace_layer
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 
 _NO_CUT = object()
@@ -91,7 +97,7 @@ def _encode_history(frame: dict, rows: list[dict]) -> str:
     return head[:-1] + ',"messages":[' + body + "]}"
 
 
-class ChatResumeMixin:
+class ChatResumeMixin(_Host):
     """resume_chat: history replay, the visit path, restore and the lazy warmup"""
 
     # The live blocks each live pump held when the last resume took its cut,
@@ -108,6 +114,14 @@ class ChatResumeMixin:
         q = await input_queue.loaded(cid)
         return {"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id,
                 "messages": q.snapshot()}
+
+    async def _send_engine_prompts(self) -> None:
+        """The cards of the engine's own permission requests still waiting
+        on the viewed chat with no pump to show them (a background subagent
+        that asked after its turn ended): the viewer can answer them."""
+        from core.session import engine_prompts
+        for p in engine_prompts.pending_for_chat(self.chat_id or ""):
+            await self._send(engine_prompts.card_frame(p))
 
     def _viewer_context(self) -> UserContext:
         """The connection's viewer as the principal the REST rules judge:
@@ -530,6 +544,16 @@ class ChatResumeMixin:
             frame["live_pending"] = True
         if as_delta:
             frame["since_id"] = min(read_floors.values())
+        kind = ""
+        if view_only_external:
+            kind = pump.source_type if pump else session_kind.of_chat(chat).source_type
+            # The viewer learns the chat is driven from outside before every
+            # read-only history, the pump poll's deltas included: the page
+            # that placed the call may still be ending its own turn when the
+            # call's pump announces itself, so the poll's first delta is what
+            # tells it. The page says so and re-resumes when the chat's
+            # status reads ready again; a repeat changes nothing there.
+            await self._send({"type": wire.CHAT_VIEW_ONLY, "chat_id": cid, "kind": kind})
         # Encoded off the loop, row by row: a long history's dump never holds
         # the loop, and the thread yields between rows.
         if await self._send_text(await asyncio.to_thread(_encode_history, frame, messages)):
@@ -540,10 +564,10 @@ class ChatResumeMixin:
             # do NOT acquire the session slot, send warmup_ready, or promise a
             # pump attach — leaving the phone/webhook driver's stream untouched
             # so the call keeps playing and tears down normally.
-            kind = pump.source_type if pump else session_kind.of_chat(chat).source_type
             logger.info(
                 f"WS dashboard: chat={cid} is driven by a {kind} session — "
-                f"read-only view, not attaching"
+                f"read-only {'delta' if as_delta else 'history'} after chat_view_only, "
+                f"not attaching"
             )
             return
 
@@ -623,6 +647,7 @@ class ChatResumeMixin:
                     **(await run_db(self._target_mismatch_fields, self.chat_id)),
                 })
                 await self._send(await self._queue_snapshot())
+                await self._send_engine_prompts()
                 # Client attaches the PTY viewer via pty_attach (see _dispatch).
                 return
             # A machine in its reconnect grace is coming back: its session
@@ -663,6 +688,7 @@ class ChatResumeMixin:
                 # No active pump: the chat's queue. Emit so the client
                 # clears any reload-persisted stale entries.
                 await self._send(await self._queue_snapshot())
+                await self._send_engine_prompts()
                 return
 
         # Session dead or doesn't exist — DON'T spawn a new process just for browsing.
@@ -714,6 +740,7 @@ class ChatResumeMixin:
         # finished but before sending again), keeping what the chat's
         # queue holds.
         await self._send(await self._queue_snapshot())
+        await self._send_engine_prompts()
         logger.info(
             f"WS dashboard resume_chat (lazy): session dead/missing, "
             f"chat={self.chat_id}, agent={self.agent_name} — will warmup on first message"

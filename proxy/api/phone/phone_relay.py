@@ -45,10 +45,10 @@ import config
 from adapters.phone import is_outbound
 from auth import roles
 from auth.session_token import validate_session_token
-from services.phone import daemon_url
+from services.phone import daemon_url, in_session_calls
 from storage.pg import run_db, run_db_fast
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 # Longest daemon-side wait (mirrors phone-mcp's clamp) — the /wait long-poll
@@ -57,7 +57,8 @@ _MAX_WAIT_S = 360
 
 # The daemon's own body rules (phone/validation.py), applied here first so a
 # refused body never reaches it.
-_PHONE_RE = re.compile(r"\+?\d{2,20}")
+# ASCII digits only (Python's ``\d`` takes every Unicode digit).
+_PHONE_RE = re.compile(r"\+?[0-9]{2,20}")
 _MAX_TASK = 4000
 _MAX_INSTRUCTIONS = 8000
 _ANSWER_MAX_CHARS = 4000
@@ -342,15 +343,66 @@ async def relay_make_call(
     fields, named_route = _validate_body(body)
     _check_destination(fields["phone_number"])
     route_id = await _pinned_route(caller, named_route)
-    _take_cap_slots(caller)
-    _audit(caller, route_id, "placed")
-    resp = await _relay(
-        "POST", "/api/calls",
-        json_body={**fields, "route_id": route_id, "wait": False},
-    )
+    # A call from the tied user's own dashboard chat runs INSIDE that chat
+    # (services/phone/in_session_calls.py): the eligibility and its one
+    # refusal come before the cap slots, so a refused call spends none.
+    from storage.phone import phone_route_store
+    route = await run_db(phone_route_store.get_route, route_id)
+    from ws import duplex
+    chat_id, why = await in_session_calls.eligible_chat(
+        sid=caller.sid, agent=caller.agent, user_sub=caller.user_sub, route=route,
+        spoken_conversation_live=duplex.live_for_chat)
+    if why == in_session_calls.BUSY_LINE:
+        _audit(caller, route_id, "refused: a call already runs in the chat")
+        raise HTTPException(status_code=409, detail=in_session_calls.BUSY_LINE)
+    grant = ""
+    if chat_id:
+        try:
+            grant = in_session_calls.mint(
+                session_id=caller.sid, chat_id=chat_id, agent=caller.agent,
+                user_sub=caller.user_sub, phone_number=fields["phone_number"])
+        except ValueError:
+            # Two make_calls of one chat raced past the eligibility: the
+            # second finds the first's grant.
+            _audit(caller, route_id, "refused: a call already runs in the chat")
+            raise HTTPException(status_code=409, detail=in_session_calls.BUSY_LINE)
+    try:
+        _take_cap_slots(caller)
+    except HTTPException:
+        # A call the caps refuse holds nothing: the chat may try again.
+        in_session_calls.release(grant)
+        raise
+    _audit(caller, route_id, "placed in the chat" if grant else f"placed ({why})")
+    daemon_body = {**fields, "route_id": route_id, "wait": False}
+    if grant:
+        daemon_body["in_session"] = {"session_id": caller.sid, "grant": grant}
+    try:
+        resp = await _relay("POST", "/api/calls", json_body=daemon_body)
+    except HTTPException:
+        in_session_calls.release(grant)
+        raise
     if 200 <= resp.status_code < 300:
         _remember_owner(resp, caller)
+        if grant:
+            _remember_in_session(resp, grant)
+    elif grant:
+        in_session_calls.release(grant)
     return resp
+
+
+def _remember_in_session(resp: Response, grant: str) -> None:
+    """The daemon took the call into the chat (its body says so): the poll
+    refuses it from here on. A daemon that ignored the field ran the call
+    as its own session, and the grant goes."""
+    try:
+        data = json.loads(resp.body)
+    except Exception:
+        data = {}
+    call_id = data.get("call_id")
+    if data.get("in_session") is True and isinstance(call_id, str) and call_id:
+        in_session_calls.remember_call(call_id, grant)
+    else:
+        in_session_calls.release(grant)
 
 
 @router.get("/v1/phone/calls/{call_id}")
@@ -373,6 +425,8 @@ async def relay_wait_for_call(
     """Long-poll for call events (→ daemon ``GET /api/calls/{id}/wait``)."""
     caller = await _require_phone_agent(authorization)
     _require_call_owner(call_id, caller)
+    if in_session_calls.is_in_session_call(call_id):
+        raise HTTPException(status_code=409, detail=in_session_calls.WAIT_REFUSED_LINE)
     timeout = max(1, min(timeout, _MAX_WAIT_S))
     return await _relay(
         "GET", f"/api/calls/{call_id}/wait",

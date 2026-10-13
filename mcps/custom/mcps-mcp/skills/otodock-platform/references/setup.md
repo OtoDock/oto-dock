@@ -7,14 +7,19 @@
   serves API + dashboard on port **8400**; `curl http://localhost:8400/health` → `ok`.
 - `.env` is the whole deployment config. The keys users actually touch:
   `DASHBOARD_PUBLIC_URL` (the address users browse to — drives cookies, OAuth
-  redirects, notification links, and remote-machine pairing), `TRUSTED_PROXY` (reverse
-  proxy IP), `TZ`, `PROXY_PORT`, `OTODOCK_MAX_FILE_MB` (upload/sync cap, default 1 GB),
-  `OIDC_*` (SSO).
+  redirects, notification links, and remote-machine pairing; connecting an account works
+  only from the dashboard at this address), `TRUSTED_PROXY` (reverse proxy IP), `TZ`,
+  `PROXY_PORT`, `OTODOCK_MAX_FILE_MB` (upload/sync cap, default 1 GB), `OIDC_*` (SSO).
+  A yes/no setting takes `true`/`false`, `1`/`0`, `yes`/`no` or `on`/`off`; another
+  word stops the server at start, naming the setting.
 - **Behind a reverse proxy / forced-login gateway**, these paths must skip the login:
   `^/ui-kit/`, `^/v1/webhooks/`, `^/v1/satellite` (remote machines), `/ws/`,
   `^/v1/images/temp/`, `^/v1/twilio/` (Twilio phone), `/favicon.png`.
-- **Upgrading** = bump `OTODOCK_VERSION` in `.env`, `docker compose pull && up -d`.
-  Always back up first (the platform ships backup/restore scripts).
+- **Upgrading** = `scripts/upgrade.sh` on a Docker install (it backs up first and prints
+  the release's notes); a source install pulls and rebuilds. `backup.sh` and `restore.sh`
+  back up and restore the whole install, and a restore refuses a backup from a newer
+  release. **Setup → OtoDock** *(admin)* shows the running version and whether a newer
+  release is out; after an upgrade a one-time dialog shows what is new.
 - RAM guide: each concurrent Claude/Codex session grows to ~1 GB; 8 GB ≈ 5–6 sessions,
   16 GB ≈ 10–12. The platform admits sessions based on live free memory.
 
@@ -43,8 +48,7 @@ Two places, same platform:
 
 Each engine has its own default model, chosen by tier, which an agent on **Auto** runs:
 Claude Opus 5.5 on Claude Code, GPT-6.1 Sol on Codex, Sonnet 5.5 on Direct LLM. Every
-model list shows its tier. Since 1.7.1 Claude Sonnet 5.5 replaces Sonnet 5 and GPT-6.1
-Sol replaces GPT-6 Sol; pins on the old ids move over at the next start.
+model list shows its tier, and a pin on a retired model runs on its successor.
 
 Routing rule: a user's own chats/tasks run on **their own** connections first; anything
 that belongs to an *agent* (agent-scope tasks, shared agents, meetings, triggers, phone
@@ -74,18 +78,25 @@ The `otodock-phone` service ships as a compose overlay
   SID + auth token, calls enter via the public dashboard URL, no extra ports; or
   **FreePBX/Asterisk**: one-time dialplan bootstrap, PBX must reach TCP 9092/9093),
   click **Verify**, then create **routes** (agent + language + number, optional
-  greeting, PIN access code, per-route call log via the clock icon). Each route
-  sets a **Caller identity**: **Per caller** (default; every phone number gets its
-  own private files and memory; callers read the agent's shared folders as
-  viewers and change nothing; a **Remember callers** toggle; callers never get
+  greeting, **Detect the caller's language**, **Transfer targets** (the colleagues the
+  agent may hand a caller to), **Require a PIN**, a per-route call log via the clock
+  icon). Each route sets a **Caller identity**: **Per caller** (default; every phone
+  number gets its own private files and memory; callers read the agent's shared folders
+  as viewers and change nothing; a **Remember callers** toggle; callers never get
   platform tools or a shell) or **A platform user** (the call runs as that user's own
-  session, capped at manager; require a PIN on an inbound line). Caller files,
-  phone conversations and the call log age out together under **Setup → Phone →
-  Caller Data** (90 days by default; **Forget all caller data now** is permanent).
+  session, capped at manager; require a PIN on an inbound line, or from the person who
+  answers an outbound one). Caller files, phone conversations and the call log age out
+  together under **Setup → Phone → Caller Data** (90 days by default; **Forget all
+  caller data now** is permanent).
+- On a call the agent hangs up itself when the conversation is done, hands the caller
+  to a transfer target by name (a blind transfer; a route without targets has none) and,
+  on a call another agent placed, asks that agent. A call a person places from their own
+  chat, on an outbound route tied to them, runs inside that chat, which resumes when the
+  call ends.
 - Wake word ("Hey OtoDock") is per-user opt-in: **User Settings → General → Wake word**,
   off by default, on-device detection.
-- Dictation language: hold the chat's microphone button to pick it, or set it under
-  **User Settings → Audio**.
+- Dictation language: hold the chat's microphone button to pick it (**Automatic** lets
+  the speech provider recognise it), or set it under **User Settings → Audio**.
 
 ## Remote machines
 
@@ -114,8 +125,9 @@ the same dashboard. Pairing is outbound-only (no open ports) and needs
 - Files sync **both ways** automatically; generated build directories are auto-skipped;
   conflicts and deletes land in the workspace **Recover bin** (7 days). Transfers are
   paced so a slow uplink keeps its connection, and a large file keeps going instead of
-  failing on a timeout. Machine cards show live status, sessions/capacity, and the CLI
-  versions the machine runs (highlighted on drift).
+  failing on a timeout. Whole folders upload too, dropped on the chat or the workspace.
+  Machine cards show live status, sessions/capacity, and the CLI versions the machine
+  runs (highlighted on drift).
 - **Updates**: with automatic updates on (the machine card, admin), the machine's agent
   software updates itself at its next reconnect after a platform upgrade. The update
   ends every session running on that machine, so a turn in flight there stops with a

@@ -207,14 +207,25 @@ describe('useWakeWord', () => {
     expect(JSON.parse(String(prewarm?.[1]?.body))).toEqual({ agent: 'alpha' })
   })
 
-  it('?wakeDiag=1 switches the diagnostics recorder on (the desktop shortcut)', async () => {
+  it('?wakeDiag=1 on the settings page switches the diagnostics recorder on (the desktop shortcut)', async () => {
     mockApi()
     try {
-      render(<Harness navigate={vi.fn()} entry="/agents?wakeDiag=1" />)
+      render(<Harness navigate={vi.fn()} entry="/user-settings?wakeDiag=1" />)
       await waitFor(() => expect(isWakeDiagOn()).toBe(true))
     } finally {
       setWakeDiag(false)
     }
+  })
+
+  it('?wakeDiag=1 on any other page leaves the recorder off (a link cannot arm it)', async () => {
+    mockApi()
+    const { unmount } = render(<Harness navigate={vi.fn()} entry="/chat/alpha?wakeDiag=1" />)
+    await new Promise((r) => setTimeout(r, 30))
+    expect(isWakeDiagOn()).toBe(false)
+    unmount()
+    render(<Harness navigate={vi.fn()} entry="/agents?wakeDiag=1" />)
+    await new Promise((r) => setTimeout(r, 30))
+    expect(isWakeDiagOn()).toBe(false)
   })
 
   it('rebuilds a worker that dies, after a bounded delay', async () => {

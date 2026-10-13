@@ -12,9 +12,11 @@ local (`PersistentSession.send_message`) and remote (`RemoteExecutionLayer
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Iterator
 
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 
@@ -26,6 +28,37 @@ logger = logging.getLogger("cli-settle")
 # task forever holding the session lock). Generous, since real background work
 # (e.g. a research subagent) legitimately runs for minutes.
 _SETTLE_PENDING_CEILING = 600.0
+
+
+@dataclass
+class RunCeilings:
+    """A task run's background ceilings (its own ``timeout_seconds`` for
+    commands, at least 1800 s for subagents), shared by the settle read and the
+    producer's wait after it: ``started`` is the latest settle's start, so the
+    two count one deadline, not two in a row."""
+
+    cmd: float
+    sub: float
+    started: float | None = None
+
+
+_run_ceilings: dict[str, RunCeilings] = {}
+
+
+@contextlib.contextmanager
+def run_ceilings(session_id: str, *, cmd: float, sub: float) -> Iterator[RunCeilings]:
+    """Register a run's ceilings for its session while the run's producer
+    drives it (a settle read with none registered keeps the 600 s backstop)."""
+    ceilings = RunCeilings(cmd=cmd, sub=sub)
+    prev = _run_ceilings.get(session_id)
+    _run_ceilings[session_id] = ceilings
+    try:
+        yield ceilings
+    finally:
+        if prev is not None:
+            _run_ceilings[session_id] = prev
+        elif _run_ceilings.get(session_id) is ceilings:
+            _run_ceilings.pop(session_id, None)
 
 # --- Foreign-result gating -------------------------------------------------
 #
@@ -178,6 +211,7 @@ class SettleController:
         "settle_after_result",
         "translator",
         "_get_hook_activity",
+        "_turn_started",
         "_settling",
         "_settle_start",
         "_last_heartbeat",
@@ -190,6 +224,7 @@ class SettleController:
         translator: ClaudeCLIEventTranslator,
         *,
         get_hook_activity: Callable[[str], float | None] | None = None,
+        turn_started: float | None = None,
     ) -> None:
         self.session_id = session_id
         self.settle_after_result = settle_after_result
@@ -198,6 +233,11 @@ class SettleController:
             from core.session.session_state import get_hook_activity as _gha
             get_hook_activity = _gha
         self._get_hook_activity = get_hook_activity
+        # The turn's start: a Stop since then is this turn's (the local
+        # session passes its turn-active span's start, which opens before the
+        # stale-output drain; the remote adapter builds the controller before
+        # its send, where a Stop still takes the hard path).
+        self._turn_started: float = time.monotonic() if turn_started is None else turn_started
 
         self._settling: bool = False
         self._settle_start: float = 0.0
@@ -209,6 +249,15 @@ class SettleController:
     def settling(self) -> bool:
         """True once enter_settle() has been called."""
         return self._settling
+
+    def stopped(self) -> bool:
+        """The person stopped this turn (``session_events.note_stop`` since
+        it began): a settle has nothing left to wait for — the result is
+        read, and background work the person no longer waits for stays with
+        the session — so the task turn ends at its result or on the next
+        settle slice."""
+        from core.session import session_events
+        return session_events.stopped_since(self.session_id, self._turn_started)
 
     def is_interactive_done(self) -> bool:
         """True if no settle was requested (interactive chat path)."""
@@ -231,6 +280,9 @@ class SettleController:
         self._settling = True
         self._settle_start = time.monotonic()
         self._last_heartbeat = self._settle_start
+        ceilings = _run_ceilings.get(self.session_id)
+        if ceilings is not None:
+            ceilings.started = self._settle_start
         self.translator.reset_for_settle()
         logger.info(
             f"[{self.session_id[:8]}] entering settle "
@@ -271,6 +323,13 @@ class SettleController:
             # Every tracked subagent AND background command finished (or none
             # spawned) → turn over.
             return True
+        if self.stopped():
+            logger.info(
+                f"[{self.session_id[:8]}] settle: the person stopped the turn — "
+                f"settling now ({reg.pending_count} subagent(s) + "
+                f"{bgreg.pending_count} bg-command(s) stay with the session)"
+            )
+            return True
 
         # Pending subagents: TRUST the SubagentStop hook — do NOT settle on
         # stdout/hook silence. A subagent that's sleeping or doing slow
@@ -282,15 +341,30 @@ class SettleController:
         # staying in settle is exactly what lets the task observe completion
         # before it returns + synthesizes. The registry flips the moment the
         # hook lands (subagents) / the frame is parsed (commands). The ceiling
-        # is the sole backstop for a genuinely lost signal.
-        if (time.monotonic() - self._settle_start) > _SETTLE_PENDING_CEILING:
-            logger.warning(
-                f"[{self.session_id[:8]}] settle: {reg.pending_count} subagent(s) + "
-                f"{bgreg.pending_count} bg-command(s) still pending after "
-                f"{_SETTLE_PENDING_CEILING:.0f}s ceiling — settling"
-            )
-            return True
-        return False
+        # is the backstop for a genuinely lost signal: the run's own ceilings
+        # when its producer registered them, else 600 s. Work waiting on a
+        # person (a permission card, an engine prompt) is progress: the
+        # prompt's own bound ends that wait.
+        from core.session.session_state import has_pending_prompt
+        now = time.monotonic()
+        ceilings = _run_ceilings.get(self.session_id)
+        if has_pending_prompt(self.session_id):
+            self._settle_start = now
+            if ceilings is not None:
+                ceilings.started = now
+            return False
+        sub_ceiling = ceilings.sub if ceilings is not None else _SETTLE_PENDING_CEILING
+        cmd_ceiling = ceilings.cmd if ceilings is not None else _SETTLE_PENDING_CEILING
+        elapsed = now - self._settle_start
+        if ((reg.has_pending and elapsed <= sub_ceiling)
+                or (bgreg.has_pending and elapsed <= cmd_ceiling)):
+            return False
+        logger.warning(
+            f"[{self.session_id[:8]}] settle: {reg.pending_count} subagent(s) + "
+            f"{bgreg.pending_count} bg-command(s) still pending after "
+            f"{elapsed:.0f}s (ceilings {sub_ceiling:.0f}s / {cmd_ceiling:.0f}s) — settling"
+        )
+        return True
 
     def maybe_log_heartbeat(self, *, proc_alive: bool = True) -> None:
         """Emit a periodic progress heartbeat during long settles.

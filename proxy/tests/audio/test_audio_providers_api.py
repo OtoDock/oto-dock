@@ -124,16 +124,73 @@ def test_delete_blocked_when_route_uses_provider(client):
 
 
 def test_create_seeds_engine_advanced_defaults(client):
-    # No advanced sent -> seeded from the provider class (defaults-on-add).
+    # No advanced sent -> seeded from the provider class (defaults-on-add);
+    # the model ids are placeholders (model_defaults), never stored, so a
+    # row follows a later default.
     p = _create(client, provider_type="stt", provider_name="deepgram")
     assert p["advanced"] == {"call_endpointing_ms": 500, "chat_endpointing_ms": 1500}
     assert p["advanced_defaults"] == {"call_endpointing_ms": 500, "chat_endpointing_ms": 1500}
+    assert p["model_defaults"] == {"model_id": "nova-3"} and p["voice_defaults"] == {}
+    e = _create(client, provider_type="tts", provider_name="elevenlabs")
+    assert "model_id" not in e["advanced"] and e["model_defaults"] == {"model_id": "eleven_flash_v2_5"}
+    assert set(e["voice_defaults"]) == {"en", "el", "de", "es", "fr", "it"}
     # Explicit advanced wins; unknown engines stay {}.
     q = _create(client, provider_type="tts", provider_name="cartesia",
                 advanced={"model_id": "sonic-x"})
     assert q["advanced"] == {"model_id": "sonic-x"}
+    assert q["model_defaults"] == {"model_id": "sonic-3.6"} and q["voice_defaults"]["de"]
     r = _create(client)  # random unknown engine name
-    assert r["advanced"] == {} and r["advanced_defaults"] == {}
+    assert r["advanced"] == {} and r["advanced_defaults"] == {} and r["model_defaults"] == {}
+
+
+def test_the_boot_walk_moves_retired_ids_and_clears_a_former_default_once(client, monkeypatch):
+    from audio.providers import model_succession
+
+    from services.phone import phone_config_seed
+    from storage import database as task_store
+    from storage.prefs import audio_provider_store
+
+    row = _create(client, provider_type="tts", provider_name="cartesia",
+                  advanced={"model_id": "sonic-2"})
+    # An elevenlabs row holding a Cartesia id, an unknown provider holding a
+    # Cartesia id: the walk keys on the row's own provider, so neither moves;
+    # an admin's explicit pick of a served id (sonic-3.5) stays.
+    other = _create(client, provider_type="tts", provider_name="elevenlabs",
+                    advanced={"model_id": "sonic-3.5"})
+    unknown = audio_provider_store.create_provider({
+        "provider_type": "tts", "provider_name": f"cartesia-{uuid.uuid4().hex[:4]}",
+        "advanced": {"model_id": "sonic-3.5"}})
+    current = _create(client, provider_type="stt", provider_name="deepgram",
+                      advanced={"model_id": "nova-3"})
+    task_store.set_platform_setting(phone_config_seed.FORMER_DEFAULTS_WALKED, "[]")
+
+    # A retired id whose successor is the live default: the row follows the
+    # default unpinned, so the next default moves it too.
+    assert phone_config_seed.remap_retired_audio_models() == {"sonic-2": 1}
+    assert "model_id" not in audio_provider_store.get_provider(row["id"])["advanced"]
+    assert audio_provider_store.get_provider(other["id"])["advanced"]["model_id"] == "sonic-3.5"
+    assert audio_provider_store.get_provider(unknown["id"])["advanced"]["model_id"] == "sonic-3.5"
+    assert audio_provider_store.get_provider(current["id"])["advanced"]["model_id"] == "nova-3"
+    audio_provider_store.update_provider(row["id"], {"advanced": {"model_id": "sonic-3.5"}})
+    assert phone_config_seed.remap_retired_audio_models() == {}
+    assert audio_provider_store.get_provider(row["id"])["advanced"]["model_id"] == "sonic-3.5"
+
+    # A retired id whose successor is not the default keeps the successor.
+    monkeypatch.setitem(model_succession.MODEL_SUCCESSORS, ("tts", "cartesia"), {"sonic-2": "sonic-3.5"})
+    audio_provider_store.update_provider(row["id"], {"advanced": {"model_id": "sonic-2"}})
+    assert phone_config_seed.remap_retired_audio_models() == {"sonic-2": 1}
+    assert audio_provider_store.get_provider(row["id"])["advanced"]["model_id"] == "sonic-3.5"
+
+    # A former default (an id a release seeded; none shipped today) is
+    # cleared once...
+    monkeypatch.setitem(model_succession.FORMER_DEFAULTS, ("tts", "cartesia"), ("sonic-3.5",))
+    task_store.set_platform_setting(phone_config_seed.FORMER_DEFAULTS_WALKED, "[]")
+    assert phone_config_seed.remap_retired_audio_models() == {"sonic-3.5": 1}
+    assert "model_id" not in audio_provider_store.get_provider(row["id"])["advanced"]
+    # ...and an admin's later pick of the same id stays on the next boot.
+    audio_provider_store.update_provider(row["id"], {"advanced": {"model_id": "sonic-3.5"}})
+    assert phone_config_seed.remap_retired_audio_models() == {}
+    assert audio_provider_store.get_provider(row["id"])["advanced"]["model_id"] == "sonic-3.5"
 
 
 def test_known_providers_hides_stubs(client):

@@ -69,7 +69,7 @@ from storage.automation import notification_store
 from storage.chat import meeting_status
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.offboarding")
+logger = logging.getLogger("otodock.offboarding")
 
 SUBSCRIBER = "automation-transfer"
 RESWEEP_AFTER_S = 75.0
@@ -304,6 +304,31 @@ def _drop_stored_wakes(sub: str, reason: str, people: dict) -> int:
     return task_store.drop_pending_wakes_of(sub, lost) if lost else 0
 
 
+async def _drop_queued_inputs(sub: str, reason: str, people: dict) -> int:
+    """The messages the person queued where they may no longer drive the
+    chat: every chat for a deletion; else the chats of agents they lost, and
+    where they fell below the editor tier the chats that take it (a
+    Shared-only agent's, an agent-scope run's or worker's). The rows, the
+    registry and the chips go together (``input_queue.drop_where``)."""
+    from core.events import input_queue
+    from core.session.visibility import is_shared_only, is_synthetic_owner
+    if reason == offboarding.DELETED:
+        # ``delete_user`` took the rows already: the registry and the chips
+        # are what is left, on every chat.
+        held = input_queue.chats_queued_by(sub)
+        await input_queue.drop_where(author_sub=sub)
+        return len(held)
+    lost = []
+    for c in await run_db(task_store.queued_chats_of, sub):
+        role = _role_now(people, sub, c["agent"])
+        editor_only = is_shared_only(c["agent"]) or is_synthetic_owner(c["user_sub"] or "")
+        if role == roles.NO_ACCESS or (editor_only and not roles.can_edit(role)):
+            lost.append(c["id"])
+    for cid in lost:
+        await input_queue.drop_where(author_sub=sub, chat_id=cid)
+    return len(lost)
+
+
 async def _sweep_user_scope(sub: str, reason: str, people: dict) -> list[str]:
     """The person's user-scope rows on agents they can no longer reach go
     (every agent for a deletion). Returns the agents swept."""
@@ -367,6 +392,12 @@ async def reconcile_person(sub: str, *, actor: str, reason: str,
             logger.info("offboarding: %d stored wake(s) of %s dropped", dropped, sub)
     except Exception:
         logger.exception("offboarding: the stored wakes of %s were not dropped", sub)
+    try:
+        chats = await _drop_queued_inputs(sub, reason, people)
+        if chats:
+            logger.info("offboarding: the queued messages of %s dropped on %d chat(s)", sub, chats)
+    except Exception:
+        logger.exception("offboarding: the queued messages of %s were not dropped", sub)
     try:
         await _end_meetings(sub, people)
     except Exception:

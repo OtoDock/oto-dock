@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -25,7 +26,7 @@ from storage.pg import run_db
 from auth import roles
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.satellite-ws")
+logger = logging.getLogger("otodock.satellite-ws")
 
 # Every store call in the handshake below runs OFF the event loop (run_db on
 # the dedicated DB executor, or a persister lane): a reconnect storm after a
@@ -186,6 +187,93 @@ def note_update_pushed(machine_id: str, target_version: str) -> None:
     online push, so a manual push whose satellite rolls back is recorded,
     counted and announced exactly like an automatic one."""
     _pending_pushed_updates[machine_id] = target_version
+
+
+#: Satellites from this version answer ``update_received`` when they read an
+#: ``update_required`` (before they start applying it).
+UPDATE_ACK_SATELLITE_VERSION = "0.5.140"
+#: An update offered in the first seconds after this process began serving
+#: waits for the rest of the window (a deploy's fresh proxy saw a satellite's
+#: socket die right after its auth, and the lost push read as a rollback).
+UPDATE_HOLD_S = 10.0
+_UPDATE_ACK_WAIT_S = 20.0
+_CLOSE_READ_S = 2.0
+# When the first satellite reached this process (the lifespan startup runs
+# before uvicorn serves, so module import is too early to count from).
+_serving_since: float | None = None
+
+
+def _note_serving() -> None:
+    global _serving_since
+    if _serving_since is None:
+        _serving_since = time.monotonic()
+
+
+def _update_hold_left() -> float:
+    if _serving_since is None:
+        return 0.0
+    return max(0.0, UPDATE_HOLD_S - (time.monotonic() - _serving_since))
+
+
+class _PushWatch:
+    """Reads a satellite's socket while an update is offered on it, before
+    the connection is registered: the frames it sends meanwhile are skipped,
+    its disconnect is remembered.
+
+    uvicorn's sans-I/O protocol writes the 4007 close and closes the
+    transport without waiting for the peer's close, so a completed close is
+    not observable here. What is: a satellite at
+    ``UPDATE_ACK_SATELLITE_VERSION`` saying it read the push, and, for any
+    satellite, whether the socket was still live when the close went out
+    (the first disconnect event is then our own 4007)."""
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self.ws = websocket
+        self.gone = False
+        self.code: int | None = None
+
+    async def _next(self, timeout: float) -> dict | None:
+        if self.gone:
+            return None
+        try:
+            msg = await asyncio.wait_for(self.ws.receive(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        except Exception:
+            self.gone = True
+            return None
+        if msg.get("type") == "websocket.disconnect":
+            self.gone, self.code = True, msg.get("code")
+            return None
+        return msg
+
+    async def lives_through(self, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while not self.gone and (left := deadline - time.monotonic()) > 0:
+            await self._next(left)
+        return not self.gone
+
+    async def acknowledged(self, target: str, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while not self.gone and (left := deadline - time.monotonic()) > 0:
+            msg = await self._next(left)
+            try:
+                frame = json.loads((msg or {}).get("text") or "null")
+            except ValueError:
+                continue
+            if (isinstance(frame, dict) and frame.get("type") == "update_received"
+                    and frame.get("target_version") == target):
+                return True
+        return False
+
+    async def closed_live(self) -> bool:
+        """After our 4007 close: whether it went out on a live socket."""
+        if self.gone:
+            return False
+        deadline = time.monotonic() + _CLOSE_READ_S
+        while not self.gone and (left := deadline - time.monotonic()) > 0:
+            await self._next(left)
+        return self.code == 4007
 
 
 def auto_update_paused(machine: dict, target_version: str | None) -> bool:
@@ -405,6 +493,7 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
     # Authenticated: the auth phase is over, so the pre-auth slot frees now
     # (the socket then lives for hours; it must not count against the cap).
     _free()
+    _note_serving()
 
     # --- version policy + auto-update push ---
     # After authentication so we never send the tarball to an unknown peer.
@@ -502,8 +591,22 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
             # ``update_required`` from its message loop, with no deadline.
             # No CLI pins: no reconcile starts on code about to be replaced.
             # The connection is never registered.
+            # A rollback is counted at the next reconnect only for a push that
+            # reached the satellite (its acknowledgement, or our close going
+            # out on a live socket): a push lost with a dying socket is a
+            # delivery failure, offered again without spending the budget or
+            # raising the banner.
+            watch = _PushWatch(websocket)
+            sent = acked = False
             try:
                 await websocket.send_text(json.dumps(_auth_ok(machine, cli_pins={})))
+                hold = _update_hold_left()
+                if hold > 0 and not await watch.lives_through(hold):
+                    logger.info(
+                        "Satellite %s: its socket ended while the update waited out the "
+                        "proxy's start; offered again at its next connect", machine_id[:8],
+                    )
+                    return
                 from api.remote.remote_machines import get_satellite_tarball_with_hash
                 import base64 as _b64
                 # Cached after the first build, but that first build tars
@@ -524,12 +627,9 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
                     len(tarball_bytes),
                 )
                 await websocket.send_text(json.dumps(payload))
-                # Broadcast to any attached dashboard WS users.
-                await _broadcast_satellite_updating(
-                    machine_id, machine, sat_version, SATELLITE_VERSION_LATEST,
-                )
-                # Remember the target so the next reconnect can detect a rollback.
-                note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
+                sent = True
+                if _version_at_least(sat_version, UPDATE_ACK_SATELLITE_VERSION):
+                    acked = await watch.acknowledged(SATELLITE_VERSION_LATEST, _UPDATE_ACK_WAIT_S)
             except Exception as e:
                 logger.exception(
                     "Satellite %s: failed to push update: %s",
@@ -540,7 +640,20 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
                     {"target_version": "", "error": f"push failed: {e}"},
                 )
             # Close so the satellite applies the update and reconnects.
-            await websocket.close(code=4007, reason="updating")
+            with contextlib.suppress(Exception):
+                await websocket.close(code=4007, reason="updating")
+            if sent and (acked or await watch.closed_live()):
+                # Remember the target so the next reconnect can detect a rollback.
+                note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
+                with contextlib.suppress(Exception):
+                    await _broadcast_satellite_updating(
+                        machine_id, machine, sat_version, SATELLITE_VERSION_LATEST,
+                    )
+            elif sent:
+                logger.warning(
+                    "Satellite %s: the update push did not reach it (its socket was gone); "
+                    "offered again at its next connect, no rollback counted", machine_id[:8],
+                )
             return
         elif must_reject:
             # Auto-update disabled (or paused after repeated rollbacks) and
@@ -599,6 +712,10 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
     conn = await cm.register(
         machine_id, websocket, capabilities, satellite_version=sat_version,
     )
+    # The machine's credential gateway served from memory while its link was
+    # down: tell it now what was revoked (or renewed) meanwhile.
+    from core.remote import mcp_gateway_push
+    mcp_gateway_push.tick_machine_soon(machine_id)
 
     # --- Message loop ---
     try:

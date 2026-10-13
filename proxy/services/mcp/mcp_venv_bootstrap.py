@@ -9,18 +9,23 @@ to the platform:
   is newer than the venv, rebuild via the shared ``mcp_installer.install_mcp``.
   Platform-shipped (``custom``) folders only: a community MCP installs from its
   ``server.source`` and its folder's ``requirements.txt`` is never built.
-- **Python interpreter** — if a venv was built on an interpreter OLDER than the
-  proxy's own (e.g. a 3.10 venv after the platform bumped to 3.13), delete it and
-  rebuild pinned to the proxy interpreter. Upstream ``requires-python`` ceilings
-  are respected: an MCP already reconciled to the current target is left alone (a
-  ``.oto-runtime.json`` marker prevents re-installing a ceiling-pinned MCP — e.g.
-  ``ha-mcp <3.14`` — on every boot).
+- **Python interpreter** — every venv the pass creates is pinned to the proxy's
+  own minor (``install_mcp``'s ``python_spec``), the first one included. A venv
+  built on an interpreter OLDER than the proxy's (e.g. a 3.10 venv after the
+  platform bumped to 3.13), or one whose interpreter lies outside the folders
+  the session sandbox binds, is deleted and rebuilt the same way. A floor the
+  package asks for is respected and recorded in the ``.oto-runtime.json``
+  marker; a pin that fails is recorded too and retried after a day, never at
+  every boot (the pass runs before the proxy serves).
 - **Node native addons** — if the system ``node`` MAJOR changed since an MCP's
   ``node_modules/`` was built, ``npm rebuild`` its native bindings (advisory).
 
 This closes the gap where a fresh clone, a ``git pull`` that bumps
 ``requirements.txt``, or a platform runtime bump leaves an MCP's venv/addons stale
 and the MCP silently fails to launch.
+
+The pass ends by removing the uv-managed interpreters no venv uses
+(``mcp_installer.prune_uv_pythons``); nothing installs while it runs.
 
 The satellite has its own equivalent (it builds venvs locally during
 ``sync_mcps`` on the satellite host's interpreter); this module is proxy-only and
@@ -37,13 +42,14 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
 from services.mcp import mcp_installer
 from services.mcp import mcp_manifest_types as _mt
 
-logger = logging.getLogger("claude-proxy.venv-bootstrap")
+logger = logging.getLogger("otodock.venv-bootstrap")
 
 # Per-MCP runtime marker (next to manifest.json, SURVIVES a venv rmtree). Records
 # the platform runtime an MCP was last reconciled against so the sweep is
@@ -51,8 +57,18 @@ logger = logging.getLogger("claude-proxy.venv-bootstrap")
 _RUNTIME_MARKER = ".oto-runtime.json"
 
 
-def _uv_bin_if_present() -> str | None:
-    """First ``uv`` binary found in the standard locations, or ``None``.
+# A failed interpreter pin is tried again after this long, not at every boot.
+PIN_RETRY_AFTER = timedelta(hours=24)
+
+# The system folders the session sandbox binds read-only that an interpreter
+# can live in (``core/sandbox/sandbox.py``'s system binds; ``/snap/bin`` holds
+# no interpreter). ``mcps/.uv-python`` and the MCP's own folder join them.
+_SYSTEM_INTERPRETER_ROOTS = ("/usr", "/bin", "/lib", "/lib64", "/lib32", "/sbin")
+
+
+def find_uv() -> str | None:
+    """The ``uv`` binary the platform installs with, or ``None``: the standard
+    locations first (a readable, executable file), then ``PATH``.
 
     Mirrors ``satellite/sessions/mcp_install_support.py::_uv_bin_if_present`` so
     platform and satellite agree on where to look. ``uv`` is preferred over plain
@@ -66,7 +82,45 @@ def _uv_bin_if_present() -> str | None:
     ):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK | os.R_OK):
             return candidate
-    return None
+    return shutil.which("uv")
+
+
+def proxy_python_spec() -> str:
+    """The proxy's own Python minor, the interpreter MCP venvs are pinned to."""
+    return f"{sys.version_info[0]}.{sys.version_info[1]}"
+
+
+def sandbox_interpreter_roots(mcp_dir: Path | None = None) -> list[Path]:
+    """The resolved folders a venv's interpreter must live in for a session
+    sandbox to run it: the system binds, ``mcps/.uv-python`` and, given, the
+    MCP's own folder."""
+    roots = [Path(p).resolve() for p in _SYSTEM_INTERPRETER_ROOTS]
+    roots.append(Path(config.MCPS_DIR).resolve() / ".uv-python")
+    if mcp_dir is not None:
+        roots.append(Path(mcp_dir).resolve())
+    return roots
+
+
+def venv_outside_sandbox(mcp_dir: Path) -> bool:
+    """Whether the MCP's ``venv/`` runs on an interpreter the session sandbox
+    does not bind (a hand-built venv on ``~/.local/share/uv``, say)."""
+    venv_dir = Path(mcp_dir) / "venv"
+    return venv_dir.is_dir() and mcp_installer.venv_outside(
+        venv_dir, sandbox_interpreter_roots(mcp_dir))
+
+
+def _pin_failed_recently(mcp_dir: Path, spec: str, now: datetime | None = None) -> str:
+    """The time of a failed pin to ``spec`` within ``PIN_RETRY_AFTER`` ("" when
+    none): the venv stays as it is until then."""
+    failed = _read_marker(mcp_dir).get("python_pin_failed") or {}
+    if not isinstance(failed, dict) or failed.get("target") != spec:
+        return ""
+    try:
+        at = datetime.fromisoformat(str(failed.get("at", "")))
+    except ValueError:
+        return ""
+    now = now or datetime.now(timezone.utc)
+    return failed["at"] if now - at < PIN_RETRY_AFTER else ""
 
 
 def _venv_is_stale(
@@ -193,34 +247,6 @@ def _needs_python_reconcile(venv_dir: Path, target: tuple[int, int], mcp_dir: Pa
     return _read_marker(mcp_dir).get("python") != f"{target[0]}.{target[1]}"
 
 
-async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], mcp_dir: Path) -> None:
-    """Pre-create ``venv_dir`` on the proxy's interpreter so the subsequent
-    ``install_mcp`` pip-installs into a venv that MATCHES the platform.
-
-    Any uv-fetched Python lands in ``mcps/.uv-python/`` (already sandbox-mounted),
-    keeping every MCP self-contained. Best-effort: on failure ``venv_dir`` is left
-    absent so ``install_mcp`` falls back to creating it on uv's default Python.
-    """
-    spec = f"{target[0]}.{target[1]}"
-    # The installer's own environment and time bound, as every install
-    # subprocess gets: no platform secret reaches uv.
-    env = mcp_installer._install_env({
-        "UV_PYTHON_INSTALL_DIR": str(mcp_dir.parent.parent / ".uv-python"),
-        "UV_LINK_MODE": "copy",
-    })
-    try:
-        rc, out = await mcp_installer._run_bounded(
-            [uv_bin, "venv", "--python", spec, str(venv_dir)],
-            cwd=None, env=env, timeout=mcp_installer.DEFAULT_INSTALL_TIMEOUT,
-        )
-        if rc != 0:
-            logger.warning(
-                "uv venv --python %s for %s failed: %s", spec, mcp_dir.name, out[-300:],
-            )
-    except Exception:
-        logger.exception("uv venv --python %s for %s errored", spec, mcp_dir.name)
-
-
 async def _reconcile_node_addons(mcp_dir: Path, name: str) -> str | None:
     """``npm rebuild`` a Node MCP's native addons when the system node MAJOR
     changed since ``node_modules`` was built.
@@ -268,13 +294,16 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
 
     - ``"ok"`` — venv was (re)built (missing or deps changed)
     - ``"ok-py-reconcile"`` — venv rebuilt because its interpreter lagged the proxy
+    - ``"ok-py-relocate"`` — venv rebuilt because its interpreter lay outside the
+      folders the session sandbox binds
     - ``"ok-node-rebuild"`` — node addons rebuilt after a node MAJOR bump
     - ``"failed"`` — install_mcp returned ``ok=False``
     - ``"exception"`` — install_mcp raised
     - ``"fresh"`` — venv exists, current deps + interpreter; skipped
     - ``"skipped-no-reqs"`` — Python MCP with no requirements.txt
     - ``"skipped-community-python"`` - a catalog Python MCP (installed from its
-      ``server.source``, never from a folder ``requirements.txt``)
+      ``server.source``, never from a folder ``requirements.txt``; one outside
+      the sandbox's folders is offered as an update by the check)
     - ``"skipped-docker"`` — Docker MCP; handled by ``docker_manager``
     - ``"skipped-bundled-node"`` — Node MCP without ``node_modules`` to rebuild
     - ``"skipped-node-rebuild-fail"`` — npm rebuild failed (advisory)
@@ -290,8 +319,9 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
         )
         return results
 
-    uv = _uv_bin_if_present()
+    uv = find_uv()
     target = sys.version_info[:2]  # the proxy's interpreter — venvs must not lag it
+    spec = proxy_python_spec()
 
     for category in ("custom", "community"):
         cat_dir = mcps_root / category
@@ -323,6 +353,12 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
                 # file names, outside the wheels-only rule: platform-shipped
                 # folders only (a community MCP installs from server.source).
                 if category != "custom":
+                    if venv_outside_sandbox(mcp_dir):
+                        logger.warning(
+                            "ensure_bundled_venvs: %s runs on an interpreter outside "
+                            "the folders the session sandbox binds; Check updates "
+                            "offers its rebuild", name,
+                        )
                     results[name] = "skipped-community-python"
                     continue
                 req_file = mcp_dir / "requirements.txt"
@@ -332,35 +368,49 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
                     continue
                 reqs_stale = _venv_is_stale(req_file, venv_dir, mcp_dir)
                 interp_stale = _needs_python_reconcile(venv_dir, target, mcp_dir)
-                if not reqs_stale and not interp_stale:
+                relocate = venv_outside_sandbox(mcp_dir)
+                rebuild = interp_stale or relocate
+                failed_at = _pin_failed_recently(mcp_dir, spec) if rebuild else ""
+                if failed_at:
+                    logger.warning(
+                        "ensure_bundled_venvs: the venv of %s stays as it is: its "
+                        "rebuild on Python %s failed at %s, tried again a day later",
+                        name, spec, failed_at,
+                    )
+                    rebuild = interp_stale = relocate = False
+                if not reqs_stale and not rebuild:
                     results[name] = "fresh"
                     continue
-                if interp_stale:
+                created = rebuild or not venv_dir.is_dir()
+                if rebuild:
                     # Swapping the interpreter REQUIRES deleting the old venv —
-                    # install_mcp reuses an existing one. Pre-create it on the
-                    # proxy interpreter so the rebuild matches the platform; on
-                    # failure install_mcp recreates it on uv's default.
+                    # install_mcp reuses an existing one and creates a missing
+                    # one on the pin. The success mark goes first: a rebuild
+                    # that fails must not leave an empty venv reading fresh.
+                    _forget_success(mcp_dir)
                     await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
-                    if uv:
-                        await _uv_venv_pinned(uv, venv_dir, target, mcp_dir)
                 logger.info(
                     "ensure_bundled_venvs: %s venv for %s at %s",
-                    "reconciling" if interp_stale else "building", name, mcp_dir,
+                    "relocating" if relocate else "reconciling" if interp_stale else "building",
+                    name, mcp_dir,
                 )
                 try:
                     result = await mcp_installer.install_mcp(
                         mcp_dir, "python", "", uv_bin=uv,
+                        python_spec=spec, sandbox_roots=sandbox_interpreter_roots(mcp_dir),
                     )
                     if result.ok:
-                        results[name] = "ok-py-reconcile" if interp_stale else "ok"
+                        results[name] = ("ok-py-relocate" if relocate
+                                         else "ok-py-reconcile" if interp_stale else "ok")
                         # Success mark: the dep sync exited 0 for THESE
                         # requirements — the staleness check trusts only this.
                         _write_marker(
                             mcp_dir,
                             requirements_sha256=_requirements_hash(req_file),
                         )
-                        if interp_stale:
-                            _write_marker(mcp_dir, python=f"{target[0]}.{target[1]}")
+                        if created:
+                            _mark_interpreter(mcp_dir, name, spec, result.venv_python,
+                                              pinnable=uv is not None)
                     else:
                         results[name] = "failed"
                         logger.warning(
@@ -389,4 +439,91 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
 
             results[name] = f"skipped-runtime-{runtime}"
 
+    removed = await asyncio.to_thread(mcp_installer.prune_uv_pythons, mcps_root)
+    if removed:
+        logger.info("ensure_bundled_venvs: removed unused uv interpreters: %s", removed)
     return results
+
+
+def _forget_success(mcp_dir: Path) -> None:
+    """Drop the success mark (and the reconciled interpreter) before a venv is
+    deleted for a rebuild: until the rebuild succeeds the venv is stale."""
+    data = _read_marker(mcp_dir)
+    dropped = [data.pop(key, None) for key in ("requirements_sha256", "python")]
+    if dropped == [None, None]:
+        return
+    try:
+        (mcp_dir / _RUNTIME_MARKER).write_text(json.dumps(data))
+    except OSError as e:
+        logger.warning("could not write runtime marker for %s: %s", mcp_dir.name, e)
+
+
+def _mark_interpreter(mcp_dir: Path, name: str, spec: str, venv_python: str,
+                      *, pinnable: bool = True) -> None:
+    """Record what the venv just created runs on. Made on the pin or on a
+    floor the package asked for, inside the sandbox's folders: reconciled.
+    On uv's default (the pin failed) or still outside: the failure, so the
+    next start leaves it alone for a day instead of reading it reconciled.
+    With no uv on the host nothing can be pinned: the venv reads reconciled
+    as before, never a daily rebuild."""
+    data = _read_marker(mcp_dir)
+    if not pinnable or (venv_python and not venv_outside_sandbox(mcp_dir)):
+        data.pop("python_pin_failed", None)
+        data["python"] = spec
+    else:
+        data.pop("python", None)
+        data["python_pin_failed"] = {
+            "target": spec, "at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.warning(
+            "ensure_bundled_venvs: %s could not be built on Python %s inside the "
+            "folders the session sandbox binds; tried again a day later", name, spec,
+        )
+    try:
+        (mcp_dir / _RUNTIME_MARKER).write_text(json.dumps(data))
+    except OSError as e:
+        logger.warning("could not write runtime marker for %s: %s", mcp_dir.name, e)
+
+
+# A cause is logged once per MCP and process, not at every session start.
+_causes_logged: set[tuple[str, str]] = set()
+
+
+def start_failure_cause(manifest) -> str:
+    """Why a stdio MCP's process may not have started, read from its folder
+    without running anything: a missing venv or command, an interpreter the
+    session sandbox does not bind, a Node MCP with no ``node_modules``. ""
+    when the folder shows nothing wrong."""
+    mcp_dir = Path(getattr(manifest, "mcp_dir", "") or "")
+    server = getattr(manifest, "server", None)
+    if not str(mcp_dir) or server is None or not mcp_dir.is_dir():
+        return ""
+    runtime = getattr(server, "runtime", "")
+    command = str(getattr(server, "command", "") or "")
+    if runtime == _mt.RUNTIME_PYTHON:
+        if not (mcp_dir / "venv" / "pyvenv.cfg").is_file():
+            return "its venv/ is missing"
+        if venv_outside_sandbox(mcp_dir):
+            paths = mcp_installer.venv_interpreter_paths(mcp_dir / "venv")
+            return (f"its interpreter ({paths[-1] if paths else 'unknown'}) lies outside "
+                    "the folders the session sandbox binds")
+    if runtime == _mt.RUNTIME_NODE and (mcp_dir / "package.json").is_file() \
+            and not (mcp_dir / "node_modules").is_dir():
+        return "its node_modules/ is missing"
+    if command and not os.path.isabs(command) and "/" in command \
+            and not (mcp_dir / command).exists():
+        return f"its command {command} is missing"
+    return ""
+
+
+def log_start_failures(manifests: list) -> None:
+    """Log, once per MCP and cause, why each of ``manifests`` (MCPs a session
+    reported failed) may not have started. Blocking file reads: call off the
+    event loop."""
+    for manifest in manifests:
+        cause = start_failure_cause(manifest) or "no cause visible to the platform"
+        key = (getattr(manifest, "name", ""), cause)
+        if key in _causes_logged:
+            continue
+        _causes_logged.add(key)
+        logger.warning("MCP %s failed to start: %s", key[0], cause)

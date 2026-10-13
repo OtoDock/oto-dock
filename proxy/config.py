@@ -127,9 +127,93 @@ _reject_unreadable_config(_config_env)
 _file_cfg = dotenv_values(_config_env) if _config_env.exists() else {}
 
 
+# Every key read through _cfg at import: the unknown-key warning at the end
+# of this module compares config.env's keys against it.
+_CFG_KEYS_READ: set[str] = set()
+
+
 def _cfg(key: str, default: str = "") -> str:
     """Read config: os.environ (Docker/systemd override) > config.env file > default."""
+    _CFG_KEYS_READ.add(key)
     return os.environ.get(key) or _file_cfg.get(key) or default
+
+
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+# A tri-state key (COOKIE_SECURE, RUNNING_IN_DOCKER, OTODOCK_LOCAL_PBX_ENABLED)
+# keeps its derived default on "auto", as every other word did before 1.8.0.
+_AUTO_WORDS = ("auto",)
+
+
+def _word(raw: str) -> str:
+    """A yes/no or numeric value as written, less an inline comment: dotenv
+    drops one, systemd's EnvironmentFile keeps it (``X=false   # why`` arrives
+    whole, ``X="true" # why`` as ``true# why``), and no accepted word or
+    number holds a ``#``."""
+    return raw.split("#", 1)[0].strip()
+
+
+def _parse_bool(key: str, raw: str, default: bool | None) -> bool | None:
+    """The yes/no rule, one for every key: 1 true yes on / 0 false no off, case
+    and surrounding whitespace ignored; empty is the default; a tri-state key
+    (``default`` None) also takes ``auto``. Any other word stops the boot
+    naming the key: a wrong value read silently as "off" is the bug this
+    replaces (``OIDC_ENABLED`` written as 1 and ``OTODOCK_AIR_GAPPED`` written
+    as yes were both off)."""
+    word = _word(raw).lower()
+    if word == "" or (default is None and word in _AUTO_WORDS):
+        return default
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    raise SystemExit(
+        f"FATAL: {key}={word!r} is not a yes/no value: use true or false "
+        f"(1/0, yes/no, on/off)."
+    )
+
+
+def _parse_int(key: str, raw: str, default: int, minimum: int | None = None) -> int:
+    """A whole number; empty is the default; ``minimum`` clamps (the floors
+    the limits keep, ``max(1, …)`` before). Anything else stops the boot
+    naming the key, where ``int()`` used to raise a bare ValueError."""
+    word = _word(raw)
+    if word == "":
+        value = default
+    else:
+        try:
+            value = int(word, 10)
+        except ValueError:
+            raise SystemExit(f"FATAL: {key}={word!r} is not a whole number.") from None
+    return value if minimum is None else max(minimum, value)
+
+
+def _parse_float(key: str, raw: str, default: float, minimum: float | None = None) -> float:
+    """A number (nan and inf refused); empty is the default; ``minimum`` clamps."""
+    import math
+    word = _word(raw)
+    if word == "":
+        value = float(default)
+    else:
+        try:
+            value = float(word)
+        except ValueError:
+            raise SystemExit(f"FATAL: {key}={word!r} is not a number.") from None
+        if not math.isfinite(value):
+            raise SystemExit(f"FATAL: {key}={word!r} is not a number.")
+    return value if minimum is None else max(minimum, value)
+
+
+def _cfg_bool(key: str, default: bool | None) -> bool | None:
+    return _parse_bool(key, _cfg(key, ""), default)
+
+
+def _cfg_int(key: str, default: int, *, minimum: int | None = None) -> int:
+    return _parse_int(key, _cfg(key, ""), default, minimum)
+
+
+def _cfg_float(key: str, default: float, *, minimum: float | None = None) -> float:
+    return _parse_float(key, _cfg(key, ""), default, minimum)
 
 
 # Is the PROXY ITSELF running inside a container? Distinct from OTODOCK_CLOUD
@@ -143,13 +227,11 @@ def _default_running_in_docker() -> bool:
     import os
     return os.path.exists("/.dockerenv")
 
-_running_in_docker_env = _cfg("RUNNING_IN_DOCKER", "").lower()
-if _running_in_docker_env in ("1", "true", "yes"):
-    RUNNING_IN_DOCKER = True
-elif _running_in_docker_env in ("0", "false", "no"):
-    RUNNING_IN_DOCKER = False
-else:
+_running_in_docker_env = _cfg_bool("RUNNING_IN_DOCKER", None)
+if _running_in_docker_env is None:
     RUNNING_IN_DOCKER = _default_running_in_docker()
+else:
+    RUNNING_IN_DOCKER = _running_in_docker_env
 
 
 def _write_config_env(text: str, *, append: bool) -> None:
@@ -291,7 +373,7 @@ UPLOAD_STAGING_DIR = PLATFORM_DATA_DIR / "upload-staging"
 # Deliberately much smaller than OTODOCK_MAX_FILE_MB (Windows-Recycle-Bin-style:
 # big files bypass the bin) so a couple of video-sized deletions can't evict the
 # small-file undo history everyone actually needs. Raise per-install if desired.
-RECOVER_BIN_MAX_BYTES = int(_cfg("RECOVER_BIN_MAX_MB", "100")) * 1024 * 1024
+RECOVER_BIN_MAX_BYTES = _cfg_int("RECOVER_BIN_MAX_MB", 100) * 1024 * 1024
 # Per-agent aggregate ceiling on live recover-bin captures. The recover-bin sits
 # OUTSIDE the agent quota tree (sibling of agents/), so without this an overwrite
 # loop could grow it unbounded and fill the backing filesystem even while the
@@ -315,7 +397,7 @@ SESSIONS_DIR = PLATFORM_DATA_DIR / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Server
-PORT = int(_cfg("PROXY_PORT", "8400"))
+PORT = _cfg_int("PROXY_PORT", 8400)
 HOST = _cfg("PROXY_HOST", "0.0.0.0")
 # The internal listener's port on 127.0.0.1, assigned by app.py at boot once
 # its socket is bound (0 = none: tests, scripts, a server not started from
@@ -364,10 +446,10 @@ TRUSTED_PROXIES = [s.strip() for s in _cfg("TRUSTED_PROXY", "").split(",") if s.
 # seconds, and counts stalls for the ``loop`` block of GET /v1/admin/health. 0 disables it. Added
 # after the 2026-09-03 stall, whose blocking frame had to be reconstructed
 # from health-probe gaps because nothing in the frozen window was logged.
-LOOP_WATCHDOG_THRESHOLD_S = float(_cfg("LOOP_WATCHDOG_THRESHOLD_S", "2.0") or 0)
+LOOP_WATCHDOG_THRESHOLD_S = _cfg_float("LOOP_WATCHDOG_THRESHOLD_S", 2.0)
 # Shorter stalls, from this long up, are logged once with the stalled stack
 # and counted in the ``loop`` histogram. 0 disables them.
-LOOP_WATCHDOG_REPORT_S = float(_cfg("LOOP_WATCHDOG_REPORT_S", "0.25") or 0)
+LOOP_WATCHDOG_REPORT_S = _cfg_float("LOOP_WATCHDOG_REPORT_S", 0.25)
 
 # Per-sandbox cap on the RAM-backed ``/tmp`` tmpfs (bwrap ``--size``), in MB.
 # ``/tmp`` is the agent's HOME (package caches, model downloads) and the CLI's
@@ -375,14 +457,14 @@ LOOP_WATCHDOG_REPORT_S = float(_cfg("LOOP_WATCHDOG_REPORT_S", "0.25") or 0)
 # commit N × RAM/2. Bounded by half the host's RAM at use (never looser than
 # the kernel default); 0 disables; ignored where bubblewrap lacks ``--size``
 # (0.6.1). See core/sandbox/sandbox.py::tmpfs_cap_mb.
-SANDBOX_TMP_SIZE_MB = int(_cfg("SANDBOX_TMP_SIZE_MB", "4096") or 0)
+SANDBOX_TMP_SIZE_MB = _cfg_int("SANDBOX_TMP_SIZE_MB", 4096)
 
 # Universal per-file size cap: ONE knob for the satellite sync engine (manifest
 # + push/pull legs) AND every dashboard/chat upload (both hit POST /v1/upload).
 # Satellites learn the sync cap via the auth_result policy handshake — the proxy
 # config is the single source of truth; pre-0.5.103 satellites are pinned to the
 # legacy 100MB by the per-machine gate in satellite_connection.effective_sync_cap.
-MAX_FILE_MB = int(_cfg("OTODOCK_MAX_FILE_MB", "1024"))
+MAX_FILE_MB = _cfg_int("OTODOCK_MAX_FILE_MB", 1024)
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 SYNC_MAX_FILE_BYTES = MAX_FILE_BYTES  # alias read by core/remote/file_sync.py
 MAX_UPLOAD_SIZE_BYTES = MAX_FILE_BYTES  # alias read live by api/media/uploads.py
@@ -442,8 +524,8 @@ SYNC_IGNORE_RULES: dict = {
 # pull-side files / bytes, or the per-turn inbound write counter crosses it
 # within its rolling window. Signal for extending SYNC_IGNORE_RULES, never a
 # decision point.
-SYNC_DELTA_ALERT_FILES = int(_cfg("OTODOCK_SYNC_DELTA_ALERT_FILES", "2000"))
-SYNC_DELTA_ALERT_BYTES = int(_cfg("OTODOCK_SYNC_DELTA_ALERT_MB", "500")) * 1024 * 1024
+SYNC_DELTA_ALERT_FILES = _cfg_int("OTODOCK_SYNC_DELTA_ALERT_FILES", 2000)
+SYNC_DELTA_ALERT_BYTES = _cfg_int("OTODOCK_SYNC_DELTA_ALERT_MB", 500) * 1024 * 1024
 
 # Chunk size handed to browsers by POST /v1/upload/chunked/init. Files bigger
 # than one chunk upload as N sequential ≤chunk-size requests, so CDN/gateway
@@ -452,52 +534,47 @@ SYNC_DELTA_ALERT_BYTES = int(_cfg("OTODOCK_SYNC_DELTA_ALERT_MB", "500")) * 1024 
 # clearing common edge caps with a 3× margin. The server DICTATES this value —
 # clients slice strictly by what init returns (a client-chosen size would
 # invite silent offset corruption).
-UPLOAD_CHUNK_MB = int(_cfg("OTODOCK_UPLOAD_CHUNK_MB", "32"))
+UPLOAD_CHUNK_MB = _cfg_int("OTODOCK_UPLOAD_CHUNK_MB", 32)
 UPLOAD_CHUNK_BYTES = UPLOAD_CHUNK_MB * 1024 * 1024
 # Chunked-upload staging bounds: open uploads per user (429) and in total
 # (503), staged MB per user (429; never below one file's cap), and how long
 # an upload may wait for its FIRST chunk before the sweep drops it (one
 # with chunks keeps the 24 h resume window). 0 = no cap for the counts.
-UPLOAD_MAX_OPEN = int(_cfg("OTODOCK_UPLOAD_MAX_OPEN", "4"))
-UPLOAD_MAX_OPEN_TOTAL = int(_cfg("OTODOCK_UPLOAD_MAX_OPEN_TOTAL", "256"))
-UPLOAD_STAGING_USER_MB = max(
-    MAX_FILE_MB, int(_cfg("OTODOCK_UPLOAD_STAGING_USER_MB", str(2 * MAX_FILE_MB))))
-UPLOAD_FIRST_CHUNK_S = int(_cfg("OTODOCK_UPLOAD_FIRST_CHUNK_S", "3600"))
+UPLOAD_MAX_OPEN = _cfg_int("OTODOCK_UPLOAD_MAX_OPEN", 4)
+UPLOAD_MAX_OPEN_TOTAL = _cfg_int("OTODOCK_UPLOAD_MAX_OPEN_TOTAL", 256)
+UPLOAD_STAGING_USER_MB = _cfg_int("OTODOCK_UPLOAD_STAGING_USER_MB", 2 * MAX_FILE_MB, minimum=MAX_FILE_MB)
+UPLOAD_FIRST_CHUNK_S = _cfg_int("OTODOCK_UPLOAD_FIRST_CHUNK_S", 3600)
 # Free space a new upload must leave on the data disk: the larger of the two
 # (507 below it).
-MIN_FREE_DISK_MB = int(_cfg("OTODOCK_MIN_FREE_DISK_MB", "5120"))
-MIN_FREE_DISK_PCT = float(_cfg("OTODOCK_MIN_FREE_DISK_PCT", "5"))
+MIN_FREE_DISK_MB = _cfg_int("OTODOCK_MIN_FREE_DISK_MB", 5120)
+MIN_FREE_DISK_PCT = _cfg_float("OTODOCK_MIN_FREE_DISK_PCT", 5)
 
 # Global cap on CONCURRENT LARGE outbound (proxy→satellite) workspace pushes,
 # across ALL machines and both push paths (live fan-out + initial-sync push
 # branch). Per-machine pacing already exists (windowed acks + the two-lane
 # writer); this bounds the AGGREGATE — default 3 ≈ max 24MB in-flight
 # regardless of machine count. 0 = unlimited (gate disabled).
-SYNC_FANOUT_CONCURRENCY = int(_cfg("OTODOCK_SYNC_FANOUT_CONCURRENCY", "3"))
+SYNC_FANOUT_CONCURRENCY = _cfg_int("OTODOCK_SYNC_FANOUT_CONCURRENCY", 3)
 # Pushes SMALLER than this bypass the gate entirely (no slot, no queued row):
 # a small file is a handful of 512KB frames already bounded by the bulk queue,
 # and gating it would head-of-line-block live edits behind bulk transfers.
-SYNC_FANOUT_MIN_MB = int(_cfg("OTODOCK_SYNC_FANOUT_MIN_MB", "4"))
+SYNC_FANOUT_MIN_MB = _cfg_int("OTODOCK_SYNC_FANOUT_MIN_MB", 4)
 # A satellite's file_changed frames: appliers in flight per machine (frames
 # past it are dropped with a rate-limited warning; 0 = no shedding),
 # appliers running at once per machine and in total, and the size of the
 # last-change stamp map.
-SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE = int(
-    _cfg("SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE", "64"))
-SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE = max(1, int(
-    _cfg("SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", "4")))
-SAT_FILE_CHANGED_CONCURRENCY_GLOBAL = max(1, int(_cfg("SAT_FILE_CHANGED_CONCURRENCY_GLOBAL", "8")))
-SAT_FILE_CHANGED_STAMP_MAX = max(1, int(_cfg("SAT_FILE_CHANGED_STAMP_MAX", "4096")))
+SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE = _cfg_int("SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE", 64)
+SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE = _cfg_int("SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", 4, minimum=1)
+SAT_FILE_CHANGED_CONCURRENCY_GLOBAL = _cfg_int("SAT_FILE_CHANGED_CONCURRENCY_GLOBAL", 8, minimum=1)
+SAT_FILE_CHANGED_STAMP_MAX = _cfg_int("SAT_FILE_CHANGED_STAMP_MAX", 4096, minimum=1)
 # Threads that write, fsync and rename uploaded and pulled files.
-FILE_COMMIT_WORKERS = max(1, int(_cfg("FILE_COMMIT_WORKERS", "4")))
+FILE_COMMIT_WORKERS = _cfg_int("FILE_COMMIT_WORKERS", 4, minimum=1)
 
 # Global BACKSTOP cap on request body size (bytes), enforced by an ASGI
 # middleware via Content-Length. Defaults to the universal file cap plus margin
 # (multipart framing overhead) so it only rejects abusive oversized bodies
 # (→ 413); finer per-endpoint caps still apply underneath.
-MAX_REQUEST_BODY_BYTES = int(
-    _cfg("MAX_REQUEST_BODY_BYTES", str(MAX_FILE_BYTES + 64 * 1024 * 1024))
-)
+MAX_REQUEST_BODY_BYTES = _cfg_int("MAX_REQUEST_BODY_BYTES", MAX_FILE_BYTES + 64 * 1024 * 1024)
 
 # Tiered body caps under that backstop, counted on the streamed bytes: the
 # login routes, the webhook receivers, a request with no valid credential (a
@@ -506,69 +583,68 @@ MAX_REQUEST_BODY_BYTES = int(
 # presented but does not validate gets 401), and every other route off the
 # upload allowlist (which keeps the backstop). 0 turns a tier off (the
 # backstop still applies).
-MAX_AUTH_BODY_BYTES = int(_cfg("MAX_AUTH_BODY_BYTES", str(64 * 1024)))
-MAX_WEBHOOK_BODY_BYTES = int(_cfg("MAX_WEBHOOK_BODY_BYTES", str(2 * 1024 * 1024)))
+MAX_AUTH_BODY_BYTES = _cfg_int("MAX_AUTH_BODY_BYTES", 64 * 1024)
+MAX_WEBHOOK_BODY_BYTES = _cfg_int("MAX_WEBHOOK_BODY_BYTES", 2 * 1024 * 1024)
 # The webhook caps a route lifts to once its sender is checked
 # (api/events/webhook_body.py): a signed delivery of a large-event provider
 # (GitHub, GitLab, Jira) and a trigger fire whose API key verified. Never
 # below MAX_WEBHOOK_BODY_BYTES; 0 is the backstop.
-MAX_WEBHOOK_SIGNED_BODY_BYTES = int(_cfg("MAX_WEBHOOK_SIGNED_BODY_BYTES", str(25 * 1024 * 1024)))
-MAX_WEBHOOK_KEYED_BODY_BYTES = int(_cfg("MAX_WEBHOOK_KEYED_BODY_BYTES", str(25 * 1024 * 1024)))
+MAX_WEBHOOK_SIGNED_BODY_BYTES = _cfg_int("MAX_WEBHOOK_SIGNED_BODY_BYTES", 25 * 1024 * 1024)
+MAX_WEBHOOK_KEYED_BODY_BYTES = _cfg_int("MAX_WEBHOOK_KEYED_BODY_BYTES", 25 * 1024 * 1024)
 # Webhook bodies being read at once, in bytes: in all (half of it for
 # unchecked senders) and per client address. 0 turns a bound off.
-MAX_WEBHOOK_INFLIGHT_BYTES = int(_cfg("MAX_WEBHOOK_INFLIGHT_BYTES", str(128 * 1024 * 1024)))
-MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT = int(
-    _cfg("MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT", str(32 * 1024 * 1024)))
-MAX_UNAUTH_BODY_BYTES = int(_cfg("MAX_UNAUTH_BODY_BYTES", str(64 * 1024)))
-MAX_JSON_BODY_BYTES = int(_cfg("MAX_JSON_BODY_BYTES", str(8 * 1024 * 1024)))
+MAX_WEBHOOK_INFLIGHT_BYTES = _cfg_int("MAX_WEBHOOK_INFLIGHT_BYTES", 128 * 1024 * 1024)
+MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT = _cfg_int("MAX_WEBHOOK_INFLIGHT_BYTES_PER_CLIENT", 32 * 1024 * 1024)
+MAX_UNAUTH_BODY_BYTES = _cfg_int("MAX_UNAUTH_BODY_BYTES", 64 * 1024)
+MAX_JSON_BODY_BYTES = _cfg_int("MAX_JSON_BODY_BYTES", 8 * 1024 * 1024)
 
 # Hard ceiling for any paginated list endpoint's page size.
-MAX_PAGE_SIZE = int(_cfg("MAX_PAGE_SIZE", "500"))
+MAX_PAGE_SIZE = _cfg_int("MAX_PAGE_SIZE", 500)
 
 # A text file larger than this is not read inline by the files API (413):
 # the client downloads it instead.
-INLINE_TEXT_MAX_BYTES = int(_cfg("INLINE_TEXT_MAX_BYTES", str(5 * 1024 * 1024)))
+INLINE_TEXT_MAX_BYTES = _cfg_int("INLINE_TEXT_MAX_BYTES", 5 * 1024 * 1024)
 # Workspace zip downloads: builds at once, paths in one request, files in
 # one archive and the total input size (413 past the last three).
-ZIP_MAX_CONCURRENT = max(1, int(_cfg("ZIP_MAX_CONCURRENT", "2")))
-ZIP_MAX_PATHS = int(_cfg("ZIP_MAX_PATHS", "500"))
-ZIP_MAX_ENTRIES = int(_cfg("ZIP_MAX_ENTRIES", "100000"))
-ZIP_MAX_INPUT_MB = int(_cfg("ZIP_MAX_INPUT_MB", "4096"))
+ZIP_MAX_CONCURRENT = _cfg_int("ZIP_MAX_CONCURRENT", 2, minimum=1)
+ZIP_MAX_PATHS = _cfg_int("ZIP_MAX_PATHS", 500)
+ZIP_MAX_ENTRIES = _cfg_int("ZIP_MAX_ENTRIES", 100000)
+ZIP_MAX_INPUT_MB = _cfg_int("ZIP_MAX_INPUT_MB", 4096)
 # Workspace copies through the files API: the bytes and the files one
 # request may copy across all its sources (a source past either fails;
 # 0 = no cap).
-COPY_MAX_INPUT_MB = int(_cfg("COPY_MAX_INPUT_MB", "4096"))
-COPY_MAX_ENTRIES = int(_cfg("COPY_MAX_ENTRIES", "100000"))
+COPY_MAX_INPUT_MB = _cfg_int("COPY_MAX_INPUT_MB", 4096)
+COPY_MAX_ENTRIES = _cfg_int("COPY_MAX_ENTRIES", 100000)
 # Temporary public image URLs (/v1/images/temp): the mint copies the image,
 # so each copy is capped, and so are the copies one session and all
 # sessions hold at once.
-TEMP_IMAGE_MAX_BYTES = int(_cfg("TEMP_IMAGE_MAX_MB", "20")) * 1024 * 1024
-TEMP_IMAGE_MAX_PER_SESSION = int(_cfg("TEMP_IMAGE_MAX_PER_SESSION", "20"))
-TEMP_IMAGE_MAX_TOTAL_BYTES = int(_cfg("TEMP_IMAGE_MAX_TOTAL_MB", "256")) * 1024 * 1024
+TEMP_IMAGE_MAX_BYTES = _cfg_int("TEMP_IMAGE_MAX_MB", 20) * 1024 * 1024
+TEMP_IMAGE_MAX_PER_SESSION = _cfg_int("TEMP_IMAGE_MAX_PER_SESSION", 20)
+TEMP_IMAGE_MAX_TOTAL_BYTES = _cfg_int("TEMP_IMAGE_MAX_TOTAL_MB", 256) * 1024 * 1024
 
 # Password hashes (bcrypt, about a core for 250 ms each) computed at once;
 # the rest wait their turn off the event loop.
-AUTH_HASH_CONCURRENCY = max(1, int(_cfg("AUTH_HASH_CONCURRENCY", "4")))
+AUTH_HASH_CONCURRENCY = _cfg_int("AUTH_HASH_CONCURRENCY", 4, minimum=1)
 # Password hashes waiting their turn; past this a login or a password change
 # is answered 503 with Retry-After instead of queueing.
-AUTH_HASH_MAX_WAITERS = int(_cfg("AUTH_HASH_MAX_WAITERS", "64"))
+AUTH_HASH_MAX_WAITERS = _cfg_int("AUTH_HASH_MAX_WAITERS", 64)
 # Webhook-fire key checks (bcrypt) at once, and how many may wait before
 # further fires are refused (503).
-WEBHOOK_KEY_VERIFY_CONCURRENCY = max(1, int(_cfg("WEBHOOK_KEY_VERIFY_CONCURRENCY", "2")))
-WEBHOOK_KEY_VERIFY_MAX_WAITERS = int(_cfg("WEBHOOK_KEY_VERIFY_MAX_WAITERS", "16"))
+WEBHOOK_KEY_VERIFY_CONCURRENCY = _cfg_int("WEBHOOK_KEY_VERIFY_CONCURRENCY", 2, minimum=1)
+WEBHOOK_KEY_VERIFY_MAX_WAITERS = _cfg_int("WEBHOOK_KEY_VERIFY_MAX_WAITERS", 16)
 
 # Max total DECOMPRESSED size of an uploaded community-MCP zip (zip-bomb guard).
-MCP_ZIP_DECOMPRESSED_MAX = int(_cfg("MCP_ZIP_DECOMPRESSED_MAX", str(500 * 1024 * 1024)))
+MCP_ZIP_DECOMPRESSED_MAX = _cfg_int("MCP_ZIP_DECOMPRESSED_MAX", 500 * 1024 * 1024)
 
 
 def _rate_limit_rule(prefix: str, mx: int, window: int, base_block: int, max_block: int) -> dict:
     """One keyed-rate-limit bucket config, each field env-overridable as
     ``RATE_LIMIT_<PREFIX>_{MAX,WINDOW,BLOCK,MAX_BLOCK}``."""
     return {
-        "max": int(_cfg(f"RATE_LIMIT_{prefix}_MAX", str(mx))),
-        "window": int(_cfg(f"RATE_LIMIT_{prefix}_WINDOW", str(window))),
-        "base_block": int(_cfg(f"RATE_LIMIT_{prefix}_BLOCK", str(base_block))),
-        "max_block": int(_cfg(f"RATE_LIMIT_{prefix}_MAX_BLOCK", str(max_block))),
+        "max": _cfg_int(f"RATE_LIMIT_{prefix}_MAX", mx),
+        "window": _cfg_int(f"RATE_LIMIT_{prefix}_WINDOW", window),
+        "base_block": _cfg_int(f"RATE_LIMIT_{prefix}_BLOCK", base_block),
+        "max_block": _cfg_int(f"RATE_LIMIT_{prefix}_MAX_BLOCK", max_block),
     }
 
 
@@ -576,7 +652,7 @@ def _rate_limit_rule(prefix: str, mx: int, window: int, base_block: int, max_blo
 # within the window). Consumed by ``auth/rate_limiter.py``. ``login`` preserves
 # the historical thresholds; the rest gate previously-unlimited surfaces.
 # Keys one rate-limit bucket keeps at most (auth/rate_limiter.py).
-RATE_LIMIT_MAX_KEYS = max(100, int(_cfg("RATE_LIMIT_MAX_KEYS", "50000")))
+RATE_LIMIT_MAX_KEYS = _cfg_int("RATE_LIMIT_MAX_KEYS", 50000, minimum=100)
 
 RATE_LIMIT_RULES = {
     "login":   _rate_limit_rule("LOGIN", 10, 900, 900, 14400),
@@ -674,12 +750,12 @@ BUN_BIN = _cfg(
     or (str(Path.home() / ".bun" / "bin" / "bun")
         if (Path.home() / ".bun" / "bin" / "bun").is_file() else "")
 )
-CLAUDE_TIMEOUT = int(_cfg("CLAUDE_TIMEOUT", "7200"))  # 2 hours — headroom for long tasks; per-deployment override via CLAUDE_TIMEOUT, per-install override via the session_timeout platform setting
+CLAUDE_TIMEOUT = _cfg_int("CLAUDE_TIMEOUT", 7200)  # 2 hours — headroom for long tasks; per-deployment override via CLAUDE_TIMEOUT, per-install override via the session_timeout platform setting
 # A chat turn with no stream line and nothing keeping it alive (no open tool,
 # no prompt waiting on a person, no background work, no recent hook) for this
 # long is ended with the ``silent`` ending (core/events/turn_life.py). Env or
 # config.env only, like CLAUDE_TIMEOUT, floored so a 0 cannot end every turn.
-TURN_SILENCE_S = max(60, int(_cfg("TURN_SILENCE_S", "600")))
+TURN_SILENCE_S = _cfg_int("TURN_SILENCE_S", 600, minimum=60)
 
 # Audio/video playback transcoding (services/media/media_pipeline.py). ffmpeg/ffprobe
 # are PROXY-SIDE ONLY — never mounted into the agent bwrap sandbox, never on
@@ -698,9 +774,9 @@ PHONE_SERVER_URL = _cfg("PHONE_SERVER_URL", "http://127.0.0.1:9093")
 # Calls agents may place through the relay: per agent and per tied user
 # each hour, per agent each day (0 = no cap), and optional E.164 prefixes a
 # destination must start with (comma-separated; empty = any number).
-PHONE_CALLS_PER_AGENT_PER_HOUR = int(_cfg("PHONE_CALLS_PER_AGENT_PER_HOUR", "10"))
-PHONE_CALLS_PER_USER_PER_HOUR = int(_cfg("PHONE_CALLS_PER_USER_PER_HOUR", "5"))
-PHONE_CALLS_PER_AGENT_PER_DAY = int(_cfg("PHONE_CALLS_PER_AGENT_PER_DAY", "50"))
+PHONE_CALLS_PER_AGENT_PER_HOUR = _cfg_int("PHONE_CALLS_PER_AGENT_PER_HOUR", 10)
+PHONE_CALLS_PER_USER_PER_HOUR = _cfg_int("PHONE_CALLS_PER_USER_PER_HOUR", 5)
+PHONE_CALLS_PER_AGENT_PER_DAY = _cfg_int("PHONE_CALLS_PER_AGENT_PER_DAY", 50)
 PHONE_CALL_ALLOWED_PREFIXES = [
     p.strip() for p in _cfg("PHONE_CALL_ALLOWED_PREFIXES", "").split(",") if p.strip()
 ]
@@ -1261,6 +1337,9 @@ def build_agent_prompt(model: str, *,
       7. ``# User Context (Personal)`` — ``users/{u}/context/*`` personal docs
       8. ``# Workspace`` — live directory tree (role-filtered)
       9. ``# Excluded MCPs`` — only when tools are unavailable
+      10. ``# Repository Instructions`` — the instruction files of the
+          repositories in the person's own workspace, for an engine that
+          declares ``behaviour.repository_instruction_files``
 
     Identity / scope / folder / permission sections are appended later by
     ``auth.path_policy.build_permission_context`` from the per-session
@@ -1557,6 +1636,24 @@ def build_agent_prompt(model: str, *,
             parts.append(_unavailable_row(mcp_name, reason))
         parts.append(_UNAVAILABLE_TAIL)
 
+    # The instruction files of the repositories in the person's own
+    # workspace, for an engine that does not load a nested repository's
+    # files itself (services/agents/repository_instructions: never the
+    # shared workspace, never an agent-scope or external session). LAST, so
+    # the platform's own headings above are found first, and under the
+    # ceiling an engine that cuts a long prompt from its end needs.
+    instruction_files = _repository_instruction_files(execution_path)
+    if instruction_files and username and not external and not external_home:
+        with contextlib.suppress(Exception):
+            from services.agents import repository_instructions as repo_instructions
+            budget = min(repo_instructions.BUDGET_BYTES,
+                         repo_instructions.PROMPT_CEILING_BYTES - len("\n".join(parts).encode()))
+            section = repo_instructions.render(
+                model, layout.scope_workspace(username), layout.virtual_workspace(username),
+                instruction_files, budget=budget)
+            if section:
+                parts.append("\n\n---\n\n" + section)
+
     return "\n".join(parts)
 
 
@@ -1641,13 +1738,13 @@ def fold_unavailable_mcps(prompt: str, unavailable: dict[str, str]) -> str:
 
 
 # Persistent sessions: idle timeout before reaping (seconds)
-PERSISTENT_SESSION_TIMEOUT = int(_cfg("PERSISTENT_SESSION_TIMEOUT", "900"))
+PERSISTENT_SESSION_TIMEOUT = _cfg_int("PERSISTENT_SESSION_TIMEOUT", 900)
 
 # A session with tracked background work (a Bash command left running, a
 # background subagent) is not idle: the reapers and the evictor spare it up
 # to this ceiling, then close it anyway (a job that never ends must not pin a
 # slot forever). Default = the per-turn ceiling.
-BACKGROUND_WORK_CEILING_S = int(_cfg("BACKGROUND_WORK_CEILING_S", str(CLAUDE_TIMEOUT)))
+BACKGROUND_WORK_CEILING_S = _cfg_int("BACKGROUND_WORK_CEILING_S", CLAUDE_TIMEOUT)
 
 
 def get_session_timeout() -> int:
@@ -1689,7 +1786,7 @@ def get_jwt_expiry_hours() -> int:
     return JWT_EXPIRY_HOURS
 
 # Max output tokens for Direct LLM API responses (all providers).
-DIRECT_LLM_MAX_TOKENS = int(_cfg("DIRECT_LLM_MAX_TOKENS", "8192"))
+DIRECT_LLM_MAX_TOKENS = _cfg_int("DIRECT_LLM_MAX_TOKENS", 8192)
 
 # The API the OpenAI provider speaks on the Direct LLM path
 # (core/layers/providers/openai_adapter.py): "responses" (default) is the
@@ -1706,9 +1803,7 @@ if DIRECT_LLM_OPENAI_API not in ("responses", "chat"):
 # ``max_output_tokens`` INCLUDES the reasoning tokens, so DIRECT_LLM_MAX_TOKENS
 # alone would let a high-effort answer exhaust its budget while thinking. The
 # larger of the two applies; the hosted relay clamps at its own ceiling.
-DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS = int(
-    _cfg("DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS", "32768")
-)
+DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS = _cfg_int("DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS", 32768)
 
 # Deferred tool loading on Direct LLM sessions
 # (core/layers/direct/tool_catalog.py). "auto" (default) keeps the MCP tool
@@ -1720,16 +1815,14 @@ DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS = int(
 DIRECT_LLM_TOOL_SEARCH = _cfg("DIRECT_LLM_TOOL_SEARCH", "auto").strip().lower()
 if DIRECT_LLM_TOOL_SEARCH not in ("auto", "on", "off"):
     DIRECT_LLM_TOOL_SEARCH = "auto"
-DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS = int(
-    _cfg("DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS", "6000")
-)
+DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS = _cfg_int("DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS", 6000)
 
 # When true, the shared MCP installer will attempt to install missing system
 # packages (libmagic, libreoffice, etc.) via the local package manager using
 # sudo. Default: false — the installer only warns and produces a clear error
 # message so the admin can install manually. Applies both on the proxy host
 # and on every satellite that runs `mcp_installer.install_system_requirements`.
-MCP_AUTO_INSTALL_SYSTEM_DEPS = _cfg("MCP_AUTO_INSTALL_SYSTEM_DEPS", "").lower() in ("1", "true", "yes")
+MCP_AUTO_INSTALL_SYSTEM_DEPS = _cfg_bool("MCP_AUTO_INSTALL_SYSTEM_DEPS", False)
 
 # NOTE: ANTHROPIC_API_KEY / ANTHROPIC_MODEL / CLAUDE_MODEL env vars have been
 # removed. API keys flow through the subscription pool (admin-managed via
@@ -1767,7 +1860,7 @@ DEFAULT_EFFORT_LEVEL = "high"
 # Max thinking tokens cap. Used alongside --effort to ensure thinking content
 # is streamed (visible in dashboard). The adaptive effort still controls WHEN
 # and HOW MUCH to think; this just sets the upper bound and enables streaming.
-MAX_THINKING_TOKENS = int(_cfg("MAX_THINKING_TOKENS", "100000"))
+MAX_THINKING_TOKENS = _cfg_int("MAX_THINKING_TOKENS", 100000)
 
 
 # Push notifications (VAPID for Web Push, FCM for Android)
@@ -1851,7 +1944,7 @@ MODEL_REGISTRY: dict[str, dict] = {
         "label": "Sonnet 5.5",
         "provider": "anthropic",
         "context_window": 1_000_000,   # native 1M window (no [1m] suffix needed)
-        "pricing": (2.0, 10.0, 2.50, 0.20),  # Sonnet 5's tuple exactly: 5.5 replaced Sonnet 5 (MODEL_SUCCESSORS; needs Claude Code >= 2.1.284 and its hosted-relay row, it serves direct-llm too)
+        "pricing": (2.0, 10.0, 2.50, 0.10),  # Sonnet 5's tuple but cache reads at 0.05x input (Anthropic's price page; Claude Code 2.1.296 prices them so too). 5.5 replaced Sonnet 5 (MODEL_SUCCESSORS; needs Claude Code >= 2.1.284 and its hosted-relay row, it serves direct-llm too)
         "layers": ["claude-code-cli", "direct-llm"],
         "server_tools": True,
         "supports_reasoning": True,   # adaptive thinking on by default; temperature/top_p never sent
@@ -1859,15 +1952,33 @@ MODEL_REGISTRY: dict[str, dict] = {
         "tier": 3,
         "good_at": "drafting, summaries and bounded analysis",
     },
-    "claude-haiku-4-5": {
-        "label": "Haiku 4.5 (200K)",
+    # Haiku 5.5 (API id claude-haiku-5-5, 2026-10-07) replaces the retired
+    # Haiku 4.5 builtin at a tenth of its price for a prompt up to 100,000
+    # tokens and half of it above: the one current model Anthropic prices by
+    # prompt length (input plus cache reads and writes, each request on its
+    # own), input, cache and output all x5 past the line — ``long_context``,
+    # applied by price_usage below and mirrored by the hosted relay's row.
+    # Its capabilities are a superset of Haiku 4.5's (1M window, adaptive
+    # thinking at every effort level, programmatic tool calling), so the swap
+    # is lossless: the boot walk moves Haiku 4.5 pins onto it
+    # (MODEL_SUCCESSORS; an admin who wants 4.5 re-adds it as a custom model
+    # first and the walk leaves those pins alone). It serves Claude Code too,
+    # whose own default Haiku it is since 2.1.293 (2.1.296 counts its tokens
+    # right; an older CLI runs it with a 200K window at a fallback price), and
+    # it is the Anthropic title model. Prices per 1M from the
+    # platform.claude.com price page at the swap.
+    "claude-haiku-5-5": {
+        "label": "Haiku 5.5",
         "provider": "anthropic",
-        "context_window": 200_000,
-        "pricing": (1.0, 5.0, 1.25, 0.10),   # Haiku 4.5 rates (input/output/5m-cache-write/cache-read)
-        "layers": ["direct-llm"],
-        "server_tools": False,  # does not support programmatic tool calling
+        "context_window": 1_000_000,   # native 1M window
+        "pricing": (0.10, 0.50, 0.125, 0.01),  # (input, output, cache_write, cache_read) per 1M, a prompt up to 100K tokens
+        "long_context": (100_000, 5.0, 5.0),   # (prompt tokens over, input and cache multiplier, output multiplier)
+        "layers": ["claude-code-cli", "direct-llm"],
+        "server_tools": True,   # programmatic tool calling and the web tools, unlike Haiku 4.5
+        "supports_reasoning": True,   # adaptive thinking, default effort medium
+        "supports_xhigh": True,   # low to max, xhigh included
         "tier": 4,
-        "good_at": "high-volume routine work; no programmatic tool calling on Direct LLM",
+        "good_at": "high-volume routine work",
     },
     # Admins add further models (Ollama, LM Studio, more Groq/OpenAI, …) through
     # the admin discover-models UI; the entries below are the shipped builtins.
@@ -1893,16 +2004,16 @@ MODEL_REGISTRY: dict[str, dict] = {
     # all three (VERSIONS.md); gpt-6.1-sol is its own default (priority 1,
     # default effort low, ultra delegating at xhigh) and is ABSENT from the
     # 0.156.1 catalog, so a Codex still on that pin refuses the id.
-    # Context: 272k is the PRICING-TIER line, not the raw model window —
-    # the GPT-6 and 5.6 models are really 1.05M (922k input + 128k output),
-    # but input beyond 272k bills the WHOLE request at the long-context tier
-    # (2x input / 1.5x output). We keep the registry at 272k deliberately:
-    # it is codex-cli's own bundled default cap (raised to an opt-in 872k
-    # override ceiling in 0.149.0, default unchanged) and it keeps the
-    # direct-llm layer's context management from silently crossing into
-    # double-rate territory. codex-cli reads the LIVE modelContextWindow at
-    # runtime (headless gauges self-correct); this registry number drives
-    # the direct-llm layer's context management and the capability display.
+    # Context: the GPT-6 and 5.6 models are 1.05M (922k input + 128k output);
+    # input beyond 272k bills the WHOLE request at the long-context tier
+    # (2x input / 1.5x output), the ``long_context`` tuple on every row:
+    # price_usage multiplies once a request's prompt passes the line. The
+    # registry window drives the direct-llm layer's context management and
+    # the capability display (until 2026-10-13 it sat at the 272k line so a
+    # Direct LLM chat never crossed into the tier). codex-cli ignores it: the
+    # daemon reports the LIVE modelContextWindow per turn, OpenAI's catalog
+    # per Codex version (258k on 0.160.0, 500k for Sol on 0.162.1), so the
+    # headless gauge shows the account's real window.
     # Agents still PINNED to a retired id with no successor (gpt-5.5) keep
     # running (the CLI supports it; pricing falls back to the provider
     # default) — sync_builtin_models retires the builtin row so pickers
@@ -1910,7 +2021,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-6.1-sol": {
         "label": "GPT-6.1 Sol",
         "provider": "openai",
-        "context_window": 272_000,   # the pricing-tier line — see the window note above
+        "context_window": 1_050_000,
+        "long_context": (272_000, 2.0, 1.5),   # (prompt tokens over, input x, output x)
         "pricing": (2.0, 10.0, 2.50, 0.10),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli"],   # codex-cli only until the hosted relay prices it
         "supports_reasoning": True,
@@ -1926,9 +2038,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     # ModelPolicy.default_model = GPT-6.1 Sol, tier 2): Astra costs 5× the
     # Sol tier on an API key, so a frontier model stays a deliberate choice —
     # registry order no longer decides the "Auto" default.
-    # Context: the same 272k pricing-tier line as the 5.6 family (1.05M real:
-    # 922k in + 128k out; input beyond 272k bills the whole request at
-    # 2× input / 1.5× output — $20 / $75 there). Prices per 1M verified
+    # Context: the same 1.05M window and 272k tier as the 5.6 family ($20 /
+    # $75 past the line). Prices per 1M verified
     # 2026-09-08 (developers.openai.com/api/docs/models/gpt-6-astra):
     # $10 in, $50 out, $12.50 cache write, $1 cached read. codex-cli only for
     # now: the hosted relay prices per model and has no Astra row yet, so a
@@ -1938,7 +2049,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-6-astra": {
         "label": "GPT-6 Astra",
         "provider": "openai",
-        "context_window": 272_000,
+        "context_window": 1_050_000,
+        "long_context": (272_000, 2.0, 1.5),
         "pricing": (10.0, 50.0, 12.50, 1.00),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli"],
         "supports_reasoning": True,
@@ -1950,7 +2062,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-5.6-terra": {
         "label": "GPT-5.6 Terra",
         "provider": "openai",
-        "context_window": 272_000,   # corrected from 1M — see the family window note above
+        "context_window": 1_050_000,
+        "long_context": (272_000, 2.0, 1.5),
         "pricing": (2.0, 12.0, 2.50, 0.20),  # 2026-07-30 cut ($2.50/$15 → $2/$12), permanent
         "layers": ["codex-cli", "direct-llm"],
         "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
@@ -1969,7 +2082,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-6-luna": {
         "label": "GPT-6 Luna",
         "provider": "openai",
-        "context_window": 272_000,   # the pricing-tier line — see the window note above
+        "context_window": 1_050_000,
+        "long_context": (272_000, 2.0, 1.5),
         "pricing": (0.10, 0.50, 0.125, 0.01),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli", "direct-llm"],
         "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
@@ -2170,7 +2284,7 @@ def get_model_layers(model: str) -> list[str]:
 # Used when a model isn't in MODEL_REGISTRY (e.g., dynamically discovered models).
 # A future per-model pricing table in the DB can override these defaults.
 PROVIDER_DEFAULT_PRICING: dict[str, tuple[float, float, float, float]] = {
-    "anthropic": (2.0, 10.0, 2.50, 0.20),   # Sonnet-level (Sonnet 5.5's $2/$10; Sonnet 5's before it)
+    "anthropic": (2.0, 10.0, 2.50, 0.10),   # Sonnet-level (Sonnet 5.5's $2/$10, cache reads at 0.05x)
     "openai":    (2.0, 8.0, 0, 1.0),          # GPT-4.1 level
     "groq":      (0.20, 0.20, 0, 0),          # very cheap hosted inference
     "ollama":            (0, 0, 0, 0),         # local, free
@@ -2202,6 +2316,7 @@ MODEL_SUCCESSORS: dict[str, str] = {
     "gpt-5.6-luna": "gpt-6-luna",             # 2026-09-24 — cheaper on every element, max-only as before
     "claude-sonnet-5": "claude-sonnet-5-5",   # the same tuple, window, flags and layers
     "gpt-6-sol": "gpt-6.1-sol",               # cheaper cached input, the rest equal
+    "claude-haiku-4-5": "claude-haiku-5-5",   # 2026-10-13 — cheaper on every element, past its 100K line too; thinking, 1M, both engines
 }
 
 
@@ -2218,6 +2333,23 @@ def successor_model(model: str) -> str:
         seen.add(cur)
         cur = MODEL_SUCCESSORS[cur]
     return cur
+
+
+def live_model_id(model: str) -> str:
+    """A pinned model id as it runs today — the boot walk's rule at read
+    time, for the pins the walk never sees (one written after the boot, a
+    browser's sticky pick, the title setting, a check's judge): the id
+    itself when it is not a retired builtin or when an admin re-added it as
+    a custom model (the walk leaves those pins alone too), else
+    ``successor_model``. A lookup error answers the successor: a
+    ``MODEL_SUCCESSORS`` key is a retired builtin by construction."""
+    if not model or model not in MODEL_SUCCESSORS:
+        return model or ""
+    with contextlib.suppress(Exception):
+        from storage.billing import subscription_store
+        if subscription_store.custom_model_exists(model):
+            return model
+    return successor_model(model)
 
 
 def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, float, float]:
@@ -2247,6 +2379,35 @@ def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, flo
     # 3. Fall back to provider-level default
     resolved = provider or get_model_provider(model)
     return PROVIDER_DEFAULT_PRICING.get(resolved, MODEL_DEFAULT_PRICING)
+
+
+def get_model_long_context(model: str) -> tuple[int, float, float]:
+    """``(prompt_tokens_over, input_multiplier, output_multiplier)`` of a
+    builtin the vendor prices by prompt length (``long_context`` on its
+    registry entry, Haiku 5.5's 100K line): a request whose prompt — input
+    plus cache reads and writes — passes the line pays the multiplied rates
+    on ALL of its tokens. ``(0, 1.0, 1.0)`` for every other model."""
+    lc = (MODEL_REGISTRY.get(model) or {}).get("long_context")
+    if not lc:
+        return 0, 1.0, 1.0
+    over, in_m, out_m = lc
+    return int(over), float(in_m), float(out_m)
+
+
+def price_usage(model: str, provider: str = "", *, input_tokens: int = 0,
+                output_tokens: int = 0, cache_write_tokens: int = 0,
+                cache_read_tokens: int = 0) -> float:
+    """The USD cost of one request's tokens at the model's rates
+    (:func:`get_model_pricing`), the long-context multipliers applied when
+    the prompt passes the model's line. The one formula for the token-priced
+    paths (the Direct LLM adapters, the interactive transcript rows); a
+    provider's per-call fees are the caller's."""
+    p_in, p_out, p_cw, p_cr = get_model_pricing(model, provider)
+    over, in_m, out_m = get_model_long_context(model)
+    if over and input_tokens + cache_write_tokens + cache_read_tokens > over:
+        p_in, p_cw, p_cr, p_out = p_in * in_m, p_cw * in_m, p_cr * in_m, p_out * out_m
+    return (input_tokens * p_in + output_tokens * p_out
+            + cache_write_tokens * p_cw + cache_read_tokens * p_cr) / 1_000_000
 
 
 def get_model_context_window(model: str) -> int:
@@ -2348,8 +2509,9 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     new middle term; the operator's rule is "the tier is the rule": each
     engine DECLARES its default as the best tier it serves with tier 1
     offered but never defaulted):
-      1. agents.default_model (the per-agent PIN). Two-mode, byte for byte as
-         before: with ``layer=None`` it is returned with no check at all; with
+      1. agents.default_model (the per-agent PIN), read through
+         :func:`live_model_id` (a retired builtin as its successor). Two-mode:
+         with ``layer=None`` it is returned with no check at all; with
          ``layer`` given it is returned when a row for it exists on that
          layer — enabled or not. A pin is an explicit human choice; the
          admin's ``enabled`` toggle moves the DEFAULT below, never a pin.
@@ -2395,7 +2557,7 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     path = (layer
             or (agent.get("execution_path") if agent else None)
             or DEFAULT_EXECUTION_PATH)
-    default_model = (agent or {}).get("default_model") or ""
+    default_model = live_model_id((agent or {}).get("default_model") or "")
     if default_model:
         if not layer:
             return default_model
@@ -2490,6 +2652,17 @@ def _skills_delivery(layer: str) -> str:
     return caps.behaviour.skills_delivery if caps else "materialized_dir"
 
 
+def _repository_instruction_files(layer: str) -> tuple[str, ...]:
+    """The engine's ``behaviour.repository_instruction_files`` (``()`` for
+    an unregistered or empty id — nothing is lifted into the prompt)."""
+    try:
+        from core.session.session_manager import get_layer_capabilities
+        caps = get_layer_capabilities(layer or "")
+    except Exception:
+        return ()
+    return tuple(caps.behaviour.repository_instruction_files) if caps else ()
+
+
 def _declared_default_model(layer: str) -> str:
     """The ``ModelPolicy.default_model`` the layer declares, or "" when the
     layer is unknown or the registry cannot be reached (a test that stubs
@@ -2513,16 +2686,40 @@ def get_cli_model(agent_name: str, layer: str | None = None) -> str:
     return resolve_agent_model(agent_name, layer=layer)
 
 
+def resolve_run_model(agent_name: str, override_model: str | None,
+                      layer: str | None = None) -> str:
+    """The model a task or delegate run spawns on: its own pin as it runs
+    today (:func:`live_model_id`), else the agent's model for the run's
+    layer (the agent's own engine when the run pins none, checked against
+    it the same way). ONE answer for the run's chat row (what billing
+    reads) and the session the run starts, so the two never name different
+    models."""
+    pinned = live_model_id(override_model or "")
+    if pinned:
+        return pinned
+    if not layer:
+        from core.execution_layer import DEFAULT_EXECUTION_PATH
+        from storage.agents import agent_store
+        layer = ((agent_store.get_agent(agent_name) or {}).get("execution_path")
+                 or DEFAULT_EXECUTION_PATH)
+    return get_cli_model(agent_name, layer=layer)
+
+
 def get_agent_model(agent_name: str) -> str:
     """Get the model for an agent (direct API / phone path)."""
     return resolve_agent_model(agent_name)
 
 
 def get_cli_effort(agent_name: str) -> str:
-    """Get the effort level for an agent (CLI sessions)."""
+    """Get the effort level for an agent (CLI sessions). A stored value off
+    the platform's ladder (an agent saved before the API checked it) reads
+    as the default: loading the agent never fails, and no engine is handed
+    a level it would refuse at spawn."""
+    from core.execution_layer import EFFORT_LADDER
     from storage.agents import agent_store
     agent = agent_store.get_agent(agent_name)
-    return (agent["default_effort"] if agent and agent["default_effort"] else DEFAULT_EFFORT_LEVEL)
+    effort = (agent or {}).get("default_effort") or ""
+    return effort if effort in EFFORT_LADDER else DEFAULT_EFFORT_LEVEL
 
 # What one provider-run web search costs on top of the tokens (USD per search):
 # Anthropic's web_search tool and OpenAI's built-in web_search both list $10 per
@@ -2531,7 +2728,7 @@ def get_cli_effort(agent_name: str) -> str:
 WEB_SEARCH_USD_PER_REQUEST = 0.01
 
 # Direct session idle timeout (seconds) before reaping
-DIRECT_SESSION_TIMEOUT = int(_cfg("DIRECT_SESSION_TIMEOUT", "900"))
+DIRECT_SESSION_TIMEOUT = _cfg_int("DIRECT_SESSION_TIMEOUT", 900)
 
 # Hooks directory (PreToolUse permission gate, etc.)
 HOOKS_DIR = BASE_DIR / "hooks"
@@ -2547,40 +2744,40 @@ DATABASE_URL = _cfg(
 # startup.py, app.py). Per process at these defaults: the shared pool (30),
 # the run_db lane pool (fast + bulk + 2) and the loop pool (3): 52, plus 3
 # for a moment during a loop-pool recovery, against Postgres' 100.
-DB_POOL_MAX_SIZE = int(_cfg("DB_POOL_MAX_SIZE", "30"))
-DB_POOL_TIMEOUT_S = float(_cfg("DB_POOL_TIMEOUT_S", "10"))
-DB_FAST_LANE_WORKERS = max(1, int(_cfg("DB_FAST_LANE_WORKERS", "6")))
-DB_BULK_LANE_WORKERS = max(1, int(_cfg("DB_BULK_LANE_WORKERS", "10")))
+DB_POOL_MAX_SIZE = _cfg_int("DB_POOL_MAX_SIZE", 30)
+DB_POOL_TIMEOUT_S = _cfg_float("DB_POOL_TIMEOUT_S", 10)
+DB_FAST_LANE_WORKERS = _cfg_int("DB_FAST_LANE_WORKERS", 6, minimum=1)
+DB_BULK_LANE_WORKERS = _cfg_int("DB_BULK_LANE_WORKERS", 10, minimum=1)
 # The event loop's own pool: how long it waits for a connection before the
 # breaker opens, how long the breaker stays open, and after how long one
 # operation triggers a liveness probe of Postgres (0 disables the probe).
-DB_LOOP_POOL_TIMEOUT_S = float(_cfg("DB_LOOP_POOL_TIMEOUT_S", "0.5"))
-DB_LOOP_BREAKER_S = float(_cfg("DB_LOOP_BREAKER_S", "5"))
-DB_LOOP_LIVENESS_PROBE_S = float(_cfg("DB_LOOP_LIVENESS_PROBE_S", "1.0"))
+DB_LOOP_POOL_TIMEOUT_S = _cfg_float("DB_LOOP_POOL_TIMEOUT_S", 0.5)
+DB_LOOP_BREAKER_S = _cfg_float("DB_LOOP_BREAKER_S", 5)
+DB_LOOP_LIVENESS_PROBE_S = _cfg_float("DB_LOOP_LIVENESS_PROBE_S", 1.0)
 # Server-side statement_timeout and idle_in_transaction_session_timeout on
 # every pool connection; 0 disables each (PgBouncer in transaction mode).
-DB_STATEMENT_TIMEOUT_S = float(_cfg("DB_STATEMENT_TIMEOUT_S", "300"))
-DB_IDLE_IN_TX_TIMEOUT_S = float(_cfg("DB_IDLE_IN_TX_TIMEOUT_S", "60"))
+DB_STATEMENT_TIMEOUT_S = _cfg_float("DB_STATEMENT_TIMEOUT_S", 300)
+DB_IDLE_IN_TX_TIMEOUT_S = _cfg_float("DB_IDLE_IN_TX_TIMEOUT_S", 60)
 # The asyncio default executor (asyncio.to_thread). More threads worsen GIL
 # contention with the loop (measured); 32 covers the to_thread sites.
-DEFAULT_EXECUTOR_WORKERS = max(1, int(_cfg("DEFAULT_EXECUTOR_WORKERS", "32")))
+DEFAULT_EXECUTOR_WORKERS = _cfg_int("DEFAULT_EXECUTOR_WORKERS", 32, minimum=1)
 # uvicorn limit_concurrency: past this many open connections (WebSockets
 # included) a new HTTP request gets 503. 0 disables.
-HTTP_LIMIT_CONCURRENCY = int(_cfg("HTTP_LIMIT_CONCURRENCY", "4000"))
+HTTP_LIMIT_CONCURRENCY = _cfg_int("HTTP_LIMIT_CONCURRENCY", 4000)
 # A WebSocket's write buffer (app.py, _BoundedWebSocketProtocol): past this
 # many buffered bytes a sender waits for the reader instead of growing the
 # buffer, and a reader that drains none of it for WS_WRITE_STALL_S is
 # dropped. The stall sits past the keepalive's ping plus pong timeout so a
 # satellite that merely stalls its loop for a moment is never cut by it.
-WS_WRITE_BUFFER_MAX_BYTES = max(64 * 1024, int(_cfg("WS_WRITE_BUFFER_MAX_BYTES", str(4 * 1024 * 1024))))
-WS_WRITE_STALL_S = max(1.0, float(_cfg("WS_WRITE_STALL_S", "60")))
+WS_WRITE_BUFFER_MAX_BYTES = _cfg_int("WS_WRITE_BUFFER_MAX_BYTES", 4 * 1024 * 1024, minimum=64 * 1024)
+WS_WRITE_STALL_S = _cfg_float("WS_WRITE_STALL_S", 60, minimum=1.0)
 # Satellite transfers (REMOTE-AGENTS.md "Chunked transfer"): the file bytes
 # a connection may have in flight to a satellite (its pong queues behind
 # every byte already handed to the transport), and how long a push or a
 # pull may go without any transfer frame on its connection before it fails.
-BULK_CREDIT_BYTES = max(64 * 1024, int(_cfg("BULK_CREDIT_BYTES", str(1024 * 1024))))
-PUSH_STALL_S = max(10.0, float(_cfg("PUSH_STALL_S", "90")))
-PULL_STALL_S = max(10.0, float(_cfg("PULL_STALL_S", "90")))
+BULK_CREDIT_BYTES = _cfg_int("BULK_CREDIT_BYTES", 1024 * 1024, minimum=64 * 1024)
+PUSH_STALL_S = _cfg_float("PUSH_STALL_S", 90, minimum=10.0)
+PULL_STALL_S = _cfg_float("PULL_STALL_S", 90, minimum=10.0)
 
 # ---------------------------------------------------------------------------
 # Concurrency admission (core/concurrency.py + core/sandbox/host_resources.py)
@@ -2603,14 +2800,14 @@ PULL_STALL_S = max(10.0, float(_cfg("PULL_STALL_S", "90")))
 # Gate 2's live MemAvailable read (grow-in-debited) is the real OOM safety and
 # reclaims/penalizes the difference as sessions actually grow, so a smaller
 # estimate buys small hosts real concurrency without losing the burst bound.
-SESSION_EST_HEAVY_MB = int(_cfg("SESSION_EST_HEAVY_MB", "850"))    # CLI/Codex/interactive/phone-CLI/task reserve
-SESSION_EST_LIGHT_MB = int(_cfg("SESSION_EST_LIGHT_MB", "250"))    # floor of the Direct-LLM estimate (no CLI process)
+SESSION_EST_HEAVY_MB = _cfg_int("SESSION_EST_HEAVY_MB", 850)    # CLI/Codex/interactive/phone-CLI/task reserve
+SESSION_EST_LIGHT_MB = _cfg_int("SESSION_EST_LIGHT_MB", 250)    # floor of the Direct-LLM estimate (no CLI process)
 # Gate-1 budget = total RAM × this. Generous on purpose — Gate 1 is a coarse cap +
 # burst bound, Gate 2 is the real safety, so this never needs precise tuning.
-BUDGET_FRACTION = float(_cfg("BUDGET_FRACTION", "0.90"))
+BUDGET_FRACTION = _cfg_float("BUDGET_FRACTION", 0.90)
 # Gate-2 headroom kept free for the OS/kernel/page-cache. Effective floor is
 # max(this, total_mb × 0.03) so large hosts keep proportional headroom.
-SESSION_RESERVE_FLOOR_MB = int(_cfg("SESSION_RESERVE_FLOOR_MB", "256"))
+SESSION_RESERVE_FLOOR_MB = _cfg_int("SESSION_RESERVE_FLOOR_MB", 256)
 # Gate-2 SWAP CREDIT: MemAvailable counts zero swap, so a small box with swap
 # configured denies sessions it could comfortably run by paging out cold heap
 # (idle CLI sessions spend most of their life blocked on the API — their
@@ -2618,45 +2815,45 @@ SESSION_RESERVE_FLOOR_MB = int(_cfg("SESSION_RESERVE_FLOOR_MB", "256"))
 # this cap): half of free swap so the credit shrinks as swap fills, capped so
 # admission never leans DEEP into swap. 0 disables. Boxes without swap are
 # unaffected (SwapFree = 0).
-SESSION_SWAP_CREDIT_MB = int(_cfg("SESSION_SWAP_CREDIT_MB", "512"))
+SESSION_SWAP_CREDIT_MB = _cfg_int("SESSION_SWAP_CREDIT_MB", 512)
 # Under Gate-1 pressure, an idle LOCAL session this old (seconds) may be gracefully
 # evicted to admit an active one (clamped below the idle-reap timeout). Streaming
 # sessions have ~0 idle age and are never eligible.
-SESSION_EVICT_FLOOR_S = int(_cfg("SESSION_EVICT_FLOOR_S", "300"))
+SESSION_EVICT_FLOOR_S = _cfg_int("SESSION_EVICT_FLOOR_S", 300)
 # Optional HARD cap on concurrent LOCAL sessions — an env-only escape hatch (no admin
 # UI). 0 = no cap (pure budget, the default). For operators on noisy shared boxes who
 # want a deterministic ceiling regardless of the live-RAM reading.
-OTODOCK_MAX_LOCAL_SESSIONS = int(_cfg("OTODOCK_MAX_LOCAL_SESSIONS", "0") or "0")
+OTODOCK_MAX_LOCAL_SESSIONS = _cfg_int("OTODOCK_MAX_LOCAL_SESSIONS", 0)
 # Sessions one person may hold at once (0 = no cap), and the session spawns
 # allowed at once (0 = half the CPUs this process may use, at least 2).
-MAX_SESSIONS_PER_USER = int(_cfg("OTODOCK_MAX_SESSIONS_PER_USER", "8") or "0")
-SESSION_SPAWN_CONCURRENCY = int(_cfg("SESSION_SPAWN_CONCURRENCY", "0") or "0") or max(
+MAX_SESSIONS_PER_USER = _cfg_int("OTODOCK_MAX_SESSIONS_PER_USER", 8)
+SESSION_SPAWN_CONCURRENCY = _cfg_int("SESSION_SPAWN_CONCURRENCY", 0) or max(
     2, len(os.sched_getaffinity(0)) // 2 if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4) // 2)
 # Admission: how long a session start waits in the queue for a slot, and how
 # long a parked delegate result or continuation wake waits for one before it
 # is stored for the chat's next turn.
-ADMISSION_QUEUE_WAIT_S = float(_cfg("ADMISSION_QUEUE_WAIT_S", "30"))
-ADMISSION_WAKE_WAIT_S = float(_cfg("ADMISSION_WAKE_WAIT_S", "600"))
+ADMISSION_QUEUE_WAIT_S = _cfg_float("ADMISSION_QUEUE_WAIT_S", 30)
+ADMISSION_WAKE_WAIT_S = _cfg_float("ADMISSION_WAKE_WAIT_S", 600)
 # The session index is written behind: dirty entries flush at most this often.
-SESSION_INDEX_FLUSH_S = float(_cfg("SESSION_INDEX_FLUSH_S", "2.0"))
+SESSION_INDEX_FLUSH_S = _cfg_float("SESSION_INDEX_FLUSH_S", 2.0)
 
 SCHEDULER_TIMEZONE = _cfg("SCHEDULER_TIMEZONE", "UTC")
 SCHEDULER_MODE = _cfg("SCHEDULER_MODE", "embedded")  # embedded | standalone
 PROXY_INTERNAL_URL = _cfg("PROXY_INTERNAL_URL", f"http://localhost:{PORT}")
-SCHEDULER_SYNC_INTERVAL = int(_cfg("SCHEDULER_SYNC_INTERVAL", "30"))
+SCHEDULER_SYNC_INTERVAL = _cfg_int("SCHEDULER_SYNC_INTERVAL", 30)
 # Minimum seconds between scheduled-task SESSION SPAWNS. Tasks that share a
 # fire time (several 06:30 digests) otherwise start their CLI + sandbox +
 # MCP handshakes in the same second — a burst that spikes RAM/CPU on small
 # hosts. The fire times themselves stay exact; only the session starts are
 # spaced. 0 disables. Manual Run-Now and event triggers are never spaced.
-TASK_SPAWN_SPACING_SECONDS = int(_cfg("TASK_SPAWN_SPACING_SECONDS", "10"))
+TASK_SPAWN_SPACING_SECONDS = _cfg_int("TASK_SPAWN_SPACING_SECONDS", 10)
 # Active clocked tasks (recurring, and one-time not yet fired) one person may
 # create and one agent may hold (429 past them; admins are exempt), and the
 # pending self-continuations per chat and per agent. 0 = no cap.
-TASK_MAX_ACTIVE_PER_USER = int(_cfg("TASK_MAX_ACTIVE_PER_USER", "25"))
-TASK_MAX_ACTIVE_PER_AGENT = int(_cfg("TASK_MAX_ACTIVE_PER_AGENT", "100"))
-CONTINUATION_MAX_ACTIVE_PER_CHAT = int(_cfg("CONTINUATION_MAX_ACTIVE_PER_CHAT", "10"))
-CONTINUATION_MAX_ACTIVE_PER_AGENT = int(_cfg("CONTINUATION_MAX_ACTIVE_PER_AGENT", "100"))
+TASK_MAX_ACTIVE_PER_USER = _cfg_int("TASK_MAX_ACTIVE_PER_USER", 25)
+TASK_MAX_ACTIVE_PER_AGENT = _cfg_int("TASK_MAX_ACTIVE_PER_AGENT", 100)
+CONTINUATION_MAX_ACTIVE_PER_CHAT = _cfg_int("CONTINUATION_MAX_ACTIVE_PER_CHAT", 10)
+CONTINUATION_MAX_ACTIVE_PER_AGENT = _cfg_int("CONTINUATION_MAX_ACTIVE_PER_AGENT", 100)
 
 
 def get_platform_timezone() -> str:
@@ -2757,7 +2954,7 @@ def format_current_time(user_tz: str | None = None) -> str:
 
 # Dashboard (React SPA served as static files)
 DASHBOARD_DIST = BASE_DIR.parent / "dashboard" / "dist"
-DASHBOARD_ENABLED = _cfg("DASHBOARD_ENABLED", "true").lower() == "true"
+DASHBOARD_ENABLED = _cfg_bool("DASHBOARD_ENABLED", True)
 
 # Wake-word spotter assets (wasm engine + model .data), committed in-repo.
 # Deliberately OUTSIDE dashboard/dist: `cap sync` copies all of dist into the
@@ -2771,7 +2968,7 @@ if not _jwt:
     _persist_secret("JWT_SECRET", _jwt)
     _boot_note(f"Generated JWT_SECRET — saved to {_config_env}")
 JWT_SECRET = _jwt
-JWT_EXPIRY_HOURS = int(_cfg("JWT_EXPIRY_HOURS", "168"))
+JWT_EXPIRY_HOURS = _cfg_int("JWT_EXPIRY_HOURS", 168)
 # The shortest JWT_SECRET or credential key a boot accepts as newly set
 # (storage.identity.credential_store.judge_secret_floor).
 SECRET_MIN_LENGTH = 32
@@ -2801,19 +2998,14 @@ def _default_cookie_secure() -> bool:
     return (DASHBOARD_PUBLIC_URL or "").strip().lower().startswith("https://")
 
 
-_cookie_secure_env = _cfg("COOKIE_SECURE", "").strip().lower()
-if _cookie_secure_env in ("1", "true", "yes", "on"):
-    COOKIE_SECURE = True
-elif _cookie_secure_env in ("0", "false", "no", "off"):
-    COOKIE_SECURE = False
-else:
-    COOKIE_SECURE = _default_cookie_secure()
+_cookie_secure_env = _cfg_bool("COOKIE_SECURE", None)
+COOKIE_SECURE = _default_cookie_secure() if _cookie_secure_env is None else _cookie_secure_env
 
 # --- OtoDock relay + deployment ---
 # Deployment axis: false = self-hosted (the fair-source product), true =
 # OtoDock-operated cloud SaaS. Drives the deployment-aware licensing
 # enforcement model and hosted-OAuth security.
-OTODOCK_CLOUD = _cfg("OTODOCK_CLOUD", "").lower() == "true"
+OTODOCK_CLOUD = _cfg_bool("OTODOCK_CLOUD", False)
 
 # Local-PBX (Asterisk / FreePBX) telephony adapters are AudioSocket-based — they
 # only work where the PBX can reach the phone daemon on the LAN. Enabled by default
@@ -2821,13 +3013,8 @@ OTODOCK_CLOUD = _cfg("OTODOCK_CLOUD", "").lower() == "true"
 # a multi-tenant pool — cloud telephony goes through Twilio/3CX instead). An explicit
 # OTODOCK_LOCAL_PBX_ENABLED wins either way (a Twilio-only self-host sets it false;
 # an advanced cloud op sets it true).
-_local_pbx_raw = _cfg("OTODOCK_LOCAL_PBX_ENABLED", "").strip().lower()
-if _local_pbx_raw in ("1", "true", "yes", "on"):
-    LOCAL_PBX_ENABLED = True
-elif _local_pbx_raw in ("0", "false", "no", "off"):
-    LOCAL_PBX_ENABLED = False
-else:
-    LOCAL_PBX_ENABLED = not OTODOCK_CLOUD
+_local_pbx_raw = _cfg_bool("OTODOCK_LOCAL_PBX_ENABLED", None)
+LOCAL_PBX_ENABLED = (not OTODOCK_CLOUD) if _local_pbx_raw is None else _local_pbx_raw
 
 def untrusted_edge(in_docker: bool, public_url: str, trusted: list[str]) -> bool:
     """In a container the edge never connects from 127.0.0.1, so an https
@@ -2876,7 +3063,7 @@ _warn_untrusted_edge(RUNNING_IN_DOCKER, DASHBOARD_PUBLIC_URL, TRUSTED_PROXIES)
 #     onto this volume so sidecars see the real agent files — the host path a
 #     containerised proxy would hand them is an empty auto-created dir.
 DOCKER_SOCKET_PROXY_HOST = _cfg("DOCKER_SOCKET_PROXY_HOST", "docker-socket-proxy")
-DOCKER_SOCKET_PROXY_PORT = int(_cfg("DOCKER_SOCKET_PROXY_PORT", "2375"))
+DOCKER_SOCKET_PROXY_PORT = _cfg_int("DOCKER_SOCKET_PROXY_PORT", 2375)
 PROXY_SERVICE_NAME = _cfg("PROXY_SERVICE_NAME", "otodock-proxy")
 OTODOCK_NETWORK = _cfg("OTODOCK_NETWORK", "otodock")
 OTODOCK_AGENTS_VOLUME = _cfg("OTODOCK_AGENTS_VOLUME", "otodock-agents")
@@ -2893,9 +3080,7 @@ OTODOCK_AGENTS_VOLUME = _cfg("OTODOCK_AGENTS_VOLUME", "otodock-agents")
 OTODOCK_MCP_ADDRESS_POOL = _cfg("OTODOCK_MCP_ADDRESS_POOL", "10.201.0.0/16")
 # Force a local `docker build` of Docker MCPs on T1 instead of pulling the catalog's
 # pre-built `server.image` (for Dockerfile iteration in dev). Default = prefer pull.
-OTODOCK_MCP_BUILD_LOCAL = _cfg("OTODOCK_MCP_BUILD_LOCAL", "").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+OTODOCK_MCP_BUILD_LOCAL = _cfg_bool("OTODOCK_MCP_BUILD_LOCAL", False)
 # Default memory bound injected into every docker-MCP container whose compose
 # declares no limit of its own (an MCP's explicit mem_limit / deploy limit
 # always wins). Guards the platform against a leaky community sidecar eating
@@ -2966,7 +3151,7 @@ TURNSTILE_SECRET_KEY = _cfg("OTODOCK_TURNSTILE_SECRET_KEY", "").strip()
 # decides licensing; this flag only governs outbound. `OTODOCK_CLOUD=true` forces
 # it false (the control plane manages connectivity). The relay holds every OtoDock
 # secret — no install does. See `services/billing/relay_client.relay_offered()`.
-OTODOCK_AIR_GAPPED = _cfg("OTODOCK_AIR_GAPPED", "").lower() == "true"
+OTODOCK_AIR_GAPPED = _cfg_bool("OTODOCK_AIR_GAPPED", False)
 # Relay base URL. Defaults to the live OtoDock relay so a connected install
 # works out of the box (native push, hosted OAuth, license activation/liveness)
 # with zero config. Outbound is still fully gated: OTODOCK_AIR_GAPPED=true makes
@@ -2975,6 +3160,17 @@ OTODOCK_AIR_GAPPED = _cfg("OTODOCK_AIR_GAPPED", "").lower() == "true"
 # staging / a private relay. Kept server-side — never exposed to clients (only
 # the derived booleans are).
 OTODOCK_RELAY_BASE = _cfg("OTODOCK_RELAY_BASE", "https://api.otodock.io")
+
+# The daily release check (services/infra/release_check.py): admins are told
+# when a newer OtoDock release exists. Off under OTODOCK_AIR_GAPPED and on the
+# cloud whatever this says; the URL is GitHub's releases/latest answer, and an
+# operator-set one may point at a private mirror.
+RELEASE_CHECK_ENABLED = _cfg_bool("OTODOCK_RELEASE_CHECK", True)
+RELEASE_CHECK_DEFAULT_URL = "https://api.github.com/repos/OtoDock/oto-dock/releases/latest"
+RELEASE_CHECK_URL = _cfg("OTODOCK_RELEASE_CHECK_URL", RELEASE_CHECK_DEFAULT_URL).strip()
+# A database last migrated by a NEWER release refuses the boot
+# (storage/schema.py::platform_version_preflight); this lets it through.
+ALLOW_NEWER_DATABASE = _cfg_bool("OTODOCK_ALLOW_NEWER_DATABASE", False)
 
 # --- Sandbox network isolation (local agents) ---
 # ALWAYS ON (no toggle): every local sandboxed process (CLI / Codex sessions,
@@ -3022,10 +3218,10 @@ QUOTA_SHARED_FOLDER_INODES_DEFAULT = 0   # 0 = unlimited (file-count cap default
 QUOTA_USER_FOLDER_INODES_DEFAULT = 0
 
 # --- Auth mode ---
-AUTH_PROVIDER_BYPASS = _cfg("AUTH_PROVIDER_BYPASS", "").lower() == "true"
+AUTH_PROVIDER_BYPASS = _cfg_bool("AUTH_PROVIDER_BYPASS", False)
 
 # --- OIDC provider ---
-OIDC_ENABLED = _cfg("OIDC_ENABLED", "").lower() == "true"
+OIDC_ENABLED = _cfg_bool("OIDC_ENABLED", False)
 OIDC_PROVIDER_NAME = _cfg("OIDC_PROVIDER_NAME", "SSO")
 OIDC_DISCOVERY_URL = _cfg("OIDC_DISCOVERY_URL", "")
 OIDC_CLIENT_ID = _cfg("OIDC_CLIENT_ID", "")
@@ -3058,10 +3254,10 @@ OIDC_ROLE_MEMBER_GROUP = _cfg("OIDC_ROLE_MEMBER_GROUP", "")
 # answer whose ``auth_time`` is older than the click — only for a provider
 # whose flows honour that (Authentik's defaults do not: they land the
 # browser on the callback with no answer, or let the old session through).
-OIDC_CONFIRM_FRESH_LOGIN = _cfg("OIDC_CONFIRM_FRESH_LOGIN", "").lower() == "true"
+OIDC_CONFIRM_FRESH_LOGIN = _cfg_bool("OIDC_CONFIRM_FRESH_LOGIN", False)
 # With the fresh login on, an ID token without ``auth_time`` passes unless
 # this is true (some providers omit the claim).
-OIDC_CONFIRM_REQUIRE_AUTH_TIME = _cfg("OIDC_CONFIRM_REQUIRE_AUTH_TIME", "").lower() == "true"
+OIDC_CONFIRM_REQUIRE_AUTH_TIME = _cfg_bool("OIDC_CONFIRM_REQUIRE_AUTH_TIME", False)
 
 # Explicit UA — Authentik (and many WAFs) reject the default Python client
 # User-Agents with 403.
@@ -3260,3 +3456,83 @@ _google_redirect_default = (
 GOOGLE_OAUTH_REDIRECT_URI = _cfg(
     "GOOGLE_OAUTH_REDIRECT_URI", _google_redirect_default
 )
+
+
+# ---------------------------------------------------------------------------
+# The keys config.env may hold
+# ---------------------------------------------------------------------------
+# Keys this module reads that config.env.example does not document, with the
+# reason (tests/config/test_config_keys.py holds every other _cfg key to the
+# example): generated and persisted by the proxy itself, set by the compose
+# files for the container, or a developer's knob.
+INTERNAL_CONFIG_KEYS: frozenset[str] = frozenset({
+    "OTODOCK_INSTALL_ID",       # generated once and persisted (_persist_secret)
+    "PHONE_API_SECRET",         # generated once, shared with the phone daemon
+    "WOPI_SECRET",              # defaults to JWT_SECRET; a split is not a documented setup
+    "RUNNING_IN_DOCKER",        # set by the compose file; /.dockerenv otherwise
+    "PROXY_SERVICE_NAME",       # the compose service name, for Docker MCP URLs
+    "OTODOCK_NETWORK",          # the compose network name, for Docker MCP attachment
+    "OTODOCK_AGENTS_VOLUME",    # the compose volume name, for Docker MCP mounts
+    "DOCKER_SOCKET_PROXY_HOST", # the compose socket-proxy service
+    "DOCKER_SOCKET_PROXY_PORT",
+    "PROXY_INTERNAL_URL",       # the standalone scheduler's address of the proxy
+    "SCHEDULER_MODE",           # embedded | standalone (the commercial scheduler)
+    "SCHEDULER_SYNC_INTERVAL",
+    "SCHEDULER_TIMEZONE",       # set by the compose file; the platform setting rules
+    "ALLOWED_TOOLS",            # a developer's narrowing of the CLI's tool set
+    "COLLABORA_SSL_TERMINATION",  # derived from DASHBOARD_PUBLIC_URL; the compose entrypoint applies the same rule
+})
+# Keys read after import, through a function, so _CFG_KEYS_READ misses them.
+LAZY_CONFIG_KEYS: frozenset[str] = frozenset({"CREDENTIAL_ENCRYPTION_KEY"})
+# Keys other components read from the same file: the compose files' ${VAR}
+# names (tests/config/test_config_keys.py keeps this list a superset of them),
+# the phone daemon's, the operator scripts' and the environment-only knobs.
+FOREIGN_CONFIG_KEYS: frozenset[str] = frozenset({
+    # docker-compose.yml, docker-compose.t1.yml, docker-compose.phone.yml, docker-compose.build.yml
+    "DB_HOST", "DB_PORT", "OTODOCK_APPARMOR_PROFILE", "OTODOCK_DATA_SUBNET",
+    "OTODOCK_DB_ADMIN_PASSWORD", "OTODOCK_DB_APP_PASSWORD", "OTODOCK_DB_INIT_WAIT_S",
+    "OTODOCK_ENV_FILE", "OTODOCK_FILETOOLS_MEM_LIMIT", "OTODOCK_INTERNAL_SUBNET",
+    "OTODOCK_NETWORK_SUBNET", "OTODOCK_PROXY_MEM_LIMIT", "OTODOCK_PROXY_PIDS_LIMIT",
+    "OTODOCK_SOCKETPROXY_SUBNET", "OTODOCK_VERSION", "OTO_PHONE_BIND", "POSTGRES_DB",
+    "POSTGRES_IMAGE", "POSTGRES_PASSWORD", "POSTGRES_USER", "PROXY_BIND_IP", "TZ", "WAIT",
+    "PYTHON_IMAGE", "NODE_IMAGE",
+    # phone/config.py
+    "PROXY_URL", "OTO_AUDIO_LOG_TRANSCRIPTS",
+    # scripts/*.sh
+    "OTODOCK_BACKUP_DIR", "OTODOCK_BACKUP_RETAIN", "OTODOCK_BACKUP_RETAIN_TREES",
+    "OTODOCK_AGENTS_DIR", "OTODOCK_SSH_KEYS_DIR", "OTODOCK_SESSIONS_DIR", "OTODOCK_UPGRADE_WAIT_S",
+    "OTODOCK_MIN_FREE_GB",
+    "OTODOCK_COMPOSE_PROJECT", "OTODOCK_POSTGRES_CONTAINER", "OTODOCK_PHONE", "OTODOCK_DIR", "OTODOCK_REF",
+    "OTODOCK_VERSIONS_MD",
+    # read from the process environment before this module parses the file
+    "PLATFORM_DATA_DIR", "PLATFORM_CONFIG_DIR",
+    # developer and test knobs read straight from the environment
+    "OTODOCK_SAFE_FS_NO_OPENAT2", "OTODOCK_DB_LOOP_GUARD", "OTODOCK_DB_LOOP_GUARD_OUT",
+    "OTODOCK_LOADTEST", "OTODOCK_LOADTEST_REPORT",
+})
+# Key families read elsewhere or spelled with a variable part.
+FOREIGN_CONFIG_PREFIXES: tuple[str, ...] = (
+    "COMPOSE_", "DOCKER_", "RATE_LIMIT_",
+    "OTODOCK_MCPS_CATALOG_", "OTODOCK_AGENTS_CATALOG_", "OTODOCK_SKILLS_CATALOG_",
+)
+
+
+def unknown_config_keys(present, known, prefixes=FOREIGN_CONFIG_PREFIXES) -> list[str]:
+    """The keys of ``present`` that neither ``known`` lists nor a prefix
+    covers, sorted: the keys config.env sets that nothing reads, most often
+    a misspelt one."""
+    return sorted(
+        k for k in present
+        if k not in known and not any(k.startswith(p) for p in prefixes)
+    )
+
+
+_unknown_keys = unknown_config_keys(
+    _file_cfg.keys(), _CFG_KEYS_READ | LAZY_CONFIG_KEYS | FOREIGN_CONFIG_KEYS,
+)
+if _unknown_keys:
+    _boot_note(
+        f"WARNING: {_config_env} sets keys no OtoDock component reads: "
+        f"{', '.join(_unknown_keys)} (a misspelt key is silently ignored; "
+        f"config.env.example lists every key)."
+    )

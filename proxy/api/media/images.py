@@ -48,7 +48,7 @@ from api.sessions.sessions import verify_session_match_async
 from core.session.session_state import get_session_security
 from services.infra import safe_fs
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 router = APIRouter()
 

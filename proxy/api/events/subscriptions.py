@@ -31,7 +31,7 @@ from services.webhooks import subscription_manager
 from storage import database as task_store
 from storage.automation import trigger_store, webhook_subscription_store
 
-logger = logging.getLogger("claude-proxy.api.subscriptions")
+logger = logging.getLogger("otodock.api.subscriptions")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 

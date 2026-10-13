@@ -73,7 +73,7 @@ from pathlib import Path
 
 import config
 
-logger = logging.getLogger("claude-proxy.oauth-refresh-worker")
+logger = logging.getLogger("otodock.oauth-refresh-worker")
 
 # How often the loop wakes up.
 _INTERVAL_SECONDS = 60

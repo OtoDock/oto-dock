@@ -4,6 +4,8 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
+from pipeline.audio_tap import OutgoingAudioTap
+
 
 @dataclass
 class CallState:
@@ -32,6 +34,11 @@ class CallState:
     # (voice-only — the bed's own sends must not suppress its next frame).
     _ambience_task: asyncio.Task | None = None
     _last_voice_sent: float = 0.0
+
+    # The outgoing-audio tap (pipeline/audio_tap.py), set by CallPipeline.run()
+    # when the debug switch is on; None otherwise (the duplex session shares
+    # the playback mixin and never has one).
+    _audio_tap: OutgoingAudioTap | None = None
 
     # STT / barge-in gating
     _stt_active: bool = False
@@ -86,7 +93,7 @@ class CallState:
     _interim_fallback_text: str = ""
     _interim_fallback_at: float = 0.0
 
-    # Fillers (backchannel + thinking)
+    # Fillers: the backchannel and the thinking filler
     _backchannel_task: asyncio.Task | None = None
     _thinking_filler_task: asyncio.Task | None = None
     _thinking_filler_done: asyncio.Event = field(default_factory=asyncio.Event)
@@ -132,9 +139,68 @@ class CallState:
     # normally-answered call; the PIN gate and error paths overwrite.
     call_outcome: str = "completed"
     pin_attempts: int = 0
+    # The failures the lockout windows counted: every attempt on an inbound
+    # call, wrong codes only on an outbound one (an outbound record reports
+    # this count, so the seed after a restart replays what was counted).
+    pin_failures: int = 0
     # True once the PIN gate passed — rides the proxy warmup (``pin_verified``)
     # so the caller's identity counts as verified there.
     pin_verified: bool = False
+
+    # Call controls (pipeline/call_control.py): the action a call tool
+    # raised, tagged with the engine turn it came from. ``_control_cut``
+    # closes TTS for the turn once the speech rule is satisfied (the text
+    # before the tool spoken whole, one more sentence only when nothing was
+    # spoken before it); ``_transfer_target`` is the resolved target an end
+    # executes as a transfer; ``_control_note`` is a system note the next
+    # dispatch carries (a failed transfer).
+    _control_action: str = ""
+    _control_turn: int | None = None
+    _control_args: dict = field(default_factory=dict)
+    _control_cut: bool = False
+    _control_boundary_seen: bool = False
+    _transfer_target: dict | None = None
+    _transferred_to: str = ""
+    _control_note: str = ""
+    _control_between_turns: asyncio.Task | None = None
+    # A transfer in flight (pipeline/call_control.py ``_do_transfer``): the
+    # handle's task, the label it moves the caller to, the outcome to restore
+    # when it fails, and whether its outcome was recorded (``_settle_transfer``
+    # runs once, from the drain or from the call's end when the media leg
+    # closes under the move).
+    _transfer_task: asyncio.Task | None = None
+    _transfer_label: str = ""
+    _transfer_previous_outcome: str = ""
+    _transfer_settled: bool = False
+
+    # The caller's language (pipeline/language.py): locked at construction
+    # unless the route identifies it; one identification task at a time;
+    # the identification's text replaces the first turn's when the language
+    # changed; the stream's frames are kept while it reopens.
+    _language_locked: bool = True
+    _language_attempts: int = 0
+    _language_task: asyncio.Task | None = None
+    _language_first_text: str = ""
+    # The turn generation: bumped when a turn's segments are dispatched or
+    # queued; an identification carries the generation of the turn whose
+    # audio it heard, and its text applies to that turn alone.
+    _language_turn_gen: int = 0
+    _language_identify_gen: int = -1
+    # The speech buffer lost its head to the window cap: an identification
+    # of it heard the turn's tail only.
+    _speech_audio_truncated: bool = False
+    _stt_restarting: bool = False
+    _stt_restart_buffer: bytearray = field(default_factory=bytearray)
+    # The proxy is gone (the call's socket never opened or closed; an
+    # in-session call's chat attach with it, pipeline/outbound.py): the call
+    # ends with the cannot_continue phrase, once.
+    _proxy_lost: bool = False
+    _unreachable_ending: bool = False
+
+    # The turn classifier's background build (pipeline/providers.py
+    # ``build_turn_classifier``): the first classification waits for it,
+    # bounded; the heuristic timing stands in while it loads.
+    _turn_clf_task: asyncio.Task | None = None
 
     # Utterance + session-warmup task handles
     _utterance_task: asyncio.Task | None = None

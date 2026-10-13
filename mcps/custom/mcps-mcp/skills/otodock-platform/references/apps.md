@@ -140,8 +140,8 @@ Default visibility never changes; a share adds access on top.
   files or chats unless they are on the agent. A personal app and a chat go to
   people only.
 - **A link** is for someone without an account. It has a password by default (generated,
-  shown once, editable) and expires by default (30 days, editable), and it can be
-  revoked any time. A link's buttons stay off until its **Buttons** switch is turned on;
+  shown once, editable) and expires by default (30 days, or the admin's longest share
+  expiry when that is shorter; editable within it), and it can be revoked any time. A link's buttons stay off until its **Buttons** switch is turned on;
   a link never sends prompts, reads the agent's files or opens platform pages. Making a
   link and turning its buttons on ask the person to confirm who they are; a link without
   a password takes a second confirmation.

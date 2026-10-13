@@ -393,7 +393,7 @@ def test_hash_signal_applies_only_to_convergeable_sources():
     assert applies({"runtime": "docker", "source": "docker:camoufox + @playwright/mcp@0.0.68"})
     assert applies({"runtime": "none"})
     assert applies({"runtime": "node", "version": ""})          # an older registry without `source`
-    assert not applies({"runtime": "python", "source": "git+https://example.com/x.git@v1"})
+    assert applies({"runtime": "python", "source": "git+https://example.com/x.git@v1"})
     assert not applies({"runtime": "remote", "source": "remote:mcp.linear.app"})
     assert not applies({"runtime": "python", "source": "remote:api.postiz.com"})
 
@@ -410,10 +410,11 @@ def test_augment_flags_a_docker_manifest_change_under_the_same_tag():
         installed_manifest_hashes={"camoufox": "aaaa"})
     assert same["update_available"] is False
     git_entry = {"name": "telegram-mcp", "runtime": "python", "version": "3.2.21",
-                 "source": "git+https://github.com/chigwell/telegram-mcp.git@v3.2.21", "manifest_hash": "aaaa"}
+                 "source": "git+https://github.com/chigwell/telegram-mcp.git@" + "c" * 40, "manifest_hash": "aaaa"}
+    # A git+ entry at a pinned commit converges on an admin's Update, like a container.
     assert community_catalog.augment_entry(
         git_entry, installed_versions={"telegram-mcp": "3.2.21"}, enabled_for_agents={},
-        installed_manifest_hashes={"telegram-mcp": "bbbb"})["update_available"] is False
+        installed_manifest_hashes={"telegram-mcp": "bbbb"})["update_available"] is True
 
 
 def test_augment_never_offers_a_docker_install_ahead_of_the_catalog_as_an_update():

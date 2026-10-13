@@ -1,12 +1,15 @@
 import { useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 
-import { useTransferStore, type TransferItem, type TransferMachineRow } from '../../store/transferStore'
+import {
+  isBatchRunning, useTransferStore, type TransferItem, type TransferMachineRow,
+} from '../../store/transferStore'
 import { Bar, fmtSize, pct } from '../common/TransferBar'
 
 /** Anchored popover listing the current section's active uploads/syncs:
  * per item a phase-1 upload bar (while the XHR runs), then phase-2 rows —
- * ONE per target machine — with live byte progress. Same portal +
+ * ONE per target machine — with live byte progress; a workspace upload
+ * batch still running has a Cancel above its items. Same portal +
  * outside-click mechanics as the toolbar's New File dropdown (portaled to
  * escape the toolbar's overflow clip). */
 
@@ -50,7 +53,7 @@ function ItemView({ item }: { item: TransferItem }) {
   const uploading = item.phase === 1 && !item.uploadFailed
   const rows = Object.values(item.machines)
   const label = item.uploadFailed
-    ? 'Upload failed'
+    ? item.uploadError ? `Upload failed: ${item.uploadError}` : 'Upload failed'
     : uploading
       ? `Uploading… ${pct(item.uploadSent, item.uploadTotal)}%`
       : rows.length
@@ -88,6 +91,19 @@ function ItemView({ item }: { item: TransferItem }) {
   )
 }
 
+/** One entry per batch with a row still uploading, named after its first
+ * row's top folder ("files" for loose files). */
+function runningBatches(items: TransferItem[]): Array<{ batchId: string; label: string }> {
+  const out = new Map<string, string>()
+  for (const t of items) {
+    if (!isBatchRunning(t) || out.has(t.batchId!)) continue
+    const first = items.find((i) => i.batchId === t.batchId)!
+    const cut = first.filename.indexOf('/')
+    out.set(t.batchId!, cut > 0 ? first.filename.slice(0, cut) : 'files')
+  }
+  return Array.from(out, ([batchId, label]) => ({ batchId, label }))
+}
+
 export default function TransferPopup({ items, anchor, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null)
 
@@ -115,6 +131,18 @@ export default function TransferPopup({ items, anchor, onClose }: Props) {
       <div className="px-3 py-1.5 border-b border-p-border-light text-[10px] font-semibold uppercase tracking-wide text-p-text-light">
         Uploads &amp; sync
       </div>
+      {runningBatches(items).map(({ batchId, label }) => (
+        <div key={batchId} className="flex items-center gap-2 px-3 py-1.5 border-b border-p-border-light">
+          <span className="text-[11px] text-p-text truncate flex-1">Uploading {label}</span>
+          <button
+            type="button"
+            onClick={() => useTransferStore.getState().cancelBatch(batchId)}
+            className="text-[11px] px-2 py-0.5 rounded-sm border border-p-border-light text-p-text hover:bg-p-surface-hover shrink-0"
+          >
+            Cancel
+          </button>
+        </div>
+      ))}
       {items.length === 0 ? (
         <div className="px-3 py-3 text-[11px] text-p-text-light">Nothing in progress.</div>
       ) : (

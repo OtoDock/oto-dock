@@ -15,7 +15,7 @@ from auth.totp import create_2fa_session_token
 from storage import database as db
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _INVALID = "Invalid email or password"
 
@@ -159,6 +159,6 @@ class LocalAuthProvider(AuthProvider):
         """Local auth uses a form, no redirect URL."""
         return None
 
-    def get_logout_url(self, **_) -> None:
+    def get_logout_url(self, post_redirect: str | None = None) -> None:
         """Local logout just clears the session cookie."""
         return None

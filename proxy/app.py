@@ -55,7 +55,7 @@ log_queue.configure(
     log_path=config.BASE_DIR / "proxy.log",
     max_bytes=20 * 1024 * 1024, backup_count=5,
 )
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # The WebSocket keepalive the satellites answer — twins of the satellite's
 # ``ws_client._WS_PING_INTERVAL`` / ``_WS_PING_TIMEOUT`` (pinned by the gate's
@@ -482,6 +482,7 @@ from api.auth import openai_oauth as openai_oauth_router
 from api.auth import setup as setup_router
 from api.phone import phone as phone_router
 from api.phone import phone_relay as phone_relay_router
+from api.phone import call_control as call_control_router
 from api.phone import phone_usage as phone_usage_router
 from api.phone import twilio_relay as twilio_relay_router
 from api.audio import audio as audio_router
@@ -552,6 +553,7 @@ app.include_router(admin_storage_router.router)
 app.include_router(meetings_router.router)
 app.include_router(phone_router.router)
 app.include_router(phone_relay_router.router)
+app.include_router(call_control_router.router)
 app.include_router(phone_usage_router.router)
 app.include_router(twilio_relay_router.router)
 app.include_router(audio_router.router)

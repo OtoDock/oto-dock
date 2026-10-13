@@ -280,6 +280,19 @@ class TwilioMediaStreamConnection(MediaTransport):
             "mark": {"name": _EOS_MARK},
         })))
 
+    async def wait_playback_drained(self, timeout: float) -> bool:
+        """Arm the eos mark and wait for its echo: everything queued before
+        it has PLAYED (a transfer must not clip the hand-over sentence).
+        False on the timeout or a closed stream."""
+        if self._closed:
+            return False
+        if not self._eos_pending:
+            self.send_hangup()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._eos_echoed.wait(), timeout=timeout)
+            return True
+        return False
+
     async def close(self) -> None:
         if self._eos_pending and not self._closed:
             with contextlib.suppress(asyncio.TimeoutError):

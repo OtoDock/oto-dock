@@ -68,18 +68,36 @@ type ConfirmExtra = { password?: string; confirm_token?: string }
 /** What a share write is, for the identity-provider round trip to keep. */
 type PendingDescriptor = Omit<PendingShare, 'at' | 'return_to'>
 
-const EXPIRY_CHOICES: Array<{ value: string; label: string }> = [
-  { value: '', label: 'Never expires' },
-  { value: '7d', label: 'Expires in 7 days' },
-  { value: '30d', label: 'Expires in 30 days' },
-  { value: '90d', label: 'Expires in 90 days' },
-]
+type ExpiryChoice = { value: string; label: string }
+const DAY_CHOICES = [7, 30, 90]
+const NEVER_CHOICE: ExpiryChoice = { value: 'never', label: 'Never expires' }
 
-// An empty expiry on a link becomes the server's 30 days, so a link that
-// must not expire (a printed QR code) says "never", which an admin cap
-// refuses: the choice is offered only once the settings say nothing caps it.
-const LINK_EXPIRY_CHOICES = EXPIRY_CHOICES.filter((c) => c.value)
-const LINK_NEVER_CHOICE = { value: 'never', label: 'Never expires' }
+/** The expiry choices a share form offers under the admin's cap (days;
+ * `null` when nothing caps it, `undefined` while the settings have not
+ * answered): the durations up to the cap, the cap itself added when it is
+ * not one of them, and "Never expires" only while nothing caps it (first
+ * for people, last for a link, whose default stays a duration so a forever
+ * link is a choice). The server refuses anything past the cap, so the form
+ * never offers it. */
+export function expiryChoices(capDays: number | null | undefined, form: 'people' | 'link'): ExpiryChoice[] {
+  const days = capDays
+    ? [...new Set([...DAY_CHOICES.filter((d) => d <= capDays), capDays])].sort((a, b) => a - b)
+    : DAY_CHOICES
+  const durations = days.map((d) => ({ value: `${d}d`, label: `Expires in ${d} day${d === 1 ? '' : 's'}` }))
+  if (capDays !== null) return durations
+  return form === 'people' ? [NEVER_CHOICE, ...durations] : [...durations, NEVER_CHOICE]
+}
+
+/** What a form shows selected: the person's pick while it is still offered,
+ * else the default: Never for people with no cap, 30 days for a link, and
+ * under a cap the longest it allows. */
+export function pickExpiry(choices: ExpiryChoice[], picked: string, form: 'people' | 'link'): string {
+  if (choices.some((c) => c.value === picked)) return picked
+  if (form === 'people' && choices[0]?.value === NEVER_CHOICE.value) return NEVER_CHOICE.value
+  if (choices.some((c) => c.value === '30d') && form === 'link') return '30d'
+  const durations = choices.filter((c) => c.value !== NEVER_CHOICE.value)
+  return durations[durations.length - 1]?.value ?? ''
+}
 
 // The role words from the weakest up: the cap select reads top to bottom.
 const CAPS_ASCENDING: readonly AgentRole[] = [...AGENT_ROLES].reverse()
@@ -121,10 +139,12 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const app = { id: target.id, title: target.title, slug: target.slug || '', scope: target.scope, actions: target.actions }
   const { data: shares, isLoading, error: loadError } = useShares(target.kind, target.id)
   const { data: directory } = useUserDirectory()
-  const { data: sharingSettings } = useSharingSettings()
-  const linkExpiryChoices = sharingSettings && sharingSettings.max_expiry_days === null
-    ? [...LINK_EXPIRY_CHOICES, LINK_NEVER_CHOICE]
-    : LINK_EXPIRY_CHOICES
+  const { data: sharingSettings, isError: settingsFailed } = useSharingSettings()
+  // The admin's cap; when the settings could not be read the server judges.
+  const capDays = sharingSettings ? sharingSettings.max_expiry_days : settingsFailed ? null : undefined
+  const settingsKnown = capDays !== undefined
+  const peopleExpiryChoices = expiryChoices(capDays, 'people')
+  const linkExpiryChoices = expiryChoices(capDays, 'link')
   const [includeTools, setIncludeTools] = useState(false)
   const create = useCreateShare()
   const patch = usePatchShare()
@@ -137,14 +157,17 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const [agentPick, setAgentPick] = useState('')
   const [deptPick, setDeptPick] = useState('')
   const [cap, setCap] = useState<AgentRole>(ROLE.VIEWER)
-  const [expiresIn, setExpiresIn] = useState('')
+  const [expiresPick, setExpiresIn] = useState('')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [copied, setCopied] = useState('')
   // Link form.
   const [publicLink, setPublicLink] = useState(false)
   const [publicUnderstood, setPublicUnderstood] = useState(false)
-  const [linkExpiry, setLinkExpiry] = useState('30d')
+  const [linkExpiryPick, setLinkExpiry] = useState('30d')
+  // What the two selects show and send: the pick while the cap allows it.
+  const expiresIn = pickExpiry(peopleExpiryChoices, expiresPick, 'people')
+  const linkExpiry = pickExpiry(linkExpiryChoices, linkExpiryPick, 'link')
   const [linkButtons, setLinkButtons] = useState(false)
   const [made, setMade] = useState<CreateShareResult | null>(null)
   // The confirm the server asked for, and what to run once given.
@@ -292,7 +315,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     // (an exact username or email, the only way with the directory closed).
     ? (candidates.find((u) => u.name === typedPerson || u.username === typedPerson || u.sub === typedPerson)?.sub ?? typedPerson)
     : effectiveKind === GRANTEE_KIND.AGENT ? agentPick : deptPick
-  const canSubmit = !!grantee && !create.isPending
+  const canSubmit = !!grantee && !create.isPending && settingsKnown
 
   const submitShare = (e: React.FormEvent) => {
     e.preventDefault()
@@ -422,7 +445,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
       : 'Only you see this app. Add a colleague, or make a link.'
 
   const kindLabel = (k: GranteeKind) => k === GRANTEE_KIND.PERSON ? 'A person' : k === GRANTEE_KIND.AGENT ? 'An agent' : 'A department'
-  const selectClass = 'min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none'
+  const selectClass = 'min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm text-p-text focus:border-brand focus:outline-none'
 
   return (
     <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center" onClick={onClose} role="presentation">
@@ -468,7 +491,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                       onChange={(e) => setWho(e.target.value)}
                       placeholder={people ? 'Name or username' : 'Exact username or email'}
                       aria-label="Who to share with"
-                      className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm pointer-coarse:text-base text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none" />
+                      className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none" />
                     {people && (
                       <datalist id={`share-directory-${app.id}`}>
                         {candidates.map((u) => <option key={u.sub} value={u.name || u.username}>{u.username}</option>)}
@@ -489,15 +512,15 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                   </select>
                 )}
                 <select value={expiresIn} onChange={(e) => setExpiresIn(e.target.value)} aria-label="Expiry"
-                  className="rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-xs pointer-coarse:text-base text-p-text-secondary focus:border-brand focus:outline-none">
-                  {EXPIRY_CHOICES.map((c) => <option key={c.value || 'never'} value={c.value}>{c.label}</option>)}
+                  className="rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-xs text-p-text-secondary focus:border-brand focus:outline-none">
+                  {peopleExpiryChoices.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
                 </select>
               </div>
               {capChoices.length > 0 && (
                 <label className="flex items-center gap-2 text-[11px] text-p-text-secondary">
                   <span className="shrink-0">They act as</span>
                   <select value={capChoices.includes(cap) ? cap : ROLE.VIEWER} onChange={(e) => setCap(e.target.value as AgentRole)} aria-label="Role"
-                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none">
+                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text focus:border-brand focus:outline-none">
                     {capChoices.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
                   </select>
                 </label>
@@ -563,7 +586,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                     Public <span className="rounded bg-amber-500/15 px-1 py-px text-[10px] text-amber-700 dark:text-amber-300">anyone with the URL</span>
                   </label>
                   <select value={linkExpiry} onChange={(e) => setLinkExpiry(e.target.value)} aria-label="Link expiry"
-                    className="ml-auto rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs pointer-coarse:text-base text-p-text-secondary focus:border-brand focus:outline-none">
+                    className="ml-auto rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text-secondary focus:border-brand focus:outline-none">
                     {linkExpiryChoices.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
                   </select>
                 </div>
@@ -590,7 +613,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                   </label>
                 )}
                 <div className="flex items-center gap-2">
-                  <button type="submit" disabled={create.isPending || (publicLink && !publicUnderstood)}
+                  <button type="submit" disabled={create.isPending || !settingsKnown || (publicLink && !publicUnderstood)}
                     className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-brand-hover disabled:opacity-50">
                     Make link
                   </button>
@@ -632,7 +655,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                 <div className="mt-2 flex gap-2">
                   <input type="password" autoComplete="current-password" value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)} aria-label="Your password" placeholder="Your password"
-                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-surface px-2 py-1.5 text-sm pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none" />
+                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-surface px-2 py-1.5 text-sm text-p-text focus:border-brand focus:outline-none" />
                   <button type="submit" disabled={!confirmPassword}
                     className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-hover disabled:opacity-50">
                     Confirm

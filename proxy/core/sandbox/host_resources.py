@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import os
 
-logger = logging.getLogger("claude-proxy.host_resources")
+logger = logging.getLogger("otodock.host_resources")
 
 _MIB = 1024 * 1024
 _warned_uncapped = False  # one-time uncapped-in-Docker warning latch

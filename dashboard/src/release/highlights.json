@@ -1,0 +1,58 @@
+{
+  "1.8.0": {
+    "everyone": [
+      {
+        "icon": "phone",
+        "title": "Calls transfer and end by the agent",
+        "text": "The agent hands a caller to a colleague on the route's list and ends the call after its goodbye. It can follow the caller's language from the first words."
+      },
+      {
+        "icon": "picture",
+        "title": "Pictures and files from tools",
+        "text": "A tool's pictures and files, such as a route map, are saved in your workspace. They show up with the result."
+      },
+      {
+        "icon": "bell",
+        "title": "A waiting permission card pings you",
+        "text": "A permission card that waits for your answer plays a ping. A chat deleted while a card waits closes at once."
+      },
+      {
+        "icon": "chat",
+        "title": "Messages kept, in order",
+        "text": "Sends typed while a chat gets ready go out after its first message. Voice, phone and meeting turns wait for a busy chat."
+      },
+      {
+        "icon": "document",
+        "title": "Documents save and come back",
+        "text": "A document saves at once and reaches a sleeping machine later. An idle document reloads when you return."
+      },
+      {
+        "icon": "sparkle",
+        "title": "Claude Haiku 5.5 on both Claude engines",
+        "text": "The fast tier joins Claude Code and Direct LLM with a 1M context, at a twentieth of Sonnet's price under 100K tokens. Chat titles run on it."
+      }
+    ],
+    "admins": [
+      {
+        "icon": "backup",
+        "title": "Backup and restore by script",
+        "text": "One dated folder holds the database, the env file, the agents tree, the SSH keys and the connected accounts. The restore checks the backup first."
+      },
+      {
+        "icon": "sparkle",
+        "title": "The version and new releases",
+        "text": "Setup, OtoDock names the running version. A daily check tells you when a newer release exists, and an older server refuses a newer database."
+      },
+      {
+        "icon": "key",
+        "title": "GitHub tokens fetched per command",
+        "text": "git and gh fetch the account's token per command, so no session or file holds it. A disconnected account stops on paired machines."
+      },
+      {
+        "icon": "shield",
+        "title": "The command floor on every engine",
+        "text": "The platform's refusals apply on every engine and in every mode. A /sys write asks instead over ssh and on a full-access machine."
+      }
+    ]
+  }
+}

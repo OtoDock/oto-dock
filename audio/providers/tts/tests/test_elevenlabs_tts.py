@@ -63,11 +63,27 @@ def test_validate_advanced():
 
 
 def test_select_voice_falls_back_to_premade_default():
-    # Empty voices map -> the shipped PREMADE voice (account-independent)
-    # keeps every language speaking; the models are multilingual.
+    # Empty voices map -> the shipped PREMADE voices (account-independent)
+    # keep every language speaking; one entry per shipped language so the
+    # language lock can move a call on this provider, English otherwise.
     tts = ElevenLabsTTS(api_key="x")
-    assert tts.select_voice("de") == "XrExE9yKIg1WjnnlVkGX"
-    assert tts.select_voice("el") == "XrExE9yKIg1WjnnlVkGX"
+    assert tts.select_voice("de") == "FGY2WhTYpPnrIDTdsKH5"
+    assert tts.select_voice("el") == "EXAVITQu4vr4xnSDxMaL"
+    assert tts.select_voice("pt") == "XrExE9yKIg1WjnnlVkGX"
+    assert tts.has_voice_for("it") and not tts.has_voice_for("pt")
+
+
+def test_an_admin_english_voice_outranks_the_shipped_accented_voices():
+    # The shipped premades speak every language with an English accent, so
+    # an admin's chosen English voice (a cloned or brand multilingual voice)
+    # keeps the languages the admin set no voice for; the admin's voice for
+    # the language itself still wins over it.
+    tts = ElevenLabsTTS(api_key="x", voices={"en": "admin-en"})
+    assert tts.select_voice("de") == "admin-en"
+    assert tts.select_voice("en") == "admin-en"
+    tts = ElevenLabsTTS(api_key="x", voices={"en": "admin-en", "de": "admin-de"})
+    assert tts.select_voice("de") == "admin-de"
+    assert ElevenLabsTTS.shipped_voices_native is False
 
 
 def test_repr_redacts_api_key():
@@ -83,6 +99,10 @@ def test_lang_and_model_helpers():
     assert _is_ws_model("eleven_flash_v2_5")
     assert _is_ws_model("eleven_multilingual_v2")
     assert not _is_ws_model("eleven_v3")
+    # The text-to-speech sockets refuse both v4 models (probed live).
+    assert not _is_ws_model("eleven_v4") and not _is_ws_model("eleven_v4_turbo")
+    assert ElevenLabsTTS.default_model_ids() == {"model_id": "eleven_flash_v2_5"}
+    assert "model_id" not in ElevenLabsTTS.default_advanced_settings()
     assert _accepts_language_code("eleven_flash_v2_5")
     assert _accepts_language_code("eleven_turbo_v2_5")
     assert not _accepts_language_code("eleven_multilingual_v2")

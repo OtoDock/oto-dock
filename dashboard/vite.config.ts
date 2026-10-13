@@ -213,6 +213,14 @@ export default defineConfig({
           dest: 'ui-kit/fonts',
           rename: { stripBase: true },
         },
+        // The Android app's bundled setup page (public/setup.html) loads its
+        // font from here, never from another host; cap sync puts it beside
+        // the page in the app's assets.
+        {
+          src: 'node_modules/@fontsource/comfortaa/files/comfortaa-{latin,greek}-{400,600}-normal.woff2',
+          dest: 'setup-fonts',
+          rename: { stripBase: true },
+        },
       ],
     }),
     bundleAnimeIife(),

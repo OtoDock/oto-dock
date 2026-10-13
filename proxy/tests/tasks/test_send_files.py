@@ -527,13 +527,19 @@ class _FakeSatellite:
 
 
 @contextmanager
-def _remote(sat: _FakeSatellite, agent: str = SRC):
+def _remote(sat: _FakeSatellite, agent: str = SRC, role: str = "editor"):
+    """A remote session of ``agent`` on ``sat``, run by alice with ``role``
+    (its security context is what the read-through's write-back gate reads)."""
+    from auth.path_policy import SecurityContext
+    sec = SecurityContext(role=role, username="alice", agent=agent, is_admin_agent=False)
     with patch.object(
         remote_file_flow, "_get_remote_session_info",
         return_value=_FakeInfo(agent_name=agent),
     ), patch(
         "core.remote.satellite_connection.get_connection_manager",
         return_value=sat.cm,
+    ), patch(
+        "core.session.session_state.get_session_security", return_value=sec,
     ):
         yield
 
@@ -778,7 +784,7 @@ class TestRemotePrefetch:
         sat = _FakeSatellite({f"{USER_WS}/notes.md": b"newer on the machine"})
         sat.cm.pull_file_to_path = AsyncMock(return_value=False)
         authz = _authz(_user_session())
-        with _remote(sat), caplog.at_level("INFO", logger="claude-proxy"):
+        with _remote(sat), caplog.at_level("INFO", logger="otodock"):
             assert await prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20) == []
         assert (f"{USER_WS}/notes.md could not be read from 'drill-sat', the platform's "
                 "copy was sent") in caplog.text
@@ -804,7 +810,7 @@ class TestRemotePrefetch:
 
         sat.cm.pull_file_to_path = AsyncMock(side_effect=_endless)
         authz = _authz(_user_session())
-        with _remote(sat), caplog.at_level("WARNING", logger="claude-proxy"):
+        with _remote(sat), caplog.at_level("WARNING", logger="otodock"):
             got = await asyncio.wait_for(
                 prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20), 5)
         assert got == []
@@ -818,6 +824,8 @@ class TestRemotePrefetch:
         with patch.object(
             remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
         ), patch.object(
+            remote_file_flow, "write_back_allowed", AsyncMock(return_value=True),
+        ), patch.object(
             remote_file_flow, "stat_probe", AsyncMock(side_effect=RuntimeError("probe")),
         ), patch.object(
             remote_file_flow, "pull_through", AsyncMock(side_effect=RuntimeError("pull")),
@@ -830,6 +838,50 @@ class TestRemotePrefetch:
         assert unavailable == ["notes.md", "reports"]
         result = perform_send_files(authz, paths=["notes.md", "reports"])
         assert len(result.landed) == 3
+
+    @pytest.mark.asyncio
+    async def test_a_viewer_never_lands_machine_bytes_in_the_shared_workspace(
+            self, send_env, flow_reset):
+        """A viewer of the source agent (a contributor on the target, so the
+        agent-scope send is authorized) reads the shared workspace but may
+        not write it back: its machine is never asked, the platform's copy
+        goes, and a file only the machine holds is reported unavailable."""
+        sat = _FakeSatellite({
+            "workspace/shared.txt": b"from the machine",
+            "workspace/new.txt": b"machine only",
+            "workspace/reports/r.md": b"machine dir",
+        })
+        user = _user_session(agent_roles={
+            SRC: "viewer", TGT_COLLAB: "contributor", TGT_SHARED: "viewer",
+            TGT_PERSONAL: "viewer"})
+        authz = _authz(user, target=TGT_COLLAB, scope="agent")
+        held: list[str] = []
+        with _remote(sat, role="viewer"):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["shared.txt", "new.txt", "reports"], max_files=20, held=held)
+        assert (sat.probes, sat.pulls, sat.manifests) == ([], [], 0)
+        assert unavailable == held == ["new.txt", "reports"]
+        shared = config.get_agent_dir(SRC) / "workspace"
+        assert (shared / "shared.txt").read_bytes() == b"shared"
+        assert not (shared / "new.txt").exists() and not (shared / "reports").exists()
+        result = perform_send_files(authz, paths=["shared.txt"])
+        dest = config.get_agent_dir(TGT_COLLAB) / "workspace" / "inbox" / SRC / "shared.txt"
+        assert result.landed and dest.read_bytes() == b"shared"
+
+    @pytest.mark.asyncio
+    async def test_a_directory_entry_the_session_may_not_write_keeps_the_platform_copy(
+            self, send_env, flow_reset):
+        """The gate holds per pulled entry too: a writable directory's
+        listing never carries one back that the session may not write."""
+        sat = _FakeSatellite({f"{USER_WS}/reports/q3.md": b"q3 v2"})
+        authz = _authz(_user_session())
+        with _remote(sat), patch.object(
+            remote_file_flow, "write_back_allowed",
+            AsyncMock(side_effect=lambda sid, agent, rel: not rel.endswith("q3.md")),
+        ):
+            await prefetch_remote_sources("s-1", authz, ["reports"], max_files=20)
+        assert sat.pulls == []
+        assert (config.get_agent_dir(SRC) / USER_WS / "reports" / "q3.md").read_text() == "q3 report"
 
 
 def _endpoint_client(user: UserContext) -> TestClient:
@@ -900,6 +952,22 @@ class TestEndpointRemoteSources:
             r = _post(client, ["missing.md"])
         assert r.status_code == 404
         assert r.json()["detail"] == "No such file or directory in your workspace: 'missing.md'"
+
+    def test_a_held_path_404_says_the_session_may_not_bring_it(self, send_env, flow_reset):
+        sat = _FakeSatellite({"workspace/new.txt": b"machine only"})
+        user = _user_session(agent_roles={
+            SRC: "viewer", TGT_COLLAB: "contributor", TGT_SHARED: "viewer",
+            TGT_PERSONAL: "viewer"})
+        client = _endpoint_client(user)
+        with _remote(sat, role="viewer"):
+            r = _post(client, ["new.txt"], scope="agent")
+        assert r.status_code == 404
+        assert r.json()["detail"] == (
+            "'new.txt' is not in the platform copy of your workspace, and this "
+            "session may not copy files from its machine into that folder (its "
+            "role cannot write there), so it cannot be sent"
+        )
+        assert sat.pulls == []
 
     def test_cookie_caller_has_no_session_and_no_prefetch(self, send_env, flow_reset):
         """A dashboard caller (no session id) never enters the prefetch — the

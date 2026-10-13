@@ -179,6 +179,38 @@ def set_decision(share_id: str, decision: str, decided_by: str,
         return cur.rowcount > 0
 
 
+def place_person_share_for_agent(share_id: str, person_sub: str, agent: str,
+                                 decided_by: str) -> bool:
+    """A person's app share accepted into a Shared-only agent becomes the
+    agent's placement there (SHARING.md "Accepting into a Shared-only
+    agent"): the same row, its sharer, cap and expiry kept, its recipient
+    now ``agent``. Only while it is still that person's live internal app
+    share: False when nothing changed (revoked, declined, expired, paused
+    or already turned meanwhile). ``ShareExists`` when an unrevoked agent
+    share of the app to that agent already holds the slot."""
+    from psycopg import errors as pg_errors
+    now = _now()
+    with get_conn() as conn:
+        try:
+            cur = conn.execute(
+                """UPDATE shares SET grantee_kind = %s, grantee_agent = %s,
+                          grantee_sub = NULL, placed_agent = NULL,
+                          hidden_by_grantee = FALSE, decision = %s,
+                          decided_by = %s, decided_at = %s
+                    WHERE id = %s AND scope = 'internal' AND target_kind = 'app'
+                      AND grantee_kind = %s AND grantee_sub = %s
+                      AND revoked_at IS NULL AND decision <> %s AND state = 'active'
+                      AND (expires_at IS NULL OR expires_at > %s)""",
+                (AGENT, agent, ACCEPTED, decided_by, now,
+                 share_id, PERSON, person_sub, DECLINED, now),
+            )
+        except pg_errors.UniqueViolation:
+            conn.rollback()
+            raise ShareExists() from None
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def set_placement_hidden(app_id: str, agent: str, user_sub: str, hidden: bool) -> None:
     """A member's own hide of a placed app in one agent. Idempotent."""
     with get_conn() as conn:

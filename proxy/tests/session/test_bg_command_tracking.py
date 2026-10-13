@@ -846,7 +846,7 @@ async def test_a_chat_busy_for_every_round_logs_once(review_env, monkeypatch, ca
     held = _HeldPump(chat_id, hold=60)
     layer = _ReviewLayer(_resolver(sid, "bR8"))
 
-    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+    with caplog.at_level(logging.WARNING, logger="otodock"):
         await _monitor(layer, sid, chat_id)
     held._task.cancel()
 

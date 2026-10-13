@@ -11,6 +11,9 @@ npm ci
 npm run dev                          # hot-reload dev server (proxy on :8400)
 npx tsc --noEmit && npm run build    # type-check + production build
 npx vitest run                       # unit tests
+npm run lint                         # ESLint
 ```
 
-Developer docs live at [docs.otodock.io](https://docs.otodock.io).
+How the dashboard fits with the proxy:
+[`ARCHITECTURE.md`](../ARCHITECTURE.md). Using and running OtoDock:
+[docs.otodock.io](https://docs.otodock.io).

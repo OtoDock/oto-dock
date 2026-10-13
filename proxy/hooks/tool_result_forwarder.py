@@ -14,7 +14,10 @@ Environment variables (set by core/sandbox/env_builder.py in the CLI's subproces
 import contextlib
 import json
 import os
+import re
 import sys
+import threading
+import time
 import urllib.request
 import urllib.error
 
@@ -75,10 +78,75 @@ _SKIP_MCP_TOOLS = {
 }
 
 
+# The texts the CLI adds to an MCP result it hands the model: the pointer
+# after an image and the line before a resource's picture (the proxy's
+# ``services/mcp/result_files.py`` drops the same two).
+_CLI_POINTER_RE = re.compile(
+    r"^\[(Image: source: [^\]\n]*tool-results[/\\][^\]\n]*"
+    r"|Resource from [^\]\n]* at [^\]\n]*)\]$")
+
+# What a result's files may weigh on the way to the proxy (the proxy's caps
+# decide; these keep the request inside its body limit): a block's base64,
+# the blocks' base64 together, and their count.
+# The MCP content block kinds that carry bytes (the MCP schema's words).
+_IMAGE_BLOCK = "image"
+_RESOURCE_BLOCK = "resource"
+_FILE_B64_MAX = 20 * 1024 * 1024
+_FILES_B64_MAX = 40 * 1024 * 1024
+_FILES_MAX = 8
+# The PostToolUse hook runs under a 10 s timeout; both requests fit in this.
+_BUDGET_S = 8.5
+
+
+def _text_blocks(blocks: list) -> str:
+    """The text of an MCP result's content blocks, the CLI's own lines left
+    out (an MCP tool's response is a LIST of blocks)."""
+    parts = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text", "")
+            if isinstance(text, str) and text and not _CLI_POINTER_RE.match(text.strip()):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _binary_blocks(tool_result) -> list:
+    """The image blocks and resource blobs of a list response, the large
+    ones replaced by their size (the proxy names them in its line)."""
+    if not isinstance(tool_result, list):
+        return []
+    out, total, sent = [], 0, 0
+    for block in tool_result:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == _IMAGE_BLOCK:
+            src = block.get("source") if isinstance(block.get("source"), dict) else {}
+            data = src.get("data") or block.get("data") or ""
+            mime = src.get("media_type") or block.get("mimeType") or ""
+        elif kind == _RESOURCE_BLOCK and isinstance(block.get(_RESOURCE_BLOCK), dict):
+            data = block[_RESOURCE_BLOCK].get("blob") or ""
+            mime = block[_RESOURCE_BLOCK].get("mimeType") or ""
+        else:
+            continue
+        if not isinstance(data, str) or not data:
+            continue
+        if (sent >= _FILES_MAX or len(data) > _FILE_B64_MAX
+                or total + len(data) > _FILES_B64_MAX):
+            out.append({"type": kind, "mime": mime, "skipped_bytes": len(data) * 3 // 4})
+            continue
+        total += len(data)
+        sent += 1
+        out.append(block)
+    return out
+
+
 def _extract_result_text(tool_result: dict) -> str:
     """Extract the full text content from a tool result."""
     result_text = ""
-    if isinstance(tool_result, dict):
+    if isinstance(tool_result, list):
+        result_text = _text_blocks(tool_result)
+    elif isinstance(tool_result, dict):
         result_text = (
             tool_result.get("content", "")
             or tool_result.get("text", "")
@@ -86,11 +154,7 @@ def _extract_result_text(tool_result: dict) -> str:
             or ""
         )
         if isinstance(result_text, list):
-            parts = []
-            for block in result_text:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-            result_text = "\n".join(parts)
+            result_text = _text_blocks(result_text)
         # Read responses nest the body under file.content — without this
         # every Read pill summarized as "empty file" even though the read
         # returned content (live find 2026-07-11).
@@ -215,8 +279,15 @@ def _is_error_result(tool_result, summary: str) -> bool:
 
 
 def main():
+    raw = sys.stdin.read()
+    # Codex app-server sessions (OTO_HOOK_NO_FORWARD set by the spawn): the
+    # JSON-RPC stream already carries every tool result to the proxy, a
+    # forward here would render each card twice. Checked before the parse:
+    # this runs after every tool call of those sessions.
+    if os.environ.get("OTO_HOOK_NO_FORWARD"):
+        return
     try:
-        inp = json.loads(sys.stdin.read())
+        inp = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return
 
@@ -225,12 +296,6 @@ def main():
     api_key = os.environ.get("PROXY_API_KEY", "")
 
     if not proxy_url or not api_key or not session_id:
-        return
-
-    # Codex app-server sessions that run the hook floor (OTO_HOOK_NO_FORWARD
-    # set by the spawn): the JSON-RPC stream already carries every tool
-    # result to the proxy, a forward here would render each card twice.
-    if os.environ.get("OTO_HOOK_NO_FORWARD"):
         return
 
     # Interactive TUI (OTO_INTERACTIVE set by the spawn): rendering is
@@ -308,6 +373,49 @@ def main():
         "tool_command": _tool_command(tool_name, tool_input),
     }).encode()
 
+    started = time.monotonic()
+    answer = _post(proxy_url, api_key, payload, timeout=5)
+
+    # A tool whose results the platform keeps (the MCP's ``result_files``,
+    # the proxy's answer says so): its pictures and file blobs go in a
+    # second request, and the line naming where they were saved reaches the
+    # agent as this hook's additionalContext.
+    if not answer.get("result_files") or _is_error_result(tool_result, summary):
+        return
+    blocks = _binary_blocks(tool_result)
+    if not blocks:
+        return
+    left = _BUDGET_S - (time.monotonic() - started)
+    if left < 1:
+        return
+    payload = json.dumps({
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "tool_use_id": inp.get("tool_use_id", "") or "",
+        "summary": "",
+        "result_content": result_text[:4000],
+        "files_only": True,
+        "result_blocks": blocks,
+    }).encode()
+    # A socket timeout bounds each read, not the upload: the request runs in
+    # a thread joined at the budget, and a late answer is dropped (the proxy
+    # still keeps the files; the agent just is not told).
+    kept: dict = {}
+    sender = threading.Thread(
+        target=lambda: kept.update(_post(proxy_url, api_key, payload, timeout=left)),
+        daemon=True,
+    )
+    sender.start()
+    sender.join(left)
+    line = kept.get("additional_context")
+    if not sender.is_alive() and isinstance(line, str) and line:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse", "additionalContext": line}}))
+
+
+def _post(proxy_url: str, api_key: str, payload: bytes, *, timeout: float) -> dict:
+    """POST to the tool-result route; the JSON answer, or {} on any
+    failure (never interrupts Claude)."""
     req = urllib.request.Request(
         f"{proxy_url}/v1/hooks/tool-result",
         data=payload,
@@ -316,12 +424,12 @@ def main():
             "Content-Type": "application/json",
         },
     )
-
     try:
-        with urllib.request.urlopen(req, timeout=5):
-            pass  # Fire and forget
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read() or b"{}")
+            return body if isinstance(body, dict) else {}
     except Exception:
-        pass  # Non-blocking — don't interrupt Claude
+        return {}
 
 
 if __name__ == "__main__":

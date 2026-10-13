@@ -8,8 +8,6 @@ dashboard/.env
 audio/.env
 phone/.env
 mcps/**/.env
-# Firebase config — project-specific; ships as google-services.json.example
-dashboard/android/app/google-services.json
 
 # ── Agent data (user-specific, not shipped) ──
 agents/
@@ -66,6 +64,7 @@ Thumbs.db
 
 # ── Testing ──
 .pytest_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 

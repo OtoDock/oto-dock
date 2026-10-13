@@ -136,8 +136,9 @@ def test_config_toml_question_flag_dashboard_and_interactive(tmp_path):
 
     headless_dashboard = _written_config(tmp_path, client_type="dashboard")
     assert headless_dashboard["features"]["default_mode_request_user_input"] is True
-    # Headless dashboard must NOT enable the TUI-only hooks flag.
-    assert "hooks" not in headless_dashboard["features"]
+    # The headless dashboard chat runs the hook too (its gate judges the
+    # Don't Ask and auto turns).
+    assert headless_dashboard["features"]["hooks"] is True
 
     headless_task = _written_config(tmp_path, client_type="task")
     assert "default_mode_request_user_input" not in headless_task["features"]
@@ -145,6 +146,22 @@ def test_config_toml_question_flag_dashboard_and_interactive(tmp_path):
     interactive = _written_config(tmp_path, interactive=True)
     assert interactive["features"]["default_mode_request_user_input"] is True
     assert interactive["features"]["hooks"] is True
+
+
+def test_config_toml_interactive_puts_codex_worktrees_beside_the_config_dir(tmp_path):
+    # Codex 0.162's managed worktrees (TUI tools) default to $CODEX_HOME/
+    # worktrees, the protected .codex dir; the root moves to a hidden sibling
+    # at the scope root, with the SANDBOX path Codex reads inside bwrap. The
+    # tools exist in the TUI only, so a headless config carries no table.
+    cfg = _written_config(tmp_path, interactive=True, trusted_cwd="/users/alice",
+                          sandbox_codex_dir="/users/alice/.codex")
+    assert cfg["desktop"]["git-worktree-root"] == "/users/alice/.codex-worktrees"
+    assert cfg["projects"]["/users/alice"]["trust_level"] == "trusted"
+    cfg = _written_config(tmp_path, interactive=True, sandbox_codex_dir="/workspace/.codex/")
+    assert cfg["desktop"]["git-worktree-root"] == "/workspace/.codex-worktrees"
+    for kwargs in ({"client_type": "dashboard", "sandbox_codex_dir": "/workspace/.codex"},
+                   {"interactive": True}):
+        assert "desktop" not in _written_config(tmp_path, **kwargs)
 
 
 def test_config_toml_local_endpoint_wire_api_responses(tmp_path):
@@ -289,12 +306,11 @@ def test_with_local_provider_note_is_idempotent_and_handles_empty():
 
 
 def test_config_toml_hook_floor_and_shell_knobs(tmp_path):
-    # Unattended sessions run the PreToolUse permission floor under the
-    # app-server (trust rides thread/start.config); dashboard app-server
-    # chats gate through the JSON-RPC bridge alone; the TUI keeps its flag.
-    for client_type in ("task", "phone", "meeting", "trigger", "internal"):
+    # Every session runs the PreToolUse permission floor: the app-server's
+    # trust rides thread/start.config (a dashboard chat's gate judges the
+    # turns the bridge does not ask in); the TUI keeps its flag.
+    for client_type in ("task", "phone", "meeting", "trigger", "internal", "dashboard", ""):
         assert _written_config(tmp_path, client_type=client_type)["features"]["hooks"] is True
-    assert "hooks" not in _written_config(tmp_path, client_type="dashboard")["features"]
     assert _written_config(tmp_path, interactive=True)["features"]["hooks"] is True
     # An external caller loses the shell tool; every other session keeps it.
     external = _written_config(tmp_path, client_type="phone", no_shell=True)["features"]

@@ -91,7 +91,9 @@ def test_manifest_companion_app(manifest):
     # the official add-on socket is OPEN (no token) — documented residual;
     # "none" is a valid companion_app.auth value
     assert ca.auth == "none"
-    assert ca.plugin.supported_host_versions == ["blender>=4.2,<5.0"]
+    # the range follows the catalog's add-on release; its form is the contract
+    assert ca.plugin.supported_host_versions
+    assert all(v.startswith("blender>=") for v in ca.plugin.supported_host_versions)
 
 
 def test_manifest_high_risk_tools(manifest):

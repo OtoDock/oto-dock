@@ -57,7 +57,7 @@ import config
 from services.media import audio_service, duplex_service, ws_audio_token
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # How long the browser side waits for the daemon's dial-back before giving
 # up (this wait IS the pending-entry TTL — no sweeper needed).
@@ -90,6 +90,14 @@ class DuplexBridge:
 # Sessions awaiting the daemon dial-back / live sessions, by duplex_id.
 _pending: dict[str, DuplexBridge] = {}
 _active: dict[str, DuplexBridge] = {}
+
+
+def live_for_chat(chat_id: str) -> "DuplexBridge | None":
+    """The spoken conversation holding ``chat_id``, pending or live."""
+    for bridge in (*_active.values(), *_pending.values()):
+        if bridge.chat_id == chat_id and not bridge.closed:
+            return bridge
+    return None
 
 
 def on_open_failed(duplex_id: str, reason: str) -> None:

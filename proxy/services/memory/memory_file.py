@@ -606,6 +606,12 @@ def op_str_replace(root: Path, rel: str, old_str: str, new_str: str) -> OpResult
 
 
 def op_insert(root: Path, rel: str, insert_line: int, insert_text: str) -> OpResult:
+    # An empty insert would rewrite the file unchanged and answer "edited";
+    # a blank line is "\n". Judged after sanitising: text of control
+    # characters alone is empty too.
+    inserted = _sanitize(insert_text or "").splitlines()
+    if not inserted:
+        raise MemoryOpError("Error: `insert_text` must be non-empty")
     with _scope_lock(root):
         target = _resolve_strict(root, rel)
         if not target.is_file():
@@ -620,7 +626,6 @@ def op_insert(root: Path, rel: str, insert_line: int, insert_text: str) -> OpRes
                 f"should be within the range of lines of the file: "
                 f"[0, {len(lines)}]"
             )
-        inserted = _sanitize(insert_text or "").splitlines()
         new_lines = lines[:insert_line] + inserted + lines[insert_line:]
         new_text = "\n".join(new_lines) + ("\n" if text.endswith("\n") or not text else "")
         warnings = _check_caps_for_write(

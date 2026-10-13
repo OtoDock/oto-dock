@@ -7,7 +7,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "lint": "eslint src"
   },
   "dependencies": {
     "@capacitor-community/text-to-speech": "^8.0.0",
@@ -46,6 +47,7 @@
   },
   "devDependencies": {
     "@capacitor/cli": "^8.2.0",
+    "@eslint/js": "10.0.1",
     "@tailwindcss/typography": "^0.5.20",
     "@tailwindcss/vite": "^4.3.1",
     "@testing-library/jest-dom": "^6.9.1",
@@ -56,12 +58,25 @@
     "@types/three": "0.185.4",
     "@types/zxcvbn": "^4.4.5",
     "@vitejs/plugin-react": "^6.0.3",
+    "eslint": "10.12.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.7",
+    "globals": "17.13.0",
     "jsdom": "^29.1.1",
     "rolldown": "~1.1.2",
     "tailwindcss": "^4.3.1",
-    "typescript": "^6.0.3",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "8.71.1",
     "vite": "^8.1.0",
     "vite-plugin-static-copy": "^4.1.1",
     "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "@tailwindcss/typography": {
+      "postcss-selector-parser": "^7.1.6"
+    },
+    "xcode": {
+      "uuid": "^11.1.1"
+    }
   }
 }

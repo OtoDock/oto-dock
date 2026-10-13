@@ -19,6 +19,7 @@ import { emitFileUpdate } from '../lib/fileUpdates'
 import { CATALOG_RESYNC, emitAppLive, releaseCatalogSender, resendCatalogSubscriptions, setCatalogSender } from '../lib/appLive'
 import { releaseFocusSender, resendFocus, setFocusSender } from '../lib/focus'
 import { noteServerBuild } from '../lib/buildId'
+import { noteServerVersion } from '../lib/session/serverInfo'
 import type { WsCallbacks } from './useDashboardWs.types'
 import { isTaskChatId } from '../lib/session/kind'
 import { CHAT_PHASE } from '../lib/status/chat'
@@ -75,7 +76,7 @@ export function mintQueueId(): string {
 function returnToComposer(
   chatId: string | null | undefined,
   frame: { text?: string; images?: Array<{ name: string; path?: string }>;
-           files?: Array<{ path: string; name: string }>; chat_id?: string },
+           files?: Array<{ path: string; name: string; folder?: boolean }>; chat_id?: string },
   cb: WsCallbacks,
 ): void {
   if (!chatId || chatId === cb.viewedChatId) {
@@ -95,7 +96,8 @@ function returnToComposer(
   }
   if (frame.files?.length) {
     st.addPendingFiles(chatId, frame.files.map((f) => ({
-      id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path })))
+      id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path,
+      ...(f.folder ? { folder: true } : {}) })))
   }
 }
 
@@ -123,6 +125,16 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // streaming — the backend echoes chat_status streaming straight to the
   // socket that resumes, so deriving this from store state would loop.
   const autoAttachRef = useRef<string | null>(null)
+  // The viewed chat a chat_view_only frame named (a phone call drives it):
+  // no auto-attach while it holds, this socket's own streaming flag stays
+  // off (the call's turns emit queue_sent for the chat and no done follows
+  // for a socket that never attached), and a full resume when its status
+  // reads ready. The frame precedes every read-only history and delta; the
+  // armed flag marks the one that follows it, so a history or delta WITHOUT
+  // one (the re-resume's, a reconnect's after the call) and another chat's
+  // history (a navigation) clear the state.
+  const viewOnlyChatRef = useRef<string | null>(null)
+  const viewOnlyArmedRef = useRef(false)
   // Wrap setStreaming to also notify Android native (controls background wake lock)
   const streaming = _streaming
   const setStreaming = useCallback((value: boolean) => {
@@ -663,7 +675,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             useChatStore.getState().touchHeartbeat(msg.chat_id)
             break
           case WIRE.WARMUP_FAILED:
-            useChatStore.getState().failWarmup(msg.chat_id, msg.error || 'warmup failed')
+            if (msg.chat_id) useChatStore.getState().failWarmup(msg.chat_id, msg.error || 'warmup failed')
             cb.onWarmupFailed?.(msg)
             break
           case WIRE.CHAT_MOVED:
@@ -672,6 +684,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // new target and the "moved" history card arrives. Failures come
             // as standard error frames instead.
             cb.onChatMoved?.(msg)
+            break
+          case WIRE.CHAT_VIEW_ONLY:
+            // The resume was answered read-only: a call drives the chat. The
+            // frame precedes that history; the ready status ends the state.
+            viewOnlyChatRef.current = msg.chat_id
+            viewOnlyArmedRef.current = true
+            cb.onChatViewOnly?.(msg)
             break
           case WIRE.ENGINE_SWITCHED:
             // Cross-engine switch: direct ack to the acting socket AND a
@@ -775,9 +794,24 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             cb.onExecutionModeChanged?.(msg)
             break
           case WIRE.CHAT_HISTORY:
+            // A history no view-only frame announced (the chat is its own
+            // again), or another chat's (a navigation): the state ends.
+            if (viewOnlyChatRef.current !== null
+                && (!viewOnlyArmedRef.current || viewOnlyChatRef.current !== msg.chat_id)) {
+              viewOnlyChatRef.current = null
+              cb.onChatViewOnly?.(null)
+            }
+            viewOnlyArmedRef.current = false
             cb.onChatHistory?.(msg)
             break
           case WIRE.CHAT_HISTORY_DELTA:
+            // The pump poll's deltas repeat the frame; one without it says
+            // the chat is its own again.
+            if (!viewOnlyArmedRef.current && viewOnlyChatRef.current === msg.chat_id) {
+              viewOnlyChatRef.current = null
+              cb.onChatViewOnly?.(null)
+            }
+            viewOnlyArmedRef.current = false
             cb.onChatHistoryDelta?.(msg)
             break
           case WIRE.QUEUED: {
@@ -822,7 +856,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               if (msg.queue_ids?.length) st.clearQueuedMessages(qsChatId, msg.queue_ids)
               st.setStreaming(qsChatId)
             }
-            if (!msg.chat_id || msg.chat_id === cb.viewedChatId) {
+            if ((!msg.chat_id || msg.chat_id === cb.viewedChatId)
+                && viewOnlyChatRef.current !== qsChatId) {
+              // A call's turns emit this for the chat they drive; this
+              // socket streams nothing of it and no done would clear the flag.
               setStreaming(true)
               cb.onQueueSent?.(msg)
             }
@@ -879,7 +916,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                       && currentChatId.current === viewed
                       && !streamingRef.current
                       && !cb.isViewedChatPtyLive?.()
-                      && autoAttachRef.current !== viewed) {
+                      && autoAttachRef.current !== viewed
+                      && viewOnlyChatRef.current !== viewed) {
                     autoAttachRef.current = viewed
                     ws.send(JSON.stringify({ type: OUT.RESUME_CHAT, chat_id: viewed }))
                   }
@@ -887,6 +925,24 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               } else {
                 if (autoAttachRef.current === msg.chat_id) autoAttachRef.current = null
                 useChatStore.getState().setReady(msg.chat_id)
+                if (viewOnlyChatRef.current === msg.chat_id) {
+                  // The call that drove the chat ended: the chat is its own
+                  // again, so the page reloads it whole (the call's rows and
+                  // the reply that closed it). This socket streamed nothing
+                  // of the chat, so its own flag is cleared, not consulted:
+                  // a queue_sent that came before the first frame set it, and
+                  // no done ever reached a socket that never attached.
+                  viewOnlyChatRef.current = null
+                  viewOnlyArmedRef.current = false
+                  cb.onChatViewOnly?.(null)
+                  setStreaming(false)
+                  const viewed = cb.viewedChatId
+                  if (viewed && msg.chat_id === viewed
+                      && currentChatId.current === viewed
+                      && !cb.isViewedChatPtyLive?.()) {
+                    ws.send(JSON.stringify({ type: OUT.RESUME_CHAT, chat_id: viewed }))
+                  }
+                }
                 // A turn just finished somewhere the user isn't looking →
                 // flip the sidebar unread dot immediately (the server row
                 // confirms on the next list refetch). A finish on the VIEWED
@@ -1049,6 +1105,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             break
           case WIRE.SERVER_INFO:
             noteServerBuild(msg.build_id)
+            noteServerVersion(msg.version)
             break
           default:
             if (!isWireType(raw.type)) warnUnknownFrame(raw.type)
@@ -1109,15 +1166,15 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     [send],
   )
 
-  const sendMessage = useCallback(
-    (text: string, chatId: string, images?: WireImage[], files?: Array<{ path: string; name: string }>) => {
-      setStreaming(true)
-      useChatStore.getState().setStreaming(chatId)
-      // The message's id in the chat's queue: a re-send after a reconnect
-      // is answered once, and a cancel names it.
-      const msg: Record<string, unknown> = {
-        type: OUT.CHAT, text, chat_id: chatId, queue_id: mintQueueId(),
-      }
+  // The `chat` frame: the message's id in the chat's queue (a re-send after a
+  // reconnect is answered once, a cancel names it) rides with it. Returns it.
+  const sendChatFrame = useCallback(
+    (text: string, chatId: string, images?: WireImage[],
+     files?: Array<{ path: string; name: string }>, queueId?: string,
+     queueOnly = false): string => {
+      const id = queueId || mintQueueId()
+      const msg: Record<string, unknown> = { type: OUT.CHAT, text, chat_id: chatId, queue_id: id }
+      if (queueOnly) msg.queue_only = true
       if (images?.length) {
         msg.images = images.map(wireImage)
       }
@@ -1125,8 +1182,30 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         msg.files = files
       }
       send(msg)
+      return id
     },
     [send],
+  )
+
+  const sendMessage = useCallback(
+    (text: string, chatId: string, images?: WireImage[], files?: Array<{ path: string; name: string }>): string => {
+      setStreaming(true)
+      useChatStore.getState().setStreaming(chatId)
+      return sendChatFrame(text, chatId, images, files)
+    },
+    [sendChatFrame],
+  )
+
+  // A message sent while its chat gets ready: the proxy queues it behind the
+  // chat's first turn (its chip comes back as `queued`), so nothing here
+  // starts a turn of its own: the streaming state stays the warmup's.
+  // `queue_only`: it follows that first turn, never steers into it or stops
+  // it, even when it reaches the proxy after the turn started.
+  const queueMessage = useCallback(
+    (text: string, chatId: string, images?: WireImage[],
+     files?: Array<{ path: string; name: string }>, queueId?: string): string =>
+      sendChatFrame(text, chatId, images, files, queueId, true),
+    [sendChatFrame],
   )
 
   const sendPermission = useCallback(
@@ -1535,6 +1614,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     preWarmup,
     warmup,
     sendMessage,
+    queueMessage,
     sendPermission,
     sendLocationResponse,
     sendPlanReviewResponse,
@@ -1571,6 +1651,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     preWarmup,
     warmup,
     sendMessage,
+    queueMessage,
     sendPermission,
     sendLocationResponse,
     sendPlanReviewResponse,

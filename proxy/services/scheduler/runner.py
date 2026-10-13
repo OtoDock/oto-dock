@@ -27,11 +27,21 @@ from storage import database as task_store
 from storage.automation import run_status
 from storage.chat import meeting_status
 from services.scheduler import delivery, firing, interactive, lanes, shared, task_kinds
+from core.events import turn_ending
 from core.execution_layer import DEFAULT_EXECUTION_PATH
 from core.session import session_kind
 from core.session.visibility import shared_chat_owner, task_chat_owner
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
+
+
+def _rebuilds_from_rows(agent_cfg) -> bool:
+    """The round's engine keeps no conversation of its own (Direct LLM): it
+    rebuilds it from the chat rows at every start."""
+    from core.session.session_manager import capabilities_for_path
+    return bool(capabilities_for_path(agent_cfg.execution_path or "")
+                .behaviour.rebuilds_history_from_db)
 
 
 async def _fire_task(task: shared.TaskDefinition) -> None:
@@ -58,7 +68,8 @@ async def _fire_task(task: shared.TaskDefinition) -> None:
             return
         from services.scheduler.scheduler import _row_to_task
         task = _row_to_task(row)
-    asyncio.create_task(_execute_task(task, trigger_type=task_kinds.TRIGGER_SCHEDULED))
+    spawn(_execute_task(task, trigger_type=task_kinds.TRIGGER_SCHEDULED),
+          name="execute_task", owner="runner")
 
 
 def _drop_job(task_id: str) -> None:
@@ -103,8 +114,8 @@ def _create_task_chat_row(chat_id: str, run_id: str, task: shared.TaskDefinition
     # Layer-aware (mirrors task_config_builder's wire resolution): with a
     # layer override, the agent-default model may be foreign to the run's
     # engine — stamping it would 400 the provider AND mis-attribute usage.
-    task_model = (task.override_model
-                  or config.get_cli_model(task.agent, layer=task_path or None))
+    task_model = config.resolve_run_model(task.agent, task.override_model,
+                                          layer=task_path or None)
     kind = task_kinds.of(task)
     if kind.worker:
         worker_sub = (task.created_by if task.scope == "user"
@@ -532,7 +543,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
             # 1. Persist the chat row + the user's prompt FIRST — BEFORE the slow
             #    spawn (config build / start_session / offline-target hard-fail) — so
             #    a pre-turn failure still shows the prompt and is visible in
-            #    TaskRunView instead of "No messages yet." General task robustness:
+            #    the run's chat instead of an empty one. General task robustness:
             #    applies to every task type (scheduled / one-time / delegate).
             if task.target_chat_id:
                 # Worker chat (surface="chat") — the spawn path created the row
@@ -687,7 +698,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
 
                 # Pin the task chat to the target it actually runs on
                 # — same affinity as dashboard chats (ws/dashboard.py warmup pin).
-                # Makes TaskRunView continues resume on the origin machine, and
+                # Makes a task run's continues resume on the origin machine, and
                 # lets delete_remote_machine transition task chats to
                 # auto-continue like any other chat.
                 await run_db(
@@ -768,7 +779,12 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                         if task.scope == "user" and task.created_by:
                             resume_username = await run_db(
                                 task_store.get_username_by_sub, task.created_by) or ""
-                        if await layer.can_resume_session(
+                        if _rebuilds_from_rows(agent_cfg):
+                            # Its conversation is its rounds' rows: the same id
+                            # rebuilds them (the round's prompt row is skipped
+                            # by id at the start below).
+                            agent_cfg.resume = True
+                        elif await layer.can_resume_session(
                             session_id, agent_name=task.agent, username=resume_username,
                         ):
                             agent_cfg.resume = True
@@ -798,6 +814,18 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                 first_prompt_in_argv = False
                 if agent_cfg.interactive and agent_cfg.resume:
                     agent_cfg.interactive = False
+                # The zone the run's [Current time] line speaks: the one the
+                # task was made in, else its creator's browser, else the
+                # platform's (every reader's fallback) — on the final id.
+                run_tz = task.user_tz or _state.get_user_tz(task.created_by or "")
+                if run_tz:
+                    _state.set_session_user_tz(session_id, run_tz)
+                # A run's first prompt carries the time and parallel-activity
+                # lines a dashboard turn carries: a headless engine stamps them
+                # at its own turn site, an interactive one is handed them here.
+                # A check's judge judges the work and gets neither.
+                stamp_first_prompt = not task_kinds.of(task).judge
+                engine_prompt = prompt
                 if agent_cfg.interactive:
                     # The chat's terminal hold, BEFORE the spawn: a continue
                     # round arriving now waits for this round and its close
@@ -811,13 +839,19 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     # fires (the run hangs) + nothing persists.
                     agent_cfg.chat_id = chat_id
                     await run_db(task_store.update_chat, chat_id, execution_mode="interactive")
+                    if stamp_first_prompt:
+                        from core.session import sibling_awareness
+                        from ws.dashboard_chat_text import task_prelude
+                        engine_prompt = task_prelude(
+                            prompt, user_tz=run_tz,
+                            parallel_line=await sibling_awareness.prelude_line(session_id))
                     # An engine whose TUI takes the cold prompt as a launch argument
                     # (Codex auto-runs it after MCP warm) gets it there; the others
                     # get it via the PTY flush in the watcher.
                     from core.session.session_manager import get_layer_capabilities
                     _rc = get_layer_capabilities(agent_cfg.execution_path or "")
                     if _rc is not None and _rc.runtime.interactive_first_prompt_via_argv:
-                        agent_cfg.interactive_first_prompt = prompt
+                        agent_cfg.interactive_first_prompt = engine_prompt
                         first_prompt_in_argv = True
 
                 # Persist the user-prompt bubble for the message-list view — but NOT
@@ -854,6 +888,8 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                 # 3. Start session via execution layer (skipped when the round
                 #    rides an already-warm session — see _try_reuse_warm_session)
                 if not reused_warm:
+                    if agent_cfg.resume and prompt_row_id and _rebuilds_from_rows(agent_cfg):
+                        agent_cfg.extra_env["_RESUME_SKIP_ROW"] = str(prompt_row_id)
                     await layer.start_session(session_id, agent_cfg)
                 session_started = True
 
@@ -878,7 +914,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     # also persists the turns to chat_messages, so the shared
                     # output-collection + update_run + delivery below Just Work.
                     await interactive._run_interactive_task(
-                        session_id, chat_id, prompt, first_prompt_in_argv,
+                        session_id, chat_id, engine_prompt, first_prompt_in_argv,
                     )
                 else:
                     # 5. Create event queue + launch producer
@@ -894,6 +930,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                             layer, session_id, prompt, event_queue, run_id,
                             broadcast_fn=_broadcast, settle_timeout=30.0,
                             bg_cmd_ceiling=bg_wait, bg_sub_ceiling=max(bg_wait, 1800.0),
+                            inject_time=stamp_first_prompt,
                         )
                     )
 
@@ -913,7 +950,9 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     pump.start()
                     # Run to completion under the stall watchdog (reaps a wedged
                     # turn instead of holding the run "generating" forever).
-                    await lanes._watch_task_pump(layer, pump, run_id, chat_id, session_id)
+                    await lanes._watch_task_pump(
+                        layer, pump, run_id, chat_id, session_id,
+                        on_parked=lambda: lanes.tell_run_parked(task, chat_id))
 
             # 6b. If the agent started a meeting, wait for it to conclude.
             # The meeting pump starts after the task pump clears (orchestrator
@@ -974,11 +1013,20 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
             # A turn that ended short (a decline, a limit, an error, an exit,
             # a silence, a loss) carries its typed ending on the pump: the run
             # failed for that reason, whatever an abort flag on the chat says.
+            # A ``stopped`` ending is the person's Stop (a review turn or a
+            # queued message met the process the abort ended): the run reads
+            # as interrupted, never as failed, and the ending only reaches the
+            # delegating agent's callback as its note.
             ending = getattr(pump, "last_ending", None)
-            if ending is not None and final_status in (
+            engine_ending = (ending if ending is not None
+                             and ending.reason != turn_ending.STOPPED else None)
+            if (ending is not None and engine_ending is None
+                    and final_status == run_status.COMPLETED):
+                final_status = run_status.USER_INTERRUPTED
+            if engine_ending is not None and final_status in (
                     run_status.COMPLETED, run_status.USER_INTERRUPTED):
                 final_status = run_status.FAILED
-                logger.warning(f"Task run {run_id} ended by the engine: {ending.summary()}")
+                logger.warning(f"Task run {run_id} ended by the engine: {engine_ending.summary()}")
 
             # A run killed by a provider usage limit streams the limit notice
             # as a clean result text — without this check it lands as a
@@ -1036,13 +1084,13 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     f"Task {run_id[:8]} finishing with "
                     f"{background_leash.pending_summary(session_id)} still running"
                 )
-            row_status = (run_status.FAILED if (ending or limit_line or run_error)
+            row_status = (run_status.FAILED if (engine_ending or limit_line or run_error)
                           else run_status.COMPLETED)
             await _end_run(
                 run_id, row_status,
                 background_pending=background_pending,
                 error_message=(
-                    ending.summary()[:2000] if ending
+                    engine_ending.summary()[:2000] if engine_ending
                     else f"Provider usage limit: {limit_line}" if limit_line
                     else (run_error[:2000] if run_error else None)
                 ),
@@ -1065,8 +1113,8 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                 library_projector.schedule_reconcile_for_agent(task.agent)
             except Exception:
                 pass
-            if ending and not final_output:
-                final_output = ending.line()
+            if engine_ending and not final_output:
+                final_output = engine_ending.line()
             elif run_error and not final_output:
                 # Pre-output engine failure: deliver a clearly-marked
                 # NON-EMPTY terminal so a delegating agent sees the failure
@@ -1083,18 +1131,18 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
             # with the limit. BEFORE the delivery: a delivery that raises must
             # not lose the page (the handler pages only a run that had no
             # verdict yet).
-            if ending or limit_line or run_error:
+            if engine_ending or limit_line or run_error:
                 # Engine/limit failure: the agent that would have
                 # self-notified in 'manual' mode died with the error, so warn
                 # for every mode but 'none'.
                 if task.notification_mode != "none":
                     from services.notifications import notification_manager
-                    stopped = ("declined" if ending and ending.reason == "declined"
-                               else "usage limit" if (ending or limit_line) else "")
-                    asyncio.create_task(notification_manager.fire_notification(
+                    stopped = ("declined" if engine_ending and engine_ending.reason == "declined"
+                               else "usage limit" if (engine_ending or limit_line) else "")
+                    spawn(notification_manager.fire_notification(
                         title=(f"Task stopped: {stopped} — {task.name}"
                                if stopped else f"Task failed: {task.name}"),
-                        body=((ending.summary() if ending else "")
+                        body=((engine_ending.summary() if engine_ending else "")
                               or limit_line or run_error or "")[:200],
                         severity="warning",
                         scope=task.scope,
@@ -1103,10 +1151,10 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                         source_id=task.id,
                         agent_slug=task.agent,
                         chat_id=chat_id,
-                    ))
+                    ), name="fire_notification", owner="runner")
             elif task.notification_mode == "auto":
                 from services.notifications import notification_manager
-                asyncio.create_task(notification_manager.fire_notification(
+                spawn(notification_manager.fire_notification(
                     title=f"Task Complete: {task.name}",
                     body=final_output[:200] if final_output else "Task finished.",
                     severity=task.notify_severity,
@@ -1116,14 +1164,14 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     source_id=task.id,
                     agent_slug=task.agent,
                     chat_id=chat_id,
-                ))
+                ), name="fire_notification", owner="runner")
 
             await delivery._deliver_task_result(
                 task, final_status, final_output,
                 worker_chat_id=chat_id, output_cursor=output_cursor,
                 prompt_row_id=prompt_row_id, prompt_text=prompt,
                 run_started_at=run_started_at, ending=ending,
-                run_id=run_id,
+                run_id=run_id, background_pending=background_pending,
             )
             result_delivered = True
 
@@ -1286,7 +1334,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
             # failure after the verdict (the run's own page went out first).
             if task.notification_mode != "none" and not user_stop and not row_ended:
                 from services.notifications import notification_manager
-                asyncio.create_task(notification_manager.fire_notification(
+                spawn(notification_manager.fire_notification(
                     title=f"Task Failed: {task.name}",
                     body=str(e)[:200],
                     severity="warning",
@@ -1296,7 +1344,7 @@ async def _run_task_body(run_id: str, session_id: str, task: shared.TaskDefiniti
                     source_id=task.id,
                     agent_slug=task.agent,
                     chat_id=chat_id,
-                ))
+                ), name="fire_notification", owner="runner")
 
             # A retry is for a run that failed — never for a cleanup failure
             # after the verdict, which would run a completed task again.

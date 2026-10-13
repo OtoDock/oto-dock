@@ -39,6 +39,13 @@ class NormalizedEvent:
     #: Vendor-side event uuid for dedup (X-GitHub-Delivery, Slack body.event_id).
     vendor_event_id: str = ""
 
+    #: The vendor's OWN id of this logical event, the same for every
+    #: subscription that sees it and for every redelivery of it ("" when the
+    #: vendor gives none, or when ``vendor_event_id`` is a key the provider
+    #: derived for its dedup ring). Keys the app-handler dedupe, which is
+    #: durable, so a derived key that repeats for later events never goes here.
+    global_event_id: str = ""
+
     #: Who triggered the event (the human / bot).
     #: Keys: id, email, name, url. All strings; missing fields = "".
     actor: dict[str, str] = field(default_factory=dict)

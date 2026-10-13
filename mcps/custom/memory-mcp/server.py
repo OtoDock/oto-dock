@@ -275,6 +275,7 @@ _WRITE_PAYLOAD_KEYS = (
     "file_text", "content", "old_str", "old_string",
     "new_str", "new_string", "insert_text",
 )
+_INSERT_TEXT_KEYS = ("insert_text", "new_str", "new_string", "text", "content")
 
 
 def _normalize_command(arguments: dict[str, Any]) -> str | None:
@@ -392,7 +393,16 @@ def build_op_body(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         line = _coerce_int(arguments.get("insert_line"))
         if line is not None:
             body["insert_line"] = line
-        body["insert_text"] = arguments.get("insert_text") or ""
+        # `new_str` is the text editor's name for the inserted text; models
+        # carry it over. An insert with no text would write nothing and
+        # still read as edited, so it is refused here.
+        text = next((arguments.get(k) for k in _INSERT_TEXT_KEYS if arguments.get(k)), "")
+        if not text:
+            raise ToolArgError(
+                "insert needs the text to insert in `insert_text` (with "
+                "`insert_line`, the line to insert after; 0 = top of file)."
+            )
+        body["insert_text"] = text
     return body
 
 

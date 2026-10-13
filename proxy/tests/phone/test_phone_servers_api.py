@@ -29,6 +29,24 @@ def client(temp_db):
     return TestClient(app)
 
 
+def test_the_prompt_defaults_are_the_adapters_texts_for_admins_only(client, temp_db):
+    from adapters.phone import PHONE_CONTEXT, PHONE_OUTBOUND
+    from api.phone import phone as phone_router
+
+    body = client.get("/v1/admin/phone/settings/defaults").json()
+    assert body == {"context_inbound": PHONE_CONTEXT, "context_outbound": PHONE_OUTBOUND}
+
+    app = FastAPI()
+    app.include_router(phone_router.router)
+
+    async def _member():
+        return UserContext(sub="m-sub", email="m@test.com", name="M",
+                           role="member", agents=[], agent_roles={})
+
+    app.dependency_overrides[get_current_user] = _member
+    assert TestClient(app).get("/v1/admin/phone/settings/defaults").status_code == 403
+
+
 def test_create_first_is_default(client):
     s = client.post("/v1/admin/phone-servers", json={"name": "pbx1", "host": "h1"}).json()
     assert s["is_default"] is True

@@ -434,3 +434,51 @@ async def test_seam_waits_for_an_inflight_wake_before_resuming(temp_db, monkeypa
     await headless_resume.resume_dead_session_headless(
         "chat-1", "sid-dead", layer, user_sub="user-admin")
     assert order == ["wake_done", "resume_check"]
+
+
+# --- the chat's claim: voice takes turns with the other starters ------------
+
+@pytest.mark.asyncio
+async def test_an_utterance_waits_for_another_starter_then_starts(temp_db, monkeypatch):
+    """A queued message's delivery holds the chat while it brings its turn
+    up: the utterance waits for it, never a second turn beside it."""
+    import asyncio
+    from core.events import input_queue
+    input_queue._registry.clear()
+    _make_chat(temp_db)
+    bridge = _bridge()
+    _attach_state(_ProbeLayer())
+    dispatched = _capture_dispatch(monkeypatch)
+    q = input_queue.get("chat-1")
+    held = q.try_claim()
+
+    async def _release_soon():
+        await asyncio.sleep(0.3)
+        q.release(held)
+    releaser = asyncio.create_task(_release_soon())
+    await duplex_attach.run_utterance(bridge, {"turn": 1, "text": "hello"})
+    await releaser
+    assert dispatched["text"] == "hello"
+    # The utterance's own claim is released once its turn started.
+    assert not q.claimed
+    input_queue._registry.clear()
+
+
+@pytest.mark.asyncio
+async def test_an_utterance_the_chat_stays_busy_for_says_so(temp_db, monkeypatch):
+    from core.events import input_queue
+    input_queue._registry.clear()
+    monkeypatch.setattr(duplex_attach, "_CLAIM_WAIT_S", 0.2)
+    _make_chat(temp_db)
+    bridge = _bridge()
+    _attach_state(_ProbeLayer())
+    dispatched = _capture_dispatch(monkeypatch)
+    q = input_queue.get("chat-1")
+    held = q.try_claim()
+    await duplex_attach.run_utterance(bridge, {"turn": 2, "text": "hello"})
+    assert dispatched == {}
+    assert bridge.engine_ws.sent[-1] == {"type": "error", "turn": 2,
+                                         "data": {"message": duplex_attach._BUSY_LINE}}
+    assert q.claimed
+    q.release(held)
+    input_queue._registry.clear()

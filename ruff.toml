@@ -1,6 +1,13 @@
-# Repo-wide lint gate scoped to import hygiene and dead/no-effect code —
-# deliberately NOT a general style or format gate.
+# Repo-wide lint gate: import hygiene, dead/no-effect code, async and
+# exception hygiene, complexity. Not a format gate.
 target-version = "py310" # satellite's floor; proxy/phone/audio run 3.13
+
+# The frozen baseline: the (file, rule) pairs that already had findings when
+# a rule was adopted, as generated per-file ignores. A rule's NEW findings
+# fail; the old ones are paid down and the file shrinks. The maintainers
+# regenerate it from a clean checkout of a commit, never by hand and never
+# with `ruff --add-noqa` (CONTRIBUTING.md).
+extend = "ruff-baseline.toml"
 
 # .gitignore already hides venvs, node_modules, and runtime trees from ruff;
 # these cover checkouts where ignored trees exist without the ignore rules.
@@ -12,6 +19,11 @@ extend-exclude = [
     "mcps/custom/mcps-mcp/skills",
 ]
 
+# First-party roots for the import sorter: the proxy and the phone service
+# import their own packages by their top-level names (named, not ".", so a
+# gitignored directory at the root never counts as first-party on one machine).
+src = ["proxy", "phone"]
+
 [lint]
 select = [
     "F401",    # unused import
@@ -20,10 +32,38 @@ select = [
     "F405",    # possibly-undefined name via star import
     "F811",    # redefinition / duplicate import
     "F841",    # unused local variable
-    "B018",    # expression statement with no effect
+    "B",       # bugbear: likely bugs and design problems
     "E722",    # bare except
     "SIM105",  # try/except/pass -> contextlib.suppress
     "PLW0108", # lambda that only forwards its arguments to a callable
+    "ASYNC",   # blocking calls and busy waits inside coroutines
+    "BLE",     # blind `except Exception`
+    "RUF006",  # a task whose reference is dropped (see proxy/core/background.py)
+    "G",       # logging calls that format eagerly
+    "LOG",     # logging misuse
+    "C901",    # function complexity, above max-complexity below
+    "I",       # import order
+    "UP",      # syntax the target version has a newer form for
+]
+
+[lint.isort]
+known-first-party = ["satellite"]
+
+[lint.mccabe]
+max-complexity = 40
+
+[lint.flake8-bugbear]
+# FastAPI's dependency markers are meant to sit in argument defaults.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Cookie",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+    "fastapi.Security",
 ]
 
 [lint.per-file-ignores]

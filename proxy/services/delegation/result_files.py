@@ -44,7 +44,7 @@ from storage import database as task_store
 from storage.automation import db_result_files, run_status
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.delegation")
+logger = logging.getLogger("otodock.delegation")
 
 # Rows a run may hold across its attach calls (every status counts), three
 # calls' worth of the per-call cap; admin-set values ride

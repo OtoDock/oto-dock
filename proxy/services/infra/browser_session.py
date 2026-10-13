@@ -16,7 +16,9 @@ loopback port, T2 the sibling container by service-DNS (same
 import asyncio
 import logging
 
-logger = logging.getLogger("claude-proxy.browser_session")
+from core.background import spawn
+
+logger = logging.getLogger("otodock.browser_session")
 
 _MCP_NAME = "camoufox"
 
@@ -60,7 +62,7 @@ def schedule_close(session_id: str) -> None:
     if not session_id:
         return
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_close(session_id))
+    spawn(_close(session_id), name="close", owner="browser_session")

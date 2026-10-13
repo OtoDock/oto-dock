@@ -28,12 +28,21 @@ REAL_DOCKER = shutil.which("docker")
 
 # A stand-in for the docker CLI. Every call is logged as a JSON argv line.
 # `ps` applies the label filters (and -a) to FAKE_CONTAINERS; `exec` answers
-# like pg_dump; `inspect` reports FAKE_HEALTH for a health format and
+# like pg_dump, and `psql -tAc` with FAKE_DB_VERSION, FAKE_FLOOR or
+# FAKE_KEYS; `inspect` reports FAKE_HEALTH for a health format and
 # FAKE_STATUS (running) for a status one; `image inspect` knows
 # FAKE_LOCAL_IMAGES; `compose config` runs the real docker when REAL_DOCKER is
 # set, else exits FAKE_CONFIG_RC (FAKE_BARE_CONFIG_RC for a call without -f,
 # the check of the files in place); `compose pull` and `compose up` exit
 # FAKE_PULL_RC and FAKE_UP_RC (FAKE_UP_RC for the first up only).
+# The recover-bin carry: `compose config --volumes` prints FAKE_VOLUMES;
+# `inspect` of the mounts prints FAKE_MOUNTS, of the writable layer
+# FAKE_SIZE_RW; `diff` prints the bin line when FAKE_DIFF_BIN is set, then
+# FAKE_DIFF_FILLER more lines; `exec ... du` prints FAKE_DU_K; `info -f`
+# prints FAKE_DOCKER_ROOT; `cp` writes a stand-in archive (FAKE_CP_RC);
+# `compose run` logs the bytes it read to FAKE_RUN_LOG (FAKE_RUN_RC). After
+# the first `compose up`, `ps` lists FAKE_CONTAINERS_AFTER_UP when it is set
+# (the server that up started).
 FAKE_DOCKER = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
@@ -41,10 +50,26 @@ with open(os.environ["FAKE_LOG"], "a") as fh:
     fh.write(json.dumps(args) + "\n")
 cs = json.loads(os.environ.get("FAKE_CONTAINERS", "[]"))
 if args[:1] == ["info"]:
+    if "-f" in args:
+        print(os.environ.get("FAKE_DOCKER_ROOT", ""))
     sys.exit(0)
+if args[:1] == ["diff"]:
+    out = sys.stdout
+    if os.environ.get("FAKE_DIFF_BIN"):
+        out.write("A /opt/otodock/recover-bin\n")
+    for i in range(int(os.environ.get("FAKE_DIFF_FILLER", "3"))):
+        out.write(f"A /opt/otodock/proxy/__pycache__/module_{i:06d}.cpython-313.pyc\n")
+    sys.exit(0)
+if args[:1] == ["cp"]:
+    sys.stdout.write("recover-bin/\n" * 10)
+    sys.exit(int(os.environ.get("FAKE_CP_RC", "0")))
 if args[:1] == ["ps"]:
     want_all = "-a" in args
     labels = [args[i + 1].partition("=")[2] for i, a in enumerate(args) if a == "--filter"]
+    if os.environ.get("FAKE_CONTAINERS_AFTER_UP"):
+        with open(os.environ["FAKE_LOG"]) as fh:
+            if any(json.loads(line)[:2] == ["compose", "up"] for line in fh):
+                cs = json.loads(os.environ["FAKE_CONTAINERS_AFTER_UP"])
     for c in cs:
         if not want_all and not c.get("running", True):
             continue
@@ -52,11 +77,27 @@ if args[:1] == ["ps"]:
             print(c["id"])
     sys.exit(0)
 if args[:1] == ["exec"]:
+    if "du" in args:
+        print(os.environ.get("FAKE_DU_K", "8") + "\t/opt/otodock/recover-bin")
+        sys.exit(0)
+    if "psql" in args and "-tAc" in args:
+        sql = args[args.index("-tAc") + 1]
+        if "schema_meta" in sql:
+            print(os.environ.get("FAKE_DB_VERSION", ""))
+        elif "secret_floor" in sql:
+            print(os.environ.get("FAKE_FLOOR", ""))
+        else:
+            print(os.environ.get("FAKE_KEYS", ""))
+        sys.exit(0)
     print("-- dump of " + args[1])
     sys.exit(0)
 if args[:1] == ["inspect"]:
     fmt = args[args.index("-f") + 1] if "-f" in args else ""
-    if "Health" in fmt:
+    if "Mounts" in fmt:
+        print("\n".join(os.environ.get("FAKE_MOUNTS", "/opt/otodock/agents").split()))
+    elif "SizeRw" in fmt:
+        print(os.environ.get("FAKE_SIZE_RW", "4096"))
+    elif "Health" in fmt:
         print(os.environ.get("FAKE_HEALTH", "healthy"))
     else:
         print(os.environ.get("FAKE_STATUS", "running"))
@@ -82,11 +123,18 @@ if args[:1] == ["compose"]:
             os.execv(os.environ["REAL_DOCKER"], [os.environ["REAL_DOCKER"], *args])
         if "--images" in args:
             print("\n".join(os.environ.get("FAKE_IMAGES", "").split()))
+        if "--volumes" in args:
+            print("\n".join(os.environ.get("FAKE_VOLUMES", "").split()))
         if "-f" not in args:
             sys.exit(int(os.environ.get("FAKE_BARE_CONFIG_RC", "0")))
         sys.exit(int(os.environ.get("FAKE_CONFIG_RC", "0")))
     if sub == "pull":
         sys.exit(int(os.environ.get("FAKE_PULL_RC", "0")))
+    if sub == "run":
+        data = sys.stdin.buffer.read()
+        with open(os.environ["FAKE_RUN_LOG"], "a") as fh:
+            fh.write(json.dumps({"read": len(data), "args": args}) + "\n")
+        sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
     if sub == "up":
         with open(os.environ["FAKE_LOG"]) as fh:
             ups = sum(1 for line in fh if json.loads(line)[:2] == ["compose", "up"])
@@ -194,6 +242,17 @@ def raw(tmp_path):
 
 
 @pytest.fixture
+def raw_1_8(raw):
+    """The published files of v1.8.0 as well: the yes/no rule applies from there."""
+    rel = raw / "v1.8.0"
+    rel.mkdir()
+    (rel / "docker-compose.yml").write_text("# the 1.8.0 base file\n")
+    (rel / "docker-compose.phone.yml").write_text("# the 1.8.0 phone overlay\n")
+    (rel / "config.env.example").write_text(NEW_EXAMPLE)
+    return raw
+
+
+@pytest.fixture
 def candidate(tmp_path):
     """A --compose-dir holding the real compose pair of this tree."""
     d = tmp_path / "candidate"
@@ -227,6 +286,7 @@ def _run(inst, tmp_path, fakebin, *args, containers=(PG, PROXY), real_config=Fal
         "FAKE_LOG": str(tmp_path / "docker.log"),
         "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
         "FAKE_RAW_ROOT": str(tmp_path / "raw"),
+        "FAKE_RUN_LOG": str(tmp_path / "run.log"),
     })
     if real_config:
         env["REAL_DOCKER"] = REAL_DOCKER
@@ -244,6 +304,13 @@ def _calls(tmp_path) -> list[list[str]]:
 
 def _compose_subcommands(tmp_path) -> list[str]:
     return [" ".join(a[1:3]) for a in _calls(tmp_path) if a[:1] == ["compose"]]
+
+
+def _changes(tmp_path) -> list[list[str]]:
+    """Every docker call that changes something: the read-only psql SELECTs
+    (the database's version, the key fingerprints) are not among them."""
+    return [a for a in _calls(tmp_path)
+            if not (a[:1] == ["exec"] and "psql" in a and "-tAc" in a) and a[:1] != ["inspect"]]
 
 
 def _did(tmp_path, sub: str) -> bool:
@@ -307,7 +374,7 @@ def test_a_hostname_stops_the_upgrade_before_anything_changes(tmp_path, fakebin,
     assert "stopped before changing anything" in r.stderr
     assert _tree(inst) == before
     assert _snapshots(inst) == []
-    assert not any(a[:1] == ["exec"] for a in _calls(tmp_path))
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
     assert not _did(tmp_path, "pull") and not _did(tmp_path, "up")
 
 
@@ -407,7 +474,7 @@ def test_dry_run_changes_nothing(tmp_path, fakebin, raw):
     assert "ADMISSION_QUEUE_WAIT_S" in r.stdout
     assert _tree(inst) == before
     assert not (inst / "backups").exists()
-    assert not any(a[:1] == ["exec"] for a in _calls(tmp_path))
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
     assert not _did(tmp_path, "pull") and not _did(tmp_path, "up")
 
 
@@ -527,7 +594,7 @@ def test_the_dump_and_the_copies_are_private(tmp_path, fakebin, raw):
     assert stat.S_IMODE((snap / ".env").stat().st_mode) == 0o600
     (dump,) = snap.glob("otodock-otodock-*.sql.gz")
     assert gzip.decompress(dump.read_bytes()) == b"-- dump of pg-t2\n"
-    execs = [a for a in _calls(tmp_path) if a[:1] == ["exec"]]
+    execs = [a for a in _changes(tmp_path) if a[:1] == ["exec"]]
     assert execs == [["exec", "pg-t2", "pg_dump", "-U", "otodock", "--clean", "--if-exists", "otodock"]]
     assert (inst / "docker-compose.yml").read_text() == "# the 1.7.0 base file\n"
     assert "done: this install runs 1.7.0 (was 1.6.1)" in r.stdout
@@ -537,7 +604,7 @@ def test_no_db_backup_takes_no_dump(tmp_path, fakebin, raw):
     inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
     r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--no-db-backup", containers=(PROXY,))
     assert r.returncode == 0, r.stderr
-    assert not any(a[:1] == ["exec"] for a in _calls(tmp_path))
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
     (snap,) = _snapshots(inst)
     assert list(snap.glob("*.sql.gz")) == []
 
@@ -550,7 +617,7 @@ def test_no_running_postgres_stops_before_anything_changes(tmp_path, fakebin, ra
     assert "no running otodock-postgres" in r.stderr
     assert _tree(inst) == before
     assert _snapshots(inst) == []
-    assert not any(a[:1] == ["exec"] for a in _calls(tmp_path))
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
 
 
 def _said(r) -> str:
@@ -603,8 +670,9 @@ def test_a_failure_after_up_keeps_the_new_files_and_names_the_dump(tmp_path, fak
     (snap,) = _snapshots(inst)
     (dump,) = snap.glob("otodock-otodock-*.sql.gz")
     assert "may already be migrated" in _said(r)
-    assert "restore.sh" in r.stderr
-    assert dump.name in r.stderr
+    # The snapshot is a restore.sh run directory: the advice names it, not the dump.
+    assert f"restore.sh ./backups/{snap.name}" in _said(r)
+    assert dump.exists()
     assert "back as they were" not in _said(r)
     assert _compose_subcommands(tmp_path).count("up -d") == 1
 
@@ -715,3 +783,266 @@ def test_the_publish_address_check_judges_only_a_literal_the_overlay_uses(
     assert r.returncode == 0, r.stderr
     assert NOT_HELD not in r.stderr
     assert not ip_log.exists()
+
+
+# ── the recover bin moves out of the old server container ───────────────────
+
+BIN_TARGET = {"FAKE_VOLUMES": "otodock-agents otodock-recover-bin otodock-sessions"}
+
+
+def _runs(tmp_path) -> list[dict]:
+    log = tmp_path / "run.log"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def _order(tmp_path) -> list[str]:
+    """pull, carry, up as they ran: `docker cp` and `compose run` are the two
+    ends of one pipeline (they start together), so either is "carry"."""
+    steps: list[str] = []
+    for a in _calls(tmp_path):
+        step = "carry" if a[:1] == ["cp"] else (
+            next((s for s in ("pull", "run", "up") if s in a), "") if a[:1] == ["compose"] else "")
+        step = "carry" if step == "run" else step
+        if step and (not steps or steps[-1] != step):
+            steps.append(step)
+    return steps
+
+
+def test_the_bin_is_carried_between_the_pull_and_up_past_a_long_diff(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV)
+    # The bin line comes first, then more diff than a pipe holds: a
+    # `docker diff | grep -q` would die of SIGPIPE under pipefail here.
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", **BIN_TARGET,
+             FAKE_DIFF_BIN="1", FAKE_DIFF_FILLER="4000")
+    assert r.returncode == 0, r.stderr
+    assert _order(tmp_path) == ["pull", "carry", "up"]
+    assert ["cp", "proxy-t2:/opt/otodock/recover-bin", "-"] in _calls(tmp_path)
+    (run,) = _runs(tmp_path)
+    assert run["read"] > 0                                   # the archive reached the one-shot
+    assert run["args"][:6] == ["compose", "run", "--rm", "--no-deps", "-T", "otodock-agents-init"]
+    script = run["args"][-1]
+    assert script.startswith("mountpoint -q /opt/otodock/recover-bin || exit 3;")
+    assert "tar -x -C /opt/otodock/recover-bin --strip-components=1" in script
+    assert "chown -R 1000:1000 /opt/otodock/recover-bin" in script
+    assert "copying the recover bin" in r.stdout
+
+
+@pytest.mark.parametrize("extra", [
+    {**BIN_TARGET, "FAKE_DIFF_BIN": "1", "FAKE_MOUNTS": "/opt/otodock/agents /opt/otodock/recover-bin"},
+    {"FAKE_VOLUMES": "otodock-agents otodock-sessions", "FAKE_DIFF_BIN": "1"},
+    {**BIN_TARGET},
+], ids=["the-server-mounts-the-volume", "the-target-has-no-volume", "no-bin-in-the-container"])
+def test_nothing_to_carry(tmp_path, fakebin, raw, extra):
+    inst = _install(tmp_path, SECRET_ENV)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", **extra)
+    assert r.returncode == 0, r.stderr
+    assert _order(tmp_path) == ["pull", "up"]
+
+
+def test_no_server_container_means_nothing_to_carry(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(PG,), **BIN_TARGET, FAKE_DIFF_BIN="1",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, PROXY]))
+    assert r.returncode == 0, r.stderr
+    assert _order(tmp_path) == ["pull", "up"]
+
+
+def test_a_failed_copy_warns_and_the_upgrade_goes_on(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", **BIN_TARGET, FAKE_DIFF_BIN="1", FAKE_RUN_RC="3")
+    assert r.returncode == 0, r.stderr
+    assert "could not copy the recover bin" in r.stderr
+    assert _order(tmp_path) == ["pull", "carry", "up"]
+    assert "done: this install runs 1.7.0" in r.stdout
+
+
+def test_not_enough_disk_skips_the_copy(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", **BIN_TARGET, FAKE_DIFF_BIN="1",
+             FAKE_DOCKER_ROOT=str(tmp_path), FAKE_DU_K=str(10 ** 12))
+    assert r.returncode == 0, r.stderr
+    assert "not enough free disk to copy the recover bin" in r.stderr
+    assert _order(tmp_path) == ["pull", "up"]
+    assert any(a[:1] == ["exec"] and "du" in a for a in _calls(tmp_path))
+
+
+def test_a_stopped_server_is_sized_by_its_writable_layer(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", **BIN_TARGET, FAKE_DIFF_BIN="1",
+             FAKE_STATUS="exited", FAKE_DOCKER_ROOT=str(tmp_path), FAKE_SIZE_RW=str(10 ** 15))
+    assert "not enough free disk to copy the recover bin" in r.stderr
+    assert not any(a[:1] == ["exec"] and "du" in a for a in _calls(tmp_path))
+
+
+def test_the_dry_run_names_the_carry_and_copies_nothing(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run", **BIN_TARGET, FAKE_DIFF_BIN="1")
+    assert r.returncode == 0, r.stderr
+    assert "copy the recover bin out of proxy-t2 into the otodock-recover-bin volume" in r.stdout
+    assert _tree(inst) == before
+    assert not any(a[:1] in (["exec"], ["cp"]) for a in _changes(tmp_path))
+    assert _runs(tmp_path) == []
+
+
+# ── the version check, the upgrade notes and the yes/no values, before anything changes ──
+
+CHANGELOG_1_7_0 = """\
+# Changelog
+
+## [Unreleased]
+
+### Added
+- Not yet.
+
+## [1.7.0] — 2026-09-29
+
+### Changed
+- **Upgrade note:** the foo changed over
+  two lines, and admins set FOO.
+- Something that is not a note.
+
+## [1.6.1] — 2026-09-15
+
+### Upgrade notes
+- An older note, below the starting release.
+"""
+
+
+@pytest.fixture
+def raw_with_notes(raw):
+    (raw / "v1.7.0" / "CHANGELOG.md").write_text(CHANGELOG_1_7_0)
+    return raw
+
+
+def test_the_upgrade_notes_are_printed_before_anything_changes(tmp_path, fakebin, raw_with_notes):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "upgrade notes from 1.6.1 to 1.7.0" in r.stdout
+    assert "the foo changed over two lines, and admins set FOO." in r.stdout
+    assert "An older note" not in r.stdout and "not a note" not in r.stdout
+    assert r.stdout.index("the foo changed") < r.stdout.index("dry run: nothing is changed")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.index("the foo changed") < r.stdout.index("backing up the database")
+
+
+def test_without_a_changelog_the_notes_point_at_the_release_page(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "no CHANGELOG.md for 1.7.0 could be read" in r.stdout
+    assert "releases/tag/v1.7.0" in r.stdout
+    assert "curl:" not in r.stderr
+
+
+def test_an_unknown_starting_release_prints_the_target_notes_alone(tmp_path, fakebin, raw_with_notes):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    (inst / "docker-compose.yml").write_text("services:\n  otodock-proxy:\n    image: ghcr.io/otodock/otodock-proxy:latest\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "upgrade notes from the current release to 1.7.0" in r.stdout
+    assert "the foo changed" in r.stdout and "An older note" not in r.stdout
+
+
+def test_the_database_version_refuses_a_downgrade_before_anything_changes(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_DB_VERSION="1.7.1")
+    assert r.returncode != 0
+    assert "last migrated by OtoDock 1.7.1" in r.stderr and "downgrade" in r.stderr
+    assert _tree(inst) == before and _snapshots(inst) == []
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
+
+
+def test_the_database_version_raises_the_starting_release(tmp_path, fakebin, raw_with_notes):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run", FAKE_DB_VERSION="1.6.2")
+    assert r.returncode == 0, r.stderr
+    assert "last migrated by 1.6.2" in r.stdout and "upgrading from there" in r.stdout
+    assert "upgrade notes from 1.6.2 to 1.7.0" in r.stdout
+
+
+BAD_YESNO = "OIDC_ENABLED=yse\nOTODOCK_AIR_GAPPED=1\nCOOKIE_SECURE=auto\nDASHBOARD_ENABLED=auto\n"
+
+
+def test_a_value_that_is_not_yes_or_no_warns_in_the_dry_run_and_stops_the_real_run(tmp_path, fakebin, raw_1_8):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + BAD_YESNO)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "not yes/no words" in r.stderr and "OIDC_ENABLED=yse" in r.stderr and "DASHBOARD_ENABLED=auto" in r.stderr
+    assert "OTODOCK_AIR_GAPPED=1" not in r.stderr and "COOKIE_SECURE" not in r.stderr
+    assert "the real run stops here" in r.stderr
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0")
+    assert r.returncode != 0
+    assert "not yes/no words" in r.stderr and "refuse to start" in r.stderr and "run the upgrade again" in r.stderr
+    assert _tree(inst) == before and _snapshots(inst) == []
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
+    assert not _did(tmp_path, "pull") and not _did(tmp_path, "up")
+
+
+def test_the_yes_no_rule_is_judged_only_for_a_target_of_1_8_0_or_later(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + BAD_YESNO)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "yes/no" not in r.stderr and "count as ON" not in r.stdout
+
+
+def test_values_that_count_as_on_from_1_8_0_are_named_in_both_runs(tmp_path, fakebin, raw_1_8):
+    """The keys releases before 1.8.0 read as on for the word "true" alone:
+    1, yes and on flip from off to on at this upgrade, and the operator is
+    told before the server reads them."""
+    flips = ("OIDC_ENABLED=1\nOTODOCK_AIR_GAPPED=yes\nDASHBOARD_ENABLED=On\nMCP_AUTO_INSTALL_SYSTEM_DEPS=on\n"
+             "OTODOCK_CLOUD=true\nOTODOCK_RELEASE_CHECK=1\n")
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + flips)
+    for extra in (["--dry-run"], []):
+        r = _run(inst, tmp_path, fakebin, "--to", "1.8.0", *extra)
+        assert r.returncode == 0, r.stderr
+        assert "count as ON" in r.stdout
+        for named in ("OIDC_ENABLED=1", "OTODOCK_AIR_GAPPED=yes", "DASHBOARD_ENABLED=on", "MCP_AUTO_INSTALL_SYSTEM_DEPS=on"):
+            assert named in r.stdout, named
+        assert "OTODOCK_CLOUD" not in r.stdout.split("count as ON")[1].split("\n\n")[0]
+        assert "OTODOCK_RELEASE_CHECK" not in r.stdout.split("count as ON")[1].split("Set each")[0]
+        if extra:
+            assert r.stdout.index("count as ON") < r.stdout.index("dry run: nothing is changed")
+        else:
+            assert r.stdout.index("count as ON") < r.stdout.index("backing up the database")
+    # An install already on 1.8.0 crosses nothing: no list.
+    (tmp_path / "two").mkdir()
+    inst2 = _install(tmp_path / "two", SECRET_ENV + PHONE_LINE + flips + "OTODOCK_VERSION=1.8.0\n")
+    r = _run(inst2, tmp_path, fakebin, "--to", "1.8.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "count as ON" not in r.stdout
+
+
+def test_the_snapshot_is_a_restore_run_directory(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    keys = '{"' + "a" * 32 + '": "JWT_SECRET"}'
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_KEYS=keys)
+    assert r.returncode == 0, r.stderr
+    (snap,) = _snapshots(inst)
+    manifest = dict(line.split("=", 1) for line in (snap / "manifest").read_text().splitlines())
+    (dump,) = snap.glob("*.sql.gz")
+    assert manifest["db"] == dump.name
+    assert manifest["otodock_version"] == "1.6.1" and manifest["complete"] == "1"
+    assert manifest["agents"] == "skipped" and manifest["credential_keys"] == keys
+    assert "credential_keys_floor" not in manifest
+    assert stat.S_IMODE((snap / "manifest").stat().st_mode) & 0o077 == 0
+    # A 1.7.1 database has no fingerprint row: the secret floor's record stands in.
+    (tmp_path / "two").mkdir()
+    inst2 = _install(tmp_path / "two", SECRET_ENV + PHONE_LINE)
+    floor = '{"JWT_SECRET": ["' + "b" * 32 + '"]}'
+    r = _run(inst2, tmp_path, fakebin, "--to", "1.7.0", FAKE_KEYS="", FAKE_FLOOR=floor)
+    assert r.returncode == 0, r.stderr
+    (snap,) = _snapshots(inst2)
+    manifest = dict(line.split("=", 1) for line in (snap / "manifest").read_text().splitlines())
+    assert manifest["credential_keys_floor"] == floor and "credential_keys" not in manifest
+
+
+def test_a_release_candidate_below_the_database_release_is_a_downgrade(tmp_path, fakebin, raw, candidate):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=1.7.0\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0-rc2", "--compose-dir", str(candidate), FAKE_DB_VERSION="1.8.0")
+    assert r.returncode != 0
+    assert "last migrated by OtoDock 1.8.0" in r.stderr and "downgrade" in r.stderr

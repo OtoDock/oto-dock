@@ -14,7 +14,6 @@ import logging
 import secrets
 import time
 
-from adapters.phone import INBOUND
 from storage.prefs import audio_provider_store
 from storage.identity import credential_store
 from storage import database as task_store
@@ -52,6 +51,19 @@ def pick_duplex_client():
         if (caps.get("duplex") or {}).get("supported"):
             return ws
     return None
+
+
+#: The daemon gates an outbound call on a route's PIN before the agent
+#: speaks (a released daemon gates inbound calls only): the API accepts a
+#: PIN on an outbound route only while a connected daemon says so.
+OUTBOUND_PIN_CAPABILITY = "outbound_pin"
+
+
+def daemon_capability(name: str) -> bool:
+    """A connected daemon advertised ``name`` in its capabilities frame
+    (``call_control``, ``in_session_calls``, ``outbound_pin``): the proxy
+    offers the matching behaviour only to a daemon that speaks it."""
+    return any(bool((caps or {}).get(name)) for caps in _management_meta.values())
 
 
 def duplex_engine_available() -> bool:
@@ -108,8 +120,16 @@ def assemble_duplex_session_config(user_sub: str) -> dict:
             "api_key": _provider_api_key(tts),
         },
         "chat_endpointing_ms": endpointing,
-        "language": prefs.get("stt_language") or "",
+        # "auto" is the Automatic pick: the session starts in English and
+        # identifies the speaker's language on the first utterance.
+        "language": "" if _is_auto(prefs.get("stt_language")) else (prefs.get("stt_language") or ""),
+        "language_detect": _is_auto(prefs.get("stt_language")),
     }
+
+
+def _is_auto(tag) -> bool:
+    from audio.streaming.lang import is_auto
+    return is_auto(tag)
 
 
 def _provider_api_key(provider: dict | None) -> str:
@@ -261,14 +281,17 @@ def assemble_phone_config() -> dict:
         if k.startswith("phone_"):
             settings[k.removeprefix("phone_")] = v
 
-    # Phone routes. Inbound PINs ride the push in plaintext for local
-    # enforcement — the established contract for daemon secrets on the
+    # Phone routes. PINs ride the push in plaintext for local enforcement
+    # — the standing rule for daemon secrets on the
     # master-key-authenticated management WS (Twilio auth token, AMI secret,
-    # provider API keys below). The PIN never exists as a route column, so
-    # the raw rows themselves stay clean.
+    # provider API keys below) — on the routes that may carry one (every
+    # inbound route, an outbound route tied to a user): a PIN stranded on a
+    # route the rules no longer allow one for gates nobody. The PIN never
+    # exists as a route column, so the raw rows themselves stay clean.
+    from services.phone.phone_identity import pin_allowed
     routes = phone_route_store.get_all_routes()
     for r in routes:
-        if r.get("direction") == INBOUND:
+        if pin_allowed(r):
             pin = phone_route_store.get_route_pin(r["id"])
             if pin:
                 r["pin"] = pin
@@ -391,6 +414,32 @@ def assemble_phone_config() -> dict:
     }
 
 
+def config_for_daemon(config_data: dict, caps: dict | None) -> dict:
+    """The push as one daemon may read it: an outbound route's PIN goes only
+    to a daemon that advertised ``outbound_pin``. An older daemon dials
+    without the gate and must not hold a secret nobody asks for; the one
+    that advertises the capability later gets the full push then."""
+    from adapters.phone import is_outbound
+
+    if (caps or {}).get(OUTBOUND_PIN_CAPABILITY):
+        return config_data
+    routes = config_data.get("routes") or []
+    if not any(is_outbound(r.get("direction")) and r.get("pin") for r in routes):
+        return config_data
+    return {
+        **config_data,
+        "routes": [
+            {k: v for k, v in r.items() if k != "pin"} if is_outbound(r.get("direction")) else r
+            for r in routes
+        ],
+    }
+
+
+def management_capabilities(ws) -> dict:
+    """What a connected daemon advertised (``{}`` before its frame)."""
+    return _management_meta.get(ws) or {}
+
+
 async def notify_phone_config_changed() -> None:
     """Broadcast updated config to all connected phone servers.
 
@@ -403,12 +452,14 @@ async def notify_phone_config_changed() -> None:
         logger.error(f"Failed to assemble phone config: {e}")
         return
 
-    msg = json.dumps({"type": "config_update", "data": config_data})
     dead: list = []
 
     for ws in list(_management_clients):
         try:
-            await ws.send_text(msg)
+            await ws.send_text(json.dumps({
+                "type": "config_update",
+                "data": config_for_daemon(config_data, management_capabilities(ws)),
+            }))
         except Exception:
             dead.append(ws)
 

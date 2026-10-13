@@ -18,7 +18,7 @@ from services.infra import retention
 
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 class RetentionRunRequest(BaseModel):

@@ -133,8 +133,9 @@ class _Gates:
 
     def __init__(self) -> None:
         self.loop: asyncio.AbstractEventLoop | None = None
-        self.hash: asyncio.Semaphore | None = None
-        self.strength: asyncio.Semaphore | None = None
+        # Unbound until current() first runs on a loop and replaces them.
+        self.hash = asyncio.Semaphore(1)
+        self.strength = asyncio.Semaphore(1)
         self.waiting = 0
 
     def current(self) -> "_Gates":

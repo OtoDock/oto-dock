@@ -137,7 +137,7 @@ export default function AppSettingsPanel({ app, agent, onClose }: Props) {
 
   const secrets = data?.secrets ?? []
   const busy = set.isPending || del.isPending
-  const field = 'w-full min-w-0 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs pointer-coarse:text-base text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none'
+  const field = 'w-full min-w-0 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none'
 
   return (
     <div

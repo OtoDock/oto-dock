@@ -30,7 +30,7 @@ from core.session import session_kind
 if TYPE_CHECKING:
     from auth.providers import UserContext
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 def chat_access_denied_reason(chat_id: str, user: UserContext | None) -> str | None:

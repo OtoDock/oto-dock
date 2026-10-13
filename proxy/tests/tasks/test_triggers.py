@@ -1136,3 +1136,56 @@ def test_a_body_over_the_keyed_cap_is_413(monkeypatch):
     with pytest.raises(HTTPException) as e:
         asyncio.run(triggers._keyed_body(_request(receive), "t"))
     assert e.value.status_code == 413
+
+
+def test_a_vendor_event_runs_a_linked_task_once_and_the_bearer_path_is_unchanged(temp_db, monkeypatch):
+    """Two subscriptions on one repository each fire their trigger with the
+    same vendor key: the task they both link runs once. A bearer fire (no
+    vendor event) keeps its documented behaviour: the header keys app
+    deliveries only."""
+    import asyncio
+    from auth.webhook_providers.base import NormalizedEvent
+    from services.scheduler import trigger_manager as tm
+    monkeypatch.setattr(tm, "_vendor_task_fires", {})
+    runs: list[str] = []
+
+    async def _run(trigger_row, body, trigger_source, vendor_event=None):
+        runs.append(trigger_row["id"])
+        return f"run-{len(runs)}"
+    monkeypatch.setattr(tm, "_fire_linked_task", _run)
+    repo = {"id": "trig-repo", "task_id": "dyn-shared", "debounce_seconds": 0}
+    org = {"id": "trig-org", "task_id": "dyn-shared", "debounce_seconds": 0}
+    event = NormalizedEvent(event_type="push", global_event_id="g-1")
+    first = asyncio.run(tm.fire_trigger(repo, {}, vendor_event=event, event_id="github:g-1"))
+    second = asyncio.run(tm.fire_trigger(org, {}, vendor_event=event, event_id="github:g-1"))
+    assert first["actions"] == ["task"] and second["actions"] == ["duplicate"]
+    assert runs == ["trig-repo"]
+    # Another event, another provider: both run.
+    asyncio.run(tm.fire_trigger(org, {}, vendor_event=event, event_id="github:g-2"))
+    asyncio.run(tm.fire_trigger(org, {}, vendor_event=event, event_id="linear:g-1"))
+    # The bearer path: the same header twice runs the task twice.
+    asyncio.run(tm.fire_trigger(repo, {}, event_id="caller-7"))
+    asyncio.run(tm.fire_trigger(repo, {}, event_id="caller-7"))
+    assert runs == ["trig-repo", "trig-org", "trig-org", "trig-repo", "trig-repo"]
+
+
+def test_a_vendor_task_fire_that_failed_leaves_the_event_to_the_next_delivery(temp_db, monkeypatch):
+    import asyncio
+    from auth.webhook_providers.base import NormalizedEvent
+    from services.scheduler import trigger_manager as tm
+    monkeypatch.setattr(tm, "_vendor_task_fires", {})
+    calls: list[str] = []
+
+    async def _run(trigger_row, body, trigger_source, vendor_event=None):
+        calls.append(trigger_row["id"])
+        if len(calls) == 1:
+            raise RuntimeError("the task cap is reached")
+        return "run-2"
+    monkeypatch.setattr(tm, "_fire_linked_task", _run)
+    event = NormalizedEvent(event_type="push", global_event_id="g-9")
+    first = asyncio.run(tm.fire_trigger({"id": "trig-a", "task_id": "dyn-x", "debounce_seconds": 0},
+                                        {}, vendor_event=event, event_id="github:g-9"))
+    second = asyncio.run(tm.fire_trigger({"id": "trig-b", "task_id": "dyn-x", "debounce_seconds": 0},
+                                         {}, vendor_event=event, event_id="github:g-9"))
+    assert first["status"] == "failed" and second["actions"] == ["task"]
+    assert calls == ["trig-a", "trig-b"]

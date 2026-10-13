@@ -165,6 +165,50 @@ def test_build_op_body_insert_coerces_line():
     assert body["insert_line"] == 2
 
 
+@pytest.mark.parametrize("key", ["new_str", "new_string", "text", "content"])
+def test_build_op_body_insert_accepts_the_editor_names_for_its_text(key):
+    body = server.build_op_body("memory", {
+        "command": "insert", "path": "/memories/agent/a.md",
+        "insert_line": 3, key: "- a new line",
+    })
+    assert body["insert_text"] == "- a new line"
+
+
+def test_build_op_body_insert_prefers_insert_text():
+    body = server.build_op_body("memory", {
+        "command": "insert", "path": "/memories/agent/a.md", "insert_line": 0,
+        "insert_text": "kept", "new_str": "dropped",
+    })
+    assert body["insert_text"] == "kept"
+
+
+@pytest.mark.parametrize("args", [
+    {"insert_line": 2},
+    {"insert_line": 2, "insert_text": ""},
+    {"insert_line": 2, "old_str": "x"},
+])
+def test_build_op_body_insert_without_text_is_refused(args):
+    with pytest.raises(server.ToolArgError, match="insert_text"):
+        server.build_op_body("memory", {
+            "command": "insert", "path": "/memories/agent/a.md", **args,
+        })
+
+
+def test_an_insert_without_text_never_reaches_the_proxy(monkeypatch):
+    posted = []
+
+    async def _post(body):
+        posted.append(body)
+        return {"output": "The file a.md has been edited."}
+
+    monkeypatch.setattr(server, "_post_op", _post)
+    monkeypatch.setattr(server, "_available_scopes", lambda: ["agent"])
+    res = asyncio.run(server.call_tool("memory", {
+        "command": "insert", "path": "/memories/agent/a.md", "insert_line": 1,
+    }))
+    assert posted == [] and "insert_text" in res[0].text
+
+
 # ---------------------------------------------------------------------------
 # Result formatting
 # ---------------------------------------------------------------------------

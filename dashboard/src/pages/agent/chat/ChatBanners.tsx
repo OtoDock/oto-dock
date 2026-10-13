@@ -28,6 +28,9 @@ interface Props {
   chatId: string | null
   pendingEngineSwitch: { layer: string; model: string } | null
   targetMismatch: TargetMismatch | null
+  /** A phone call drives the viewed chat (its history is read-only until
+   *  the call ends and the page reloads it). */
+  phoneCallActive: boolean
   viewedStreaming: boolean
   warming: boolean
   ws: Stream['ws']
@@ -49,7 +52,7 @@ interface Props {
 
 export default function ChatBanners({
   sessionExecutionTarget, sessionFallbackReason, offlineMachineName, zeroAccessible,
-  chatId, pendingEngineSwitch, targetMismatch, viewedStreaming, warming, ws, agentName,
+  chatId, pendingEngineSwitch, targetMismatch, phoneCallActive, viewedStreaming, warming, ws, agentName,
   mode, model, chatActiveLayer, selectedLayer, interactive, preWarmedRef, preWarmPath,
   layers, agentLayerModels, engineSwitchBusy, engineSwitchError,
   handleEngineSwitchConfirm, handleEngineSwitchCancel,
@@ -64,6 +67,16 @@ export default function ChatBanners({
         fallbackReason={sessionFallbackReason}
         machineName={offlineMachineName}
       />
+
+      {phoneCallActive && (
+        <div
+          role="status"
+          data-testid="phone-call-notice"
+          className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-sky-300/40 bg-sky-50/40 text-sky-900 dark:bg-sky-500/10 dark:text-sky-200"
+        >
+          This chat is on a phone call. It picks up here when the call ends.
+        </div>
+      )}
 
       {zeroAccessible && (
         <div

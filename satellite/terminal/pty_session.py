@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 
 from ..sessions.cli_session import _write_cli_hooks, _write_hook_scripts
-from ..config import otodock_dir
+from ..config import otodock_dir, session_tools_env, write_command_wrappers
 from .pty_session_base import BasePtySession
 
 logger = logging.getLogger("satellite")
@@ -113,6 +113,7 @@ class PtySession(BasePtySession):
                     _shutil.rmtree(proj / "memory", ignore_errors=True)
 
         _write_hook_scripts(self._claude_dir, self.config.get("hook_scripts", {}))
+        write_command_wrappers(self._claude_dir, self.config.get("command_wrappers", {}))
 
         prompt_file = self._claude_dir / "system-prompt.md"
         prompt_file.write_text(self.config.get("system_prompt", ""))
@@ -169,7 +170,7 @@ class PtySession(BasePtySession):
         # todo checklist depends on their frames. Mirrors proxy env_builder.
         env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1"
         env.pop("CLAUDECODE", None)
-        env = self._translate_env(env)
+        env = session_tools_env(self._translate_env(env), self._claude_dir)
 
         # Seed the TUI past the first-run wizard (theme/login/trust). Without this
         # the remote terminal hangs at the picker. cwd key = the satellite-

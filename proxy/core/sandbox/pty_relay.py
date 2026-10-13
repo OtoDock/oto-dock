@@ -53,8 +53,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Awaitable, Callable, Optional, Sequence
 
 import config
+from core.background import spawn
+from core.terminal_queries import PasteModeTracker
 
-logger = logging.getLogger("claude-proxy.pty_relay")
+logger = logging.getLogger("otodock.pty_relay")
 
 # Session trees run at this nice value, below the proxy.
 SESSION_NICE = 10
@@ -133,6 +135,7 @@ class PtyProcess:
         self._scrollback_limit = scrollback_limit
         self._scrollback: "deque[bytes]" = deque()
         self._scrollback_len = 0
+        self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
         self._closed = False
         self._reader_active = False
@@ -170,20 +173,25 @@ class PtyProcess:
                 self._remember(data)
                 out = self._on_output(data)
                 if asyncio.iscoroutine(out):
-                    self._loop.create_task(out)
+                    spawn(out, name="output", owner="pty_relay")
         except Exception:  # never let a reader callback take down the loop
             logger.exception("pty %s: read loop error", self.pid)
             self._on_eof()
 
     def _remember(self, data: bytes) -> None:
+        self._paste_mode.feed(data)
         self._scrollback.append(data)
         self._scrollback_len += len(data)
         while self._scrollback_len > self._scrollback_limit and self._scrollback:
             self._scrollback_len -= len(self._scrollback.popleft())
+            self._paste_mode.trimmed = True
 
     def scrollback(self) -> bytes:
-        """Recent rendered output, for replay to a reconnecting viewer."""
-        return b"".join(self._scrollback)
+        """Recent rendered output, for replay to a reconnecting viewer. Once the ring has dropped
+        the program's bracketed-paste toggle, the mode it holds comes first
+        (``terminal_queries.PasteModeTracker``): a fresh mirror would
+        otherwise paste unbracketed and the TUI submit the first line."""
+        return self._paste_mode.replay_prefix() + b"".join(self._scrollback)
 
     # -- input: proxy -> child ------------------------------------------------
     def write(self, data: bytes) -> None:
@@ -276,7 +284,7 @@ class PtyProcess:
             self._signal_group(signal.SIGTERM)
         with contextlib.suppress(OSError):
             os.close(self.master_fd)
-        self._loop.create_task(self._reap_and_notify())
+        spawn(self._reap_and_notify(), name="reap_and_notify", owner="pty_relay")
 
     def _signal_group(self, sig: "signal.Signals") -> None:
         # The child is its own session/group leader (start_new_session), so

@@ -1,5 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { useAuth } from '../../../contexts/AuthContext'
+import { postSaveAndWait, useCollaboraIdle } from '../../../hooks/useCollaboraIdle'
 import { useCollaboraLiveReload } from '../../../hooks/useCollaboraLiveReload'
 import { emitFileUpdate } from '../../../lib/fileUpdates'
 import type { PushedDocument } from '../../../store/documentPaneStore'
@@ -333,30 +334,9 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
     if (!modifiedRef.current) return true
     const win = iframeRef.current?.contentWindow
     if (!win) return true
-    const ok = await new Promise<boolean>((resolve) => {
-      const done = (v: boolean) => {
-        window.removeEventListener('message', onMsg)
-        clearTimeout(timer)
-        resolve(v)
-      }
-      const onMsg = (e: MessageEvent) => {
-        if (e.source !== win) return
-        const d = parseMessage(e.data)
-        if (d?.MessageId === 'Action_Save_Resp') done(d.Values?.success === true)
-      }
-      // Collabora answers once its own save is done (whatever the upload
-      // answered); no answer in time keeps the document.
-      const timer = setTimeout(() => done(false), timeoutMs)
-      window.addEventListener('message', onMsg)
-      try {
-        win.postMessage(JSON.stringify({
-          MessageId: 'Action_Save',
-          Values: { DontTerminateEdit: true, DontSaveIfUnmodified: true, Notify: true },
-        }), '*')
-      } catch {
-        done(false)
-      }
-    })
+    // Collabora answers once its own save is done (whatever the upload
+    // answered); no answer in time keeps the document.
+    const ok = await postSaveAndWait(win, timeoutMs)
     if (ok) {
       modifiedRef.current = false
       onDirtyChange?.(false)
@@ -395,6 +375,19 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
   }, [reloadNow])
 
   useImperativeHandle(ref, () => ({ leave, save, refresh }), [leave, save, refresh])
+
+  // Collabora's idle end: a resume in place when it can, else a reload with
+  // a fresh token. Not while the Reload banner is up (the file changed
+  // under the edits: the person decides); unsaved edits are saved first
+  // (bounded: a load of the same document joins it, edits included).
+  const recoverIdle = useCallback(() => {
+    if (live && changedUnderEditsRef.current) return
+    void (async () => {
+      if (live && modifiedRef.current) await requestSave()
+      reloadNow()
+    })()
+  }, [live, modifiedRef, requestSave, reloadNow])
+  useCollaboraIdle({ iframeRef, hostRef, loadKey, token: frame?.token, shown, recover: recoverIdle })
 
   // A frame on another origin than the editor's can never load (the browser
   // and Collabora's frame-ancestors check refuse it): explain the fix.

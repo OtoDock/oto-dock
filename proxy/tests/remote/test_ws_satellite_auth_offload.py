@@ -20,14 +20,28 @@ from ws import satellite as sat_ws
 
 
 class FakeSatelliteWS:
-    """Minimal starlette-WebSocket stand-in: one inbound auth frame, then EOF."""
+    """Minimal starlette-WebSocket stand-in: one inbound auth frame, then EOF.
+    ``receive()`` (the update push's watch) yields ``frames`` and then waits;
+    after a close it gives the disconnect uvicorn queues for it: the close's
+    own code on a live socket, ``gone_code`` when the peer was already gone."""
 
-    def __init__(self, auth: dict | None = None, raw: str | None = None):
+    def __init__(self, auth: dict | None = None, raw: str | None = None,
+                 frames: list[dict] | None = None, gone_code: int | None = None):
         self._auth = raw if raw is not None else json.dumps(auth)
         self._served = False
         self.accepted = False
         self.sent: list[dict] = []
         self.closed: tuple | None = None
+        self.frames = list(frames or [])
+        self.gone_code = gone_code
+
+    async def receive(self):
+        if self.closed is not None:
+            return {"type": "websocket.disconnect",
+                    "code": self.gone_code if self.gone_code is not None else self.closed[0]}
+        if self.frames and any(f.get("type") == "update_required" for f in self.sent):
+            return {"type": "websocket.receive", "text": json.dumps(self.frames.pop(0))}
+        await asyncio.sleep(3600)
 
     async def accept(self):
         self.accepted = True
@@ -50,8 +64,10 @@ class FakeSatelliteWS:
 
 
 @pytest.fixture(autouse=True)
-def _clean_pushed():
+def _clean_pushed(monkeypatch):
     sat_ws._pending_pushed_updates.clear()
+    # The hold after a proxy start has its own test.
+    monkeypatch.setattr(sat_ws, "UPDATE_HOLD_S", 0.0)
     yield
     sat_ws._pending_pushed_updates.clear()
 
@@ -108,6 +124,21 @@ async def test_ok_auth_frames_unchanged_and_no_db_on_loop(loop_db_guard):
     assert row["satellite_version"] == sat_ws.SATELLITE_VERSION_LATEST
     assert row["status"] == "disconnected"      # EOF → deregister → persisted
     assert row["last_seen"]                     # exact last contact carried
+
+
+@pytest.mark.asyncio
+async def test_a_registration_ticks_the_machines_credential_gateway(loop_db_guard, monkeypatch):
+    """The gateway on the machine served from memory while its link was
+    down: its reconnect runs a gateway tick for it, so a credential revoked
+    meanwhile stops there within seconds."""
+    from core.remote import mcp_gateway_push
+    ticked = []
+    monkeypatch.setattr(mcp_gateway_push, "tick_machine_soon", ticked.append)
+    mid, secret = await _make_machine()
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(FakeSatelliteWS(_auth(mid, secret)))
+        await _settle()
+    assert ticked == [mid]
 
 
 @pytest.mark.asyncio
@@ -173,6 +204,92 @@ async def test_update_push_4007_and_rollback_bookkeeping(loop_db_guard, monkeypa
     row = await _row(mid)
     assert int(row["update_rollback_count"]) == 1
     assert row["update_rollback_target"] == sat_ws.SATELLITE_VERSION_LATEST
+
+
+@pytest.mark.asyncio
+async def test_a_push_whose_socket_was_gone_counts_no_rollback(loop_db_guard, monkeypatch):
+    """A push lost with a dying socket (the proxy's close found the peer
+    gone) is a delivery failure: nothing remembered, so the reconnect below
+    the target is offered the update again instead of recording a rollback."""
+    from api.remote import remote_machines as rm
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    banners = []
+
+    async def _updating(*a, **k):
+        banners.append(a)
+    monkeypatch.setattr(sat_ws, "_broadcast_satellite_updating", _updating)
+    mid, secret = await _make_machine()
+    old = sat_ws.MIN_SATELLITE_VERSION
+    ws = FakeSatelliteWS(_auth(mid, secret, version=old), gone_code=1005)
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert [f["type"] for f in ws.sent] == ["auth_result", "update_required"]
+    assert mid not in sat_ws._pending_pushed_updates and banners == []
+    ws2 = FakeSatelliteWS(_auth(mid, secret, version=old))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws2)
+        await _settle()
+    assert [f["type"] for f in ws2.sent] == ["auth_result", "update_required"]
+    assert int((await _row(mid))["update_rollback_count"] or 0) == 0
+    assert sat_ws._pending_pushed_updates[mid] == sat_ws.SATELLITE_VERSION_LATEST and banners
+
+
+@pytest.mark.asyncio
+async def test_an_acknowledged_push_counts_and_a_lost_ack_falls_back_to_the_socket(
+    loop_db_guard, monkeypatch,
+):
+    """A satellite that acknowledges is counted on its ``update_received``
+    even when its socket is gone at the close; with no acknowledgement the
+    socket's state decides, so a lost ack never switches the budget off."""
+    from api.remote import remote_machines as rm
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    monkeypatch.setattr(sat_ws, "UPDATE_ACK_SATELLITE_VERSION", sat_ws.MIN_SATELLITE_VERSION)
+    monkeypatch.setattr(sat_ws, "_UPDATE_ACK_WAIT_S", 0.2)
+    mid, secret = await _make_machine()
+    old = sat_ws.MIN_SATELLITE_VERSION
+    target = sat_ws.SATELLITE_VERSION_LATEST
+    acked = FakeSatelliteWS(_auth(mid, secret, version=old), gone_code=1005, frames=[
+        {"type": "heartbeat"}, {"type": "update_received", "target_version": target}])
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(acked)
+    assert sat_ws._pending_pushed_updates.pop(mid) == target
+    silent_live = FakeSatelliteWS(_auth(mid, secret, version=old))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(silent_live)
+    assert sat_ws._pending_pushed_updates.pop(mid) == target
+    silent_gone = FakeSatelliteWS(_auth(mid, secret, version=old), gone_code=1001)
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(silent_gone)
+    assert mid not in sat_ws._pending_pushed_updates
+
+
+@pytest.mark.asyncio
+async def test_an_update_waits_out_the_proxys_start_and_drops_a_socket_that_ends(
+    loop_db_guard, monkeypatch,
+):
+    from api.remote import remote_machines as rm
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "deadbeef"))
+    monkeypatch.setattr(sat_ws, "UPDATE_HOLD_S", 0.3)
+    monkeypatch.setattr(sat_ws, "_serving_since", None)
+    mid, secret = await _make_machine()
+    old = sat_ws.MIN_SATELLITE_VERSION
+
+    class _EndsInTheHold(FakeSatelliteWS):
+        async def receive(self):
+            await asyncio.sleep(0.05)
+            return {"type": "websocket.disconnect", "code": 1006}
+
+    ws = _EndsInTheHold(_auth(mid, secret, version=old))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert [f["type"] for f in ws.sent] == ["auth_result"] and ws.closed is None
+    assert mid not in sat_ws._pending_pushed_updates
+    # Past the window the push goes out at once.
+    monkeypatch.setattr(sat_ws, "_serving_since", sat_ws.time.monotonic() - 60)
+    ws2 = FakeSatelliteWS(_auth(mid, secret, version=old))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws2)
+    assert [f["type"] for f in ws2.sent] == ["auth_result", "update_required"]
 
 
 @pytest.mark.asyncio

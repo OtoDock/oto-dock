@@ -24,6 +24,9 @@ Passes (the full list and its order are ``_run_sweep_sync``'s):
      idle homes. ``state_*.sqlite`` (thread state) and ``sessions/`` are kept.
   D. MCP tarball cache GC — ``services/mcp_tarball.gc()`` (500 MB quota +
      7-day stale) existed but was never scheduled; the sweep calls it.
+  Recover bin (``recover-bin-blobs``) — always on: rows whose bytes are
+     gone or incomplete, then bytes no row names after a day of grace
+     (``storage/files/recover_bin_store.py``).
   Shares (``share-snapshots``, then ``stale-shares``) — always on: a
      revoked chat share's copy 7 days after the revoke, then revoked and
      declined share rows 30 days after the revoke or the decision
@@ -61,7 +64,7 @@ from services.infra.agent_dirs import agent_dirs
 from storage import database as task_store
 from core import layout
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 DEFAULT_DAYS = 180
 MIN_DAYS = 7
@@ -646,6 +649,15 @@ def _pass_orphan_quota_projects(stats: dict, dry_run: bool) -> None:
         logger.exception("retention: orphan quota-project reap failed")
 
 
+def _pass_recover_bin_blobs(stats: dict, dry_run: bool) -> None:
+    """The recover bin's rows and bytes agree: a row whose bytes are gone or
+    cut short is dropped (a container recreated without the bin's volume
+    left the rows behind), then bytes no row names, older than a day."""
+    from storage.files import recover_bin_store
+    stats["recover_bin_rows_pruned"] += recover_bin_store.prune_missing_blobs(dry_run=dry_run)
+    stats["recover_bin_orphans_deleted"] += recover_bin_store.prune_orphan_blobs(dry_run=dry_run)
+
+
 # ---------------------------------------------------------------------------
 # Sweep entry points
 # ---------------------------------------------------------------------------
@@ -699,6 +711,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "mcp_autoupdate_rows_deleted": 0,
         "share_snapshots_deleted": 0,
         "shares_deleted": 0,
+        "recover_bin_rows_pruned": 0,
+        "recover_bin_orphans_deleted": 0,
         # Caller data (external routes) — services/infra/external_retention.py
         "callers_forgotten": 0,
         "callers_busy_skipped": 0,
@@ -730,6 +744,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         ("orphan-partials", lambda: _pass_orphan_partials(stats, dry_run)),
         ("orphan-quota-projects", lambda: _pass_orphan_quota_projects(stats, dry_run)),
         ("mcp-autoupdate-log", lambda: _pass_mcp_autoupdate_log(stats, dry_run)),
+        ("recover-bin-blobs", lambda: _pass_recover_bin_blobs(stats, dry_run)),
         ("share-snapshots", lambda: _pass_share_snapshots(stats, dry_run)),
         ("stale-shares", lambda: _pass_stale_shares(stats, dry_run)),
         ("offboarded-archives", lambda: _pass_offboarded_archives(stats, dry_run)),
@@ -754,6 +769,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         f"{stats['callers_forgotten']} callers forgotten, "
         f"{stats['phone_chats_deleted']} phone chats, "
         f"{stats['shares_deleted']} share rows, "
+        f"{stats['recover_bin_rows_pruned']} recover-bin rows without bytes, "
         f"{total} bytes total"
     )
     return stats

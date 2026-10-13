@@ -332,3 +332,97 @@ async def test_path_policy_denial_never_prompts(direct_session):
     await _collect(session)
     assert "memory" in _tool_results(session)["m1"]
     assert get_permission_queue(session.session_id).empty()
+
+
+class _PictureMCP(_FakeMCP):
+    """An MCP whose result carries a picture beside its text."""
+
+    async def execute_tools(self, tool_calls):
+        self.calls.extend(tool_calls)
+        return [{"tool_use_id": tc["id"], "content": "[binary data: image/png]\nRoute: 12 km",
+                 "file_blocks": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}
+                for tc in tool_calls]
+
+
+async def _picture_turn(session, monkeypatch, *, kept, pictures: bool):
+    from services.mcp import result_files
+    seen, formatted = [], []
+
+    async def _keep(session_id, tool_name, blobs, text="", **kw):
+        seen.append((tool_name, [b.kind for b in blobs], text, kw.get("wait_for_push")))
+        return kept
+
+    real_format = _ADAPTER.format_tool_results
+
+    def _format(results):
+        formatted.extend(dict(r) for r in results)
+        return real_format(results)
+
+    monkeypatch.setattr(result_files, "keep", _keep)
+    monkeypatch.setattr(_ADAPTER, "tool_result_images", pictures, raising=False)
+    monkeypatch.setattr(_ADAPTER, "format_tool_results", _format)
+    session.mcp_manager = _PictureMCP()
+    set_session_mode(session.session_id, "dontAsk")
+    _ADAPTER.scripts = [_tool_turn([("p1", "mcp__maps__static_map", {})]), _final_text("done")]
+    await _collect(session)
+    return seen, formatted
+
+
+@pytest.mark.asyncio
+async def test_a_kept_picture_names_its_path_and_rides_its_tool_result(direct_session, monkeypatch):
+    from services.mcp.result_files import Kept
+    session, _ = direct_session
+    pics = [{"base64": f"b{i}", "media_type": "image/png"} for i in range(6)]
+    seen, formatted = await _picture_turn(session, monkeypatch, pictures=True, kept=Kept(
+        line="The platform saved this result's file as /users/alice/workspace/maps/m.png.",
+        vision=pics, saved=["/users/alice/workspace/maps/m.png"]))
+    assert seen == [("mcp__maps__static_map", ["image"], "Route: 12 km", False)]
+    (res,) = formatted
+    assert res["content"] == (
+        "Route: 12 km\nThe platform saved this result's file as /users/alice/workspace/maps/m.png.")
+    # At most four pictures ride the history.
+    assert res["images"] == pics[:4]
+    assert "file_blocks" not in res
+
+
+@pytest.mark.asyncio
+async def test_a_provider_without_pictures_gets_the_line_alone(direct_session, monkeypatch):
+    from services.mcp.result_files import Kept
+    session, _ = direct_session
+    _, formatted = await _picture_turn(session, monkeypatch, pictures=False, kept=Kept(
+        line="Saved.", vision=[{"base64": "iVBORw0KGgo=", "media_type": "image/png"}]))
+    (res,) = formatted
+    assert res["content"] == "Route: 12 km\nSaved."
+    assert "images" not in res
+
+
+@pytest.mark.asyncio
+async def test_a_tool_not_kept_keeps_its_text(direct_session, monkeypatch):
+    session, _ = direct_session
+    _, formatted = await _picture_turn(session, monkeypatch, pictures=True, kept=None)
+    assert formatted[0]["content"] == "[binary data: image/png]\nRoute: 12 km"
+    assert "images" not in formatted[0]
+
+
+def test_the_anthropic_adapter_puts_the_pictures_inside_the_tool_result():
+    from core.layers.providers.anthropic_adapter import AnthropicAdapter
+    a = AnthropicAdapter()
+    assert a.tool_result_images is True
+    (msg,) = a.format_tool_results([
+        {"tool_use_id": "t1", "content": "Saved.",
+         "images": [{"base64": "iVBORw0KGgo=", "media_type": "image/png"}]},
+        {"tool_use_id": "t2", "content": "plain"},
+    ])
+    first, second = msg["content"]
+    assert first["content"][0] == {"type": "text", "text": "Saved."}
+    assert first["content"][1]["source"] == {"type": "base64", "media_type": "image/png",
+                                             "data": "iVBORw0KGgo="}
+    assert second["content"] == "plain"
+
+
+def test_the_openai_family_shows_no_pictures_in_tool_results():
+    from core.layers.providers.openai_adapter import OpenAIAdapter
+    from core.layers.providers.openai_compat_adapter import (
+        GroqAdapter, OllamaAdapter, OpenAICompatibleAdapter)
+    for cls in (OpenAIAdapter, GroqAdapter, OllamaAdapter, OpenAICompatibleAdapter):
+        assert cls.tool_result_images is False

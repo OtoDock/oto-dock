@@ -23,6 +23,12 @@ export interface AudioProvider {
   /** The engine's advanced-settings defaults (server-provided; drives which
    *  advanced fields render + the Restore button). */
   advanced_defaults: Record<string, unknown>
+  /** The model ids that run when the row stores none (placeholders; never
+   *  stored, so a row follows a later default). */
+  model_defaults?: Record<string, string>
+  /** The voices the engine ships per language (placeholders; the admin's
+   *  voice for a language wins over the shipped one). */
+  voice_defaults?: Record<string, string>
 }
 
 export type AudioProviderCreate = {

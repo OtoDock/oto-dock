@@ -171,7 +171,7 @@ setup_proxy() {
 start_postgres() {
     [ -f "$PLATFORM_ROOT/config.env" ] || die "config.env missing — proxy/setup.sh should have created it"
     local DC="docker"; docker info >/dev/null 2>&1 || DC="sudo docker"
-    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine}) in Docker..."
+    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}) in Docker..."
     $DC compose --env-file "$PLATFORM_ROOT/config.env" -f "$PLATFORM_ROOT/docker-compose.t1.yml" up -d postgres
     ok "Postgres up on 127.0.0.1:5432 (container otodock-postgres)"
 }

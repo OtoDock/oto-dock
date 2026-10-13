@@ -28,7 +28,7 @@ from typing import Awaitable, Callable
 from services.mcp import mcp_installer, mcp_registry, mcp_tarball
 from services.mcp import mcp_manifest_types as _mt
 
-logger = logging.getLogger("claude-proxy.mcp-sync")
+logger = logging.getLogger("otodock.mcp-sync")
 
 # Per-(machine_id, mcp) backoff for updates the satellite DEFERRED because the
 # old version was still in use — its running process held the files so the

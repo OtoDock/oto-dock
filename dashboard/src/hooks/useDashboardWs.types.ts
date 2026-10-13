@@ -1,7 +1,7 @@
 import type {
   AbortedFrame, AudioFrame, BgAgentDoneFrame, BgAgentsCompleteFrame, BgCommandDoneFrame,
   BgCommandSpawnFrame, BgCommandsCompleteFrame, ChatHistoryFrame,
-  ChatHistoryDeltaFrame, ChatMovedFrame, ChatRowsFrame,
+  ChatHistoryDeltaFrame, ChatMovedFrame, ChatRowsFrame, ChatViewOnlyFrame,
   ContextCompactFrame, DelegateResultFrame, DelegateSpawnFrame, DocumentPreviewFrame,
   EngineSwitchedFrame, ExecutionModeChangedFrame, FileFrame, FileUpdatedFrame, GoalUpdateFrame,
   ImageGeneratingFrame,
@@ -100,6 +100,10 @@ export interface WsCallbacks {
   // the chat so the fresh warmup runs there and the "moved" history card
   // arrives. Failures come as standard error frames (toasts), not this.
   onChatMoved?: (data: ChatMovedFrame) => void
+  // chat_view_only — the viewed chat is driven from outside (a phone call):
+  // its history is read-only until the chat's status reads ready, when the
+  // hook re-resumes it and calls this with null.
+  onChatViewOnly?: (data: ChatViewOnlyFrame | null) => void
   // switch_engine ack — the chat now runs on a different execution engine
   // (cross-engine resume). Arrives on the acting socket; the per-user
   // broadcast for sibling tabs is not delivered today (a carried defect,

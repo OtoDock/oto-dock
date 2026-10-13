@@ -59,7 +59,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from mcp.server import Server
@@ -159,8 +159,13 @@ async def _request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
+    timeout: float | None = None,
+    retry: Literal["all", "connect"] = "all",
 ) -> Any:
-    """Call the platform with one retry on 5xx (1s backoff)."""
+    """Call the platform with one retry (1s backoff): ``retry="all"`` after
+    a 5xx or any transport error, ``"connect"`` only after a connection
+    that never opened (a slow call a second attempt would only repeat).
+    ``timeout`` replaces the client's 10 s for one slow call."""
     url = f"{PROXY_URL}{path}"
     for attempt in (0, 1):
         try:
@@ -169,14 +174,16 @@ async def _request(
                 params=params,
                 json=body,
                 headers=_headers(),
+                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
             )
         except httpx.HTTPError as exc:
-            if attempt == 0:
+            if attempt == 0 and (
+                    retry == "all" or isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))):
                 await asyncio.sleep(1.0)
                 continue
             raise _ApiError(f"network: {exc}") from exc
 
-        if 500 <= r.status_code < 600 and attempt == 0:
+        if 500 <= r.status_code < 600 and retry == "all" and attempt == 0:
             await asyncio.sleep(1.0)
             continue
 
@@ -201,8 +208,10 @@ async def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     return await _request("GET", path, params=params)
 
 
-async def _post(path: str, body: dict[str, Any] | None = None) -> Any:
-    return await _request("POST", path, body=body or {})
+async def _post(path: str, body: dict[str, Any] | None = None, *,
+                timeout: float | None = None,
+                retry: Literal["all", "connect"] = "all") -> Any:
+    return await _request("POST", path, body=body or {}, timeout=timeout, retry=retry)
 
 
 async def _put(path: str, body: dict[str, Any] | None = None) -> Any:
@@ -977,7 +986,12 @@ async def _handle_validate_package(args: dict) -> str:
     if not path:
         return "❌ Error: path is required"
     try:
-        result = await _post("/v1/mcps/local-package/validate", {"path": path})
+        # A remote session's folder is read from its machine first, under
+        # the platform's 60 s deadline; a 503 or a timeout is that read
+        # failing or running long, which a second attempt would only repeat.
+        result = await _post(
+            "/v1/mcps/local-package/validate", {"path": path}, timeout=120.0, retry="connect",
+        )
     except _ApiError as exc:
         return f"❌ Error: {exc}"
     if not isinstance(result, dict):

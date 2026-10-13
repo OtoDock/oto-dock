@@ -13,7 +13,7 @@ from storage.pg import get_conn
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.db-users")
+logger = logging.getLogger("otodock.db-users")
 
 
 def _make_username_slug(name: str, conn, taken: frozenset[str] = frozenset()) -> str:
@@ -86,13 +86,13 @@ def upsert_user(sub: str, email: str, name: str, role: str,
     # scan must not hold a pooled connection idle) and only when a slug is
     # about to be minted.
     taken = frozenset() if get_username_by_sub(sub) else usernames_on_disk()
-    for _attempt in range(3):
+    for _attempt in range(2):
         try:
             return _upsert_user_once(sub, email, name, role, display_name, taken)
         except Exception as exc:
-            if "uq_users_username" in str(exc) and _attempt < 2:
-                continue
-            raise
+            if "uq_users_username" not in str(exc):
+                raise
+    return _upsert_user_once(sub, email, name, role, display_name, taken)
 
 
 def _upsert_user_once(sub: str, email: str, name: str, role: str,
@@ -471,7 +471,8 @@ def delete_user(sub: str) -> bool:
     their user-scope tasks, triggers and notifications (no foreign key to
     ``users``) go in the same transaction on every agent (a platform admin
     holds them on agents without a row), so none fires for a person who no
-    longer exists. Their username retires with them (``retired_usernames``):
+    longer exists; so do their waiting chat messages (``chat_input_queue``).
+    Their username retires with them (``retired_usernames``):
     never minted again, and the offboarding archive finds their trees by
     it. A name retired once before (an older dump restored, the person
     deleted again) is stamped afresh."""
@@ -486,6 +487,9 @@ def delete_user(sub: str) -> bool:
         # the row cascades the rest.
         from storage.sharing import share_store
         share_store.hand_over_team_shares(conn, sub)
+        # Their waiting messages: nobody could send them as a person who no
+        # longer exists (the offboarding clears the chips).
+        conn.execute("DELETE FROM chat_input_queue WHERE author_sub=%s", (sub,))
         if row and row["username"]:
             conn.execute(
                 """INSERT INTO retired_usernames (username, sub, retired_at, archived_at)
@@ -740,6 +744,19 @@ def set_user_password(sub: str, password_hash: str) -> None:
         conn.commit()
 
 
+def claim_totp_step(sub: str, step: int) -> bool:
+    """Record ``step`` as the account's last accepted TOTP step when it is
+    past the stored one; False when it is not (the code was used already).
+    One conditional UPDATE, so two requests with one code cannot both pass."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE users SET totp_last_step=%s WHERE sub=%s AND totp_last_step < %s",
+            (step, sub, step),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
 def bump_token_epoch(sub: str) -> str:
     """Move the person's token epoch to now (an admin's "sign out
     everywhere"): every session cookie and agent session token minted
@@ -770,7 +787,7 @@ def update_user_auth_fields(sub: str, **kwargs) -> None:
         return
     allowed = {
         "auth_provider", "totp_secret_enc", "totp_enabled", "totp_recovery_enc",
-        "failed_login_attempts", "last_failed_login", "locked_until",
+        "totp_last_step", "failed_login_attempts", "last_failed_login", "locked_until",
         "local_only", "must_change_password",
     }
     fields = {k: v for k, v in kwargs.items() if k in allowed}

@@ -108,16 +108,19 @@ class AMIClient:
         context: str = "oto-audiosocket-outbound",
         dial_prefix: str = "",
         timeout_ms: int = 30000,
+        action_id: str = "",
     ) -> dict:
         """Originate an outbound call.
 
         Dials the phone number via the configured SIP trunk, and upon
         answer routes to the oto-audiosocket-outbound dialplan context which connects
-        to AudioSocket with the given UUID.
+        to AudioSocket with the given UUID. ``action_id`` names the request:
+        the PBX echoes it on the ``OriginateResponse`` event the persistent
+        listener reads to learn the dialled channel (``ami_events``).
         """
         action = {
             "Action": "Originate",
-            "ActionID": str(uuid.uuid4())[:8],
+            "ActionID": action_id or str(uuid.uuid4())[:8],
             "Channel": f"Local/{dial_prefix}{phone_number}@from-internal",
             "Context": context,
             "Exten": "s",

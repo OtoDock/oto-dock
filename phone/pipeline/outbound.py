@@ -16,9 +16,51 @@ from .markers import _CALL_COMPLETE_RE, _QUESTION_RE
 
 logger = logging.getLogger("pipeline")
 
+#: How long a call that ends before adopting its pre-warmed client waits for
+#: the opening still generating on it (the client exists only once it is).
+UNADOPTED_OPENING_WAIT_S = 15.0
+#: Why an outbound call ended at the PIN gate, as the record and the chat
+#: read it.
+PIN_REFUSED = "the person who answered did not enter the PIN"
+PIN_COOLDOWN = "the number was still in PIN cooldown, nobody was asked"
+
 
 class OutboundMixin:
     """Outbound opening/warmup, finalization, and the [QUESTION:] hold/answer cycle."""
+
+    async def _settle_unadopted_outbound(self, *, adopt: bool) -> None:
+        """An outbound call ending before it adopted its pre-warmed client
+        (the PIN gate refused the person, a hangup during the gate, the max
+        duration): the client, and the opening still generating on it, must
+        not stay open on the proxy. ``adopt`` takes the client as the call's
+        own (``self.llm``) so the finalize can tell the record and the chat
+        why (a refused code, a hangup during the gate), and the cleanup
+        closes it; any other exit closes it here, after cancelling a
+        pre-generation still running."""
+        if not self._call_manager or not self._outbound_call_id:
+            return
+        call = self._call_manager.get_call(self._outbound_call_id)
+        if call is None:
+            return
+        ready = getattr(call, "_opening_ready", None)
+        if ready is not None and not ready.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(ready.wait(), timeout=UNADOPTED_OPENING_WAIT_S)
+        client = getattr(call, "warmup_client", None)
+        if adopt and client is not None:
+            call.warmup_client = None
+            self.llm = client
+            return
+        task = getattr(call, "pregen_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        client = getattr(call, "warmup_client", None)
+        if client is not None:
+            call.warmup_client = None
+            with contextlib.suppress(Exception):
+                await client.close()
 
     async def _adopt_prewarmed_backend(self):
         """Take over the connection that pre-warmed this call's session during
@@ -100,6 +142,15 @@ class OutboundMixin:
             logger.error(f"[{self.conn.peer_addr}] Outbound call not found: {self._outbound_call_id}")
             return
 
+        if getattr(self.llm, "proxy_lost", False) or (
+                self._in_session and not getattr(self.llm, "session_id", None)):
+            # No session to speak from: the proxy's socket never opened, or
+            # the chat refused or lost the attach. A short apology, then the
+            # line closes; an in-session call's finalize tells the chat (when
+            # the socket still stands).
+            await self._end_unreachable_call()
+            return
+
         # The pre-generation was awaited (or cancelled) when the backend was
         # adopted (_adopt_prewarmed_backend); this is only a guard for a
         # caller that skipped that step.
@@ -114,17 +165,6 @@ class OutboundMixin:
                 f"[{self.conn.peer_addr}] Using pre-generated opening "
                 f"({len(call.opening_text)} chars): {call.opening_text[:80]}..."
             )
-
-            # Inject the opening exchange into local LLM messages for session continuity.
-            # Only needed for proxy (CLI) mode — the session marker lets --resume work.
-            # For direct mode, the proxy already has the messages stored server-side.
-            if not self._is_direct:
-                if call.opening_prompt:
-                    self.llm.messages.append({"role": "user", "content": call.opening_prompt})
-                response_content = call.opening_text
-                if getattr(self.llm, 'session_id', None):
-                    response_content += f"\n\n[//]: # (session:{self.llm.session_id})"
-                self.llm.messages.append({"role": "assistant", "content": response_content})
 
             # Record transcript
             if self._call_manager:
@@ -281,6 +321,81 @@ class OutboundMixin:
                     f"during opening"
                 )
 
+    def _on_proxy_lost(self) -> None:
+        """The proxy's socket is gone (the proxy restarted or closed the
+        call's socket; for an in-session call also when the chat was stopped
+        or deleted, or its turn ended). The person is never left on a silent
+        line: the call ends with the apology now, or right after the turn
+        that is running."""
+        if not self.state._running:
+            return
+        self.state._proxy_lost = True
+        task = self.state._utterance_task
+        if task is not None and not task.done():
+            return   # the dispatch sees the flag at its stream's end
+        asyncio.get_running_loop().create_task(self._end_unreachable_call())
+
+    async def _end_unreachable_call(self) -> None:
+        if self.state._unreachable_ending:
+            return
+        self.state._unreachable_ending = True
+        logger.warning(
+            f"[{self.conn.peer_addr}] The proxy is not reachable for this call "
+            f"— ending it")
+        self.state.call_outcome = "error"
+        with contextlib.suppress(Exception):
+            await self._play_phrase("cannot_continue")
+        await asyncio.sleep(0.5)
+        self.conn.send_hangup()
+        self.state._running = False
+
+    def _in_session_ending(self) -> str:
+        """How an in-session call ended, for the resume note and the record."""
+        if self.state._transferred_to:
+            return f"transferred to {self.state._transferred_to}"
+        if self.state.call_outcome == "error":
+            return "ended by an error"
+        if self.state.call_outcome == "pin_cooldown":
+            return f"ended: {PIN_COOLDOWN}"
+        if self.state.call_outcome.startswith("pin_"):
+            return f"ended: {PIN_REFUSED}"
+        if self.state._call_complete or self._control_pending_end():
+            return "completed: you ended it"
+        if self.state.call_outcome == "hangup":
+            return "the person hung up"
+        return f"ended after {int(self.cfg.idle_timeout_s)} s of silence"
+
+    async def _finalize_in_session_call(self, call) -> None:
+        """The chat gets the resume note as the call's last turn (the reply is
+        not awaited: the proxy's producer runs it after the socket closes),
+        and the record its ending; no summary turn, the chat has the whole
+        exchange as rows."""
+        from calls.call_manager import CallStatus
+        how = self._in_session_ending()
+        note = (
+            f"[The phone call has ended ({how}); the line is closed. You are back in the "
+            "text chat: the phone rules no longer apply. Summarise the call's outcome for "
+            "the user in one or two sentences, then continue your task.]")
+        sent = False
+        with contextlib.suppress(Exception):
+            sent = await self.llm.send_system_note(note, resume=True)
+        if self.state._transferred_to:
+            call.transferred_to = self.state._transferred_to
+        failed = self.state.call_outcome == "error" or not (
+            self.state._transferred_to or self.state._call_complete
+            or self._control_pending_end())
+        if failed and self.state.call_outcome != "error":
+            self.state._call_complete = False
+        self._call_manager.update_status(
+            self._outbound_call_id,
+            CallStatus.FAILED if failed else CallStatus.COMPLETED,
+            outcome=None if failed else f"Ran in the chat, {how}",
+            error=f"ran in the chat, {how}" if failed else None,
+        )
+        logger.info(
+            f"[{self.conn.peer_addr}] In-session call finished: {how} "
+            f"(resume note {'sent' if sent else 'not sent'})")
+
     async def _finalize_outbound_call(self) -> None:
         """Finalize the outbound call: get outcome summary and update status."""
         if not self._call_manager or not self._outbound_call_id:
@@ -289,6 +404,39 @@ class OutboundMixin:
         call = self._call_manager.get_call(self._outbound_call_id)
         if not call:
             return
+
+        # A transfer in flight when the media leg closed: its outcome first.
+        await self._settle_transfer()
+        # The PIN gate's result rides the record into the terminal report
+        # (set before the status update that fires it). An outbound record
+        # carries the failures the windows counted, never the silent rounds.
+        call.pin_attempts = self.state.pin_failures
+        call.pin_outcome = (self.state.call_outcome
+                            if self.state.call_outcome.startswith("pin_") else "")
+        call.hung_up = self.state.call_outcome == "hangup"
+        from calls.call_manager import CallStatus
+        if self._in_session:
+            await self._finalize_in_session_call(call)
+            return
+        if call.pin_outcome:
+            self._call_manager.update_status(
+                self._outbound_call_id, CallStatus.FAILED,
+                error=PIN_COOLDOWN if call.pin_outcome == "pin_cooldown" else PIN_REFUSED)
+            logger.warning(
+                f"[{self.conn.peer_addr}] Outbound call ended at the PIN gate "
+                f"({call.pin_outcome}, {self.state.pin_failures} wrong codes)")
+            return
+        if self.state._transferred_to:
+            call.transferred_to = self.state._transferred_to
+            self._call_manager.update_status(
+                self._outbound_call_id, CallStatus.COMPLETED,
+                outcome=f"Transferred to {self.state._transferred_to}",
+            )
+            logger.info(f"[{self.conn.peer_addr}] Outbound call transferred to {self.state._transferred_to}")
+            return
+        # An end the agent asked for counts, whoever hung up first.
+        if self._control_pending_end():
+            self.state._call_complete = True
 
         if self.state._call_complete:
             # Ask the LLM for a 1-sentence outcome summary
@@ -311,7 +459,6 @@ class OutboundMixin:
                 logger.error(f"[{self.conn.peer_addr}] Failed to get outcome summary: {e}")
                 outcome = "Call completed (summary unavailable)"
 
-            from calls.call_manager import CallStatus
             self._call_manager.update_status(
                 self._outbound_call_id,
                 CallStatus.COMPLETED,
@@ -319,13 +466,15 @@ class OutboundMixin:
             )
             logger.info(f"[{self.conn.peer_addr}] Outbound call completed: {outcome}")
         else:
-            from calls.call_manager import CallStatus
+            if self.state.call_outcome == "hangup":
+                how = "the person hung up before the call was completed"
+            elif self.state.call_outcome == "error":
+                how = "ended by an error"
+            else:
+                how = f"ended after {int(self.cfg.idle_timeout_s)} s of silence"
             self._call_manager.update_status(
-                self._outbound_call_id,
-                CallStatus.FAILED,
-                error="call ended without [CALL_COMPLETE] marker",
-            )
-            logger.warning(f"[{self.conn.peer_addr}] Outbound call ended without completion")
+                self._outbound_call_id, CallStatus.FAILED, error=how)
+            logger.warning(f"[{self.conn.peer_addr}] Outbound call ended without completion: {how}")
 
     async def _handle_question(self, question_text: str) -> str | None:
         """Handle a [QUESTION:] marker from the caller agent.
@@ -422,7 +571,7 @@ class OutboundMixin:
             while True:
                 if not self.state._tts_playing:
                     try:
-                        self.conn.send_audio(silence)
+                        self._send_frame(silence)
                     except Exception:
                         break
                 await asyncio.sleep(0.02)

@@ -36,7 +36,7 @@ PHONE_CONTEXT = (
     "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
     "- Don't spell out URLs, paths, or IPs unless asked.\n"
     "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you'). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
-    "- To end the call (e.g. user says goodbye or the conversation is clearly over), append [CALL_COMPLETE] at the end of your final message. The system will strip it before speaking.\n"
+    "- To end the call (e.g. user says goodbye or the conversation is clearly over): say your goodbye first, then call the end_call tool if you have it; without that tool, append [CALL_COMPLETE] at the end of your final message. Nothing you write after the tool call or the marker is heard.\n"
 )
 
 # Standalone call context for OUTBOUND calls — a full template (NOT appended to
@@ -53,11 +53,48 @@ PHONE_OUTBOUND = (
     "- Don't spell out URLs, paths, or IPs unless asked.\n"
     "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you'). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
     "- Complete the task you were given, politely and professionally.\n"
-    "- If you need information from your manager during the call, emit [QUESTION: your question here] in your response. "
-    "The system will relay the question while the call stays active.\n"
-    "- When the task is complete or clearly cannot be completed, end your final message with [CALL_COMPLETE].\n"
-    "- The [CALL_COMPLETE] and [QUESTION:] markers are stripped before speaking — they're signals for the system.\n"
+    "- If you need information from the agent that placed this call, call the ask_initiating_agent tool if you have it; without that tool, emit [QUESTION: your question here] in your response. "
+    "The system relays the question while the call stays active.\n"
+    "- When the task is complete or clearly cannot be completed: say your goodbye first, then call the end_call tool if you have it; without that tool, end your final message with [CALL_COMPLETE].\n"
+    "- The [CALL_COMPLETE] and [QUESTION:] markers are stripped before speaking — they're signals for the system. Nothing you write after an end_call or a marker is heard.\n"
 )
+
+# The call tools block, appended after the call context when the session
+# actually carries the tools (the call-control MCP attached, or the Direct
+# builtins registered). The transfer targets are listed by label only.
+_CALL_TOOLS_HEAD = (
+    "CALL CONTROLS (tools):\n"
+    "- end_call(reason): say your goodbye in one short sentence FIRST, then call it; "
+    "the line closes right after. Nothing you write after the call is heard.\n"
+)
+_CALL_TOOLS_TRANSFER = (
+    "- transfer_call(target): hands the caller to a colleague. Targets on this line: {targets}. "
+    "Tell the caller in one short sentence first, then call it with the target's name.\n"
+)
+_CALL_TOOLS_NO_TRANSFER = (
+    "- transfer_call: this line has no transfer targets; if asked, say you cannot transfer.\n"
+)
+_CALL_TOOLS_ASK = (
+    "- ask_initiating_agent(question): relays a question to the agent that placed this call. "
+    "Say that you are checking (one short sentence) and stop; the answer arrives as your next "
+    "message within about 40 seconds.\n"
+)
+_CALL_TOOLS_TAIL = (
+    "The text markers [CALL_COMPLETE] and [QUESTION: ...] still work as a fallback.\n"
+)
+
+
+def call_tools_block(*, ask_back: bool, transfer_targets: list[dict] | None) -> str:
+    """The prompt block naming the call tools a session carries."""
+    labels = [str(t.get("label") or t.get("number") or "").strip()
+              for t in (transfer_targets or []) if isinstance(t, dict)]
+    labels = [label for label in labels if label]
+    block = _CALL_TOOLS_HEAD
+    block += (_CALL_TOOLS_TRANSFER.format(targets=", ".join(labels))
+              if labels else _CALL_TOOLS_NO_TRANSFER)
+    if ask_back:
+        block += _CALL_TOOLS_ASK
+    return block + _CALL_TOOLS_TAIL
 
 
 class PhoneAdapter(ClientAdapter):

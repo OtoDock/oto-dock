@@ -39,6 +39,9 @@ export interface CommunityMcpEntry {
   deprecated: boolean
   patched: boolean
   patch_note: string | null
+  // Who stands behind the entry, from the catalog; an untagged one reads
+  // third-party (the proxy normalizes it).
+  trust?: McpTrustTier
   // Augmentation added by the proxy (local platform state).
   installed: boolean
   installed_version: string | null
@@ -46,12 +49,24 @@ export interface CommunityMcpEntry {
   // The catalog source moved: the Browse button cannot apply it, the MCP
   // Servers page carries the switch (proxy COMMUNITY-MARKETPLACE.md).
   source_changed?: boolean
+  // A git+ entry the catalog pins to a tag or a branch: the install from
+  // the catalog refuses it, so no Update until the catalog pins a commit.
+  catalog_unpinned?: boolean
   enabled_for_agents: string[]
   // Manager scope: open request id for this (mcp, agent). Admin scope:
   // always null (admins don't request).
   pending_request: number | null
   // Count of open requests across all agents (admin-side badge).
   pending_request_count: number
+}
+
+export type McpTrustTier = 'first-party' | 'maintained' | 'third-party'
+
+// The badge and its tooltip per tier.
+export const MCP_TRUST_TIERS: Record<McpTrustTier, { label: string; title: string }> = {
+  'first-party': { label: 'first-party', title: 'OtoDock writes or maintains this server.' },
+  maintained: { label: 'maintained', title: "The vendor's or a maintained project's own server, reviewed by the catalog." },
+  'third-party': { label: 'third-party', title: 'A community package that follows its upstream project.' },
 }
 
 export interface CommunityMcpsResponse {

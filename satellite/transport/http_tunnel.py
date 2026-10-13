@@ -54,7 +54,9 @@ logger = logging.getLogger("satellite.tunnel")
 _ALLOWLIST_REGEXES = [
     re.compile(
         r"^/v1/hooks/(resolve-path|resolve-tool-arg-paths|permission|"
-        r"mcp-credentials|session-files|"
+        # The command-line credential git and gh ask for per command
+        # (0.5.139), session-JWT gated proxy-side.
+        r"mcp-credentials|session-files|cli-credential|"
         r"images|image-generating|image-gen-failed|url|file|media|ui|"
         r"document-preview|tool-result|file-written|subagent|"
         # The Stop hook (turn end, both engines) and the Codex question

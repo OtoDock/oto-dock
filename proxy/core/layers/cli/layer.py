@@ -51,7 +51,7 @@ from core.session.session_state import (
     mark_starting, clear_starting, mark_closing, session_is_held, START_MARK_TTL_S,
 )
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # How long the graceful interrupt gets to close the turn (result event →
 # producer completion) before the watchdog falls back to killpg. The CLI
@@ -190,7 +190,10 @@ def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
         events.append(CommonEvent(type=PLAN_MODE, data=chunk.event_data))
 
     elif et == "permission_prompt":
-        events.append(CommonEvent(type=PERMISSION_REQUEST, data=chunk.event_data))
+        # The raising session's id: a meeting participant's request rides
+        # the meeting's pump, whose own id names no session.
+        events.append(CommonEvent(type=PERMISSION_REQUEST, data={
+            **chunk.event_data, "session_id": chunk.session_id or ""}))
 
     elif et == "system":
         subtype = chunk.event_data.get("subtype", "")
@@ -325,6 +328,9 @@ _CLI_CAPABILITIES = LayerCapabilities(
             "question": ("AskUserQuestion",),
         },
         question_tool_holds_turn=False,       # headless: the platform denies AskUserQuestion, shows the card; the answer is the next message
+        # Under --setting-sources user the CLI reads no CLAUDE.md or AGENTS.md
+        # of a repository below its working folder (probed on 2.1.289).
+        repository_instruction_files=("CLAUDE.md", "AGENTS.md"),
     ),
     model_policy=ModelPolicy(
         default_model="claude-opus-5-5",      # tier 2: the frontier model is a deliberate choice
@@ -743,8 +749,22 @@ class CLIExecutionLayer(ExecutionLayer):
             inject_time: bool — prepend current datetime to message
             settle_after_result: float — wait for background agents
         """
+        # A pool entry whose process the proxy's own abort ended (a Stop, its
+        # watchdog) answers a message with the ``stopped`` ending: the lookup
+        # below drops the dead entry, so read it first.
+        pooled = _persistent_sessions.get(session_id)
+        killed = (pooled is not None and pooled._proxy_killed
+                  and pooled.proc is not None and pooled.proc.returncode is not None)
         session = await get_persistent_session(session_id)
         if not session:
+            if killed:
+                ending = turn_ending.TurnEnding(
+                    reason=turn_ending.STOPPED, detail="the process was stopped",
+                )
+                yield CommonEvent(type=ERROR, data={"message": ending.line(),
+                                                    "ending": ending.as_dict()})
+                yield CommonEvent(type=DONE, data={})
+                return
             yield CommonEvent(type=ERROR, data={"message": "Session not found"})
             return
 
@@ -871,7 +891,16 @@ class CLIExecutionLayer(ExecutionLayer):
         # Native CLI permissions use the control channel
         session = await get_persistent_session(session_id)
         if session and session.use_native_permissions:
-            await session.send_control_response(request_id, approved)
+            from core.session.engine_prompts import input_of
+            await session.send_control_response(
+                request_id, approved, tool_input=input_of(request_id) or None)
+
+    async def answer_engine_prompt(
+        self, session_id: str, request_id: str, approved: bool, tool_input: dict,
+    ) -> None:
+        session = await get_persistent_session(session_id)
+        if session is not None:
+            await session.send_control_response(request_id, approved, tool_input=tool_input)
 
     async def change_model(
         self, session_id: str, model: str,

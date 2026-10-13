@@ -84,3 +84,45 @@ async def test_telephony_default_never_bursts():
 
 def test_telephony_is_the_class_default():
     assert PlaybackMixin._pace_catch_up_s == 0.0
+
+
+@pytest.mark.asyncio
+async def test_tap_records_every_frame_and_the_stall_as_silence(tmp_path):
+    """The debug tap sees every frame the sender hands the transport; the
+    file carries the hiccup as silence of its length (a stall is a gap
+    in the file, sleep jitter of a few ms is not), named after the call."""
+    import wave
+
+    from pipeline.audio_tap import OutgoingAudioTap
+
+    conn = _HiccupConn()
+    p = _Sender(conn, catch_up=0.0)
+    tap = p.state._audio_tap = OutgoingAudioTap(8000, 320)
+    pcm = b"".join(bytes([i]) * 320 for i in range(1, 26))   # no zero byte
+    await p._paced_playback(pcm)
+    assert conn.sent == tap.frame_count == 25
+
+    path = tap.write(tmp_path / "debug-audio", "twilio:ab12")
+    assert path.parent == tmp_path / "debug-audio"
+    assert path.name.endswith("-twilio-ab12-out.wav")
+    with wave.open(str(path)) as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (8000, 1, 2)
+        data = w.readframes(w.getnframes())
+    assert data[:1600] == pcm[:1600]                    # five frames, back to back
+    assert data.replace(b"\x00", b"") == pcm            # only silence was added
+    rest = data[1600:]
+    filled = len(rest) - len(rest.lstrip(b"\x00"))
+    assert 0.2 * 16000 < filled < 0.4 * 16000           # the 0.3 s hiccup, less one period
+
+
+def test_tap_keeps_the_newest_files(tmp_path):
+    from pipeline.audio_tap import KEEP_FILES, OutgoingAudioTap
+
+    assert CallState()._audio_tap is None               # off unless run() sets one
+    d = tmp_path / "debug-audio"
+    for i in range(KEEP_FILES + 2):
+        tap = OutgoingAudioTap(8000, 320)
+        tap.add(b"\x01" * 320)
+        tap.write(d, f"call{i:02d}")
+    names = sorted(p.name for p in d.glob("*-out.wav"))
+    assert [n.split("-")[1] for n in names] == [f"call{i:02d}" for i in range(2, KEEP_FILES + 2)]

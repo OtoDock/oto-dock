@@ -124,6 +124,27 @@ class TestPreludeLine:
         sa._snapshot["ts"] = 0.0
         assert sa._line_for_chat_sync(own) != ""
 
+    def test_a_title_with_a_line_break_stays_one_line(self, temp_db, streaming_state):
+        # The transcripts strip the line from titles and bubbles as ONE line.
+        own = _mk_chat()
+        sib = _mk_chat(title="Fix [bug]\n  in the  inbox")
+        _stream(sib)
+        line = sa._line_for_chat_sync(own)
+        assert "\n" not in line and "'Fix [bug] in the inbox' (generating)" in line
+        from core.session.transcript_tailer import _title_from_prompt
+        assert _title_from_prompt(f"{line}\n\nthe prompt") == "the prompt"
+
+    def test_the_caches_stay_bounded(self, temp_db, monkeypatch):
+        # Every task run has its own chat and session id: past the cap the
+        # expired entries go, then everything.
+        monkeypatch.setattr(sa, "_CACHE_CAP", 4)
+        for i in range(10):
+            sa._chat_row_sync(f"no-such-chat-{i}")
+        assert len(sa._chat_rows) <= 4
+        sa._last_hash.update({f"c{i}": i for i in range(4)})
+        sa._bound(sa._last_hash, None)
+        assert sa._last_hash == {}
+
     def test_prelude_line_resolves_session(self, temp_db, streaming_state):
         own = _mk_chat()
         sid = str(uuid.uuid4())

@@ -262,7 +262,7 @@ class TestDenialLogLevel:
             "content_b64": base64.b64encode(b"x").decode(),
         }
         called = {"n": 0}
-        with caplog.at_level(logging.DEBUG, logger="claude-proxy.satellite"), \
+        with caplog.at_level(logging.DEBUG, logger="otodock.satellite"), \
              patch("core.session.session_state.get_session_security", return_value=sec), \
              patch("core.remote.file_sync.apply_incoming_file",
                    lambda *a, **k: called.__setitem__("n", called["n"] + 1)):

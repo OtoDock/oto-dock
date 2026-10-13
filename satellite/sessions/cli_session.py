@@ -20,7 +20,10 @@ from ..config import (
     kill_process_tree,
     otodock_dir,
     reap_descendants,
+    session_tools_env,
     snapshot_descendants,
+    write_command_wrappers,
+    write_if_changed,
 )
 import contextlib
 from .. import config
@@ -33,6 +36,9 @@ logger = logging.getLogger("satellite")
 
 # A turn's reader checks its stop flag every second (``_read_stdout_until_stop``).
 _READER_HANDOFF_S = 10.0
+# The inputs of the CLI's open ``can_use_tool`` requests kept for their
+# answers; a request never answered ages out past this many.
+_PROMPT_INPUTS_MAX = 64
 
 # Claude Code's built-in plugins (2.1.287+) but the four the platform keeps
 # on (agents-md, diff, telemetry, the managed-only sec-default), switched off
@@ -83,6 +89,10 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
         # both stay off (mirrors core/layers/cli/config_dir.build_settings).
         "syncClaudeAiSkills": False,
         "syncClaudeAiPlugins": False,
+        # The account's claude.ai connectors (Claude Docs, Google Drive, …)
+        # would load as MCP servers too and act on the pool owner's account;
+        # off (mirrors the proxy builder).
+        "disableClaudeAiConnectors": True,
         # Built-in-tool deny list, shipped by the proxy (single source of truth:
         # core/layers/cli/config_dir.DISALLOWED_BUILTIN_TOOLS alone: a session's own
         # denials ride the gate over the tunnel, since this file is the scope's and
@@ -101,6 +111,11 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
                     "type": "command",
                     "command": gate,
                     "timeout": config.HOOK_WAIT_S,
+                    # Claude Code 2.1.295+: a gate that cannot start, times
+                    # out or exits non-zero blocks the call (the proxy's
+                    # builder writes the same; older CLIs ignore the key).
+                    # The gate alone, never the trackers.
+                    "onFailure": "block",
                 }],
             }],
             "PostToolUse": [{
@@ -139,27 +154,25 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
             }],
         }
     }
-    (claude_dir / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
+    write_if_changed(claude_dir / "settings.json", (json.dumps(settings, indent=2) + "\n").encode("utf-8"))
 
 
 def _write_hook_scripts(claude_dir: Path, scripts: dict[str, str]) -> None:
     """Write hook scripts sent by the proxy into the .claude/ dir.
 
-    Makes them executable. Refreshed on every session start so satellites
-    always run the current proxy version of each hook.
+    Executable, and refreshed on every session start so satellites always
+    run the current proxy version of each hook: an unchanged script is left
+    alone, a changed one replaced whole (``config.write_if_changed``; a
+    sibling session may launch a hook from this dir at that moment). Hooks
+    run via ``"python.exe" "<path>"`` on all platforms, so the exec bit only
+    serves Unix shebang dispatch.
     """
     if not scripts:
         return
     for filename, content in scripts.items():
         if not content:
             continue
-        path = claude_dir / filename
-        path.write_text(content)
-        # Hooks run via `"python.exe" "<path>"` on all platforms, so the
-        # exec bit is only useful for Unix shebang dispatch (and a no-op
-        # on Windows).
-        if config.HOST.posix:
-            path.chmod(0o755)
+        write_if_changed(claude_dir / filename, content.encode("utf-8"), 0o755)
 
 
 class CLISession:
@@ -197,6 +210,9 @@ class CLISession:
         self.stop_turn_event: asyncio.Event = asyncio.Event()
         # One reader per stdout: a turn's loop holds this until it exits.
         self._reader_lock: asyncio.Lock = asyncio.Lock()
+        # request id -> the input of an open ``can_use_tool`` request (the
+        # CLI's own copy, for the allow that answers it).
+        self._prompt_inputs: dict[str, dict] = {}
         # Post-turn background-command drain: when the proxy's stop_turn carries
         # drain_bg (a bg command still pending), keep reading + forwarding stdout
         # AFTER the turn so the command's completion frame (claude emits it idle,
@@ -255,6 +271,7 @@ class CLISession:
         # Write hook scripts shipped from the proxy. These must land before
         # settings.json is written, because settings.json points at them.
         _write_hook_scripts(self._claude_dir, self.config.get("hook_scripts", {}))
+        write_command_wrappers(self._claude_dir, self.config.get("command_wrappers", {}))
 
         # Write system prompt
         prompt_file = self._claude_dir / "system-prompt.md"
@@ -325,10 +342,12 @@ class CLISession:
             cmd += ["--dangerously-skip-permissions"]
             # Mirrors the local CLI layer: the prompt-tool's PRESENCE makes
             # the CLI expose AskUserQuestion headless (absent from every -p
-            # roster since at least 2.1.193). Bypass never raises permission
-            # prompts and the PreToolUse hook denies-and-surfaces the
-            # question, so the stdio channel stays silent. Not added to the
-            # plan/native branches (a real prompt could route to stdio,
+            # roster since at least 2.1.193). The PreToolUse hook
+            # denies-and-surfaces the question before the tool runs; the CLI
+            # still asks over this channel for some calls under bypass (a
+            # heredoc writing a file, a wide ``rm -rf``), which the proxy
+            # answers like a card (core/session/engine_prompts). Not added to
+            # the plan/native branches (a real prompt could route to stdio,
             # which nothing answers).
             cmd += ["--permission-prompt-tool", "stdio"]
         if mcp_config is not None:
@@ -360,7 +379,7 @@ class CLISession:
 
         # Build env. Curate the operator's AMBIENT env (drop their personal shell
         # secrets) BEFORE overlaying the platform-shipped config["env"] (which
-        # carries the intentional GH_TOKEN / PROXY_API_KEY / ANTHROPIC_API_KEY
+        # carries the intentional PROXY_API_KEY / ANTHROPIC_API_KEY
         # and survives curation). Defense-in-depth — see env_hygiene.py.
         env = env_hygiene.curate_satellite_env(os.environ)
         env.update(self.config.get("env", {}))
@@ -419,6 +438,7 @@ class CLISession:
             session_id=self.session_id,
             multi_value_envs=self.config.get("multi_value_envs") or {},
         )
+        env = session_tools_env(env, self._claude_dir)
 
         # Spawn. Bump StreamReader buffer to 10MB (default is 64KB) so the
         # CLI's `--output-format stream-json` lines don't get truncated. A
@@ -546,6 +566,7 @@ class CLISession:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                self._note_control_request(event)
                 yield event
         finally:
             self._turn_active = False
@@ -688,6 +709,7 @@ class CLISession:
                     event = json.loads(decoded)
                 except json.JSONDecodeError:
                     continue
+                self._note_control_request(event)
                 await forward(event)
         except asyncio.CancelledError:
             return
@@ -763,27 +785,53 @@ class CLISession:
         self.proc.stdin.write((msg + "\n").encode())
         await self.proc.stdin.drain()
 
-    async def send_permission_response(
-        self, request_id: str, approved: bool,
-    ) -> None:
-        """Answer a native can_use_tool permission prompt on the CLI's control channel.
+    def _note_control_request(self, event: dict) -> None:
+        """Remember the input of a ``can_use_tool`` request the CLI printed,
+        for the allow that answers it (bounded: the oldest go first)."""
+        if event.get("type") != "control_request":
+            return
+        request = event.get("request") or {}
+        rid = str(event.get("request_id") or "")
+        if not rid or not isinstance(request, dict) or request.get("subtype") != "can_use_tool":
+            return
+        tool_input = request.get("input")
+        if isinstance(tool_input, dict):
+            self._prompt_inputs[rid] = tool_input
+            while len(self._prompt_inputs) > _PROMPT_INPUTS_MAX:
+                self._prompt_inputs.pop(next(iter(self._prompt_inputs)))
 
-        Wire format matches proxy/core/layers/cli/session.py:send_control_response.
-        """
+    async def send_permission_response(
+        self, request_id: str, approved: bool, response: dict | None = None,
+    ) -> None:
+        """Answer a ``can_use_tool`` request on the CLI's control channel in
+        the shape it parses (the proxy's ``engine_prompts.answer_frame``):
+        ``response.response`` carries ``behavior``, an allow the request's
+        input, a deny a message. The decision is the proxy's ``response``
+        (its ``behavior`` and a deny's ``message``) when it names this
+        request, else ``approved`` (a proxy before 1.8.0 sends only that).
+        An allow carries the input the CLI printed, never a copy that crossed
+        the wire twice (a changed input is refused), or none when it is not
+        known (the CLI keeps its own); nothing else the frame holds reaches
+        the CLI."""
         if self.proc is None or self.proc.returncode is not None:
             return
-        permission = (
-            {"behavior": "allow"}
-            if approved
-            else {"behavior": "deny", "message": "User denied"}
-        )
+        decision: dict = {}
+        if isinstance(response, dict) and str(response.get("request_id") or "") == request_id:
+            inner = response.get("response")
+            if isinstance(inner, dict) and inner.get("behavior") in ("allow", "deny"):
+                decision = inner
+        allow = decision.get("behavior") == "allow" if decision else bool(approved)
+        tool_input = self._prompt_inputs.pop(request_id, None)
+        if allow:
+            answer: dict = {"behavior": "allow"}
+            if tool_input is not None:
+                answer["updatedInput"] = tool_input
+        else:
+            answer = {"behavior": "deny",
+                      "message": str(decision.get("message") or "The request was not approved.")}
         msg = json.dumps({
             "type": "control_response",
-            "response": {
-                "request_id": request_id,
-                "subtype": "success",
-                "permission": permission,
-            },
+            "response": {"subtype": "success", "request_id": request_id, "response": answer},
         })
         self.proc.stdin.write((msg + "\n").encode())
         await self.proc.stdin.drain()

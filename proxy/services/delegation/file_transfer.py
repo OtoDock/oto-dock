@@ -49,7 +49,7 @@ from storage import database as task_store
 from storage.pg import run_db
 from core import layout
 
-logger = logging.getLogger("claude-proxy.delegation")
+logger = logging.getLogger("otodock.delegation")
 
 # Per-call and per-creator ceilings. Admin-set values ride
 # ``mcp_config_values['delegation-mcp']`` (manifest declares the same
@@ -609,6 +609,7 @@ async def prefetch_remote_sources(
     paths: list[str],
     *,
     max_files: int | None = None,
+    held: list[str] | None = None,
 ) -> list[str]:
     """Bring the requested paths up to date from the caller's satellite
     BEFORE ``perform_send_files`` reads the platform tree.
@@ -637,6 +638,11 @@ async def prefetch_remote_sources(
     reach the satellite; every probe / pull / manifest failure degrades to
     today's platform-tree behaviour. Deletions inside a directory this turn
     still ride the turn-end scan (the manifest drives pulls, not deletes).
+
+    A path the session may not write back (a viewer's shared workspace) is
+    never read from the machine (``remote_file_flow.pull_through``): the
+    platform's copy goes as it is, and a raw path with none is returned as
+    unavailable and also collected in ``held``.
     """
     from core.remote import remote_file_flow
 
@@ -655,6 +661,7 @@ async def prefetch_remote_sources(
     budget: int | None = None
     pulled: list[str] = []
     fallback: list[str] = []
+    held_rels: list[str] = []
     # The delegation MCP waits 300 s for the call: a pull still running past
     # this is abandoned and the platform's copy goes instead (reported).
     deadline = asyncio.get_running_loop().time() + _PREFETCH_BUDGET_S
@@ -665,7 +672,8 @@ async def prefetch_remote_sources(
             if remaining <= 0:
                 raise TimeoutError
             got = await asyncio.wait_for(
-                remote_file_flow.pull_through(session_id, remote_rel, fallback=fallback),
+                remote_file_flow.pull_through(
+                    session_id, remote_rel, fallback=fallback, held=held_rels),
                 timeout=remaining,
             )
         except TimeoutError:
@@ -679,7 +687,7 @@ async def prefetch_remote_sources(
                 "send_files prefetch: pull failed for %s", remote_rel, exc_info=True,
             )
             return None
-        if got is not None and remote_rel not in fallback:
+        if got is not None and remote_rel not in fallback and remote_rel not in held_rels:
             pulled.append(remote_rel)
         return got
 
@@ -727,6 +735,16 @@ async def prefetch_remote_sources(
         except HTTPException:
             continue  # perform raises the same 400 — nothing reaches the satellite
         remote_rel = prefix if rel == "." else f"{prefix}/{rel}"
+        # A path the session may not write back never asks the machine: the
+        # platform's copy, file or folder, goes as it is.
+        if not await remote_file_flow.write_back_allowed(
+                session_id, authz.source_agent, remote_rel):
+            held_rels.append(remote_rel)
+            if not (authz.source_root / rel).exists():
+                unavailable.append(raw)
+                if held is not None:
+                    held.append(raw)
+            continue
         if _left() <= 0:
             # Past the budget nothing more asks the machine: a file the
             # platform holds goes as it is there, the rest is perform's.
@@ -763,8 +781,9 @@ async def prefetch_remote_sources(
             )
     logger.info(
         "send_files prefetch: session=%s agent=%s paths=%d read through=%d "
-        "fallback=%s manifest=%s unavailable=%s",
+        "fallback=%s held=%s manifest=%s unavailable=%s",
         session_id[:8], authz.source_agent, len(paths), len(pulled), fallback or "-",
+        held_rels or "-",
         "failed" if manifest_failed else ("yes" if manifest is not None else "no"),
         unavailable or "-",
     )

@@ -221,11 +221,16 @@ class TestComputeManifest:
         (agent_dir / "workspace" / ".ssh" / "id_rsa").write_text("secret")
         (agent_dir / "workspace" / ".aws").mkdir()
         (agent_dir / "workspace" / ".aws" / "credentials").write_text("aws")
+        # Codex's managed worktrees (git-worktree-root beside .codex): whole
+        # checkouts that stay on the machine that made them.
+        (agent_dir / "workspace" / ".codex-worktrees" / "repo-1").mkdir(parents=True)
+        (agent_dir / "workspace" / ".codex-worktrees" / "repo-1" / "app.py").write_text("x")
 
         entries = compute_manifest(agent_dir)
         paths = {e.path for e in entries}
         assert "workspace/.ssh/id_rsa" not in paths
         assert "workspace/.aws/credentials" not in paths
+        assert not any(".codex-worktrees" in p for p in paths)
 
     def test_codex_runtime_sqlite_excluded(self, agent_dir):
         """Host-local ``.codex`` files must NOT sync: the app-server's
@@ -841,7 +846,7 @@ class TestWriteBackGuardLogLevel:
 
     def test_machinery_path_after_close_is_info_not_warning(self, caplog):
         import logging as _logging
-        with caplog.at_level(_logging.DEBUG, logger="claude-proxy.satellite"):
+        with caplog.at_level(_logging.DEBUG, logger="otodock.satellite"):
             self._apply("users/dev-admin/.claude/.last-cleanup")
         records = [r for r in caplog.records if "write-back" in r.getMessage()]
         assert [r.levelno for r in records] == [_logging.INFO]
@@ -849,7 +854,7 @@ class TestWriteBackGuardLogLevel:
 
     def test_normal_path_without_context_keeps_the_warning(self, caplog):
         import logging as _logging
-        with caplog.at_level(_logging.DEBUG, logger="claude-proxy.satellite"):
+        with caplog.at_level(_logging.DEBUG, logger="otodock.satellite"):
             self._apply("workspace/notes.md")
         records = [r for r in caplog.records if "write-back" in r.getMessage()]
         assert [r.levelno for r in records] == [_logging.WARNING]

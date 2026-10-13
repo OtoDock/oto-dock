@@ -109,6 +109,27 @@ def test_the_per_session_mcp_config_copies_are_host_local_in_both_trees():
     assert _satellite_constant("_CLAUDE_HOST_LOCAL_RE") == proxy_fs._CLAUDE_HOST_LOCAL_RE.pattern
 
 
+def test_a_hook_file_writes_temp_never_syncs_on_either_side():
+    """``write_if_changed`` writes a temp beside a hook file (and beside a
+    command wrapper in ``bin/``) for the moment of the rename; a crashed
+    start may leave one. Both trees keep it host-local under the same
+    marker."""
+    from core.sandbox import session_config_dir as scd
+    assert proxy_fs.WRITE_TEMP_MARKER == scd.WRITE_TEMP_MARKER
+    sat_config = _REPO_ROOT / "satellite" / "config.py"
+    tree = ast.parse(sat_config.read_text(encoding="utf-8"))
+    sat_marker = next(ast.literal_eval(n.value) for n in ast.walk(tree)
+                      if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "WRITE_TEMP_MARKER" for t in n.targets))
+    assert sat_marker == scd.WRITE_TEMP_MARKER
+    assert "config.WRITE_TEMP_MARKER in file_name" in _SATELLITE_FILE_SYNC.read_text(encoding="utf-8")
+    temp = f".settings.json{scd.WRITE_TEMP_MARKER}0a1b2c"
+    for d in (*proxy_fs.INCLUDE_DOTTED_DIRS, "bin"):
+        assert proxy_fs._is_cli_runtime_cruft_file(d, temp), d
+    assert not proxy_fs._is_cli_runtime_cruft_file("workspace", temp)
+    assert not proxy_fs._is_cli_runtime_cruft_file(".claude", "notes.oto-tmp.md")
+
+
 def test_the_runtime_helpers_key_on_the_one_whitelist():
     # The cruft-dir and cruft-file helpers answer for every synced engine dir
     # (they used to spell the pair themselves).

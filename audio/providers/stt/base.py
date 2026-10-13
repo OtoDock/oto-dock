@@ -9,6 +9,7 @@ path (file → text with word timings), plus capability/billing metadata and the
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -17,8 +18,9 @@ from typing import Any, Callable, ClassVar
 from audio.capabilities import STTCapabilities, BillingUnit
 from audio.log_policy import log_transcript
 from audio.providers.credential_resolver import CredentialResolver
+from audio.providers.model_succession import successor_of
 
-__all__ = ["STTProvider", "TranscriptResult", "Word"]
+__all__ = ["STTProvider", "TranscriptResult", "LanguageGuess", "Word"]
 
 
 @dataclass
@@ -39,6 +41,20 @@ class TranscriptResult:
     audio_seconds: float            # decoded duration; the billing multiplier
     words: list[Word] = field(default_factory=list)
     provider_used: str = ""         # provider_name that served it (e.g. "deepgram")
+    # The engine's confidence in ``language`` when it identified it (0.0 when
+    # the language was given or the engine reports none).
+    language_confidence: float = 0.0
+
+
+@dataclass
+class LanguageGuess:
+    """What a batch identification of one utterance said: the base language
+    code, the engine's confidence (0 to 1) and the text it heard in that
+    language (the call's first turn when the guess changes the language)."""
+
+    language: str
+    confidence: float
+    text: str = ""
 
 
 class STTProvider(ABC):
@@ -57,8 +73,25 @@ class STTProvider(ABC):
     # True on not-yet-implemented placeholder classes (importable, __init__ raises).
     # The admin "Add provider" menu hides stubs; flip when the implementation lands.
     is_stub: ClassVar[bool] = False
+    # Retired model ids and their successors (``audio.providers.model_succession``):
+    # a stored id resolves through ``live_model_id`` at every build, and the
+    # proxy's boot walk rewrites the rows.
+    model_successors: ClassVar[dict[str, str]] = {}
 
     _is_open: bool = False
+
+    @classmethod
+    def live_model_id(cls, model_id: str | None) -> str:
+        """A stored model id as it runs today: the end of its successor chain,
+        else the id itself ("" when the row stores none)."""
+        return successor_of(cls.model_successors, model_id or "")
+
+    @classmethod
+    def default_model_ids(cls) -> dict[str, str]:
+        """The model ids that run when the row stores none (the admin pill's
+        placeholders). Never written to a row: ``default_advanced_settings``
+        carries no model id, so a later default moves every such row."""
+        return {}
 
     # Optional push hook: the receive loop invokes this with each FINAL
     # transcript at the moment it is queued for ``drain_transcript``. Streaming
@@ -146,6 +179,41 @@ class STTProvider(ABC):
         unsupported (capabilities.supports_transcribe_file stays False).
         """
         raise NotImplementedError(f"{type(self).__name__} does not support file transcription")
+
+    # ── Language identification (one utterance, batch) ─────────────
+
+    async def identify_language(self, audio_wav: bytes) -> LanguageGuess | None:
+        """Identify the language of one short utterance (a WAV file) through
+        the provider's batch endpoint with no language given. The call
+        pipeline uses it ONCE per call to lock the caller's language;
+        ``None`` means the provider cannot identify (the route's language
+        stays). Default: no identification."""
+        return None
+
+    def streams_language(self, language: str) -> bool:
+        """Whether the streaming model can transcribe ``language`` (a base
+        code): a language the identification names but the stream cannot
+        handle must not lock a call. Default: every language."""
+        return True
+
+    @property
+    def multi_languages(self) -> frozenset[str] | None:
+        """The base codes the automatic stream (``start`` with ``multi``)
+        transcribes, or None when it identifies every language on its own.
+        The dictation relay locks a language the automatic stream does not
+        cover: it identifies the first utterance (``identify_language``) and
+        reopens the stream in it (``restart``). Default: None."""
+        return None
+
+    async def restart(self, language: str) -> bool:
+        """Reopen the stream in ``language`` with the connection's stored
+        parameters (the rate, interims, endpointing). The lock changes the
+        language mid-call; ``ensure_alive`` only reconnects a dead socket.
+        Default: a plain close and start (providers keep their own params)."""
+        with contextlib.suppress(Exception):
+            await self.close()
+        await self.start(language=language)
+        return True
 
     # ── Core streaming methods ─────────────────────────────────────
 

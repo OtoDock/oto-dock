@@ -23,7 +23,7 @@ from api.agents._router import router
 from core.execution_layer import DEFAULT_EXECUTION_PATH, PROVIDER_LOCAL
 from core import layout
 
-logger = logging.getLogger("claude-proxy.agents")
+logger = logging.getLogger("otodock.agents")
 
 
 
@@ -138,6 +138,9 @@ def _execution_layers_sync() -> dict:
     from storage.billing import subscription_status, subscription_store
 
     caps = get_all_capabilities()
+    # A retired id an admin re-added as a custom model stays itself
+    # (config.live_model_id's rule), read once for every engine.
+    custom_ids = {m["model_id"] for m in subscription_store.list_models() if not m["is_builtin"]}
     result = {}
     for path, layer_dict in caps.items():
         layer = dict(layer_dict)
@@ -204,6 +207,15 @@ def _execution_layers_sync() -> dict:
             ]
 
         layer["models"] = merged
+        # Retired id → the model it runs as today, for the retired ids whose
+        # successor this engine offers: the dashboard maps a browser's sticky
+        # pick (or a stale agent default) through it before falling back.
+        offered = {m.get("value") for m in merged if m.get("value")}
+        layer["model_successors"] = {
+            old: live for old in config.MODEL_SUCCESSORS
+            if old not in custom_ids
+            and (live := config.successor_model(old)) != old and live in offered
+        }
         # What "Auto" runs on this engine right now: the resolver's own answer
         # for an unpinned agent (declared default → fall-down, restricted to
         # what the platform pool serves), with the row's display name so the

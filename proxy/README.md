@@ -14,5 +14,7 @@ required backing service.
 - Configuration: generated `config.env` at the repo root;
   [`../config.env.example`](../config.env.example) documents every knob.
 
-Architecture and feature deep-dives live in the developer docs at
-[docs.otodock.io](https://docs.otodock.io).
+How the proxy fits with the rest of the platform, with the paths of its
+core pieces: [`ARCHITECTURE.md`](../ARCHITECTURE.md). Every suite and the
+dev setup: [`CONTRIBUTING.md`](../CONTRIBUTING.md). Using and running
+OtoDock: [docs.otodock.io](https://docs.otodock.io).

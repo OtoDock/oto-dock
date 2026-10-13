@@ -24,6 +24,7 @@ import type {
 } from '../../api/credentials'
 import { reconnectReasonText } from '../../api/credentials'
 import {
+  exchangeOAuthCode,
   useStartOAuth,
   useDisconnectOAuth,
   usePatSave,
@@ -272,13 +273,22 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         await openOAuthWindow(url, `${providerId}-oauth`, undefined, {
           useDeepLink: true,
         })
+        let link = ''
         try {
-          await waitForDeepLink()
-          qc.invalidateQueries({ queryKey: [queryKey] })
-          onDone()
+          link = await waitForDeepLink()
         } catch {
-          /* timeout / user closed */
+          return /* timeout / user closed */
         }
+        // The link carries the vendor's code: the exchange runs here, under
+        // this login, so the connect is the person's who started it.
+        try {
+          await exchangeOAuthCode(providerId, link)
+        } catch (e: unknown) {
+          setError(e instanceof Error ? e.message : 'Failed to complete the connect')
+          return
+        }
+        qc.invalidateQueries({ queryKey: [queryKey] })
+        onDone()
       } else {
         const ok = await openOAuthWindow(url, `${providerId}-oauth`, () => {
           qc.invalidateQueries({ queryKey: [queryKey] })

@@ -51,7 +51,7 @@ from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path,
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.agents")
+logger = logging.getLogger("otodock.agents")
 
 
 TEXT_EXTENSIONS = {

@@ -966,6 +966,21 @@ def get_task_session(task_id: str) -> str | None:
 # --- Session → run lookup ---
 
 
+def round_chats_of_session(session_id: str) -> list[str]:
+    """The chats of the runs on ``session_id``, each once, in the order
+    their first run started: a worker's rounds, which an engine that keeps
+    no history of its own rebuilds its conversation from."""
+    if not session_id:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM task_runs WHERE session_id=%s AND COALESCE(chat_id, '') <> '' "
+            "GROUP BY chat_id ORDER BY MIN(started_at) ASC NULLS LAST",
+            (session_id,),
+        ).fetchall()
+        return [r["chat_id"] for r in rows]
+
+
 def get_run_by_session(session_id: str) -> dict | None:
     """Return the most recent ``task_runs`` row for ``session_id``, or None.
 

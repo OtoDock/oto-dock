@@ -2,6 +2,8 @@
 // per-chat state store (chatStore). Lives here so chatStore doesn't have
 // to import from a component file.
 
+import type { CollectedFile } from '../lib/droppedItems'
+
 export interface PendingImage {
   id: string
   /** A fresh photo: the data URL to send. Absent for a photo the chat's
@@ -26,6 +28,19 @@ export interface PendingFile {
    * queue would silently drop it (handleSend keeps only uploadedPath). */
   queued?: boolean
   uploadedPath?: string
+  /** A folder attached in chat: one chip for all its files. */
+  folder?: boolean
+  /** The folder's file count (the chip says it instead of a size); absent
+   * while the folder is still being read. */
+  fileCount?: number
+  /** A folder's files, their paths inside it: what a Retry uploads. */
+  folderFiles?: CollectedFile[]
+  /** The folder reserved for them, once it is; a Retry reuses it. */
+  folderPath?: string
+  /** How many of `folderFiles` landed: a Retry resumes at the next. */
+  filesDone?: number
+  /** What a good chip still says once uploaded (items left out). */
+  note?: string
   error?: string
   abortController?: AbortController
   /** Live byte progress while the XHR runs (throttled writes). */
@@ -47,6 +62,8 @@ export interface AttachedImageMeta {
 export interface AttachedFileMeta {
   path: string
   name: string
+  /** A folder attached in chat (the server marks it). */
+  folder?: boolean
 }
 
 /** One message waiting behind a live turn (or held by a steer): the text

@@ -328,7 +328,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     for (const feed of serverSubsRef.current) unsubscribeCatalog(agentRef.current, feed)
     serverSubsRef.current.clear()
   }
-  useEffect(() => () => dropServerSubs(), []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => dropServerSubs(), [])
   // A folder app reloads through its hash (a deploy, an approval, a
   // rollback, a fresh preview copy): the outgoing document's subscriptions
   // die here, as requestReload drops them before a nonce bump.
@@ -339,7 +339,6 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       dropServerSubs()
     }
     docShaRef.current = docSha
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docSha])
   const loadCatalogFeed = async (feed: string) => {
     try {
@@ -460,7 +459,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     if (f.app_id !== app.id) return
     const win = iframeRef.current?.contentWindow
     if (win) postTo(win, { type: 'push', payload: f.payload, ts: f.ts })
-  }), [app.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  }), [app.id])
 
   // The viewer token (APPS.md "Viewer identity"): minted for the person at
   // the keyboard when a folder app's page says `ready`, posted into the

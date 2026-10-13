@@ -123,6 +123,27 @@ def test_chunked_roundtrip_assembles_and_lands_like_single_shot(
     assert _staged_files(staging_dir) == []  # staging + meta gone
 
 
+def test_chunked_complete_refreshes_the_open_trees_once(app_with_router, monkeypatch):
+    """The landed file is announced like a single-shot upload: one
+    ``file_updated`` for the landed path, none for the chunks."""
+    from unittest.mock import AsyncMock
+    import config
+    from services.notifications import notification_manager
+    told = AsyncMock()
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", told)
+    app, _agents_dir, _staging_dir, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 8, raising=False)
+    client = TestClient(app)
+    payload = b"x" * 20
+    upload_id = _init(client, len(payload)).json()["upload_id"]
+    _upload_all(client, upload_id, payload, 8)
+    assert told.await_count == 0
+    assert client.post(f"/v1/upload/chunked/{upload_id}/complete").status_code == 200
+    assert told.await_args_list == [
+        (("test-agent", "users/alice/workspace/uploads/files/video.bin"), {"source": "disk"}),
+    ]
+
+
 def test_chunked_conflict_rename_matches_single_shot(app_with_router, monkeypatch):
     import config
     app, agents_dir, _staging, _user = app_with_router

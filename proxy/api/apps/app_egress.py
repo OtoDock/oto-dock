@@ -26,24 +26,35 @@ from api.apps import app_proxy
 from api.apps import manifest as _mf
 from auth.request_path import has_traversal
 from services.apps import app_secrets, app_supervisor
+from services.infra import pinned_http
 from services.infra.outbound_url import validate_outbound_url
 from storage import database as task_store
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 EGRESS_RATE = 20.0
 EGRESS_TIMEOUT_S = 30.0
 
 _client: httpx.AsyncClient | None = None
+_proxied_client: httpx.AsyncClient | None = None
 
 
-def _http() -> httpx.AsyncClient:
+def _http(url: str = "") -> httpx.AsyncClient:
     """A client of its own (never the app proxy's loopback client): no
-    cookie jar, no redirects, the vendor's timeout."""
-    global _client
+    cookie jar, no redirects, the vendor's timeout. It connects only to
+    public addresses, resolved at the dial (``pinned_http``), unless the
+    environment's egress proxy carries the URL."""
+    global _client, _proxied_client
+    if url and pinned_http.proxied(url):
+        if _proxied_client is None or _proxied_client.is_closed:
+            _proxied_client = httpx.AsyncClient(timeout=EGRESS_TIMEOUT_S, follow_redirects=False)
+            _proxied_client.cookies.jar = app_proxy._NoCookieJar()
+        return _proxied_client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=EGRESS_TIMEOUT_S, follow_redirects=False)
+        _client = httpx.AsyncClient(
+            timeout=EGRESS_TIMEOUT_S, follow_redirects=False,
+            transport=pinned_http.CheckedTransport(pinned_http.public_only))
         _client.cookies.jar = app_proxy._NoCookieJar()
     return _client
 
@@ -116,7 +127,7 @@ async def app_egress(app_id: str, host: str, path: str, request: Request):
     url = f"https://{host}{rest}"
     if query:
         url += "?" + (query.decode("latin-1") if isinstance(query, bytes) else str(query))
-    client = _http()
+    client = _http(url)
     try:
         upstream = await client.send(
             client.build_request(request.method, url, headers=headers, content=body),

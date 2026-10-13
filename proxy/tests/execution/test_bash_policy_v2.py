@@ -117,6 +117,341 @@ class TestAdminFloorUniversal:
         assert _d(cmd, self._admin()).allowed, f"admin agent blocked on normal op: {cmd}"
 
 
+class TestRecursiveDeleteFloor:
+    """The root or home as one operand among others, and the flag spellings
+    the first form missed (``rm -rf / x`` reached the tier and asked)."""
+
+    def _admin(self):
+        return _ctx(role="admin", is_admin_agent=True)
+
+    @pytest.mark.parametrize("cmd", [
+        "rm -rf / x", "rm -Rf /", "rm -fR / x", "rm -rfv /", "rm -frv / x",
+        "rm -rf --no-preserve-root /", "rm -rf x /", "rm -rf '/'", 'rm -rf "/" x',
+        "rm -rf ~ x", "rm -rf ~/", "rm -rf ~/*", "rm -rf -- /", "sudo rm -rf / x",
+        "rm\t-rf\t/\tx", "rm -rf / 2>/dev/null", "bash -c 'rm -rf / x'",
+        "rm --recursive --force / x", "rm -rf /*", "rm -rf /*/", "rm -rf /**",
+        "rm -rf /*/* x", "rm -rf /*.*", "rm -rf '/*/'", "rm -rf ~/*/",
+    ])
+    def test_a_root_or_home_operand_is_refused(self, cmd):
+        assert not _d(cmd).allowed, cmd
+        assert not _d(cmd, self._admin()).allowed, cmd
+
+    @pytest.mark.parametrize("cmd", [
+        "rm -rf /tmp/x", "rm -rf ./ x", "rm -rf x/ y", "rm -rf ~/x", "rm -rf ~/.cache",
+        "rm -rf ~user", "rm -rf /x y", "farm -rf / x", 'rm -rf "$d" x',
+        "rm -rf /tmp/*", "rm -rf ~/.cache/*", "rm -rf ./*/", "rm -rf x/*/",
+        "rm -rf build && ls /", "rm -rf build; cd /", "rm -rf x || echo /",
+        "rm -rf dist | tee /", "rm -rf build & cd /", "rm -rf node_modules # then cd /",
+        "rm -rf x 2>/dev/null; ls ~", "rm -rf a\nls /",
+        "cat > /tmp/n.txt <<'EOF'\nrm -rf /\nEOF",
+    ])
+    def test_the_lookalikes_pass_the_floor(self, cmd):
+        assert _d(cmd, self._admin()).allowed, cmd
+
+    def test_a_long_command_is_judged_in_linear_time(self):
+        """The gate runs on the event loop: 64 KB of `rm` words must not
+        take the quadratic path an unbounded operand run does."""
+        import time
+        from auth import path_shell
+        pattern = path_shell._DANGEROUS_PATTERNS[0][0]
+        for text in ("rm -rf " * 9400, "rm -rf x " * 7300):
+            t0 = time.monotonic()
+            pattern.search(text)
+            assert time.monotonic() - t0 < 0.5
+
+
+class TestSshRemoteFloor:
+    """The host-state patterns (a /proc or /sys write, a kernel module) judge
+    the host a command runs on: the words an ``ssh`` sends to another host
+    ask (destructive) instead of being refused, while every catastrophe,
+    and every part this host runs, stays refused."""
+
+    def _admin(self):
+        return _ctx(role="admin")
+
+    def test_the_split_names_the_host_state_patterns(self):
+        from auth import path_shell
+        assert [r for _, r in path_shell._HOST_STATE_PATTERNS] == [
+            "Write to /proc blocked", "Write to /sys blocked", "Kernel module operations blocked"]
+        assert not set(map(id, path_shell._HOST_STATE_PATTERNS)) & set(
+            map(id, path_shell._CATASTROPHE_PATTERNS))
+
+    @pytest.mark.parametrize("cmd", [
+        "ssh drill-sat 'echo 1 > /sys/class/block/sda/device/rescan'",
+        "ssh h -p 2222 'echo 1 > /sys/x'",
+        "ssh -i k -J jump user@h 'modprobe nbd'",
+        "ssh h 'echo 1 > /proc/sys/vm/drop_caches'",
+        "ssh h '$(echo 1 > /sys/x)'",
+        "ssh a \"ssh b 'echo 1 > /proc/x'\"",
+        "timeout 5 ssh h 'echo 1 > /sys/x'",
+        "for h in a b; do ssh $h 'modprobe nbd'; done",
+        "ssh -vp 2222 h 'echo 1 > /sys/x'",
+    ])
+    def test_a_remote_host_state_write_asks(self, cmd):
+        d = _d(cmd, self._admin())
+        assert d.allowed and d.destructive, (cmd, d.reason)
+        assert d.permission_tier == "admin", cmd
+
+    @pytest.mark.parametrize("cmd", [
+        'ssh h "echo 1" > /sys/x',
+        'ssh h "$(echo 1 > /sys/x)"',
+        "ssh h \"`echo 1 > /sys/x`\"",
+        "ssh -o 'ProxyCommand=sh -c \"echo 1 > /sys/x\"' h true",
+        "ssh -vo 'ProxyCommand=sh -c \"echo 1 > /proc/x\"' h true",
+        "ssh h -o 'LocalCommand=echo 1 > /sys/x' true",
+        "ssh h bash <<'EOF'\necho 1 > /sys/x\nEOF",
+        "ssh h 'rm -rf /'",
+        "ssh h 'echo 1 > /dev/sda'",
+        "ssh h 'echo 1 > /sys/x",
+        "bash -c \"ssh h 'echo 1 > /sys/x'\"",
+        "sudo ssh h 'modprobe nbd'",
+        "cat <<'EOF' | bash\necho 1 > /sys/x\nEOF",
+        "cat <<'EOF' | sh\necho 1 > /proc/x\nEOF",
+        "'bash' <<'EOF'\necho 1 > /sys/x\nEOF",
+        "$SHELL <<'EOF'\necho 1 > /sys/x\nEOF",
+        "cat <<'EOF' | bash\nmodprobe x\nEOF",
+        "busybox sh -c 'echo 1 > /sys/x'",
+        "echo 1 > /sys/x; ssh h ls",
+    ])
+    def test_what_this_host_runs_stays_refused(self, cmd):
+        assert not _d(cmd, self._admin()).allowed, cmd
+        assert not _d(cmd, _ctx(role="admin", is_admin_agent=True)).allowed, cmd
+
+    def test_a_plain_remote_command_is_not_destructive(self):
+        for cmd in ("ssh h ls -la /sys", "ssh h cat /proc/cpuinfo", "ssh -t h"):
+            d = _d(cmd, self._admin())
+            assert d.allowed and not d.destructive and d.permission_tier == "admin", cmd
+
+    def test_ssh_keeps_its_role_gate(self):
+        assert not _d("ssh h 'echo 1 > /sys/x'", _ctx(role="manager")).allowed
+        d = _d("ssh h 'echo 1 > /sys/x'", _remote_ctx())
+        assert d.allowed and d.destructive
+
+    def test_an_admin_agent_runs_it_on_the_floor_alone(self):
+        d = _d("ssh h 'echo 1 > /sys/x'", _ctx(role="admin", is_admin_agent=True))
+        assert d.allowed and d.permission_tier == "admin"
+
+    def test_a_remote_command_is_not_judged_against_this_machines_paths(self):
+        d = _d("ssh other 'cat ~/.oto-dock/satellite.conf'",
+               _remote_ctx("admin", "root", "ops", is_admin_agent=True))
+        assert d.allowed
+
+    def test_a_joined_line_in_the_remote_command_still_asks(self):
+        d = _d("ssh h 'echo 1 >\\\n/sys/x'", self._admin())
+        assert d.allowed and d.destructive
+
+
+# Spelled from parts: a shell line that names one is refused by the floor
+# itself, so a grep for these finds the patterns, never the tests.
+_SYSRQ = "/proc/" + "sysrq-" + "trigger"
+_POWER = "/sys/power/" + "state"
+
+
+def _machine(*, full: bool, role="manager", kind=placement.KIND_ADMIN_REMOTE,
+             is_admin_agent=False) -> SecurityContext:
+    return SecurityContext(
+        role=role, username="alice", agent="head", is_admin_agent=is_admin_agent,
+        placement=placement.PlacementCapabilities(
+            kind=kind, machine_id="office-pc", home_dir="/home/office", os_user="office",
+            agents_dir="/home/office/.oto-dock/agents", os="linux", allow_full_fs=full,
+            claude_runtime_root="/tmp/claude-1000"),
+    )
+
+
+class TestHostStateOnAFullAccessMachine:
+    """A /proc or /sys write and a kernel-module command refuse on the local
+    sandbox and on a machine with home-only access; on a machine paired with
+    full filesystem access they ask (destructive) for the roles the admin
+    tier admits there, and an admin on an admin agent runs them."""
+
+    HOST_STATE = [
+        "echo 1 > /sys/class/block/sda/device/rescan",
+        "echo 3 > /proc/sys/vm/drop_caches",
+        "modprobe nbd",
+        "sudo rmmod nbd",
+        "bash -c 'echo 1 > /sys/x'",
+        "echo $(echo 1 > /sys/x)",
+        "cat <<'EOF' | bash\necho 1 > /sys/x\nEOF",
+        "echo 1 >\\\n/sys/x",
+        "( echo 1 > /proc/x )",
+        "find /tmp -name x -exec sh -c 'echo 1 > /sys/x' \\;",
+        # Spellings the raw patterns cannot see, judged on the parsed target.
+        'echo 1 > "/sys/class/x"',
+        "echo 1 > /tmp/../sys/x",
+        "echo 1 >& /sys/x",
+        "echo 1 >| /sys/x",
+        "echo 1 | tee /sys/x",
+        "cp /tmp/x /proc/sys/vm/swappiness",
+    ]
+
+    @pytest.mark.parametrize("cmd", HOST_STATE)
+    @pytest.mark.parametrize("ctx", [
+        _ctx(),
+        _ctx(role="admin", is_admin_agent=True),
+        _machine(full=False),
+        _machine(full=False, role="admin", is_admin_agent=True),
+        _machine(full=False, kind=placement.KIND_USER_REMOTE, role="editor"),
+        _machine(full=True, role="viewer"),
+        _machine(full=True, role="contributor"),
+    ], ids=["local", "local-admin-agent", "limited", "limited-admin-agent",
+            "limited-user-paired", "full-viewer", "full-contributor"])
+    def test_it_is_refused_where_it_does_not_ask(self, cmd, ctx):
+        d = _d(cmd, ctx)
+        assert not d.allowed, (cmd, d)
+        assert "blocked" in d.reason, d.reason
+
+    @pytest.mark.parametrize("cmd", HOST_STATE)
+    @pytest.mark.parametrize("ctx", [
+        _machine(full=True),
+        _machine(full=True, role="editor"),
+        _machine(full=True, role="admin"),
+        _machine(full=True, kind=placement.KIND_USER_REMOTE, role="editor"),
+    ], ids=["manager", "editor", "admin", "user-paired-editor"])
+    def test_it_asks_on_a_full_access_machine(self, cmd, ctx):
+        d = _d(cmd, ctx)
+        assert d.allowed and d.destructive, (cmd, d.reason)
+
+    @pytest.mark.parametrize("cmd", HOST_STATE)
+    def test_an_admin_agent_runs_it_on_a_full_access_machine(self, cmd):
+        d = _d(cmd, _machine(full=True, role="admin", is_admin_agent=True))
+        assert d.allowed and d.permission_tier == "admin", (cmd, d.reason)
+
+    def test_the_pairing_toggle_decides_at_the_next_command(self):
+        from dataclasses import replace
+        on = _machine(full=True)
+        assert _d("modprobe nbd", on).allowed
+        off = replace(on, placement=replace(on.placement, allow_full_fs=False))
+        assert not _d("modprobe nbd", off).allowed
+
+    def test_the_rest_of_the_floor_holds_there(self):
+        for cmd in ("rm -rf /", "dd if=/dev/zero of=/dev/sda", "cat /etc/shadow",
+                    ":(){ :|:& };:"):
+            assert not _d(cmd, _machine(full=True)).allowed, cmd
+            assert not _d(cmd, _machine(full=True, role="admin", is_admin_agent=True)).allowed
+
+
+class TestTheTwoTargetsEndTheHost:
+    """A write to the kernel's SysRq trigger or the system power state ends
+    the machine or the satellite running the session: refused on every host,
+    over ``ssh``, and for an admin on an admin agent."""
+
+    WRITES = [
+        f"echo b > {_SYSRQ}",
+        f"echo b >{_SYSRQ}",
+        f"echo b >> '{_SYSRQ}'",
+        f'echo mem >"{_POWER}"',
+        f"echo mem >| {_POWER}",
+        f"printf b &> {_SYSRQ}",
+        f"echo b 1> {_SYSRQ}",
+        f"echo b | tee {_SYSRQ}",
+        f"echo mem | sudo tee -a /tmp/log {_POWER} > /dev/null",
+        f"dd if=/tmp/b of={_SYSRQ}",
+        f"cp /tmp/mem {_POWER}",
+        f"install -m 644 /tmp/b '{_SYSRQ}'",
+        f"mv /tmp/mem {_POWER}; echo done",
+        f"rsync /tmp/mem {_POWER}",
+        f"echo b > //proc//./{_SYSRQ.rsplit('/', 1)[1]}",
+        f"echo b > /proc/1/root{_SYSRQ}",
+        "cd /proc && echo b > " + _SYSRQ.rsplit("/", 1)[1],
+        "echo mem > /sys/kernel/../power/" + "state",
+        "echo mem > /sys//power/./" + "state",
+        f"sudo sh -c 'echo b > {_SYSRQ}'",
+        f"bash <<'EOF'\necho b > {_SYSRQ}\nEOF",
+        f"echo $(echo b > {_SYSRQ})",
+        f"ssh h 'echo b > {_SYSRQ}'",
+        f"ssh h 'echo mem | sudo tee {_POWER}'",
+        f"echo b >& {_SYSRQ}",
+        f"echo b >&{_SYSRQ}",
+        "echo mem > /tmp/../" + _POWER[1:],
+        "cp /tmp/mem /tmp/../" + _POWER[1:],
+        "> /s''ys/power/" + "state",
+        "echo b > '/proc/'" + _SYSRQ.rsplit("/", 1)[1],
+        "echo mem > /sys/pow\\er/" + "state",
+    ]
+
+    @pytest.mark.parametrize("cmd", WRITES)
+    @pytest.mark.parametrize("ctx", [
+        _ctx(role="admin"),
+        _ctx(role="admin", is_admin_agent=True),
+        _machine(full=False),
+        _machine(full=True),
+        _machine(full=True, role="admin", is_admin_agent=True),
+    ], ids=["local", "local-admin-agent", "limited", "full", "full-admin-agent"])
+    def test_a_write_is_refused_everywhere(self, cmd, ctx):
+        from auth import path_shell
+        d = _d(cmd, ctx)
+        assert not d.allowed, (cmd, d)
+        assert d.reason.endswith(path_shell._ENDS_THE_HOST_REASON), d.reason
+
+    @pytest.mark.parametrize("cmd", [
+        f"cat {_POWER}",
+        f"ls -l {_SYSRQ}",
+        "grep -rn " + _SYSRQ.rsplit("/", 1)[1] + " docs/",
+        f"cp {_POWER} /tmp/state.txt",
+        f"ln -s {_SYSRQ} /tmp/trigger-link",
+        "echo x > /tmp/power/" + "state",
+        f"echo x > {_SYSRQ}.md",
+        f"echo x > {_POWER}s",
+        "echo x > ~/notes/power-state.md",
+        "echo x > ~/notes/" + _SYSRQ.rsplit("/", 1)[1],
+        "echo x | tee /proc/self/fd/2",
+    ])
+    def test_a_read_or_a_lookalike_passes_the_floor(self, cmd):
+        d = _d(cmd, _machine(full=True))
+        assert d.allowed, (cmd, d.reason)
+        # A write under /proc or /sys still asks there.
+        assert d.destructive == cmd.startswith(("echo x > /proc/", "echo x > /sys/")), (cmd, d)
+
+    def test_the_target_matcher_is_a_catastrophe(self):
+        from auth import path_shell
+        reasons = [r for _, r in path_shell._CATASTROPHE_PATTERNS]
+        assert reasons.count(path_shell._ENDS_THE_HOST_REASON) == 1
+        assert path_shell._DANGEROUS_PATTERNS == (
+            path_shell._CATASTROPHE_PATTERNS + path_shell._HOST_STATE_PATTERNS)
+
+    def test_a_long_command_is_judged_in_linear_time(self):
+        import time
+        from auth import path_shell
+        patterns = [p for p, r in path_shell._CATASTROPHE_PATTERNS
+                    if r == path_shell._ENDS_THE_HOST_REASON]
+        long_token = "a/" * 120 + "b"
+        for text in ("> " + long_token + " " * 1 + "x" * 60000,
+                     ("cp " + long_token + " ") * 250,
+                     ("tee " + long_token + " ") * 250,
+                     "> /sys/" * 9000,
+                     ("cp /sys" + "/" * 300 + " power ") * 150,
+                     ("> /sys/power" + "/" * 900 + "x ") * 60,
+                     ">" * 60000):
+            for pattern in patterns:
+                t0 = time.monotonic()
+                pattern.search(text)
+                assert time.monotonic() - t0 < 0.5
+
+
+class TestRedirectTargets:
+    """``>&WORD`` writes both streams to WORD unless WORD is a descriptor or
+    ``-``, and ``>|`` is a redirection past noclobber, never a pipe: both
+    targets meet the path gate like ``>``'s."""
+
+    @pytest.mark.parametrize("cmd", [
+        "echo 1 >& /home/office/.oto-dock/satellite.conf",
+        "echo 1 >&/home/office/.oto-dock/satellite.conf",
+        "echo 1 >| /home/office/.oto-dock/satellite.conf",
+    ])
+    def test_the_target_meets_the_path_gate(self, cmd):
+        d = _d(cmd, _machine(full=False, role="viewer"))
+        assert not d.allowed and "satellite.conf" in d.reason, d.reason
+
+    def test_a_noclobber_target_outside_the_tree_is_refused_locally(self):
+        assert not _d("echo 1 >| /home/bob/x").allowed
+
+    @pytest.mark.parametrize("cmd", ["ls 2>&1", "make >&2", "exec 3>&-", "ls >& 2"])
+    def test_a_descriptor_is_not_a_file(self, cmd):
+        from auth import path_shell
+        assert path_shell._extract_redirect_targets(cmd) == []
+        assert _d(cmd, _ctx(role="admin")).allowed
+
+
 # ===== Unknown command → "ask" (no more hard-deny) =====
 
 class TestUnknownAsk:

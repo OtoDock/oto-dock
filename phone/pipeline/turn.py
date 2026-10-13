@@ -14,6 +14,19 @@ from .markers import _CALL_COMPLETE_RE, _QUESTION_RE
 
 logger = logging.getLogger("pipeline")
 
+#: How long a classification waits for the classifier still building in
+#: the background before the heuristic timing stands in for that turn.
+TURN_CLASSIFIER_WAIT_S = 3.0
+
+
+def _norm_words(text: str) -> list[str]:
+    """Casefolded words with punctuation stripped: the shape two transcripts
+    of the same audio are compared in (a partial and its final differ in
+    punctuation and case)."""
+    return "".join(
+        ch if ch.isalnum() or ch.isspace() else " "
+        for ch in text.lower()).split()
+
 
 class TurnMixin:
     """Turn accumulation and turn-completeness classification."""
@@ -89,6 +102,34 @@ class TurnMixin:
             f"{content[:80]}"
         )
 
+    async def _turn_classifier(self):
+        """The dispatcher, built in the background from the call's start
+        (``pipeline/providers.build_turn_classifier``: the Smart Turn load
+        off the loop, seconds on a process's first load). A classification
+        waits for it up to ``TURN_CLASSIFIER_WAIT_S``; while it loads, and
+        after a build that failed, the heuristic timing stands in."""
+        if self._turn_clf is not None:
+            return self._turn_clf
+        task = self.state._turn_clf_task
+        if task is None:
+            return None
+        try:
+            self._turn_clf = await asyncio.wait_for(
+                asyncio.shield(task), timeout=TURN_CLASSIFIER_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.info(
+                f"[{self.conn.peer_addr}] Turn classifier still loading — "
+                f"heuristic timing for this turn"
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[{self.conn.peer_addr}] Turn classifier failed to build: {e}")
+            self.state._turn_clf_task = None
+            return None
+        return self._turn_clf
+
     async def _classify_turn(self, segments: list[str]) -> float:
         """Classify turn completeness using the appropriate backend.
 
@@ -99,14 +140,15 @@ class TurnMixin:
           - TURN_CLASSIFIER_GRACE_S (0.2s) for complete turns
           - TURN_INCOMPLETE_TIMEOUT_S (4s) for incomplete turns
         """
-        if self._turn_clf is not None:
+        clf = await self._turn_classifier()
+        if clf is not None:
             try:
                 context = self._build_classifier_context()
                 language = self._locked_language
 
                 # Prepare audio if Smart Turn backend needs it
                 audio_16k = None
-                if self._turn_clf.needs_audio(language) and self.state._speech_audio_buf:
+                if clf.needs_audio(language) and self.state._speech_audio_buf:
                     audio_16k = self._speech_audio_16k(bytes(self.state._speech_audio_buf))
 
                 # Format segments as numbered list for text-based backends
@@ -117,7 +159,7 @@ class TurnMixin:
                 else:
                     speech_text = segments[0]
 
-                is_complete = await self._turn_clf.classify(
+                is_complete = await clf.classify(
                     text=speech_text,
                     context=context,
                     language=language,
@@ -249,11 +291,12 @@ class TurnMixin:
         discarded (it's just adding detail to the original request which
         the AI is already handling).
         """
-        if self._turn_clf is None:
+        clf = await self._turn_classifier()
+        if clf is None:
             return False
         try:
             context = self._build_classifier_context()
-            return await self._turn_clf.classify_continuation(
+            return await clf.classify_continuation(
                 original, follow_up, context,
             )
         except Exception as e:
@@ -285,13 +328,7 @@ class TurnMixin:
             return False
         if time.monotonic() - self.state._interim_fallback_at > 2.0:
             return False
-
-        def norm(s: str) -> list[str]:
-            return "".join(
-                ch if ch.isalnum() or ch.isspace() else " "
-                for ch in s.lower()).split()
-
-        if norm(text) == norm(recorded):
+        if _norm_words(text) == _norm_words(recorded):
             self.state._interim_fallback_text = ""
             return True
         return False
@@ -371,21 +408,34 @@ class TurnMixin:
             final, source = self.stt.drain_transcript(), "final"
             if not final and self.stt.latest_interim:
                 final, source = self.stt.latest_interim, "interim"
-                # The live partial is being DISPATCHED. Its REAL final is
-                # usually not lost, just ~1s late — record the text so the
-                # late arrival is recognized as the same utterance instead
-                # of dispatching again (Paros double-send, 2026-08-25).
-                self.state._interim_fallback_text = final
-                self.state._interim_fallback_at = time.monotonic()
             self.state._speech_end_time = time.monotonic()
             if final:
-                self._append_turn_segment(final)
+                appended = self._append_turn_segment(final, source=source)
+                if source == "interim" and appended:
+                    # The live partial is being DISPATCHED. Its REAL final is
+                    # usually not lost, just ~1s late — record the text so the
+                    # late arrival is recognized as the same utterance instead
+                    # of dispatching again (Paros double-send, 2026-08-25).
+                    self.state._interim_fallback_text = final
+                    self.state._interim_fallback_at = time.monotonic()
                 logger.info(
                     f"[{self.conn.peer_addr}] STT final flush ({source}): {final}"
                 )
 
         if self.state._turn_segments:
+            # The first dispatch of a call that identifies the caller's
+            # language waits for the identification (bounded): when it moved
+            # the call to another language, its text is this turn's (the
+            # stream was tuned to the route's language).
+            await self._await_language_identification()
             joined = " ".join(self.state._turn_segments)
+            identified = self._take_language_first_text()
+            if identified:
+                logger.info(
+                    f"[{self.conn.peer_addr}] Turn text from the language "
+                    f"identification ({len(identified)} chars)"
+                )
+                joined = identified
             count = len(self.state._turn_segments)
             self.state._turn_segments.clear()
             self.state._turn_timer = None
@@ -412,13 +462,21 @@ class TurnMixin:
                     self._process_utterance(joined)
                 )
 
-    def _append_turn_segment(self, transcript: str) -> None:
+    def _append_turn_segment(self, transcript: str, *, source: str = "final") -> bool:
         """Append transcript to turn segments, deduplicating interim→final overlaps.
 
         STT providers may return an interim as a segment and later return a
         final that starts with the same text.  Without dedup, the pipeline
         would dispatch duplicated text.  This method replaces the previous
         segment when the new one supersedes it.
+
+        A segment taken from the live partial (``source="interim"``, the
+        fallback for a final that never came) is judged by its words: the
+        same words as the last segment, or a leading part of them, is the
+        last segment again (a partial the provider kept past its final) and
+        is dropped. A final is never dropped: a caller repeating a word, or
+        dictating a number in groups, said it twice. Returns True when the
+        transcript is now part of the turn.
         """
         if self.state._turn_segments:
             last = self.state._turn_segments[-1]
@@ -428,8 +486,17 @@ class TurnMixin:
                     f"with final: \"{last}\" → \"{transcript}\""
                 )
                 self.state._turn_segments[-1] = transcript
-                return
+                return True
+            if source == "interim":
+                new, old = _norm_words(transcript), _norm_words(last)
+                if new and new == old[:len(new)]:
+                    logger.info(
+                        f"[{self.conn.peer_addr}] Interim segment repeats the "
+                        f"last one — dropped: \"{transcript}\""
+                    )
+                    return False
         self.state._turn_segments.append(transcript)
+        return True
 
     def _cancel_turn_timer(self) -> None:
         """Cancel the turn continuation timer if running."""
@@ -526,7 +593,7 @@ class TurnMixin:
                 )
                 return
             if transcript:
-                self._append_turn_segment(transcript)
+                self._append_turn_segment(transcript, source=source)
                 logger.info(
                     f"[{self.conn.peer_addr}] Delayed drain got ({source}, {elapsed_ms:.0f}ms): {transcript}"
                 )

@@ -9,7 +9,7 @@ import { useChatAudioCapability } from '../../hooks/useChatAudioCapability'
 import { useMyAudioPrefs, useUpdateMyAudioPrefs, type AudioMode } from '../../api/userAudio'
 import { useAudioPrefsStore } from '../../store/audioPrefsStore'
 import { loadVoices, type VoiceOption } from '../../audio/backends/nativeTts'
-import { LANGUAGES } from '../../audio/lang'
+import { AUTO_LANGUAGE, LANGUAGES } from '../../audio/lang'
 
 const MODES: AudioMode[] = ['auto', 'native', 'platform']
 
@@ -115,13 +115,14 @@ export function AudioPrefsSection() {
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <span className="text-sm text-p-text">Dictation language</span>
-                  <p className="text-xs text-p-text-light">The language the mic recognizes (set this to dictate non-English).</p>
+                  <p className="text-xs text-p-text-light">The language the mic recognizes (set this to dictate non-English). Automatic lets the platform engine identify it from your first words, which then arrive a moment later. The device recognizer keeps your browser language.</p>
                 </div>
                 <select
                   value={prefs?.stt_language || 'en-US'}
                   onChange={e => update.mutate({ stt_language: e.target.value })}
                   className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text"
                 >
+                  <option value={AUTO_LANGUAGE}>Automatic</option>
                   {STT_LANGS.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
                 </select>
               </div>

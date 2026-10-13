@@ -89,6 +89,15 @@ class LlmStreamingMixin:
             if not is_opening:
                 self._on_turn_dispatch(transcript)
 
+            # A caller who speaks after the agent's goodbye resumes the call:
+            # an end a previous turn raised does not carry over (a transfer
+            # does: it completes at this turn's end). A failed transfer's
+            # note rides this dispatch.
+            self._clear_call_control("new dispatch", keep_transfer=True)
+            if self.state._control_note:
+                transcript = f"{self.state._control_note}\n{transcript}"
+                self.state._control_note = ""
+
             # Track user entry in voice-aware transcript (skip opening prompts)
             if not is_opening:
                 self.state._call_transcript.append({"role": "user", "content": transcript})
@@ -168,6 +177,13 @@ class LlmStreamingMixin:
                     tts_text = tts_text[:_m.start()].strip()
                     self.state._call_complete = True
                     logger.info(f"[{self.conn.peer_addr}] [CALL_COMPLETE] detected in pre-collected response")
+                elif self._control_pending_end():
+                    # The parallel turn's end or transfer: the collector kept
+                    # only the words before the tool (and one sentence when
+                    # nothing came before it), so the text plays whole.
+                    transcript_text = tts_text.strip()
+                    self.state._call_complete = True
+                    logger.info(f"[{self.conn.peer_addr}] call control: end pending in pre-collected response")
                 elif self._is_outbound and not self.state._call_complete:
                     q_match = _QUESTION_RE.search(tts_text)
                     if q_match:
@@ -230,6 +246,17 @@ class LlmStreamingMixin:
                 _complete_marker_seen = False  # stop TTS flushing once [CALL_COMPLETE] streamed
                 _stream_done = False   # stream ran to completion (no break)
                 _abort_requeue = False  # abort + re-dispatch batched with queued speech
+                # The call tools' speech rule: once an end or a transfer is
+                # pending, the text produced before the tool plays whole;
+                # after the tool's boundary at most one sentence, and only
+                # when nothing was spoken before it. _control_break leaves
+                # the stream the moment the last speakable text is flushed:
+                # the completion point is the TTS drain, never the stream's
+                # end (whatever the engine still produces is transcript).
+                _spoke_any = False        # text of this turn reached TTS
+                _control_spoke_before = False
+                _control_break = False
+                _context_open = True      # a streaming context waits for is_last
 
                 self.state._t_dispatch = time.monotonic()
                 self.state._t_text_first = 0.0
@@ -261,12 +288,20 @@ class LlmStreamingMixin:
 
                         # --- Tool boundary: finalize current TTS segment ---
                         if token is TOOL_USE_SIGNAL:
+                            if self._control_pending_end() and not self.state._control_boundary_seen:
+                                # The action's own tool boundary (Codex sends it
+                                # after the tool ran, with the pre-tool text
+                                # still in the buffer: it plays whole below).
+                                self.state._control_boundary_seen = True
+                                _control_spoke_before = _spoke_any or bool(text_buffer.strip())
                             if not _question_marker_seen and text_buffer.strip():
                                 logger.info(
                                     f"[{self.conn.peer_addr}] Tool start: "
                                     f"flushing {len(text_buffer)} chars to TTS"
                                 )
                                 await self.tts.send_text_chunk(text_buffer, is_last=True)
+                                _context_open = False
+                                _spoke_any = True
                                 text_buffer = ""
 
                                 # Wait for this segment to finish playing.
@@ -318,15 +353,37 @@ class LlmStreamingMixin:
                                 self.state._tts_task = None
                                 self.state._audio_out_buf.clear()
 
+                                # The words before the end or transfer tool
+                                # have played: the line closes now, whatever
+                                # the engine says next.
+                                if self._control_pending_end() and _control_spoke_before:
+                                    self.state._control_cut = True
+                                    _control_break = True
+                                    break
+
                                 # New TTS context for post-tool text
                                 self.tts.start_streaming_context(
             language=self._locked_language, output_sample_rate=self._rate_out)
+                                _context_open = True
                                 self.state._tts_task = asyncio.create_task(
                                     self._stream_tts_audio()
                                 )
                             else:
                                 # Buffer empty or whitespace-only — discard
                                 text_buffer = ""
+                                if self._control_pending_end() and _control_spoke_before:
+                                    # Spoken earlier in the turn; nothing new
+                                    # before this boundary: the line closes.
+                                    # The words already with TTS wait for the
+                                    # end of input (a streaming context speaks
+                                    # nothing before its flush): close it so
+                                    # they play, then leave the stream.
+                                    if _context_open and not self.state._utterance_cancelled:
+                                        await self.tts.send_text_chunk("", is_last=True)
+                                        _context_open = False
+                                    self.state._control_cut = True
+                                    _control_break = True
+                                    break
                             continue
 
                         # --- Normal text token ---
@@ -339,9 +396,25 @@ class LlmStreamingMixin:
                         # whole call report was read out before the hang-up).
                         # The tokens still reach full_response (transcript +
                         # post-stream detection) but never the TTS buffer.
-                        if _complete_marker_seen:
+                        if _complete_marker_seen or self.state._control_cut:
                             continue
                         text_buffer += token
+
+                        # After an end or transfer tool with no words before
+                        # it: one sentence (or 200 characters) plays, then the
+                        # line closes.
+                        if self._control_pending_end() and self.state._control_boundary_seen:
+                            _m = sentence_end_re.search(text_buffer)
+                            if _m or len(text_buffer) >= 200:
+                                piece = text_buffer[:_m.end()] if _m else text_buffer[:200]
+                                await self.tts.send_text_chunk(piece.strip(), is_last=True)
+                                _context_open = False
+                                _spoke_any = True
+                                text_buffer = ""
+                                self.state._control_cut = True
+                                _control_break = True
+                                break
+                            continue
 
                         # Once [QUESTION marker detected, stop all TTS flushing.
                         # Let tokens accumulate silently — post-stream detection
@@ -354,6 +427,7 @@ class LlmStreamingMixin:
                             pre_marker = text_buffer[:_m.start()].strip()
                             if pre_marker:
                                 await self.tts.send_text_chunk(pre_marker)
+                                _spoke_any = True
                             text_buffer = ""
                             _complete_marker_seen = True
                             logger.info(
@@ -371,6 +445,7 @@ class LlmStreamingMixin:
                                 tts_chunk = _CALL_COMPLETE_RE.sub("", pre_marker)
                                 if tts_chunk:
                                     await self.tts.send_text_chunk(tts_chunk)
+                                    _spoke_any = True
                             text_buffer = text_buffer[bracket_idx:]  # keep marker in buffer
                             _question_marker_seen = True
                             logger.info(
@@ -398,6 +473,7 @@ class LlmStreamingMixin:
                                         flush_part = _CALL_COMPLETE_RE.sub("", flush_part).strip()
                                         if flush_part:
                                             await self.tts.send_text_chunk(flush_part)
+                                            _spoke_any = True
                                     continue
 
                             # Strip [CALL_COMPLETE] before sending to TTS
@@ -415,9 +491,22 @@ class LlmStreamingMixin:
                                     )
                             if tts_chunk:
                                 await self.tts.send_text_chunk(tts_chunk)
+                                _spoke_any = True
                             text_buffer = ""
                     else:
                         _stream_done = True
+
+                    if _control_break:
+                        # The last speakable words are with TTS: stop reading
+                        # the engine (the proxy keeps its transcript) and go to
+                        # the completion point below.
+                        discard = getattr(self.llm, "discard_turn", None)
+                        if discard is not None:
+                            discard()
+                        logger.info(
+                            f"[{self.conn.peer_addr}] call control: stream left at "
+                            f"the last spoken words ({self.state._control_action})"
+                        )
 
                     # Caller kept talking before anything played — tear down
                     # this turn (TTS context + server-side generation) and
@@ -453,7 +542,8 @@ class LlmStreamingMixin:
                     # turn server-side (Direct) so the model isn't still
                     # answering it; its transcript is folded into the next
                     # dispatch (the erased turn "never happened" upstream).
-                    if (not _stream_done and self.state._utterance_cancelled
+                    if (not _stream_done and not _control_break
+                            and self.state._utterance_cancelled
                             and getattr(self.llm, "supports_abort", False)):
                         await self.llm.abort_turn()
                         if getattr(self.llm, "abort_erases_turn", True):
@@ -475,26 +565,46 @@ class LlmStreamingMixin:
                     _has_question = False
                     if not self.state._utterance_cancelled:
                         full_text = "".join(full_response)
-                        if _CALL_COMPLETE_RE.search(full_text):
+                        if _CALL_COMPLETE_RE.search(full_text) or self._control_pending_end():
+                            # The marker, or an end / transfer tool (the first
+                            # action wins; an end and a transfer beat a question).
                             self.state._call_complete = True
                             logger.info(
-                                f"[{self.conn.peer_addr}] [CALL_COMPLETE] detected"
+                                f"[{self.conn.peer_addr}] "
+                                f"{'call control: ' + self.state._control_action if self._control_pending_end() else '[CALL_COMPLETE]'} "
+                                f"detected"
                             )
                             # Strip marker from remaining buffer before TTS
                             text_buffer = _CALL_COMPLETE_RE.sub("", text_buffer).strip()
+                            if self._control_pending_end() and not self.state._control_boundary_seen:
+                                # No tool boundary came: everything the engine
+                                # produced counts as the words before the tool.
+                                pass
+                            elif self._control_pending_end() and not self.state._control_cut:
+                                # The stream ended inside the one-sentence
+                                # allowance: its remainder plays (200 chars).
+                                text_buffer = text_buffer[:200]
 
                         # --- Detect [QUESTION:] — outbound only ---
                         elif self._is_outbound and not self.state._call_complete:
-                            q_match = _QUESTION_RE.search(full_text)
-                            if q_match:
+                            if self.state._control_action == "ask":
+                                # The ask tool's question; a marker beside it is
+                                # dropped (one question per turn).
                                 _has_question = True
-                                question_text = q_match.group(1).strip()
-                                logger.debug(
-                                    f"[{self.conn.peer_addr}] [QUESTION:] detected: "
-                                    f"{question_text[:80]}"
-                                )
-                                # Strip the marker from TTS buffer
+                                question_text = str(self.state._control_args.get("question") or "").strip()
                                 text_buffer = _QUESTION_RE.sub("", text_buffer).strip()
+                                self._clear_call_control("question taken")
+                            else:
+                                q_match = _QUESTION_RE.search(full_text)
+                                if q_match:
+                                    _has_question = True
+                                    question_text = q_match.group(1).strip()
+                                    logger.debug(
+                                        f"[{self.conn.peer_addr}] [QUESTION:] detected: "
+                                        f"{question_text[:80]}"
+                                    )
+                                    # Strip the marker from TTS buffer
+                                    text_buffer = _QUESTION_RE.sub("", text_buffer).strip()
 
                     # Record assistant transcript for outbound
                     if self._is_outbound and self._call_manager and full_response:
@@ -531,7 +641,11 @@ class LlmStreamingMixin:
                             )
 
                     # Send remaining text as final chunk (strip markers before TTS)
-                    if _early_continuation:
+                    if _control_break:
+                        # The last speakable words were flushed with is_last
+                        # at the cut; the context is closed already.
+                        pass
+                    elif _early_continuation:
                         # Continuation: close TTS context without final text.
                         # Queued speech handler below will cancel TTS and resend.
                         await self.tts.send_text_chunk("", is_last=True)
@@ -547,8 +661,28 @@ class LlmStreamingMixin:
                             await self.tts.send_text_chunk("", is_last=True)
                     elif not self.state._utterance_cancelled:
                         await self.tts.send_text_chunk("", is_last=True)
+                    if (self._control_pending_end() and not _control_break
+                            and not _spoke_any and not text_buffer.strip()
+                            and not self.state._utterance_cancelled):
+                        # A tool-first reply with no words at all: the line
+                        # still says goodbye (or announces the hand-over).
+                        if self.state._tts_task and not self.state._tts_task.done():
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await self.state._tts_task
+                        self.state._tts_task = None
+                        with contextlib.suppress(Exception):
+                            await self._play_phrase(
+                                "transferring" if self.state._transfer_target else "goodbye")
 
                     # --- Handle question: wait for TTS, play hold, wait for answer ---
+                    if _has_question and self._in_session:
+                        # Nobody to ask on a call that runs inside the caller's
+                        # chat: the marker was stripped from the speech, the
+                        # call goes on.
+                        logger.info(
+                            f"[{self.conn.peer_addr}] [QUESTION:] on an in-session call — "
+                            f"no hold, the question is dropped")
+                        _has_question = False
                     if _has_question:
                         # Wait for current TTS to finish (caller's pre-question speech)
                         if self.state._tts_task and not self.state._tts_task.done():
@@ -582,6 +716,13 @@ class LlmStreamingMixin:
 
             # --- LLM is done (or pre-collected text sent to TTS). ---
 
+            # The proxy went away during the turn (an in-session call's chat
+            # attach with it): the apology, the hangup (nobody else may
+            # answer this call).
+            if self.state._proxy_lost or getattr(self.llm, "proxy_lost", False):
+                await self._end_unreachable_call()
+                break
+
             # If call complete, wait for TTS to finish then hang up
             if self.state._call_complete:
                 if self.state._tts_task and not self.state._tts_task.done():
@@ -598,9 +739,14 @@ class LlmStreamingMixin:
                 # keeps feeding VAD (inbound + outbound), so their speech becomes
                 # the next turn and the agent re-emits [CALL_COMPLETE] when the call
                 # is truly over. This is also what makes the farewell wait for the
-                # caller rather than deadlocking on a forever-parked TTS.
-                if self.state._utterance_cancelled or self.state._queued_speech:
+                # caller rather than deadlocking on a forever-parked TTS. A
+                # transfer the agent asked for goes through regardless: the
+                # caller's "thanks" over the hand-over sentence must not
+                # strand them with the agent.
+                if ((self.state._utterance_cancelled or self.state._queued_speech)
+                        and self.state._transfer_target is None):
                     self.state._call_complete = False
+                    self._clear_call_control("farewell resumed")
                     logger.info(
                         f"[{self.conn.peer_addr}] Caller still engaged during "
                         f"farewell — resuming instead of hanging up"
@@ -609,12 +755,16 @@ class LlmStreamingMixin:
                         return  # not queued yet; the next turn will pick it up
                     # else fall through to the queued-speech handler below
                 else:
-                    # Brief pause then hang up
-                    await asyncio.sleep(0.5)
-                    self.conn.send_hangup()
-                    self.state._running = False
-                    logger.info(f"[{self.conn.peer_addr}] Call complete — hanging up")
-                    break
+                    # The completion point: the transfer when one is pending,
+                    # else the brief pause and the hangup.
+                    if await self._execute_pending_end():
+                        break
+                    # A failed transfer: the call resumes, the agent told.
+                    transcript = self.state._control_note
+                    self.state._control_note = ""
+                    is_opening = True
+                    self.state._last_activity = time.monotonic()
+                    continue
 
             # Wait for user to finish speaking before processing queued speech.
             # Without this, we'd grab a partial sentence from the queue while
@@ -945,9 +1095,20 @@ class LlmStreamingMixin:
         pre_tool: list[str] = []
         post_tool: list[str] = []
         pre_tool_signalled = False
+        # The call tools' speech rule, as in the streaming path: after an
+        # end or transfer tool's boundary, text is kept only when nothing
+        # came before it, and then one sentence.
+        control_cut = False
+        control_spoke_before = False
+        sentence_end_re = re.compile(r"[.!?;]\s")
         try:
             async for token in self.llm.send_message(voice_prompt):
                 if token is TOOL_USE_SIGNAL:
+                    if self._control_pending_end() and not self.state._control_boundary_seen:
+                        self.state._control_boundary_seen = True
+                        control_spoke_before = bool("".join(pre_tool + post_tool).strip())
+                        if control_spoke_before:
+                            control_cut = True
                     if not pre_tool_signalled:
                         pre_tool_text = "".join(pre_tool).strip()
                         if pre_tool_text:
@@ -962,10 +1123,22 @@ class LlmStreamingMixin:
                         pre_tool_signalled = True
                     continue
 
+                if control_cut:
+                    continue   # transcript only: the proxy keeps the engine's text
                 if pre_tool_signalled:
                     post_tool.append(token)
                 else:
                     pre_tool.append(token)
+                if self._control_pending_end() and self.state._control_boundary_seen:
+                    tail = "".join(post_tool if pre_tool_signalled else pre_tool)
+                    _m = sentence_end_re.search(tail)
+                    if _m or len(tail) >= 200:
+                        kept = tail[:_m.end()] if _m else tail[:200]
+                        if pre_tool_signalled:
+                            post_tool[:] = [kept]
+                        else:
+                            pre_tool[:] = [kept]
+                        control_cut = True
         except asyncio.CancelledError:
             while len(self.llm.messages) > msg_count_before:
                 self.llm.messages.pop()

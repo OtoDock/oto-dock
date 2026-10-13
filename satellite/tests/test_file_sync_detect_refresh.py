@@ -25,11 +25,14 @@ import os
 
 import pytest
 
+from satellite.transport import file_sync as _file_sync
 from satellite.transport.file_sync import (
     compute_manifest,
     detect_changes,
     snapshot_agent_dir,
 )
+
+_REAL_HASH_FILE = _file_sync._hash_file
 
 
 def test_repeat_call_with_no_writes_returns_no_changes(tmp_path):
@@ -296,6 +299,197 @@ def test_a_named_pipe_is_skipped_without_blocking(tmp_path):
     assert out["paths"] == {"workspace/real.txt"}
 
 
+def _windows_os(monkeypatch):
+    """The Windows shape of ``os`` on this host: no ``O_NONBLOCK``, and an
+    ``os.set_blocking`` that takes only a pipe (Python 3.12+ raises
+    "Incorrect function" for a regular file)."""
+    import stat
+    monkeypatch.delattr(os, "O_NONBLOCK", raising=False)
+
+    def set_blocking(fd, blocking):
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise OSError(1, "Incorrect function")
+
+    monkeypatch.setattr(os, "set_blocking", set_blocking)
+
+
+def test_windows_hashes_every_file(tmp_path, monkeypatch):
+    """On Windows every hash raised once the named-pipe guard called
+    ``os.set_blocking`` on a regular file: the snapshot was empty, so no file
+    a session wrote there was ever sent back. The snapshot, the manifest and
+    the turn-end scan must all see the files there."""
+    import hashlib
+
+    from satellite.transport.file_sync import _hash_file
+    _windows_os(monkeypatch)
+    agent = tmp_path
+    (agent / "workspace").mkdir()
+    (agent / "workspace" / "a.txt").write_text("v1")
+    expected = "sha256:" + hashlib.sha256(b"v1").hexdigest()
+
+    assert _hash_file(agent / "workspace" / "a.txt") == expected
+    snap = snapshot_agent_dir(agent)
+    assert snap == {"workspace/a.txt": expected}
+    assert [e["path"] for e in compute_manifest(agent)] == ["workspace/a.txt"]
+
+    (agent / "workspace" / "written-by-bash.txt").write_text("new")
+    changes = detect_changes(agent, snap)
+    assert [(c["path"], c["action"]) for c in changes] == [
+        ("workspace/written-by-bash.txt", "write"),
+    ]
+
+
+def _lock(monkeypatch, *names, vanished=()):
+    """``_hash_file`` refusing the named files as a Windows lock does, and
+    raising FileNotFoundError for the vanished ones."""
+    from satellite.transport import file_sync
+    real = _REAL_HASH_FILE
+
+    def hash_file(path):
+        if path.name in names:
+            raise PermissionError(13, "The process cannot access the file")
+        if path.name in vanished:
+            raise FileNotFoundError(2, "No such file")
+        return real(path)
+
+    monkeypatch.setattr(file_sync, "_hash_file", hash_file)
+
+
+def test_an_unreadable_file_is_summed_up_once_per_change(tmp_path, monkeypatch, caplog):
+    """A skipped file never reaches the platform, so a walk sums its skips
+    up, logged when the summary changes (a file locked for hours logs once,
+    not every turn), at ERROR when nothing could be read, and once more when
+    every file reads again. A file that vanished under the walk is expected
+    and stays silent."""
+    import logging
+
+    from satellite.transport import file_sync
+    monkeypatch.setattr(file_sync, "_last_skip_summary", file_sync.OrderedDict())
+    agent = tmp_path
+    (agent / "workspace").mkdir()
+    (agent / "workspace" / "locked.docx").write_text("x")
+    (agent / "workspace" / "gone.txt").write_text("y")
+    (agent / "workspace" / "fine.txt").write_text("z")
+    _lock(monkeypatch, "locked.docx", vanished=("gone.txt",))
+
+    def logged():
+        return [(r.levelno, r.getMessage()) for r in caplog.records
+                if r.getMessage().startswith("sync snapshot")]
+
+    with caplog.at_level(logging.INFO, logger="satellite"):
+        assert set(snapshot_agent_dir(agent)) == {"workspace/fine.txt"}
+        assert set(snapshot_agent_dir(agent)) == {"workspace/fine.txt"}
+        assert [(lvl, "skipped 1 of 2" in m and "locked.docx" in m) for lvl, m in logged()] == [
+            (logging.WARNING, True)]
+        caplog.clear()
+        _lock(monkeypatch, "locked.docx", "fine.txt", vanished=("gone.txt",))
+        assert snapshot_agent_dir(agent) == {}
+        assert [lvl for lvl, _ in logged()] == [logging.ERROR]
+        caplog.clear()
+        _lock(monkeypatch)
+        assert len(snapshot_agent_dir(agent)) == 3
+        snapshot_agent_dir(agent)
+        assert [(lvl, "reads every file" in m) for lvl, m in logged()] == [(logging.INFO, True)]
+
+
+def test_the_manifest_lists_what_it_could_not_read_when_asked(tmp_path, monkeypatch):
+    """A file the manifest leaves out reads as deleted to the merge: a
+    proxy that asks gets it as a skipped entry with no hash instead (locked,
+    or over the size cap); a vanished file is gone and stays out. Without
+    the flag the reply is what an older proxy expects."""
+    from satellite.transport import file_sync
+    monkeypatch.setattr(file_sync, "MAX_FILE_SIZE", 10)
+    agent = tmp_path
+    ws = agent / "workspace"
+    ws.mkdir()
+    (ws / "locked.pst").write_text("x")
+    (ws / "gone.txt").write_text("y")
+    (ws / "big.bin").write_text("z" * 50)
+    (ws / "fine.txt").write_text("ok")
+    _lock(monkeypatch, "locked.pst", vanished=("gone.txt",))
+
+    assert [e["path"] for e in compute_manifest(agent)] == ["workspace/fine.txt"]
+    by_path = {e["path"]: e for e in compute_manifest(agent, report_skipped=True)}
+    assert set(by_path) == {"workspace/fine.txt", "workspace/locked.pst", "workspace/big.bin"}
+    assert "hash" in by_path["workspace/fine.txt"]
+    locked, big = by_path["workspace/locked.pst"], by_path["workspace/big.bin"]
+    assert locked["skipped"] == "unreadable" and "hash" not in locked and locked["size"] == 1
+    assert big["skipped"] == "too_large" and "hash" not in big and big["size"] == 50
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="a folder mode keeps nothing from root")
+def test_a_folder_the_walk_cannot_list_is_unknown_not_deleted(tmp_path):
+    """A folder that can no longer be listed (a root-owned 700 folder a
+    container left) hides its files from the walk. The manifest lists it
+    as a skipped folder when asked, and the turn-end scan keeps its files
+    in the baseline instead of reporting them deleted."""
+    agent = tmp_path
+    locked = agent / "workspace" / "build"
+    locked.mkdir(parents=True)
+    (locked / "out.txt").write_text("v1")
+    (agent / "workspace" / "a.txt").write_text("a")
+    snap = snapshot_agent_dir(agent)
+    assert "workspace/build/out.txt" in snap
+
+    locked.chmod(0)
+    try:
+        entries = compute_manifest(agent, report_skipped=True)
+        assert {"path": "workspace/build", "skipped": "unreadable_dir", "dir": True} in entries
+        assert "workspace/build/out.txt" not in {e["path"] for e in entries}
+        assert detect_changes(agent, snap) == []
+        assert "workspace/build/out.txt" in snap
+    finally:
+        locked.chmod(0o755)
+    assert detect_changes(agent, snap) == []
+
+
+def test_a_junction_is_not_followed_and_is_reported(tmp_path, monkeypatch):
+    """Windows' ``os.walk`` follows a junction, which can lead out of the
+    folder or loop back into it: the walk leaves such a folder out, and a
+    manifest that reports skips names it as a link so its files keep their
+    platform copies."""
+    from satellite import config
+    from satellite.host import safe_fs
+    agent = tmp_path
+    (agent / "workspace" / "jn").mkdir(parents=True)
+    (agent / "workspace" / "jn" / "far.txt").write_text("outside")
+    (agent / "workspace" / "a.txt").write_text("a")
+    monkeypatch.setattr(config, "HOST", config.of("windows"))
+    monkeypatch.setattr(safe_fs, "is_link_like", lambda p: p.name == "jn")
+
+    assert set(snapshot_agent_dir(agent)) == {"workspace/a.txt"}
+    entries = compute_manifest(agent, report_skipped=True)
+    assert {"path": "workspace/jn", "skipped": "link", "dir": True} in entries
+    assert [e["path"] for e in entries if "hash" in e] == ["workspace/a.txt"]
+
+
+def test_a_file_hashed_but_not_read_is_reported_next_turn(tmp_path, monkeypatch):
+    """A write the scan hashed but could not read (locked in between) keeps
+    the baseline the platform knows, so the next turn reports it instead of
+    losing it until a merge."""
+    from pathlib import Path
+    agent = tmp_path
+    ws = agent / "workspace"
+    ws.mkdir()
+    (ws / "doc.txt").write_text("v1")
+    snap = snapshot_agent_dir(agent)
+    (ws / "doc.txt").write_text("v2")
+    (ws / "new.txt").write_text("n")
+    real = Path.read_bytes
+
+    def read_bytes(self):
+        if self.name in ("doc.txt", "new.txt"):
+            raise PermissionError(13, "locked")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    assert detect_changes(agent, snap) == []
+    monkeypatch.setattr(Path, "read_bytes", real)
+    assert sorted(c["path"] for c in detect_changes(agent, snap)) == [
+        "workspace/doc.txt", "workspace/new.txt"]
+
+
 def test_cli_runtime_cruft_excluded(tmp_path):
     """Satellite mirrors the proxy: session transcripts + temp/caches/snapshots/
     backups + hidden dirs under .claude/.codex are pruned from the snapshot AND
@@ -311,6 +505,10 @@ def test_cli_runtime_cruft_excluded(tmp_path):
     for cruft in ("sessions", ".tmp", "cache"):
         (cx / cruft).mkdir(); (cx / cruft / "f").write_text("c")
     (cl / ".claude.json.backup.1").write_text("b")
+    # A hook-file write's temp, beside the file or a wrapper (a crash left it).
+    (cl / ".settings.json.oto-tmp-0a1b").write_text("t")
+    (cl / "bin").mkdir()
+    (cl / "bin" / ".gh.oto-tmp-0a1b").write_text("t")
     (cx / "skills" / ".system").mkdir(parents=True)
     (cx / "skills" / ".system" / "sk.md").write_text("s")
 
@@ -323,6 +521,8 @@ def test_cli_runtime_cruft_excluded(tmp_path):
         # OAuth credential file — written per host (start payload + rotation
         # fan-out push); syncing it would race the dedicated push channel.
         assert "users/alice/.claude/.credentials.json" not in paths
+        assert "users/alice/.claude/.settings.json.oto-tmp-0a1b" not in paths
+        assert "users/alice/.claude/bin/.gh.oto-tmp-0a1b" not in paths
         # .codex/models_cache.json is real config and DOES sync.
         assert "users/alice/.codex/models_cache.json" in paths
         for leaked in ("users/alice/.claude/projects/f", "users/alice/.claude/tasks/f",
@@ -433,3 +633,49 @@ def test_hash_cache_keeps_the_raw_digest_and_primes_tolerantly(tmp_path):
     assert fs._hash_file_cached(f, st) == fs._hash_file(f)
     assert fs._hash_file_cached(f, st) == fs._hash_file(f)  # the hit answers the text form
     assert fs._HASH_CACHE_MAX >= 200_000
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="a folder mode keeps nothing from root")
+def test_a_folder_listed_but_not_entered_never_aborts_the_walk(tmp_path):
+    """Read but no traverse permission: the walk lists the names, and every
+    look at a file there fails. The walk goes on; the files are reported
+    as unreadable, never as deleted."""
+    agent = tmp_path
+    half = agent / "workspace" / "half"
+    half.mkdir(parents=True)
+    (half / "in.txt").write_text("x")
+    (agent / "workspace" / "a.txt").write_text("a")
+    snap = snapshot_agent_dir(agent)
+    half.chmod(0o444)
+    try:
+        assert set(snapshot_agent_dir(agent)) == {"workspace/a.txt"}
+        entries = {e["path"]: e for e in compute_manifest(agent, report_skipped=True)}
+        assert entries["workspace/half/in.txt"]["skipped"] == "unreadable"
+        assert detect_changes(agent, snap) == []
+    finally:
+        half.chmod(0o755)
+
+
+def test_a_posix_symlinked_folder_is_not_reported_as_a_link(tmp_path):
+    """On POSIX ``os.walk`` never enters a symlinked folder and the walk does
+    not stat children for links: nothing changes there."""
+    agent = tmp_path
+    (agent / "elsewhere").mkdir()
+    (agent / "elsewhere" / "far.txt").write_text("x")
+    (agent / "workspace").mkdir()
+    (agent / "workspace" / "a.txt").write_text("a")
+    (agent / "workspace" / "ln").symlink_to(agent / "elsewhere")
+    entries = compute_manifest(agent, report_skipped=True)
+    assert not [e for e in entries if e.get("skipped")]
+
+
+def test_a_junction_is_a_name_surrogate_and_a_placeholder_is_not():
+    from types import SimpleNamespace
+
+    from satellite.host.safe_fs import _is_surrogate
+    regular_dir = 0o040755
+    assert _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0xA0000003))
+    assert _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0xA000000C))
+    assert not _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0x9000001A))
+    assert not _is_surrogate(SimpleNamespace(st_mode=regular_dir, st_reparse_tag=0))

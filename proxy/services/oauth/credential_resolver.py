@@ -26,6 +26,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from storage.identity import credential_store
 from storage.mcp import mcp_store
@@ -34,7 +35,10 @@ from storage import database as task_store
 from services.mcp import mcp_manifest_types as _mt
 from core import layout
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:  # the broker's type only; services import core lazily
+    from core.credentials.mcp_gateway import CliCredential
+
+logger = logging.getLogger("otodock")
 
 
 @dataclass
@@ -53,11 +57,16 @@ class ResolvedCredentials:
     # Secret classification. ``secret_keys`` = env-var names that are PURE
     # MCP secrets (infra + per-user creds) — stripped from the flat ``env_vars``
     # union and the config files, delivered ONLY via the broker bundle.
-    # ``bash_env_keys`` = OAuth ``env_injection`` names (GH_TOKEN/GIT_CONFIG_*)
-    # the agent's BASH needs (git/gh): they STAY in the flat env, but are listed
-    # in OTO_STRIP_KEYS so wrapped MCP children drop them.
+    # ``bash_env_keys`` = the git configuration entries (``GIT_CONFIG_*``) that
+    # point the agent's shell at the platform's credential helper: they carry
+    # no secret, STAY in the flat env, and are listed in OTO_STRIP_KEYS so
+    # wrapped MCP children drop them.
     secret_keys: set[str] = field(default_factory=set)
     bash_env_keys: set[str] = field(default_factory=set)
+    # Per-MCP command-line credentials (``git_credential_helper`` manifests):
+    # the token by reference, fetched per command through the broker; the
+    # config builder puts each on its MCP's bundle.
+    cli_credentials: dict[str, "CliCredential"] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -226,7 +235,7 @@ def resolve_credentials(
                 try:
                     oauth_env = _resolve_oauth_mcp(
                         mcp_name, cred_schema, user_sub, task_scope,
-                        agent_name=agent_name,
+                        agent_name=agent_name, cli_credentials=result.cli_credentials,
                     )
                 except AccountNeedsReconnect as needs:
                     result.excluded_mcps.add(mcp_name)
@@ -238,11 +247,12 @@ def resolve_credentials(
                     result.env_vars.update(oauth_env)
                     result.env_by_mcp[mcp_name] = oauth_env
                     # OAuth env = credentials_dir PATHS (kept in the flat env) +
-                    # env_injection (GH_TOKEN/GIT_CONFIG_*, bash-only) +
-                    # mcp_env_injection (the MCP subprocess's own token env,
-                    # e.g. notion NOTION_TOKEN). Paths/bash-injection aren't
-                    # pure secrets; mcp_env_injection IS — secret_keys → broker
-                    # bundle only, never config files or the bash env.
+                    # the git helper entries (GIT_CONFIG_*, bash-only, no
+                    # secret) + mcp_env_injection (the MCP subprocess's own
+                    # token env, e.g. notion NOTION_TOKEN). Paths and git
+                    # entries aren't secrets; mcp_env_injection IS —
+                    # secret_keys → broker bundle only, never config files or
+                    # the bash env.
                     _path_keys = {
                         ev for ev, _ in mcp_registry.get_credentials_dirs(mcp_name)
                     }
@@ -277,10 +287,23 @@ def resolve_credentials(
                         )
                 continue
 
-            env_vars = _resolve_per_user(
-                mcp_name, cred_schema, user_sub, task_scope,
-                agent_name=agent_name,
-            )
+            try:
+                env_vars = _resolve_per_user(
+                    mcp_name, cred_schema, user_sub, task_scope,
+                    agent_name=agent_name,
+                )
+            except AccountMissingFields as missing:
+                label = cred_schema.get("label", mcp_name)
+                fields = ", ".join(missing.args[0])
+                result.excluded_mcps.add(mcp_name)
+                result.exclusion_reasons[mcp_name] = (
+                    f"{label} needs {fields}, which your account does not hold yet. "
+                    f"Update the account in Settings > Integrations."
+                    if user_sub and task_scope == "user" else
+                    f"The account bound to {label} for this agent lacks {fields}; "
+                    f"its owner updates it in Settings > Integrations."
+                )
+                continue
             if env_vars is not None:
                 result.env_vars.update(env_vars)
                 result.env_by_mcp[mcp_name] = env_vars
@@ -322,9 +345,34 @@ def _resolve_infra(
     db_creds = credential_store.get_infra_credentials(mcp_name)
     if db_creds:
         return db_creds
-    if not cred_type_info.get("fields"):
-        return {}  # No credentials needed
+    if not required_field_keys(cred_type_info):
+        return {}  # No credentials needed (none declared, or every one optional)
     return None
+
+
+class AccountMissingFields(Exception):
+    """A bound account holds no value for a field the manifest requires (a
+    field added as required after the account was saved). ``args[0]`` is the
+    list of the missing fields' labels."""
+
+
+def required_field_keys(cred_type_info: dict) -> list[str]:
+    """The ``credentials.fields`` keys a saved account must hold: every field
+    but one declaring ``"required": false`` (JSON false only; a missing key
+    or any other value reads required)."""
+    return [
+        f["key"] for f in cred_type_info.get("fields", [])
+        if isinstance(f, dict) and f.get("key") and f.get("required") is not False
+    ]
+
+
+def missing_required_labels(cred_type_info: dict, creds: dict) -> list[str]:
+    """The labels of the required fields ``creds`` holds no value for."""
+    keys = set(required_field_keys(cred_type_info))
+    return [
+        str(f.get("label") or f["key"]) for f in cred_type_info.get("fields", [])
+        if isinstance(f, dict) and f.get("key") in keys and f["key"] not in creds
+    ]
 
 
 def _resolve_per_user(
@@ -340,9 +388,10 @@ def _resolve_per_user(
     session's scope (per-agent binding > none). User scope reads the caller's
     ``user_credentials``; agent scope reads the bound user's
     ``user_credentials`` (the binding's ``account_owner_sub``) — both keyed by
-    ``account_label``.
+    ``account_label``. A field declaring ``"required": false`` may be left
+    unset; an account lacking a required one raises ``AccountMissingFields``
+    so the session says which.
     """
-    required_keys = [f["key"] for f in cred_type_info.get("fields", [])]
 
     if user_sub and task_scope == "user":
         if agent_name:
@@ -368,16 +417,19 @@ def _resolve_per_user(
             ref.owner_sub, mcp_name, ref.label,
         )
 
-    if required_keys and not all(k in creds for k in required_keys):
-        return None
+    missing = missing_required_labels(cred_type_info, creds)
+    if missing:
+        raise AccountMissingFields(missing)
 
-    # Merge server config defaults from mcp_config_values (e.g. email SMTP/IMAP).
-    # User credentials override these defaults. `_`-prefixed keys are internal
-    # control state (`_hosted_service_mode`, `_managed_instance_deleted`) and
-    # MUST NOT leak into the MCP subprocess env.
-    config_vals = mcp_store.get_mcp_config_values(mcp_name)
+    # Merge the server config (e.g. email SMTP/IMAP): the admin's saved value,
+    # else the manifest's default. The person's own values override both.
+    # `_`-prefixed keys are internal control state (`_hosted_service_mode`,
+    # `_managed_instance_deleted`) and never reach the MCP subprocess env.
+    from services.mcp import mcp_registry
+    config_vals = mcp_registry.effective_config(
+        mcp_registry.get_manifest(mcp_name), mcp_store.get_mcp_config_values(mcp_name))
     if config_vals:
-        merged = {k: v for k, v in config_vals.items() if not k.startswith("_")}
+        merged = dict(config_vals)
         merged.update(creds)
         return merged if merged else None
 
@@ -390,6 +442,7 @@ def _resolve_oauth_mcp(
     user_sub: str | None,
     task_scope: str,
     agent_name: str = "",
+    cli_credentials: dict | None = None,
 ) -> dict[str, str] | None:
     """Resolve OAuth-based MCP credentials by checking token file existence.
 
@@ -402,6 +455,11 @@ def _resolve_oauth_mcp(
     the answer carries the sandbox-virtual path of that directory; the
     bound account's token file reaches the MCP through the session's
     delivery route, never through the agent tree.
+
+    A manifest that names a ``git_credential_helper`` host gets the git
+    entries that point the shell at the platform's helper and, when
+    ``cli_credentials`` is given, a ``CliCredential`` recorded under the MCP
+    name: the token by reference, fetched per command, never in the answer.
     """
     from services.mcp import mcp_registry
     from services.oauth import oauth_account_store
@@ -453,42 +511,37 @@ def _resolve_oauth_mcp(
         )
         raise AccountNeedsReconnect(dead)
 
-    # `env_injection` (manifest opt-in): expose the bound account's
-    # canonical access_token via the declared env var names so CLIs
-    # inside the agent's bash sandbox (`git`, `gh`, `aws`, ...) can
-    # authenticate without the user logging in a second time. Works for
-    # bearer-required AND stdio MCPs — the env vars sit alongside any
-    # credentials_dir paths the manifest also declares.
+    # The command-line delivery (manifest opt-in, github →
+    # ``git_credential_helper: {host: "github.com", helper: …}`` beside
+    # ``env_injection: ["GH_TOKEN", "GITHUB_TOKEN"]``): the shell's ``git``
+    # is pointed at the platform's credential helper for the host through
+    # git's env-config (``GIT_CONFIG_*``, git ≥ 2.31, session-scoped, no
+    # ``~/.gitconfig`` mutation), and the ``gh`` wrapper sets the declared
+    # names on the real command's own process. The token itself is fetched
+    # per command from the broker (``core/credentials/mcp_gateway.CliCredential``,
+    # ``/v1/hooks/cli-credential``) and is never placed in the session's
+    # environment. The manifest's own ``helper`` string is accepted and not
+    # read for a session: the platform supplies the helper for the host (an
+    # app step script, which runs with no helper beside it, takes the
+    # manifest's entries: ``services/apps/app_steps.credential_env_for``). The git
+    # *identity* (user.name/email) is deliberately NOT injected — it stays a
+    # plain, overridable `git config` the agent sets from its account per
+    # the github-mcp skill, so the user can change it freely.
     env_injection_vars: dict[str, str] = {}
     _oauth = manifest.credentials.oauth
-    injection_names = _oauth.get("env_injection") or []
-    # `mcp_env_injection` (manifest opt-in): expose the same canonical
+    injection_names = [str(n) for n in (_oauth.get("env_injection") or [])]
+    # `mcp_env_injection` (manifest opt-in): expose the canonical
     # access_token via env vars destined for the MCP SERVER subprocess —
     # for stdio MCPs whose upstream reads its token from env (the official
-    # notion server's NOTION_TOKEN). Unlike env_injection (bash env), these
-    # are PURE secrets: the caller adds them to `secret_keys` so they're
-    # stripped from config files and delivered only via the broker bundle.
+    # notion server's NOTION_TOKEN). These are PURE secrets: the caller adds
+    # them to `secret_keys` so they're stripped from config files and
+    # delivered only via the broker bundle.
     mcp_env_names = _oauth.get("mcp_env_injection") or []
     mcp_env_vars: dict[str, str] = {}
-    # `git_credential_helper` (manifest opt-in, github →
-    # ``{host:"github.com", helper:"!gh auth git-credential"}``): wire `git
-    # push`/`clone` to authenticate NON-INTERACTIVELY from the injected
-    # ``GH_TOKEN`` via git's env-config (``GIT_CONFIG_*``, git ≥2.31) —
-    # session-scoped, NO token in config (the CLI supplies it live), NO
-    # ``~/.gitconfig`` mutation. EXACTLY what ``gh auth setup-git`` writes: an
-    # empty ``helper`` first to RESET the list, then ``!gh auth git-credential``.
-    # The reset is LOAD-BEARING on Windows satellites: Git for Windows ships
-    # ``credential.helper=manager`` (Git Credential Manager) in its SYSTEM
-    # gitconfig, tried FIRST, which pops an INTERACTIVE browser/app auth — fine
-    # on a desktop but HANGS on a headless sandbox. Clearing it makes our token
-    # helper the only one. (It also clears the proxy-host
-    # ``oto-git-credential-helper`` — harmless: ``gh`` is at /usr/bin/gh, mounted
-    # into the bwrap, and authed by the same ``GH_TOKEN``.) The git *identity*
-    # (user.name/email) is deliberately NOT injected — it stays a plain,
-    # overridable `git config` the agent sets from its account per the github-mcp
-    # skill, so the user can change it freely.
     git_cred_helper = _oauth.get("git_credential_helper") or {}
-    if injection_names or git_cred_helper or mcp_env_names:
+    git_host = (str(git_cred_helper.get("host") or "").strip().lower()
+                if isinstance(git_cred_helper, dict) else "")
+    if git_host or mcp_env_names:
         token_data = oauth_account_store.read_account_token(
             source_dir, account_label,
         ) or {}
@@ -496,30 +549,23 @@ def _resolve_oauth_mcp(
         if not access_token:
             logger.warning(
                 "oauth resolve %s: bound account '%s' token file holds no "
-                "canonical access_token — declared env (%s) NOT injected",
+                "canonical access_token — declared delivery (%s) NOT made",
                 mcp_name, account_label,
-                ",".join(injection_names + mcp_env_names) or "git helper",
+                ",".join(injection_names + list(mcp_env_names)) or "git helper",
             )
-        if injection_names and access_token:
-            for env_name in injection_names:
-                env_injection_vars[env_name] = access_token
         if mcp_env_names and access_token:
             for env_name in mcp_env_names:
                 mcp_env_vars[env_name] = access_token
-        if (
-            isinstance(git_cred_helper, dict)
-            and git_cred_helper.get("host")
-            and git_cred_helper.get("helper")
-        ):
-            _ch_key = f"credential.https://{git_cred_helper['host']}.helper"
-            env_injection_vars["GIT_CONFIG_COUNT"] = "2"
-            # Entry 0: empty value RESETS the helper list — drops interactive
-            # helpers (Windows GCM) read from earlier/lower-precedence config.
-            env_injection_vars["GIT_CONFIG_KEY_0"] = _ch_key
-            env_injection_vars["GIT_CONFIG_VALUE_0"] = ""
-            # Entry 1: our non-interactive token helper, now the ONLY one.
-            env_injection_vars["GIT_CONFIG_KEY_1"] = _ch_key
-            env_injection_vars["GIT_CONFIG_VALUE_1"] = str(git_cred_helper["helper"])
+        if git_host and access_token:
+            env_injection_vars.update(git_helper_env(git_host))
+            if cli_credentials is not None:
+                from core.credentials.mcp_gateway import CliCredential, TokenRef
+                cli_credentials[mcp_name] = CliCredential(
+                    host=git_host,
+                    token_ref=TokenRef(str(source_dir), account_label),
+                    env_names=tuple(injection_names),
+                    manifest=mcp_name,
+                )
 
     # Bearer-injected MCPs (slack, github, linear, notion) have no
     # `credentials_dir` path_env — their token reaches the MCP through the
@@ -607,6 +653,70 @@ def purge_agent_tree_credentials() -> int:
         logger.info("credentials: removed %d agent-tree .credentials dir(s) left by "
                     "earlier releases", removed)
     return removed
+
+
+# The helper every session's git asks for a credential: the two variables
+# are set by each spawn path (the sandbox's env overrides, the satellite's
+# session env) and expand through the shell git runs a ``!`` helper with.
+# ``credential_helper.py`` is one of ``session_config_dir.HOOK_SCRIPTS``.
+PLATFORM_GIT_HELPER = '!"$OTO_HOOK_PY" -I "$OTO_HOOKS_DIR/credential_helper.py" git'
+
+
+def git_helper_env(host: str, helper: str = PLATFORM_GIT_HELPER) -> dict[str, str]:
+    """Git's env-config entries that make ``helper`` the only credential
+    helper for ``https://<host>``: an empty value first resets the list
+    read from every config file (Git Credential Manager on a Windows
+    satellite, which would prompt; the host's own helper), then ours."""
+    key = f"credential.https://{host}.helper"
+    return {
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": key, "GIT_CONFIG_VALUE_1": helper,
+    }
+
+
+def cli_token_env(
+    agent_name: str, user_sub: str | None, *, task_scope: str, providers: list[str],
+) -> dict[str, str]:
+    """The self-contained command-line delivery an app step's script gets
+    for the providers the app requires: the manifest's ``env_injection``
+    names set to the bound account's current token, and the git entries
+    naming the manifest's own helper (``gh auth git-credential``, which
+    reads that environment). A step has no broker helper beside it; the
+    session path never produces this shape. Only the MCPs enabled on the
+    local placement count, where a step runs: a provider whose MCP is
+    enabled on a paired machine alone gives a step nothing. Synchronous."""
+    from core import placement
+    from services.mcp import mcp_registry
+    from services.oauth import oauth_account_store
+    out: dict[str, str] = {}
+    for m in (mcp_registry.get_agent_mcps(agent_name, placement=placement.LOCAL_PLACEMENT) or []):
+        oauth = (getattr(getattr(m, "credentials", None), "oauth", None) or {})
+        provider_id = str(oauth.get("provider_id") or "")
+        if not provider_id or provider_id not in providers:
+            continue
+        names = [str(n) for n in (oauth.get("env_injection") or [])]
+        helper = oauth.get("git_credential_helper") or {}
+        if not names and not helper:
+            continue
+        picked = _bound_token_source(
+            m.name, provider_id, user_sub=user_sub, task_scope=task_scope,
+            agent_name=agent_name,
+        )
+        if picked is None:
+            continue
+        source_dir, label, _username = picked
+        raw = oauth_account_store.read_account_token(source_dir, label) or {}
+        if account_unusable_reason(raw, m):
+            continue
+        token = oauth_account_store.get_canonical_access_token(raw)
+        if not token:
+            continue
+        for name in names:
+            out[name] = token
+        if isinstance(helper, dict) and helper.get("host") and helper.get("helper"):
+            out.update(git_helper_env(str(helper["host"]).strip().lower(), str(helper["helper"])))
+    return out
 
 
 def _bound_token_source(

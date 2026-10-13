@@ -176,9 +176,10 @@ def _app_shape(data):
     return data
 
 
-def _start(rig, services=("read", "write"), label=""):
+def _start(rig, services=("read", "write"), label="", mobile=False):
     return rig.client.post(f"/v1/oauth/{PROVIDER}/start",
-                           json={"mcp_name": MCP, "services": list(services), "account_label": label})
+                           json={"mcp_name": MCP, "services": list(services), "account_label": label,
+                                 "mobile": mobile})
 
 
 def _params(url):
@@ -339,7 +340,7 @@ class TestCallback:
         # the state was consumed: a replay of the same callback is refused
         again = rig.client.get(f"/v1/oauth/{PROVIDER}/callback",
                                params={"code": "c-1", "state": q["state"], "iss": ISSUER})
-        assert "Token exchange failed" in again.text and len(rig.posted["token"]) == 1
+        assert "expired or was already used" in again.text and len(rig.posted["token"]) == 1
 
     def test_typed_label_wins(self, rig):
         q = self._consent(rig, label="Work")
@@ -385,12 +386,12 @@ class TestCallback:
         assert "Account Connected" in ok.text
 
     def test_the_mobile_exchange_carries_iss_and_reflects_no_vendor_text(self, rig):
-        q = self._consent(rig)
+        q = self._consent(rig, mobile=True)
         resp = rig.client.post(f"/v1/oauth/{PROVIDER}/exchange",
                                json={"code": "c", "state": q["state"], "iss": "https://evil.example"})
         assert resp.status_code == 400 and resp.json()["detail"] == "Token exchange failed (RuntimeError)"
         assert rig.posted["token"] == []
-        q = self._consent(rig)
+        q = self._consent(rig, mobile=True)
         rig.vendor.routes[("POST", TOKEN)] = (400, {"error": "invalid_grant", "error_description": "secret vendor words"}, {})
         resp = rig.client.post(f"/v1/oauth/{PROVIDER}/exchange",
                                json={"code": "c", "state": q["state"], "iss": ISSUER})
@@ -486,7 +487,10 @@ class TestCallback:
 
 
 class TestDisconnect:
-    def test_revokes_at_the_issuer_and_deletes(self, rig):
+    def test_revokes_at_the_issuer_and_deletes(self, rig, monkeypatch):
+        from core.remote import mcp_gateway_push
+        ticks: list = []
+        monkeypatch.setattr(mcp_gateway_push, "tick_soon", lambda: ticks.append(1))
         q = _params(_start(rig).json()["url"])
         rig.client.get(f"/v1/oauth/{PROVIDER}/callback", params={"code": "c", "state": q["state"], "iss": ISSUER})
         resp = rig.client.post(f"/v1/oauth/{PROVIDER}/disconnect", json={"mcp_name": MCP, "account_label": "ws-1"})
@@ -494,6 +498,8 @@ class TestDisconnect:
         assert rig.posted["revoke"][0]["token"] == "RT-1" and rig.posted["revoke"][0]["client_id"] == "cid-live"
         assert not (rig.token_dir() / "ws-1.json").exists()
         assert credential_store.list_user_accounts(rig.sub, MCP) == []
+        # a paired machine holding the token under a lease is told at once
+        assert ticks == [1]
 
     def test_bad_label_is_a_400(self, rig):
         resp = rig.client.post(f"/v1/oauth/{PROVIDER}/disconnect", json={"mcp_name": MCP, "account_label": "../x"})

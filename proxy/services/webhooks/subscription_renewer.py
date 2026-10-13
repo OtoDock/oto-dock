@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from services.webhooks import subscription_manager
 from storage.automation import webhook_subscription_store
 
-logger = logging.getLogger("claude-proxy.subscription-renewer")
+logger = logging.getLogger("otodock.subscription-renewer")
 
 # Cadence of the loop. Sized to MS Graph's 3-day TTL with 24h lead time —
 # 5 min cadence = 288 wake-ups per 24h, plenty of opportunities to renew.

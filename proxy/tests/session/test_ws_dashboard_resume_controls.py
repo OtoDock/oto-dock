@@ -127,6 +127,8 @@ class TestResumeValidation:
             async with dashboard_connection(manager) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": call})
+                # The call's view is announced, then its history, nothing else.
+                await ws.expect({"type": "chat_view_only", "chat_id": call, "kind": "phone"})
                 frame = await ws.next_frame()
                 assert (frame["type"], frame["chat_id"]) == ("chat_history", call), frame
                 await asyncio.sleep(0.2)
@@ -381,9 +383,11 @@ class TestByIdFramesFollowTheOpenRule:
         (ack,) = [f for f in conn.sent if f.get("type") == "artifact_ack"]
         assert ack["status"] == "denied" and "editor role" in ack["reason"]
 
-    def test_a_new_shared_chat_row_carries_no_picks_below_editor(self, temp_db, monkeypatch):
-        """The warm-up that mints a Shared-only chat for a
-        caller below the editor tier writes the row with no picks of theirs."""
+    def test_a_send_below_editor_on_a_shared_agent_writes_no_chat(self, temp_db, monkeypatch):
+        """The first send of a new Shared-only chat by a caller below the
+        editor tier is refused before the chat is minted: the frame carries
+        the role sentence and no chat id, and the agent's one history holds
+        no row of theirs (no chat, no prompt)."""
         from core.session.visibility import shared_chat_owner
         from storage import database as task_store
         layer = FakeExecutionLayer()
@@ -392,23 +396,30 @@ class TestByIdFramesFollowTheOpenRule:
         task_store.add_user_agent("user-viewer", slug, "contributor", "test")
         contributor = session_cookie(sub="user-viewer", email="viewer@test.com",
                                      name="Viewer User", role="member")
+        frames: list[dict] = []
 
         async def scenario():
             async with dashboard_connection(contributor) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "warmup", "agent": slug, "permission_mode": "dontAsk",
                                 "model": TEST_MODEL, "execution_mode": "interactive",
-                                "text": "hello"})
+                                "text": "my private question"})
                 ws.client_send({"type": "ping"})
                 for _ in range(60):
-                    if (await ws.next_frame()).get("type") == "pong":
+                    frame = await ws.next_frame()
+                    frames.append(frame)
+                    if frame.get("type") == "pong":
                         break
         run_ws_scenario(scenario)
-        rows = [c for c in task_store.list_chats(shared_chat_owner(slug))]
-        assert rows, "the warm-up minted no chat"
-        for row in rows:
-            assert row["permission_mode"] == "default"
-            assert not (row.get("model") or "") and not (row.get("execution_mode") or "")
+        (failed,) = [f for f in frames if f.get("type") == "warmup_failed"]
+        assert failed["reason"] == "below_editor" and "editor role" in failed["error"]
+        assert "chat_id" not in failed
+        assert not any(f.get("type") == "warmup_started" for f in frames)
+        assert task_store.list_chats(shared_chat_owner(slug)) == []
+        from storage.pg import get_conn
+        with get_conn() as conn:
+            assert conn.execute("SELECT count(*) AS n FROM chat_messages "
+                                "WHERE content = 'my private question'").fetchone()["n"] == 0
 
     def test_below_editor_never_takes_over_or_answers_for_a_shared_pool_chat(
             self, temp_db, monkeypatch):
@@ -1576,15 +1587,29 @@ class TestStreamingTurnControls:
 
                 from core.session import session_events
                 t0 = time.monotonic()
+                # The abort flag is on the row BEFORE the layer's abort: a
+                # hard kill can end the pump before the handler resumes, and
+                # whatever reads the row then must see the Stop.
+                flag_at_abort: list[bool] = []
+                real_abort = layer.abort
+
+                async def _abort(aborted_sid):
+                    flag_at_abort.append(bool(temp_db.get_chat(chat_id)["last_turn_aborted"]))
+                    return await real_abort(aborted_sid)
+
+                layer.abort = _abort
                 ws.client_send({"type": "abort"})
                 await ws.expect({"type": "aborted", "chat_id": chat_id})
                 assert layer.aborted == [sid]
+                assert flag_at_abort == [True]
                 chat = temp_db.get_chat(chat_id)
                 assert chat["last_turn_aborted"] is True
                 assert chat["last_abort_graceful"] is True
                 # The graceful turn still ends with its DONE: Stop is noted
-                # so no check judges it and starts a fix round.
+                # so no check judges it and starts a fix round, and a task
+                # turn's settle and review read it as the person's Stop.
                 assert session_events.user_message_since(sid, t0)
+                assert session_events.stopped_since(sid, t0)
 
                 # The engine closes the interrupted turn; the SURVIVING
                 # producer/pump persists the partial text.
@@ -2315,10 +2340,22 @@ class TestPhoneChatReadOnly:
             async with dashboard_connection(cookie) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": cid})
+                # The viewer is told the chat is a call's before the history,
+                # then the history and nothing else: no warmup_ready binds
+                # this socket to the call's live session.
+                await ws.expect({"type": "chat_view_only", "chat_id": cid, "kind": "phone"})
                 frame = await ws.next_frame()
                 assert (frame["type"], frame["chat_id"]) == ("chat_history", cid), frame
-                # The history and nothing else: no warmup_ready binds this
-                # socket to the call's live session.
+                await asyncio.sleep(0.2)
+                ws.no_more_frames()
+                # The pump poll's delta resumes (a client that takes deltas)
+                # repeat the view-only frame: the page that placed the call
+                # may have missed the full resume's.
+                ws.client_send({"type": "client_info", "platform": "web", "history_deltas": True})
+                ws.client_send({"type": "resume_chat", "chat_id": cid, "delta": True})
+                await ws.expect({"type": "chat_view_only", "chat_id": cid, "kind": "phone"})
+                frame = await ws.next_frame()
+                assert (frame["type"], frame["chat_id"]) == ("chat_history_delta", cid), frame
                 await asyncio.sleep(0.2)
                 ws.no_more_frames()
                 ws.client_send({"type": "chat", "text": "manager typed this", "chat_id": cid})

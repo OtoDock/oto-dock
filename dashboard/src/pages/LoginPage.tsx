@@ -5,7 +5,7 @@ import { type AuthConfig, localLogin, verify2FA, startOidcLogin, forgotPassword 
 import { passkeyLogin, passkeySecondFactor, passkeySupported, startNativeHandoff } from '../api/webauthn'
 import { TurnstileWidget, type TurnstileHandle } from '../components/TurnstileWidget'
 import { useBuildWatch } from '../hooks/useBuildWatch'
-import { callNative, hasNativeBridge, openNativeBrowser } from '../lib/nativeBridge'
+import { callNative, hasNativeBridge, inAppShell, openNativeBrowser, openPrivacyPolicy } from '../lib/nativeBridge'
 
 interface LoginPageProps {
   authConfig: AuthConfig
@@ -45,6 +45,15 @@ function Shell({ children }: { children: React.ReactNode }) {
         </div>
         <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs">
           {children}
+          {/* The stores require a link to the privacy policy on every screen a
+              person meets before signing in (the sign-in, the reset, the
+              second factor); the web dashboard links nothing. */}
+          {inAppShell() && (
+            <button type="button" onClick={openPrivacyPolicy}
+              className="mt-4 w-full text-xs text-p-text-light underline hover:text-p-text">
+              Privacy policy
+            </button>
+          )}
         </div>
       </div>
     </div>

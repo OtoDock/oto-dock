@@ -13,7 +13,22 @@ name: release-images
 #   branch rc/<X>-rcN   → <X>-rcN only (a rehearsal of this pipeline before
 #                         the tag, driven by the maintainers' release tooling;
 #                         no compose file points at an rc tag)
-#   dispatch on main    → <X> and latest, as a tag push would
+#   dispatch on main    → <X> and latest, as a tag push would; a dispatch
+#                         from any other branch is refused. Its attestation
+#                         names refs/heads/main, which the verify SECURITY.md
+#                         documents (refs/tags/v<X>) does not accept: to
+#                         republish a release, re-run the tag's own workflow
+#                         run instead.
+#
+# TRUST: every leg builds with an SBOM and full (mode=max) provenance in the
+# image; the `boot` job starts the digest-addressed images of each
+# architecture (scripts/image-boot-check.sh) and the merge, the only job that
+# writes a tag, waits for it, so an image that does not start never gets a
+# version tag. The `attest` job then signs a build provenance attestation for
+# each tagged manifest list (the digest `docker pull <image>:<tag>` resolves),
+# pushed beside it in the registry: `gh attestation verify
+# oci://ghcr.io/otodock/<image>:<version> --repo OtoDock/oto-dock` checks it
+# (SECURITY.md). Only that job holds the OIDC token.
 #
 # ARCHITECTURES: every image publishes linux/amd64 AND linux/arm64 as a
 # manifest list, so `docker pull ghcr.io/otodock/<image>:<version>` resolves per
@@ -109,10 +124,18 @@ jobs:
           # No `tags` here: each leg pushes an untagged, digest-addressed image
           # and the merge job below tags the assembled manifest list.
           outputs: type=image,name=ghcr.io/otodock/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          # The SBOM and the provenance travel inside the image index as
+          # attestation manifests (os "unknown"); the merge keeps them.
+          sbom: true
+          provenance: mode=max
           # file-tools takes PYTHON_IMAGE only; NODE_IMAGE is inert there.
+          # OTODOCK_VERSION fills the org.opencontainers.image.version label.
           build-args: |
             PYTHON_IMAGE=${{ steps.meta.outputs.python_image }}
             NODE_IMAGE=${{ steps.meta.outputs.node_image }}
+            OTODOCK_VERSION=${{ steps.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           # Registry cache, keyed per image AND platform. GHCR has no size cap,
           # unlike the 10 GB/repo GitHub Actions cache these images would thrash
           # (the proxy layer set alone is ~3.7 GB uncompressed).
@@ -133,12 +156,60 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    # Assemble one manifest list per image from the per-platform digests and
-    # apply the release tags. A failed build leg skips this job (no
-    # `if: always()`), so a half-built release never gets a tag.
+  boot:
+    # Start the images each platform built, by digest, before any tag exists:
+    # a Postgres, the proxy until /health answers (its first boot builds the
+    # bundled MCP venvs), the phone service against that proxy, the file tools
+    # (scripts/image-boot-check.sh). Each architecture boots on its own native
+    # runner, as it was built.
     if: github.repository == 'OtoDock/oto-dock'
     needs: [build]
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Sanitise the platform for use in file names
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+
+      - name: Download this platform's digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*-${{ env.PLATFORM_PAIR }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Boot the images
+        env:
+          DIGESTS: ${{ runner.temp }}/digests
+        run: |
+          ref() {
+            local d
+            d="$(ls "$DIGESTS/digests-$1-$PLATFORM_PAIR")"
+            echo "ghcr.io/otodock/$1@sha256:$d"
+          }
+          bash scripts/image-boot-check.sh "$(ref otodock-proxy)" "$(ref otodock-file-tools)" "$(ref otodock-phone)"
+
+  merge:
+    # Assemble one manifest list per image from the per-platform digests and
+    # apply the release tags. A failed build leg or boot skips this job (no
+    # `if: always()`), so a half-built or unbootable release never gets a tag.
+    if: github.repository == 'OtoDock/oto-dock'
+    needs: [build, boot]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -182,12 +253,15 @@ jobs:
                 *) echo "::error::branch $REF_NAME does not match OTODOCK_VERSION=$version (expected rc/$version-rcN)"; exit 1 ;;
               esac
               tags="$rc" ;;
-            *)
+            branch/main)
               tags="$version latest" ;;
+            *)
+              echo "::error::$REF_TYPE $REF_NAME: images publish from a v* tag, an rc/* branch or a dispatch on main"; exit 1 ;;
           esac
           {
             echo "tags=$tags"
             echo "primary=${tags%% *}"
+            echo "version=$version"
           } >> "$GITHUB_OUTPUT"
           echo "::notice::${{ matrix.image }} → $tags"
 
@@ -213,7 +287,13 @@ jobs:
           for d in *; do refs+=("${image}@sha256:${d}"); done
           tag_args=()
           for t in $TAGS; do tag_args+=(-t "${image}:${t}"); done
-          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
+          docker buildx imagetools create "${tag_args[@]}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.version=${{ steps.meta.outputs.version }}" \
+            --annotation "index:org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "index:org.opencontainers.image.licenses=FSL-1.1-ALv2" \
+            --annotation "index:org.opencontainers.image.description=OtoDock ${{ matrix.image }}, linux/amd64 and linux/arm64" \
+            "${refs[@]}"
 
       - name: Verify both architectures
         # The list also carries buildx's provenance attestations (os "unknown"),
@@ -225,3 +305,61 @@ jobs:
             | jq -e '[.manifests[]?.platform | select(.os != "unknown") | "\(.os)/\(.architecture)"]
                      | index("linux/amd64") != null and index("linux/arm64") != null' >/dev/null \
             || { echo "::error::$image lacks linux/amd64 or linux/arm64"; exit 1; }
+
+      - name: Record the manifest list's digest
+        # The digest a pull of the tag resolves: the index, never a platform
+        # manifest. The attestation is made for this one.
+        run: |
+          mkdir -p "${{ runner.temp }}/list"
+          docker buildx imagetools inspect "ghcr.io/otodock/${{ matrix.image }}:${{ steps.meta.outputs.primary }}" \
+            --format '{{json .Manifest}}' | jq -r .digest > "${{ runner.temp }}/list/${{ matrix.image }}"
+          grep -qE '^sha256:[0-9a-f]{64}$' "${{ runner.temp }}/list/${{ matrix.image }}"
+
+      - name: Upload the list digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: list-${{ matrix.image }}
+          path: ${{ runner.temp }}/list/${{ matrix.image }}
+          if-no-files-found: error
+          retention-days: 1
+
+  attest:
+    # A build provenance attestation per manifest list, signed with this
+    # workflow's OIDC identity and pushed to the registry beside the image.
+    if: github.repository == 'OtoDock/oto-dock'
+    needs: [merge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [otodock-proxy, otodock-file-tools, otodock-phone]
+    steps:
+      - name: Download the list digest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: list-${{ matrix.image }}
+          path: ${{ runner.temp }}/list
+
+      - name: Read the digest
+        id: list
+        run: echo "digest=$(cat "${{ runner.temp }}/list/${{ matrix.image }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/otodock/${{ matrix.image }}
+          subject-digest: ${{ steps.list.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false

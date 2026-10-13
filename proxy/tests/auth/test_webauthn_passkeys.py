@@ -465,6 +465,30 @@ def test_second_factor_mode_gates_passwordless_and_runs_step_flow(monkeypatch):
                        json={"totp_session_token": step}).status_code == 401
 
 
+def test_a_held_step_token_refuses_the_passkey_verify_and_keeps_the_challenge(monkeypatch):
+    """While another request holds the step token the verify answers 409
+    before it pops the challenge, so the ceremony completes once the holder
+    gives the token back."""
+    from auth import totp as totp_mod
+    sub = _mk_user()
+    cred_id = _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    db.set_platform_setting("passkey_login_mode", "second_factor")
+    clear_rate_limit("login", "testclient")
+    step = client.post("/auth/login/local",
+                       json={"email": _EMAIL, "password": _PW}).json()["totp_session_token"]
+    state = client.post("/auth/passkey/options", json={"totp_session_token": step}).json()["state"]
+    monkeypatch.setattr(wa, "verify_authentication_response",
+                        lambda **kw: SimpleNamespace(new_sign_count=2))
+    body = {"state": state, "credential": {"id": cred_id}, "totp_session_token": step}
+    held = totp_mod.reserve_2fa_session_token(step)
+    assert client.post("/auth/passkey/verify", json=body).status_code == 409
+    totp_mod.release_2fa_session_token(held)
+    resp = client.post("/auth/passkey/verify", json=body)
+    assert resp.status_code == 200 and "session" in resp.cookies
+    assert not totp_mod._reserved_jtis
+
+
 def test_step_token_binds_the_user(monkeypatch):
     """A step token for user A must not complete with user B's credential."""
     from auth.password import hash_password as _hp

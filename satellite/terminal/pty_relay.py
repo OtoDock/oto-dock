@@ -49,6 +49,8 @@ import termios
 from collections import deque
 from typing import Awaitable, Callable, Optional, Sequence
 
+from .._vendored.terminal_queries import PasteModeTracker
+
 logger = logging.getLogger("claude-proxy.pty_relay")
 
 DEFAULT_SCROLLBACK_BYTES = 256 * 1024
@@ -96,6 +98,7 @@ class PtyProcess:
         self._scrollback_limit = scrollback_limit
         self._scrollback: "deque[bytes]" = deque()
         self._scrollback_len = 0
+        self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
         self._closed = False
         # The output reader is a TASK (not a fire-and-forget add_reader
@@ -167,14 +170,19 @@ class PtyProcess:
                 self._loop.remove_reader(self.master_fd)
 
     def _remember(self, data: bytes) -> None:
+        self._paste_mode.feed(data)
         self._scrollback.append(data)
         self._scrollback_len += len(data)
         while self._scrollback_len > self._scrollback_limit and self._scrollback:
             self._scrollback_len -= len(self._scrollback.popleft())
+            self._paste_mode.trimmed = True
 
     def scrollback(self) -> bytes:
-        """Recent rendered output, for replay to a reconnecting viewer."""
-        return b"".join(self._scrollback)
+        """Recent rendered output, for replay to a reconnecting viewer. Once the ring has dropped the
+        program's bracketed-paste toggle, the mode it holds comes first
+        (``terminal_queries.PasteModeTracker``): an attaching terminal would
+        otherwise paste unbracketed and the TUI submit the first line."""
+        return self._paste_mode.replay_prefix() + b"".join(self._scrollback)
 
     def inject_output(self, data: bytes) -> None:
         """Feed satellite-authored bytes into the output stream as if the child

@@ -20,7 +20,7 @@ from pathlib import Path
 
 from core.sandbox import session_config_dir as scd
 
-logger = logging.getLogger("claude-proxy.sandbox")
+logger = logging.getLogger("otodock.sandbox")
 
 
 def build_hooks(sandbox_codex_dir: str) -> dict:
@@ -38,12 +38,12 @@ def build_hooks(sandbox_codex_dir: str) -> dict:
     there) — so the provider-agnostic scripts run unchanged and one
     ``decide_tool_permission`` / ``session_events`` authority serves every
     surface. Runs for INTERACTIVE Codex sessions (``[features] hooks = true``
-    + ``--dangerously-bypass-hook-trust``) and for UNATTENDED app-server
-    sessions (the kinds ``session_kind.attended()`` refuses — trusted per thread via
-    ``thread/start.config``; ``session.py``); dashboard app-server chats
-    leave it dormant and gate via the JSON-RPC approval bridge (a Codex
-    PreToolUse hook cannot ask a person, and the stream already carries
-    turn/completed). Empty matcher = all tools.
+    + ``--dangerously-bypass-hook-trust``) and for every app-server thread
+    (trusted per thread via ``thread/start.config``; ``session.py``): an
+    unattended session's gate judges every call, a dashboard chat's only the
+    turns Codex runs under ``never`` (Don't Ask, auto), while the JSON-RPC
+    approval bridge asks the person in the others (a Codex PreToolUse hook
+    cannot say "ask"). Empty matcher = all tools.
     """
     gate = f"{sandbox_codex_dir}/permission_gate.py"
     forwarder = f"{sandbox_codex_dir}/tool_result_forwarder.py"
@@ -56,12 +56,14 @@ def build_hooks(sandbox_codex_dir: str) -> dict:
             "hooks": [{"type": "command", "command": command, "timeout": timeout}],
         }]
 
+    # The interpreter by its resolved path, as Claude's settings name it.
+    py = scd.sandbox_python()
     return {
         "hooks": {
-            "PreToolUse": _hook(f'python3 -I "{gate}"', scd.LONG_HOOK_TIMEOUT_S),
-            "PostToolUse": _hook(f'python3 -I "{forwarder}"', 10),
-            "SubagentStop": _hook(f'python3 -I "{subagent}"', 10),
-            "Stop": _hook(f'python3 -I "{stop}"', scd.STOP_HOOK_TIMEOUT_S),
+            "PreToolUse": _hook(f'{py} -I "{gate}"', scd.LONG_HOOK_TIMEOUT_S),
+            "PostToolUse": _hook(f'{py} -I "{forwarder}"', 10),
+            "SubagentStop": _hook(f'{py} -I "{subagent}"', 10),
+            "Stop": _hook(f'{py} -I "{stop}"', scd.STOP_HOOK_TIMEOUT_S),
         },
     }
 
@@ -81,8 +83,8 @@ def ensure_persistent_codex_dir(
     codex_dir, sandbox_codex_dir = scd.scope_config_dir(
         agent_name, ".codex", username=username, scope=scope, external_home=external_home,
     )
-    scd.write_no_follow(codex_dir / "hooks.json",
-                        (json.dumps(build_hooks(sandbox_codex_dir), indent=2) + "\n").encode())
+    scd.write_if_changed(codex_dir / "hooks.json",
+                         (json.dumps(build_hooks(sandbox_codex_dir), indent=2) + "\n").encode())
     scd.install_hook_scripts(codex_dir)
 
     # Fail-soft; see skills_materializer for the full protocol.

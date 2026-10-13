@@ -56,6 +56,34 @@ async def test_conversations_gate_allows_manager_and_admin(monkeypatch):
     assert res2["total"] == 1
 
 
+@pytest.mark.asyncio
+async def test_an_agent_scope_session_lists_neither_conversations_nor_the_roster(monkeypatch):
+    """A task run's or a call's session token names no person and carries
+    no per-agent role: the conversations list refuses it before its manager
+    check, and the roster's manager check refuses it as it always did. A
+    person's own session token still lists the conversations."""
+    from api.agents import discovery
+    from storage import database as task_store
+    monkeypatch.setattr(task_store, "get_agent_conversations", lambda *a, **k: [{"id": "c1"}])
+    monkeypatch.setattr(task_store, "count_agent_conversations", lambda *a, **k: 1)
+    monkeypatch.setattr(task_store, "get_agent_users_with_profile", lambda name: [])
+    run = UserContext(sub="session:s-run", email="session@internal", name="Session Token",
+                      role="agent", is_api_key=True, session_id="s-run", agent="acme")
+    assert run.is_no_user_session and not run.can_manage_agent("acme")
+    with pytest.raises(HTTPException) as exc:
+        await agents.list_agent_conversations("acme", user=run)
+    assert exc.value.status_code == 403
+    with pytest.raises(HTTPException) as exc:
+        await discovery.list_agent_users("acme", user=run)
+    assert exc.value.status_code == 403
+
+    person = UserContext(sub="u-mgr", email="m@t.com", name="m", role="member", is_api_key=True,
+                         session_id="s-chat", agent="acme", agents=["acme"],
+                         agent_roles={"acme": "manager"})
+    assert not person.is_no_user_session
+    assert (await agents.list_agent_conversations("acme", user=person))["total"] == 1
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/chats/{id}/detail — the by-id rule the dashboard's resume shares
 # ---------------------------------------------------------------------------

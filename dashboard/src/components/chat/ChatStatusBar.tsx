@@ -142,6 +142,7 @@ const DEFAULT_MODEL_OPTIONS = [
   { value: 'claude-fable-5-1', label: 'Fable 5.1 (1M)' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5 (1M)' },
   { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (1M)' },
+  { value: 'claude-haiku-5-5', label: 'Haiku 5.5 (1M)' },
 ]
 
 // The mode and model pickers share the icon dropdown in components/ui.

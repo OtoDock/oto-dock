@@ -3,9 +3,8 @@
 Provider-agnostic **STT / TTS / VAD / turn-classifier** package for OtoDock.
 
 It is imported by the **proxy** for the chat audio surface (`/v1/audio/tts`,
-`/ws/audio/stt`, `/v1/audio/transcribe`), and by the **phone service**
-(shipping next) for its telephony call pipeline. The package is deliberately
-consumer-agnostic:
+`/ws/audio/stt`, `/v1/audio/transcribe`), and by the **phone service** for
+its telephony call pipeline. The package is deliberately consumer-agnostic:
 
 The package contains **no telephony glue and no HTTP surface** — only reusable
 provider implementations behind small ABCs.
@@ -36,8 +35,9 @@ audio/
   providers/
     registry.py       KNOWN_STT / KNOWN_TTS provider maps + build/cache
     credential_resolver.py   CredentialResolver Protocol (caller-supplied)
-    stt/  { base, deepgram, canary(stub), example_provider }
-    tts/  { base, cartesia, elevenlabs(stub), chatterbox(stub) }
+    model_succession.py   default model ids, retired ids → successors
+    stt/  { base, deepgram, elevenlabs, example_provider }
+    tts/  { base, cartesia, elevenlabs }
     vad/  { base, silero (state machine), silero_model (the ONNX session) }
     turn/ { base, smart_turn, groq, dispatcher }
   streaming/          lang.py (language registry/detect), text_chunks.py (sentence chunking), tts_stream.py (streaming-TTS orchestration)

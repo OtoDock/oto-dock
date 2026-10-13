@@ -146,6 +146,73 @@ class TestInterruptTurn:
         s.proc.returncode = 1
         assert await s.interrupt_turn() is False
 
+    @pytest.mark.asyncio
+    async def test_refuses_while_the_turn_settles(self, monkeypatch):
+        """The task turn's result was read and only the wait for background
+        work holds the stream: the frame would find nothing to interrupt, so
+        the layer's abort kills at once instead of waiting out the
+        watchdog (the 2026-10-13 finding)."""
+        s = _mk_session()
+        s._turn_active = True
+        s._settling = True
+        _persistent_sessions[s.session_id] = s
+        assert await s.interrupt_turn() is False
+        assert s.proc.stdin.lines == []
+
+        killed: list[str] = []
+
+        async def fake_kill(sid):
+            killed.append(sid)
+            return True
+
+        monkeypatch.setattr(cli_layer_mod, "interrupt_persistent_session", fake_kill)
+        assert await CLIExecutionLayer().abort(s.session_id) is False
+        assert killed == [s.session_id]
+
+    @pytest.mark.asyncio
+    async def test_the_settle_flag_ends_with_the_turn(self, _no_foreign):
+        """Off between turns: a self-wake bracket there occupies the
+        turn-active span and must still be interrupted gracefully."""
+        s = _mk_session()
+        s._settling = True
+        await _drive_result(s, {"type": "result", "subtype": "success",
+                                "is_error": False, "result": "ok"})
+        assert s._settling is False and s._turn_active is False
+
+
+# ---------------------------------------------------------------------------
+# A message to a process the proxy's own abort ended.
+# ---------------------------------------------------------------------------
+
+class TestSendAfterTheProxysKill:
+    @pytest.mark.asyncio
+    async def test_a_killed_pool_entry_answers_the_stopped_ending(self):
+        from core.events import turn_ending
+        from core.events.common_events import DONE, ERROR
+        s = _mk_session()
+        s.proc.returncode = -15
+        s._proxy_killed = True
+        _persistent_sessions[s.session_id] = s
+
+        events = [e async for e in CLIExecutionLayer()._send_turn(s.session_id, "review")]
+
+        assert [e.type for e in events] == [ERROR, DONE]
+        ending = turn_ending.from_dict(events[0].data["ending"])
+        assert ending.reason == turn_ending.STOPPED
+        assert s.session_id not in _persistent_sessions  # the dead entry is dropped
+
+    @pytest.mark.asyncio
+    async def test_a_dead_entry_the_proxy_did_not_kill_is_not_found(self):
+        from core.events.common_events import ERROR
+        s = _mk_session()
+        s.proc.returncode = 1
+        _persistent_sessions[s.session_id] = s
+
+        events = [e async for e in CLIExecutionLayer()._send_turn(s.session_id, "review")]
+
+        assert [e.type for e in events] == [ERROR]
+        assert events[0].data == {"message": "Session not found"}
+
 
 # ---------------------------------------------------------------------------
 # CLIExecutionLayer.abort — graceful-first with killpg fallback.

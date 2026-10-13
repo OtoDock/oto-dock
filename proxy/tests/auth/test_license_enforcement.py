@@ -22,6 +22,16 @@ def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
+def _tamper(token: str) -> str:
+    """``token`` with one bit of its signature flipped. Replacing its last
+    base64url characters leaves it valid about once in a thousand: they
+    carry the signature's top bits, which an Ed25519 signature leaves zero."""
+    payload, sig = token.rsplit(".", 1)
+    raw = bytearray(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)))
+    raw[0] ^= 0x01
+    return payload + "." + _b64u(bytes(raw))
+
+
 @pytest.fixture
 def signer(monkeypatch):
     """Install a test public key on the license module + return a signer."""
@@ -64,7 +74,7 @@ def test_custom_seat_count(signer):
 
 def test_tampered_key_rejected(signer):
     tok = signer("business", _days(100))
-    assert L.validate_license_key(tok[:-3] + "AAA") is None
+    assert L.validate_license_key(_tamper(tok)) is None
 
 
 def test_unknown_tier_rejected(signer):

@@ -112,6 +112,7 @@ def test_allowlist_is_small_and_exact():
         "POST /v1/hooks/tool-result",
         "POST /v1/internal/memory/op",
         "POST /v1/mcp-gateway/{mcp}/{rest:path}",
+        "POST /v1/phone/call-control",
     ]
 
 

@@ -21,7 +21,8 @@ agent (the Personal Assistant); the rest are created or installed.
 - `apps/<slug>` inside the shared workspace or a person's workspace — the working files
   of a shared or a personal app; viewers see its release, never these (apps.md).
 - In chat, the file overlay shows these as chips: **My Workspace · My Context · Shared
-  Workspace · Knowledge · Agent Config** (config chip only for managers).
+  Workspace · Knowledge · Agent Config** (config chip only for managers). People add
+  files, whole folders included, by dropping them on the chat or the overlay.
 
 Per-agent roles map onto the folders: **viewer** = own space RW, everything else RO;
 **contributor** = + shared workspace RW (files only — never agent-scope tasks, triggers,
@@ -58,9 +59,8 @@ colleague's live interactive terminal you get read-only + a **Take over** button
   to be enabled), pick a **Default Model** (or Auto), a **Default Session Mode**
   (headless vs interactive terminal), and a **Default Effort** (thinking depth).
 - **Auto** (no pinned model) runs the engine's own default, chosen by tier: Claude Opus
-  5.5 on Claude Code, GPT-6.1 Sol on Codex, Sonnet 5.5 on Direct LLM. Since 1.7.1 Claude
-  Sonnet 5.5 replaces Sonnet 5 and GPT-6.1 Sol replaces GPT-6 Sol; pins on the old ids
-  move over at the next start.
+  5.5 on Claude Code, GPT-6.1 Sol on Codex, Sonnet 5.5 on Direct LLM. A pin on a retired
+  model runs on its successor.
 - A message typed while the agent works reaches a Claude Code or Codex turn at its next
   tool step (in the sandbox, on a paired machine, and in a delegated worker still
   working). When the turn cannot take it (a Direct LLM chat, a turn that is ending) it
@@ -77,7 +77,10 @@ colleague's live interactive terminal you get read-only + a **Take over** button
   **Send again**, which sends that turn's messages again as a new turn.
 - A chat's permission mode sits in its status bar (**Default**, **Accept Edits**,
   **Plan**, **Don't Ask**); a Codex chat asks before commands and edits the way a Claude
-  chat does.
+  chat does, and the platform's command floor holds on every engine and mode.
+- Claude Code and Codex read the instruction file at the top of each repository in the
+  person's own workspace (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex), in that
+  person's chats only: never in tasks, triggers or a Shared only agent's chats.
 - Users switch models per chat from the picker; when a chat's session has ended, other
   enabled engines appear too — picking one restarts the chat on that engine from saved
   history (works on finished task chats as well, with editor access).
@@ -104,7 +107,9 @@ people in itself (Notion, Linear) needs no OAuth app from an admin: the install
 registers itself with the vendor on first use, each person signs in on the vendor's
 page from Connected Accounts, and the token is added to the server's calls in transit,
 never handed to a session or a machine. An admin sees the registration on **Admin →
-MCP Servers** and can **Forget** it.
+MCP Servers** and can **Forget** it. A connected GitHub account reaches `git` and `gh`
+through a credential helper that fetches the token per command, so no session file or
+variable holds it.
 
 ## Skills
 

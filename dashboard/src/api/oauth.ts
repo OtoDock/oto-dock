@@ -39,6 +39,32 @@ export interface OAuthStartParams {
   mobile?: boolean
 }
 
+/**
+ * The app's half of a connect it started: the otodock:// link brings the
+ * vendor's code and the state back, and the exchange runs here under the
+ * app's own login (the server exchanges nothing on the callback for an app
+ * connect). A link without a code is an older server's, already exchanged.
+ */
+export async function exchangeOAuthCode(provider: string, link: string): Promise<void> {
+  let params: URLSearchParams
+  try {
+    params = new URL(link).searchParams
+  } catch {
+    return
+  }
+  const code = params.get('code')
+  const state = params.get('state')
+  if (!code || !state) return
+  const res = await apiFetch(`/v1/oauth/${provider}/exchange`, {
+    method: 'POST',
+    body: JSON.stringify({ code, state, iss: params.get('iss') || '' }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to complete the connect')
+  }
+}
+
 export const useStartOAuth = () => {
   return useMutation({
     mutationFn: async (params: OAuthStartParams): Promise<{ url: string }> => {

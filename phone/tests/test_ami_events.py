@@ -122,6 +122,7 @@ def _client(server, on_dtmf=None, **kw):
     return AmiEventClient(
         "127.0.0.1", server.port, "oto", "secret",
         server_key="7", on_dtmf=on_dtmf or (lambda *a: None),
+        on_originate=kw.pop("on_originate", None),
         ping_interval_s=kw.pop("ping_interval_s", 10.0),
         read_timeout_s=kw.pop("read_timeout_s", 5.0),
         backoff_min_s=kw.pop("backoff_min_s", 0.05),
@@ -294,16 +295,43 @@ async def test_action_injection_guard(ami_server):
         await _stop(client, task)
 
 
+async def test_originate_response_reaches_its_handler(ami_server):
+    """The event the outbound binding reads: every field by name, the handler
+    optional (the digit path has none)."""
+    got = []
+    client = _client(ami_server, on_dtmf=lambda *a: None,
+                     on_originate=lambda *a: got.append(a))
+    task = await _run_until_connected(client)
+    try:
+        ami_server.send_event(
+            Event="OriginateResponse", ActionID="abc123", Response="Success",
+            Channel="Local/6974163468@from-internal-00000012;1", Context="oto-audiosocket-outbound",
+            Exten="s", Reason="4", Uniqueid="1760000000.77")
+        await asyncio.sleep(0.1)
+        assert got == [("7", "abc123", "Success", "1760000000.77",
+                        "Local/6974163468@from-internal-00000012;1", "4")]
+    finally:
+        await _stop(client, task)
+    quiet = _client(ami_server, on_dtmf=lambda *a: None)
+    task = await _run_until_connected(quiet)
+    try:
+        ami_server.send_event(Event="OriginateResponse", ActionID="x", Response="Success")
+        await asyncio.sleep(0.05)      # no handler: nothing raised, nothing done
+    finally:
+        await _stop(quiet, task)
+
+
 # ---------------------------------------------------------------------------
 # AmiListenerManager — lifecycle + registration
 # ---------------------------------------------------------------------------
 
 class FakeEventClient:
     def __init__(self, host, port, username, secret, *, server_key, on_dtmf,
-                 **kw):
+                 on_originate=None, **kw):
         self.coords = (host, port, username, secret)
         self.server_key = server_key
         self.on_dtmf = on_dtmf
+        self.on_originate = on_originate
         self.closed = False
         self.unmatched_events = 0
 
@@ -442,6 +470,107 @@ async def test_registration_routes_digits_to_the_right_call():
 
     await mgr.stop()
     mgr.unregister_call("7", "222.2")  # no-op after stop
+
+
+class _Conn:
+    def __init__(self):
+        self.got = []
+
+    def inject_dtmf(self, digit, duration_ms=0):
+        self.got.append((digit, duration_ms))
+
+
+_LOCAL1 = "Local/6974163468@from-internal-00000012;1"
+
+
+async def test_an_outbound_call_binds_from_the_originate_response_in_either_order():
+    mgr, made = _mgr()
+    await mgr.apply(CfgStub(servers={"7": dict(_ENTRY)}))
+    assert made[0].on_originate is not None
+
+    # The PBX reports first (the usual order: the event precedes the
+    # dialplan's AudioSocket connect by milliseconds).
+    conn = _Conn()
+    mgr.expect_originate("7", "aid1", "uuid-1")
+    mgr._on_originate("7", "aid1", "Success", "1760000000.77", _LOCAL1, "4")
+    assert mgr.bind_outbound("7", "uuid-1", conn) is True
+    assert mgr.outbound_bound("7", "uuid-1") and mgr.call_channel("7", "1760000000.77") == _LOCAL1
+    mgr._on_dtmf("7", "1760000000.77", "1", 80)
+    mgr._on_dtmf("7", "1760000000.78", "9", 80)       # the ;2 leg: unmatched
+    assert conn.got == [("1", 80)] and made[0].unmatched_events == 1
+    mgr.unbind_outbound("7", "uuid-1")
+    mgr._on_dtmf("7", "1760000000.77", "2", 80)
+    assert conn.got == [("1", 80)] and not mgr.outbound_bound("7", "uuid-1")
+
+    # The media leg arrives first: held, then bound when the event lands.
+    conn = _Conn()
+    mgr.expect_originate("7", "aid2", "uuid-2")
+    assert mgr.bind_outbound("7", "uuid-2", conn) is False
+    mgr._on_dtmf("7", "1760000001.10", "5", 80)       # nothing bound yet
+    mgr._on_originate("7", "aid2", "Success", "1760000001.10", _LOCAL1, "4")
+    assert mgr.outbound_bound("7", "uuid-2")
+    mgr._on_dtmf("7", "1760000001.10", "5", 80)
+    assert conn.got == [("5", 80)]
+    mgr.unbind_outbound("7", "uuid-2")
+    await mgr.stop()
+
+
+async def test_an_originate_that_failed_or_was_not_ours_binds_nothing(monkeypatch):
+    mgr, made = _mgr()
+    await mgr.apply(CfgStub(servers={"7": dict(_ENTRY)}))
+    conn = _Conn()
+    # A failed originate: no channel, the dial watchdog fails the call.
+    mgr.expect_originate("7", "aid1", "uuid-1")
+    mgr._on_originate("7", "aid1", "Failure", "<unknown>", "Local/x@from-internal", "1")
+    assert mgr.bind_outbound("7", "uuid-1", conn) is False
+    # Another manager client's originate, and one our expectation never named.
+    mgr._on_originate("7", "someone-else", "Success", "1760000002.1", _LOCAL1, "4")
+    mgr._on_originate("other", "aid1", "Success", "1760000002.2", _LOCAL1, "4")
+    # An unusable channel or uniqueid never keys the map.
+    mgr.expect_originate("7", "aid3", "uuid-3")
+    mgr._on_originate("7", "aid3", "Success", "bad id\r\n", _LOCAL1, "4")
+    assert mgr.bind_outbound("7", "uuid-3", conn) is False
+    assert mgr._calls == {} and not mgr.outbound_bound("7", "uuid-3")
+    mgr.unbind_outbound("7", "uuid-1")
+    mgr.unbind_outbound("7", "uuid-3")
+    # The expectation and a report nobody claimed age out.
+    import telephony.ami_events as ev
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ev.time, "monotonic", lambda: clock["t"])
+    mgr.expect_originate("7", "aid4", "uuid-4")
+    mgr._on_originate("7", "aid4", "Success", "1760000003.1", _LOCAL1, "4")
+    clock["t"] += ev.ORIGINATE_TTL_S + 1
+    assert mgr.bind_outbound("7", "uuid-4", conn) is False
+    mgr.unbind_outbound("7", "uuid-4")
+    await mgr.stop()
+    assert mgr._awaiting == {} and mgr._expected == {} and mgr._originated == {}
+
+
+async def test_the_dialled_numbers_plus_binds_and_a_refusal_logs_the_shape(caplog):
+    """FreePBX names the dialled Local channel with the E.164 number
+    (``Local/+30…@from-internal-<seq>;1``); a name past the alphabet is
+    refused with its shape in the log, never the digits it carries."""
+    import logging
+    mgr, made = _mgr()
+    await mgr.apply(CfgStub(servers={"7": dict(_ENTRY)}))
+    conn = _Conn()
+    plus = "Local/+306974163468@from-internal-0000002a;1"
+    mgr.expect_originate("7", "aid1", "uuid-1")
+    mgr._on_originate("7", "aid1", "Success", "1760000000.77", plus, "4")
+    assert mgr.bind_outbound("7", "uuid-1", conn) is True
+    assert mgr.call_channel("7", "1760000000.77") == plus
+    mgr.unbind_outbound("7", "uuid-1")
+
+    bad = "Local/+306974163468 x@ctx;1"
+    mgr.expect_originate("7", "aid2", "uuid-2")
+    with caplog.at_level(logging.WARNING, logger="ami_events"):
+        mgr._on_originate("7", "aid2", "Success", "1760000001.10", bad, "4")
+    assert mgr.bind_outbound("7", "uuid-2", conn) is False
+    line = [r.getMessage() for r in caplog.records if "unusable channel" in r.getMessage()][0]
+    assert "'1760000001.10'" in line and f"{len(bad)} characters" in line and "' '" in line
+    assert "6974163468" not in line
+    mgr.unbind_outbound("7", "uuid-2")
+    await mgr.stop()
 
 
 async def test_resolve_server_key_prefers_exact_then_flat():

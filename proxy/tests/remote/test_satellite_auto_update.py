@@ -522,6 +522,82 @@ async def test_update_now_online_push_registers_the_target(monkeypatch):
         sat_ws._pending_pushed_updates.pop("m-now", None)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["acked", "silent_live", "silent_gone"])
+async def test_update_now_counts_an_acknowledging_satellite_once_it_read_the_push(monkeypatch, outcome):
+    """A satellite that acknowledges is noted for the rollback check when
+    its ``update_received`` comes (the request answers at once); with none,
+    when the connection it went out on is still the machine's after the
+    wait, and not at all when that connection ended first."""
+    import asyncio
+    from api.remote import remote_machines as rm
+    from ws import satellite as sat_ws
+    import core.remote.satellite_connection as sc
+
+    class _Conn:
+        satellite_version = "1.0.0"
+
+        async def enqueue_send(self, msg, *, bulk=False):
+            pass
+
+    conn = _Conn()
+    state = {"conn": conn}
+
+    class _CM:
+        def __init__(self):
+            self.fut = None
+
+        def is_connected(self, mid):
+            return True
+
+        def get_connection(self, mid):
+            return state["conn"]
+
+        def expect_update_ack(self, mid):
+            self.fut = asyncio.get_running_loop().create_future()
+            return self.fut
+
+    cm = _CM()
+
+    async def _no_broadcast(*a, **k):
+        return None
+
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: cm)
+    monkeypatch.setattr(rm, "_require_satellite_source", lambda: None)
+    monkeypatch.setattr(rm, "get_satellite_tarball_with_hash", lambda: (b"tar", "sha"))
+    monkeypatch.setattr(sat_ws, "_broadcast_satellite_updating", _no_broadcast)
+    monkeypatch.setattr(sat_ws, "SATELLITE_VERSION_LATEST", "9.9.9")
+    monkeypatch.setattr(sat_ws, "UPDATE_ACK_SATELLITE_VERSION", "1.0.0")
+    monkeypatch.setattr(sat_ws, "_UPDATE_ACK_WAIT_S", 0.1)
+    sat_ws._pending_pushed_updates.pop("m-ack", None)
+    try:
+        out = await rm._do_trigger_update_now("m-ack", {"satellite_version": "1.0.0"})
+        assert out["pushed_now"] is True
+        assert "m-ack" not in sat_ws._pending_pushed_updates   # not before the ack
+        if outcome == "acked":
+            cm.fut.set_result("9.9.9")
+        elif outcome == "silent_gone":
+            state["conn"] = None
+        await asyncio.sleep(0.25)
+        expected = None if outcome == "silent_gone" else "9.9.9"
+        assert sat_ws._pending_pushed_updates.get("m-ack") == expected
+    finally:
+        sat_ws._pending_pushed_updates.pop("m-ack", None)
+
+
+def test_the_connection_manager_hands_the_acknowledgement_to_the_waiting_push():
+    import asyncio
+    from core.remote.satellite_connection import SatelliteConnectionManager
+
+    async def _run():
+        cm = SatelliteConnectionManager()
+        fut = cm.expect_update_ack("m-1")
+        await cm.handle_message("m-1", {"type": "update_received", "target_version": "9.9.9"})
+        assert fut.result() == "9.9.9"
+        await cm.handle_message("m-1", {"type": "update_received"})   # nobody waits: ignored
+    asyncio.run(_run())
+
+
 def _plaintext_update_now_stubs(monkeypatch, *, connected: bool, conn_caps: dict | None):
     """'Update now' against a machine on a plaintext link: what was sent,
     broadcast and queued, for the two branches of _do_trigger_update_now."""

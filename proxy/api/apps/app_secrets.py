@@ -16,7 +16,7 @@ from auth.providers import UserContext, get_current_user, require_auth, require_
 from services.apps import app_deploy, app_secrets
 from storage import db_app_secrets, db_apps
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 

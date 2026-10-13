@@ -64,8 +64,9 @@ from core import placement
 from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from storage.pg import run_db
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.workspace-fanout")
+logger = logging.getLogger("otodock.workspace-fanout")
 
 # A tracked push's progress rows move at most this often.
 _PROGRESS_EVERY_S = 0.5
@@ -315,14 +316,80 @@ async def idle_connected_targets(
         return []
 
 
+async def mark_fan_out_targets(
+    agent_slug: str, rel_path: str, *, exclude_machine_id: str | None = None,
+) -> dict[str, tuple[int, int]] | None:
+    """Mark every active fan-out target of a platform write in flight, with
+    the platform copy's stat, and return them (machine to stat) for the
+    fan-out's ``marked``: empty when no machine is a target. Called inside
+    the path lock right after the write: from its release until the fan-out
+    marks the targets itself (after its store read, the descriptor open and
+    the hash, or after the save it serves has answered), a read on a target
+    with no pull record would pull the older bytes over the write. Never
+    raises: a failure marks nothing and answers None (logged); the fan-out
+    still runs and marks its targets itself."""
+    try:
+        shared_only = await shared_only_of(agent_slug, rel_path)
+        machines = _targets(agent_slug, rel_path, exclude_machine_id, shared_only)
+        if not machines:
+            return {}
+        st = await asyncio.to_thread(
+            safe_fs.lstat_beneath, config.AGENTS_DIR,
+            f"{agent_slug}/{normalize_rel_path(rel_path)}")
+        from core.remote import remote_file_flow
+        from core.remote.satellite_file_transfer import push_ceiling_s
+        stat = (st.st_size, st.st_mtime_ns)
+        in_flight_s = push_ceiling_s(st.st_size)
+        for mid in machines:
+            remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *stat,
+                                                 in_flight_s=in_flight_s)
+        return {mid: stat for mid in machines}
+    except Exception:
+        logger.warning("marking the fan-out targets of %s/%s failed", agent_slug, rel_path,
+                       exc_info=True)
+        return None
+
+
 async def fan_out_write(
     agent_slug: str, rel_path: str, source: "bytes | Path", *,
     exclude_machine_id: str | None = None, include_idle: bool = False,
     transfer_kind: str = "sync", transfer_id: str | None = None,
-    origin_user_sub: str = "",
+    origin_user_sub: str = "", only_machine_id: str | None = None,
+    marked: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     """Push a file at ``rel_path`` to every OTHER machine running ``agent_slug``
-    that is allowed to receive it. Best-effort; never raises.
+    that is allowed to receive it (``only_machine_id``: to that one machine,
+    when it is one of them). Best-effort; never raises.
+
+    ``marked``: the machines the caller marked in flight before it
+    (``mark_fan_out_targets``). Each one this fan-out does not push to (it
+    left the targets meanwhile, the fan-out ended early or raised) gets the
+    failure's rules instead of a window no push will end
+    (``remote_file_flow.end_in_flight``)."""
+    pushed: list[str] = []
+    try:
+        pushed = await _fan_out_write(
+            agent_slug, rel_path, source, exclude_machine_id=exclude_machine_id,
+            include_idle=include_idle, transfer_kind=transfer_kind,
+            transfer_id=transfer_id, origin_user_sub=origin_user_sub,
+            only_machine_id=only_machine_id,
+        )
+    finally:
+        if marked:
+            from core.remote import remote_file_flow
+            for mid, stat in marked.items():
+                if mid not in pushed:
+                    remote_file_flow.end_in_flight(mid, agent_slug, rel_path, stat)
+
+
+async def _fan_out_write(
+    agent_slug: str, rel_path: str, source: "bytes | Path", *,
+    exclude_machine_id: str | None, include_idle: bool,
+    transfer_kind: str, transfer_id: str | None,
+    origin_user_sub: str, only_machine_id: str | None,
+) -> list[str]:
+    """``fan_out_write``'s body; returns the machines it pushed to (acked or
+    not).
 
     ``source`` is either the file's bytes (small in-memory payloads — WOPI,
     hooks) or its platform filesystem ``Path`` — the streaming mode all
@@ -351,6 +418,8 @@ async def fan_out_write(
         )
         if idle:
             machines = list(set(machines) | set(idle))
+    if only_machine_id is not None:
+        machines = [m for m in machines if m == only_machine_id]
     from core.remote import transfer_registry
     from core.remote.file_sync import MAX_CHUNK_SIZE
 
@@ -383,7 +452,7 @@ async def fan_out_write(
                 type(exc).__name__,
             )
             await _empty_terminal(0)
-            return
+            return []
     if not machines:
         size = 0
         if not from_path:
@@ -393,7 +462,7 @@ async def fan_out_write(
                 size = (await asyncio.to_thread(
                     safe_fs.lstat_beneath, config.AGENTS_DIR, rel)).st_size
         await _empty_terminal(size)
-        return
+        return []
 
     # The bytes every push reads are that platform copy, opened ONCE beneath
     # the agents root with no link followed; ``push_file`` receives the
@@ -415,7 +484,7 @@ async def fan_out_write(
                 type(exc).__name__,
             )
             await _empty_terminal(0)
-            return
+            return []
         size, base_mtime = st.st_size, st.st_mtime
         platform_stat: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
         content_hash = await asyncio.to_thread(_hash_fd, src_fd)
@@ -442,6 +511,7 @@ async def fan_out_write(
     finally:
         if src_fd is not None:
             os.close(src_fd)
+    return machines
 
 
 def _hash_fd(fd: int) -> str:
@@ -662,15 +732,88 @@ async def _atomic_write_agent_file(
     )
 
 
+# The fan-out of a Collabora save runs after the save answered, one queued
+# per path at most: a save while one waits for the fan-out lock adds its
+# marked machines to it, and that one pushes the platform copy as it is when
+# it starts. Keyed (agent, path, excluded machine).
+_queued_save_fan_outs: dict[tuple[str, str, str | None], dict] = {}
+_save_fan_out_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_save_fan_out(agent_slug: str, rel_path: str,
+                           exclude_machine_id: str | None,
+                           marked: dict[str, tuple[int, int]] | None) -> None:
+    """Start the fan-out of a save that marked ``marked``, or fold the marks
+    into the one already queued. Tracked as an in-flight push of the
+    machines it marked (``upload_inflight``): a headless turn on one of them
+    waits for it before its prompt goes out (the agent reads the saved
+    bytes); a turn on another machine does not. ``marked`` None (the marks
+    failed): the fan-out runs all the same, bound for no known machine, so
+    it holds every machine's turn."""
+    key = (agent_slug, rel_path, exclude_machine_id)
+    queued = _queued_save_fan_outs.get(key)
+    if queued is not None:
+        if marked is None:
+            from core.remote import upload_inflight
+            upload_inflight.unbind(queued["task"])
+        else:
+            queued["marked"].update(marked)
+            queued["machines"].update(marked)
+        return
+    if marked is not None and not marked:
+        return  # no machine runs a session that may see the path
+    entry = {"marked": dict(marked or {}), "machines": set(marked or ())}
+    from core.remote import upload_inflight
+    task = upload_inflight.track(agent_slug, _save_fan_out(key, entry),
+                                 machines=None if marked is None else entry["machines"])
+    entry["task"] = task
+    _save_fan_out_tasks.add(task)
+    task.add_done_callback(_save_fan_out_tasks.discard)
+    # The task runs only once this coroutine yields: registered after it
+    # exists, so a failed start never leaves a queue nobody drains.
+    _queued_save_fan_outs[key] = entry
+
+
+async def _save_fan_out(key: tuple[str, str, str | None], entry: dict) -> None:
+    agent_slug, rel_path, exclude_machine_id = key
+    from core.remote.remote_file_flow import acquire_fanout_lock
+    try:
+        # The fan-out lock alone, never the path lock while holding it: the
+        # writers that take both take the path lock first.
+        fanout_lock = await acquire_fanout_lock(agent_slug, rel_path)
+        async with fanout_lock:
+            # A save from here on schedules its own fan-out: this one opens
+            # the platform copy after this point, so every save folded into
+            # it is in what it pushes.
+            if _queued_save_fan_outs.get(key) is entry:
+                del _queued_save_fan_outs[key]
+            await fan_out_write(
+                agent_slug, rel_path, config.AGENTS_DIR / agent_slug / rel_path,
+                exclude_machine_id=exclude_machine_id, marked=entry["marked"],
+            )
+    except Exception:
+        logger.exception("the fan-out of a save of %s/%s failed", agent_slug, rel_path)
+    finally:
+        if _queued_save_fan_outs.get(key) is entry:
+            del _queued_save_fan_outs[key]
+
+
+async def drain_save_fan_outs() -> None:
+    """Wait until no save's fan-out is queued or running (tests)."""
+    while _save_fan_out_tasks:
+        await asyncio.gather(*list(_save_fan_out_tasks), return_exceptions=True)
+
+
 async def propagate_write(
     agent_slug: str, rel_path: str, content: bytes, *,
     exclude_machine_id: str | None = None, writer: str | None = None,
     precheck: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
-    """Atomically write ``content`` to the platform agent tree AND fan it out to
-    every machine running ``agent_slug`` (``exclude_machine_id`` aside) — all under the global
-    per-(agent, rel_path) lock so it never interleaves with the ``file_changed``
-    applier / ``push_back`` / ``pull_through``.
+    """Atomically write ``content`` to the platform agent tree under the
+    global per-(agent, rel_path) lock, so it never interleaves with the
+    ``file_changed`` applier / ``push_back`` / ``pull_through``, and fan it
+    out to every machine running ``agent_slug`` (``exclude_machine_id``
+    aside) AFTER the call returns.
 
     The propagation entry point of a Collabora save
     (``api/media/wopi.py::wopi_put_file``), whose bytes are produced OUTSIDE
@@ -687,10 +830,20 @@ async def propagate_write(
     Conflict detection + recovery stays on the ``file_changed`` path
     (``core/remote/satellite_connection.py``) — the only writer that pre-captures.
 
+    The save answers once its bytes are stored: a machine that stalls (its
+    socket drops only after 30 s) would otherwise make Collabora's upload
+    time out and retry into a refusal of its own save. Inside the path lock
+    the targets are marked in flight (a read there serves the platform copy
+    from the moment the save answers); the fan-out then runs under the
+    fan-out lock alone (``_schedule_save_fan_out``).
+
     Failure semantics: the atomic disk write RAISES on failure (the caller treats
-    it as fatal — e.g. Collabora's PutFile → 500). The fan-out is best-effort
-    (``fan_out_write`` swallows per-push failures), so a satellite being offline
-    never fails the write; it reconciles at that satellite's next session start.
+    it as fatal — e.g. Collabora's PutFile → 500). Nothing after it fails
+    the save (logged): a 500 once the bytes landed would have Collabora retry
+    into a refusal. The fan-out is best-effort (``fan_out_write`` swallows
+    per-push failures and marks a missed machine ahead), so a satellite being
+    offline never fails the write; it reconciles at its next read, reconnect
+    or session start.
 
     ``precheck`` (the WOPI save check) is awaited inside the path lock,
     before the write: a write queued for the lock meanwhile cannot land
@@ -702,7 +855,7 @@ async def propagate_write(
     lock, and then calls ``fan_out_write`` directly under the fan-out lock alone
     (since 1.7.1), so a slow target never holds the next writer of the path.
     """
-    from core.remote.remote_file_flow import _acquire_global_path_lock, acquire_fanout_lock
+    from core.remote.remote_file_flow import _acquire_global_path_lock
     lock = await _acquire_global_path_lock(agent_slug, rel_path)
     async with lock:
         if precheck is not None and not await precheck():
@@ -711,19 +864,21 @@ async def propagate_write(
         # Versioned-sync bookkeeping: the path is live again (retire any tombstone)
         # and ``writer`` (the editing user's slug, if known) becomes its author for
         # cross-user conflict attribution. Best-effort.
-        from storage.files import file_tombstones_store
-        from storage.files import file_author_store
-        await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
-        if writer:
-            await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
-        # The fan-out lock is taken inside the path lock (the lock order every
-        # writer keeps: path lock, fan-out lock, transfer gate), so fan-outs
-        # of one path never interleave, whoever starts them.
-        fanout_lock = await acquire_fanout_lock(agent_slug, rel_path)
-        async with fanout_lock:
-            await fan_out_write(
-                agent_slug, rel_path, content, exclude_machine_id=exclude_machine_id,
-            )
+        try:
+            from storage.files import file_tombstones_store
+            from storage.files import file_author_store
+            await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
+            if writer:
+                await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
+        except Exception:
+            logger.warning("the bookkeeping of a save of %s/%s failed", agent_slug, rel_path,
+                           exc_info=True)
+        marked = await mark_fan_out_targets(agent_slug, rel_path,
+                                            exclude_machine_id=exclude_machine_id)
+    try:
+        _schedule_save_fan_out(agent_slug, rel_path, exclude_machine_id, marked)
+    except Exception:
+        logger.exception("scheduling the fan-out of a save of %s/%s failed", agent_slug, rel_path)
     # Knowledge-library projection (outside the lock — the projector takes
     # its own per-source lock): Collabora/file-tools writes into a promoted
     # source's knowledge propagate to consumer mirrors; RW mirror edits flow
@@ -734,11 +889,11 @@ async def propagate_write(
         if parsed is not None:
             _src, _sub = parsed
             if _sub:
-                asyncio.create_task(
-                    library_projector.propagate_mirror_write(
-                        agent_slug, _src, _sub))
+                spawn(library_projector.propagate_mirror_write(
+                        agent_slug, _src, _sub),
+                      name="propagate_mirror_write", owner="workspace_fanout")
         else:
-            asyncio.create_task(
-                library_projector.propagate_source_write(
-                    agent_slug, rel_path[len("knowledge/"):]))
+            spawn(library_projector.propagate_source_write(
+                    agent_slug, rel_path[len("knowledge/"):]),
+                  name="propagate_source_write", owner="workspace_fanout")
     return True

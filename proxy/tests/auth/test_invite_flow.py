@@ -314,3 +314,16 @@ def test_admin_create_and_list_read_off_the_loop(monkeypatch):
     assert resp.status_code == 200, resp.text
     assert client.put("/v1/admin/users/no-such-sub/role",
                       json={"role": "creator"}).status_code == 404
+
+
+def test_accepting_an_invite_forgets_the_holder_cache(monkeypatch):
+    from auth import token_holder
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
+    data = _create_invited()
+    forgot: list[str] = []
+    monkeypatch.setattr(token_holder, "forget", forgot.append)
+    resp = client.post("/auth/accept-invite", json={
+        "token": _token_of(data["invite_url"]), "new_password": _STRONG_PW,
+    })
+    assert resp.status_code == 200, resp.text
+    assert forgot == [data["user"]["sub"]]

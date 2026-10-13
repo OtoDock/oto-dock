@@ -13,15 +13,21 @@ from typing import TYPE_CHECKING
 import config
 from storage import database as task_store
 from storage.automation import run_status
+from core.events import input_queue
 from core.session import visibility as _vis
 from ws import chat_phase
 from ws import wire_events as wire
 from ws.dashboard_chat_text import TurnDeferred
 
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
 if TYPE_CHECKING:  # the annotation below is a string; nothing runs at import
     from core.execution_layer import ExecutionLayer
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Frames whose per-user broadcast duplicates a direct send to the acting
 # socket (``dashboard_chat_send`` / ``dashboard_dispatch``): dropped here as
@@ -59,7 +65,7 @@ def result_event_from_notify(notification: dict) -> dict:
     return event
 
 
-class ServerNotificationController:
+class ServerNotificationController(_Host):
     """Server-initiated work delivered via the notify queue: notification
     forwards, the server-kicked first turn, and bg-nudge / task-result
     review turns on their originating chats."""
@@ -151,6 +157,7 @@ class ServerNotificationController:
             # Kill the session and skip the turn — the client already got `aborted`.
             if self._warmup_abort_chat == kick_cid:
                 self._warmup_abort_chat = None
+                input_queue.first_turn_started(kick_cid)
                 _k_layer = self.layer if kick_cid == self.chat_id else await self._resolve_layer_for_chat_async(kick_cid)
                 if _k_layer and kick_sid:
                     try:
@@ -171,6 +178,7 @@ class ServerNotificationController:
                     "_server_kick": True,
                     "_focus_line": notification.get("focus_line", ""),
                 })
+                input_queue.first_turn_not_run(kick_cid)
             else:
                 await self._run_kick_headless(kick_cid, kick_sid, kick_text, kick_images, kick_files)
             return
@@ -372,7 +380,6 @@ class ServerNotificationController:
         # queued delivery holding the chat for the turn it is starting, or a
         # pump driving it, means this prompt is the caller's to keep (a
         # stored wake, a parked result), never a second pump on the chat.
-        from core.events import input_queue
         q = input_queue.get(target_chat_id)
         claim = q.try_claim()
         if claim is None:
@@ -443,6 +450,16 @@ class ServerNotificationController:
         viewed attributes) so attachments save to the right workspace, then
         drives the turn into wcid's pump + DB. The prompt was already persisted
         at send-time (_persist_first_prompt)."""
+        try:
+            await self._run_kick_headless_turn(wcid, sid, text, images, files,
+                                               force_headless=force_headless)
+        finally:
+            input_queue.first_turn_not_run(wcid)
+
+    async def _run_kick_headless_turn(self,
+        wcid: str, sid: str | None, text: str,
+        images: list[dict], files: list[dict], *, force_headless: bool,
+    ) -> None:
         from storage.pg import run_db
         rec = await run_db(task_store.get_chat, wcid)
         if not rec:

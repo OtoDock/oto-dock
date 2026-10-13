@@ -381,3 +381,22 @@ def test_session_config_overlays_user_voice_picks(temp_db):
     # A user with no picks keeps the row map untouched.
     cfg2 = phone_config.assemble_duplex_session_config("user-2")
     assert cfg2["tts"]["voices"] == {"en": "row-en-voice", "el": "row-el-voice"}
+
+
+def test_duplex_config_automatic_language_starts_english_and_detects(temp_db):
+    from storage.prefs import user_audio_prefs_store
+    p = audio_provider_store.create_provider({
+        "provider_type": "tts", "provider_name": "elevenlabs",
+        "credential_key": "audio-elevenlabs", "voices": {"en": "v"},
+    })
+    credential_store.set_infra_credentials("audio-elevenlabs", {"API_KEY": "sk-x"})
+    audio_provider_store.set_default(p["id"], "chat")
+    task_store.upsert_user("user-auto", "ua@example.com", "U Auto", "member")
+    task_store.upsert_user("user-el", "uel@example.com", "U El", "member")
+    user_audio_prefs_store.upsert_prefs("user-auto", {"stt_language": "auto"})
+    user_audio_prefs_store.upsert_prefs("user-el", {"stt_language": "el-GR"})
+
+    auto = phone_config.assemble_duplex_session_config("user-auto")
+    assert auto["language"] == "" and auto["language_detect"] is True
+    picked = phone_config.assemble_duplex_session_config("user-el")
+    assert picked["language"] == "el-GR" and picked["language_detect"] is False

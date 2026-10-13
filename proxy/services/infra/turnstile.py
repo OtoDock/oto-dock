@@ -12,7 +12,7 @@ import config
 from storage import database as db
 from storage.identity.credential_store import _decrypt, _encrypt
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 

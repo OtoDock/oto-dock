@@ -23,6 +23,7 @@ from core.session.session_state import (
     reconcile_background_snapshot, mark_closing,
 )
 from core.events.bg_command_state import reset_bg_command_registry
+from core.session import engine_prompts
 from core.events import turn_ending, turn_life
 from core.layers.cli.helpers import (
     ClaudeStreamChunk, _build_env, _kill_process,
@@ -39,7 +40,7 @@ from core.layers.cli.settle import (
 )
 import contextlib
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 def _record_rate_limit(session_id: str, info: dict) -> None:
@@ -48,6 +49,9 @@ def _record_rate_limit(session_id: str, info: dict) -> None:
     record_event_async(session_id, info)
 
 _PROMPT_FILENAME = "system-prompt.md"
+# The interrupt a close writes into a parked turn: a wedged CLI's full pipe
+# must not hold the close (the kill at its end still comes).
+_CLOSE_INTERRUPT_S = 2.0
 
 # claude-code#63943: a graceful interrupt mid-thinking can persist an unsigned
 # thinking block in the CLI's session history; every later API call then 400s
@@ -162,6 +166,14 @@ class PersistentSession:
         # watchdog, the silence or an ending's kill): the end of output that
         # follows is that kill, not an exit of the engine's own.
         self._proxy_killed = False
+        # The task turn's result was read and the drive loop only waits for
+        # background work (the settle): a graceful interrupt has nothing to
+        # interrupt there, so a Stop takes the kill path at once. Off between
+        # turns, where a self-wake bracket occupies the turn-active span and
+        # must still be interrupted gracefully.
+        self._settling = False
+        # The turn-active span's start: a Stop since then is this turn's.
+        self._turn_started_at = time.monotonic()
 
     @staticmethod
     def _strip_session_id(url: str) -> str:
@@ -325,12 +337,11 @@ class PersistentSession:
                 # The prompt-tool's PRESENCE is what makes the CLI expose
                 # AskUserQuestion to a headless session (absent from every -p
                 # roster since at least 2.1.193 — no flag/env/model re-adds
-                # it). Bypass mode never raises permission prompts and the
-                # PreToolUse hook denies-and-surfaces the question before the
-                # tool executes, so the stdio permission channel stays silent.
-                # Deliberately NOT added to the plan/-p or native-permission
-                # branches: there a real prompt could route to stdio, which
-                # the stream translator does not answer.
+                # it). The PreToolUse hook denies-and-surfaces the question
+                # before the tool executes; the CLI still asks over this
+                # channel for some calls under bypass (a heredoc writing a
+                # file, a wide ``rm -rf``), which core/session/engine_prompts
+                # answers like a card.
                 cmd.extend(["--permission-prompt-tool", "stdio"])
 
         if self.disallowed_tools:
@@ -569,6 +580,8 @@ class PersistentSession:
                         f"Persistent session {self.session_id}: MCP ready — "
                         f"connected={connected}, failed={failed}"
                     )
+                    if failed:
+                        await self._log_mcp_start_failures(failed)
                     self._init_done = True
                     return
         except asyncio.TimeoutError:
@@ -577,6 +590,18 @@ class PersistentSession:
                 f"proceeding anyway"
             )
             self._init_done = True
+
+    @staticmethod
+    async def _log_mcp_start_failures(failed: list[str]) -> None:
+        """Log why the MCPs the CLI reported failed may not have started:
+        their stderr stays in the CLI's log inside the sandbox, so the cause
+        is read from each MCP's folder (best effort, never raises)."""
+        from services.mcp import mcp_registry, mcp_venv_bootstrap
+        try:
+            manifests = [m for m in (mcp_registry.get_manifest_by_config_key(n) for n in failed) if m]
+            await asyncio.to_thread(mcp_venv_bootstrap.log_start_failures, manifests)
+        except Exception:
+            logger.debug("MCP start-failure diagnosis failed", exc_info=True)
 
     async def _read_parsed_frame(self, timeout: float) -> dict | None:
         """Next parsed stream-json frame from stdout, or None on
@@ -685,6 +710,7 @@ class PersistentSession:
                         # badge sticks forever and the agent never gets nudged.
                         resolve_bg_command_frame(self.session_id, data)
                         reconcile_background_snapshot(self.session_id, data)
+                        engine_prompts.note_frame(self.session_id, data)
                         if data.get("type") == "result":
                             break  # Previous response fully drained
             except asyncio.TimeoutError:
@@ -743,6 +769,7 @@ class PersistentSession:
                 if resolve_bg_command_frame(self.session_id, data):
                     progressed = True
                 reconcile_background_snapshot(self.session_id, data)
+                engine_prompts.note_frame(self.session_id, data)
         finally:
             self.lock.release()
         return progressed
@@ -796,30 +823,26 @@ class PersistentSession:
             # Skip other events (system init, etc.) while waiting
 
     async def send_control_response(
-        self, request_id: str, approved: bool,
+        self, request_id: str, approved: bool, *, tool_input: dict | None = None,
     ) -> None:
-        """Answer a native permission prompt (can_use_tool control_request).
+        """Answer a permission request the CLI raised on its stdio channel
+        (``can_use_tool``), in the shape it parses (``engine_prompts.answer_frame``).
 
         Safe to call while send_message() is actively reading stdout —
         stdin and stdout are independent pipes.  Does NOT acquire the
         session lock.
         """
-        if self.proc is None or self.proc.stdin is None:
+        if self.proc is None or self.proc.stdin is None or self.proc.returncode is not None:
             return
-        if approved:
-            permission = {"behavior": "allow"}
-        else:
-            permission = {"behavior": "deny", "message": "User denied"}
-        msg = json.dumps({
-            "type": "control_response",
-            "response": {
-                "request_id": request_id,
-                "subtype": "success",
-                "permission": permission,
-            },
-        })
-        self.proc.stdin.write((msg + "\n").encode("utf-8"))
-        await self.proc.stdin.drain()
+        from core.session.engine_prompts import answer_frame
+        msg = json.dumps(answer_frame(request_id, approved, tool_input))
+        try:
+            self.proc.stdin.write((msg + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info(f"Persistent session {self.session_id}: the permission answer "
+                        f"for {request_id[:8]} found the process gone")
+            return
         logger.info(
             f"Persistent session {self.session_id}: "
             f"sent permission {'allow' if approved else 'deny'} "
@@ -836,22 +859,44 @@ class PersistentSession:
         partial turn in its own session history — so the caller must let the
         turn's consumer run to completion, and no cancelled-context injection
         is needed afterwards. Returns False when there is no live turn to
-        interrupt or the pipe is dead (caller falls back to killpg).
+        interrupt, the turn is settling (its result was read; only the wait
+        for background work holds it, and the frame would find nothing to
+        interrupt) or the pipe is dead (caller falls back to killpg).
         """
-        if (self._closed or self.proc is None or self.proc.stdin is None
-                or self.proc.returncode is not None or not self._turn_active):
+        if self._closed or self._settling:
+            return False
+        return await self._send_interrupt()
+
+    async def _send_interrupt(self, *, any_turn: bool = False) -> bool:
+        """The interrupt frame, written. ``any_turn``: also when no turn of
+        ours is live — a request the CLI raised on its own channel between
+        our turns holds its turn open just the same."""
+        if (self.proc is None or self.proc.stdin is None
+                or self.proc.returncode is not None
+                or not (self._turn_active or any_turn)):
             return False
         msg = json.dumps({
             "type": "control_request",
             "request_id": str(uuid.uuid4()),
             "request": {"subtype": "interrupt"},
         })
+        # Flagged before the write: once written the frame may reach the CLI
+        # even when the drain is cut short (a close's bound), and its result
+        # must read as the interrupt it is.
+        watch_was = self._post_interrupt_watch
+        translator = self._translator
+        was_interrupted = translator.interrupted if translator is not None else False
+        self._post_interrupt_watch = True
+        if translator is not None:
+            translator.interrupted = True
         try:
             self.proc.stdin.write((msg + "\n").encode("utf-8"))
             await self.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+            self._post_interrupt_watch = watch_was
+            if translator is not None:
+                translator.interrupted = was_interrupted
             return False
-        self._post_interrupt_watch = True
         logger.info(
             f"Persistent session {self.session_id}: sent graceful interrupt "
             f"(turn_seq={self._turn_seq})"
@@ -956,9 +1001,11 @@ class PersistentSession:
         # covers every exit (result, EOF, cancellation via GeneratorExit).
         self._turn_seq += 1
         self._turn_active = True
+        self._turn_started_at = time.monotonic()
         self._result_seen = False
         self._steer_written = False
         self._proxy_killed = False
+        self._settling = False
         self._task_turn = settle_after_result > 0
         try:
             async for _chunk in self._drive_turn(
@@ -967,6 +1014,7 @@ class PersistentSession:
                 yield _chunk
         finally:
             self._turn_active = False
+            self._settling = False
 
     async def _drive_turn(
         self, prompt: str, settle_after_result: float,
@@ -1016,6 +1064,7 @@ class PersistentSession:
         self._translator = translator
         settle = SettleController(
             self.session_id, settle_after_result, translator,
+            turn_started=self._turn_started_at,
         )
 
         # Foreign-result skip regime (see settle.ForeignSkipGate): resume
@@ -1177,6 +1226,7 @@ class PersistentSession:
             # Parse the event into one or more chunks and yield them.
             # The translator owns all per-turn state; we only observe the
             # raw event to handle the result-boundary book-keeping below.
+            engine_prompts.note_frame(self.session_id, data, in_turn=True)
             for chunk in translator.feed(data):
                 if chunk.event_type == "rate_limit":
                     # The account's window state: for the pool, never the chat.
@@ -1277,20 +1327,51 @@ class PersistentSession:
                         if nxt is not None:
                             resolve_bg_command_frame(self.session_id, nxt)
                             reconcile_background_snapshot(self.session_id, nxt)
+                            engine_prompts.note_frame(self.session_id, nxt)
                     yield ClaudeStreamChunk(
                         is_done=True,
                         session_id=translator.actual_session_id,
                     )
                     return  # Turn complete, process stays alive
 
+                if settle.stopped():
+                    # The person stopped the turn and the interrupt closed it
+                    # with this result: nothing to settle for (the background
+                    # work stays with the warm process), and the turn ends
+                    # before the interrupt watchdog could take it for stuck.
+                    logger.info(
+                        f"Persistent session {self.session_id}: the person stopped "
+                        f"the task turn — ending it at its result"
+                    )
+                    yield ClaudeStreamChunk(
+                        is_done=True, session_id=translator.actual_session_id,
+                    )
+                    return
+
                 # Task mode: enter settle (clears parsing state; keeps counters)
                 settle.enter_settle()
+                self._settling = True
 
     async def close(self) -> None:
-        """Gracefully close the persistent session."""
+        """Gracefully close the persistent session. A turn parked on a prompt
+        is interrupted and the session's prompts released (a deny) before
+        stdin closes: the CLI never acts on its stdin's end while a hook or
+        its own request waits, so it would sit out the 10 s wait and the
+        kill; a release alone would let it run on after the deny."""
         if self._closed:
             return
         self._closed = True
+
+        try:
+            if self.proc and self.proc.returncode is None and has_pending_prompt(self.session_id):
+                try:
+                    await asyncio.wait_for(self._send_interrupt(any_turn=True),
+                                           timeout=_CLOSE_INTERRUPT_S)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Persistent session {self.session_id}: the interrupt at "
+                                   f"close did not drain")
+        finally:
+            resolve_session_permissions(self.session_id, approved=False)
 
         if self.proc and self.proc.returncode is None:
             logger.info(f"Closing persistent session {self.session_id} (pid={self.proc.pid})")

@@ -134,6 +134,32 @@ describe('SharePopover', () => {
     expect(screen.getByText('Waiting for Ana Ruiz to accept.')).toBeTruthy()
   })
 
+  it('the People expiry follows the admin cap: no "Never" under it, nothing past it, the cap itself offered', () => {
+    state.directory = { ...directoryWithAll(), agents: [], departments: [] }
+    const expiry = () => screen.getByLabelText('Expiry') as HTMLSelectElement
+    const values = () => Array.from(expiry().options).map((o) => o.value)
+    // No cap: Never first and selected.
+    const free = renderPopover()
+    expect(values()).toEqual(['never', '7d', '30d', '90d'])
+    expect(expiry().value).toBe('never')
+    free.unmount()
+    // A 45-day cap: the durations up to it and the cap, the cap selected.
+    state.settings = { max_expiry_days: 45 }
+    const capped = renderPopover()
+    expect(values()).toEqual(['7d', '30d', '45d'])
+    expect(expiry().value).toBe('45d')
+    expect(Array.from(expiry().options).map((o) => o.textContent)).toContain('Expires in 45 days')
+    fireEvent.change(screen.getByLabelText('Who to share with'), { target: { value: 'Ana Ruiz' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Share' }))
+    expect(state.create).toHaveBeenLastCalledWith(expect.objectContaining({ expires_in: '45d' }), expect.anything())
+    capped.unmount()
+    // Still loading: Share waits for the settings.
+    state.settings = undefined
+    renderPopover()
+    fireEvent.change(screen.getByLabelText('Who to share with'), { target: { value: 'Ana Ruiz' } })
+    expect((screen.getByRole('button', { name: 'Share' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('a team app offers an agent and, to an admin, a department; the caps stop at my role', () => {
     // The server lists departments to an admin only; an editor's directory
     // carries none.
@@ -157,7 +183,7 @@ describe('SharePopover', () => {
     fireEvent.change(agentSel, { target: { value: 'ops' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenLastCalledWith(
-      { target_kind: 'app', target_id: 'app-2', grantee_kind: 'agent', grantee: 'ops', expires_in: '', role_cap: 'viewer' },
+      { target_kind: 'app', target_id: 'app-2', grantee_kind: 'agent', grantee: 'ops', expires_in: 'never', role_cap: 'viewer' },
       expect.anything(),
     )
     act(() => { state.create.mock.calls[0][1].onSuccess({ status: 'ok', share: { target_kind: 'app', grantee: null, to_agent: { slug: 'ops', name: 'Ops Desk' }, to_department: null } }) })
@@ -178,7 +204,7 @@ describe('SharePopover', () => {
     fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'manager' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenLastCalledWith(
-      { target_kind: 'app', target_id: 'app-2', grantee_kind: 'department', grantee: 'dept-1', expires_in: '', role_cap: 'manager' },
+      { target_kind: 'app', target_id: 'app-2', grantee_kind: 'department', grantee: 'dept-1', expires_in: 'never', role_cap: 'manager' },
       expect.anything(),
     )
   })
@@ -261,7 +287,7 @@ describe('SharePopover — chats', () => {
     fireEvent.change(screen.getByLabelText('Who to share with'), { target: { value: 'ana' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenCalledWith(
-      { target_kind: 'chat', target_id: 'chat-1', grantee_kind: 'person', grantee: 'u9', expires_in: '', include_tools: true },
+      { target_kind: 'chat', target_id: 'chat-1', grantee_kind: 'person', grantee: 'u9', expires_in: 'never', include_tools: true },
       expect.anything(),
     )
   })
@@ -328,17 +354,26 @@ describe('SharePopover — links', () => {
     expect(state.createAsync).toHaveBeenLastCalledWith(expect.objectContaining({ public: true, expires_in: 'never' }))
   })
 
-  it('a capped or still-loading expiry setting offers no "Never" on a link', () => {
+  it('a capped or still-loading expiry setting offers no "Never" on a link, and nothing past the cap', () => {
     state.settings = { max_expiry_days: 30 }
     const { unmount } = renderPopover()
     openLinkTab()
     const values = () => Array.from((screen.getByLabelText('Link expiry') as HTMLSelectElement).options).map((o) => o.value)
-    expect(values()).toEqual(['7d', '30d', '90d'])
+    expect(values()).toEqual(['7d', '30d'])
     unmount()
+    // A cap below the default: the link's default becomes the cap.
+    state.settings = { max_expiry_days: 3 }
+    const second = renderPopover()
+    openLinkTab()
+    expect(values()).toEqual(['3d'])
+    expect((screen.getByLabelText('Link expiry') as HTMLSelectElement).value).toBe('3d')
+    second.unmount()
+    // Still loading: durations only, and the link waits for the answer.
     state.settings = undefined
     renderPopover()
     openLinkTab()
     expect(values()).toEqual(['7d', '30d', '90d'])
+    expect((screen.getByRole('button', { name: 'Make link' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('an identity-provider account is sent to the provider with its choices kept', async () => {

@@ -41,6 +41,15 @@ def capabilities_frame() -> dict:
     return {
         "type": "capabilities",
         "duplex": {"supported": duplex_supported(), "rates": [16000], "version": 1},
+        # The call tools (``call_control`` frames on the per-call socket) and
+        # outbound calls that run inside the caller's chat (the warmup's
+        # ``attach_grant``): the proxy offers each only to a daemon that
+        # advertises it.
+        "call_control": True,
+        "in_session_calls": True,
+        # The PIN gate runs on an outbound call too (a route tied to a user):
+        # the proxy accepts a PIN on such a route only while a daemon says so.
+        "outbound_pin": True,
     }
 
 

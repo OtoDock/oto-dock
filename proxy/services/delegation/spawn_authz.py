@@ -22,7 +22,7 @@ from storage.agents import agent_store
 from storage.mcp import mcp_store
 from storage import database as task_store
 
-logger = logging.getLogger("claude-proxy.delegation")
+logger = logging.getLogger("otodock.delegation")
 
 # Per-creator ceiling on concurrently active delegated workers. One admin-set
 # value (``mcp_config_values['delegation-mcp'].MAX_PARALLEL_SPAWNS``); the
@@ -50,12 +50,15 @@ class SpawnAuthz:
 
 
 def _max_parallel_spawns() -> int:
+    """The admin's limit: 0 allows no worker (the limit is a number; the
+    ``mcp_state`` switch is what turns the MCP off); an empty, negative or
+    unreadable value is the default."""
     raw = mcp_store.get_mcp_config_values("delegation-mcp").get("MAX_PARALLEL_SPAWNS")
     try:
         value = int(raw)
     except (TypeError, ValueError):
         return DEFAULT_MAX_PARALLEL_SPAWNS
-    return value if value > 0 else DEFAULT_MAX_PARALLEL_SPAWNS
+    return value if value >= 0 else DEFAULT_MAX_PARALLEL_SPAWNS
 
 
 def _max_delegation_depth() -> int:
@@ -161,10 +164,11 @@ def authorize_spawn(
         raise HTTPException(status_code=404, detail=f"Unknown agent: {target_agent}")
 
     # 2. Delegating agent + roster. The source is token-authoritative: a
-    #    session caller's JWT names the agent it was minted for; the master
-    #    key falls back to X-Agent-Name; a dashboard cookie has no delegating
-    #    agent (self-delegation to the target).
-    source = user.agent or x_agent_name or source_agent or target_agent
+    #    session caller's JWT names the agent it was minted for; only the
+    #    master key names one by X-Agent-Name or the body; a dashboard cookie
+    #    has no delegating agent (self-delegation to the target).
+    claimed = (x_agent_name or source_agent) if user.is_service else None
+    source = user.agent or claimed or target_agent
     if source != target_agent:
         allowed = agent_store.get_delegation_targets(source)
         if target_agent not in allowed:
@@ -243,6 +247,12 @@ def authorize_spawn(
     # 7. Per-creator cap — policy "no" beats the RAM-gate veto, so this runs
     #    before any task/chat/run row exists.
     cap = _max_parallel_spawns()
+    if cap == 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Delegation is limited to 0 parallel workers on this platform "
+                   "(MAX_PARALLEL_SPAWNS for delegation-mcp).",
+        )
     active = task_store.count_active_delegate_runs(created_by)
     if active + 1 > cap:
         raise HTTPException(

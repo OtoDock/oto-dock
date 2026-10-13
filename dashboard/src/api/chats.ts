@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { apiJson } from '../lib/http/apiJson'
 import { type SourceType } from '../lib/session/kind'
 import type { ActiveRowPhase } from '../lib/status/chat'
 
@@ -120,15 +121,14 @@ export interface ActiveChat {
 }
 
 export async function fetchActiveChats(): Promise<ActiveChat[]> {
-  const res = await apiFetch('/v1/chats/active')
-  if (!res.ok) throw new Error('Failed to fetch active chats')
-  const data = await res.json()
-  return data.chats as ActiveChat[]
+  const data = await apiJson<{ chats: ActiveChat[] }>('/v1/chats/active', {}, 'Failed to fetch active chats')
+  return data.chats
 }
 
 /** FTS search — follows the sidebar mode: kind 'chats' (default) searches the
  * viewer's chat history, 'tasks' searches the agent's task-run chats under
- * the same run permission rules as the task listing. */
+ * the same run permission rules as the task listing. The newest matches
+ * come first (up to 50), every word of the query a prefix. */
 export function useSearchChats(agent: string | undefined, query: string, kind: 'chats' | 'tasks' = 'chats') {
   return useQuery({
     queryKey: ['chat-search', agent, query, kind],
@@ -136,10 +136,8 @@ export function useSearchChats(agent: string | undefined, query: string, kind: '
       if (!query.trim() || !agent) return null
       const params = new URLSearchParams({ q: query, agent })
       if (kind !== 'chats') params.set('kind', kind)
-      const res = await apiFetch(`/v1/chats/search?${params}`)
-      if (!res.ok) throw new Error('Search failed')
-      const data = await res.json()
-      return data.chats as Chat[]
+      const data = await apiJson<{ chats: Chat[] }>(`/v1/chats/search?${params}`, {}, 'Search failed')
+      return data.chats
     },
     enabled: !!query.trim() && !!agent,
     staleTime: 5000,

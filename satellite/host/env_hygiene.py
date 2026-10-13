@@ -4,7 +4,7 @@ The satellite spawns the agent CLI (claude / codex / MCP warm-up) as a child of
 the satellite daemon, which runs as the operator's OS user. The three spawn sites
 seeded the child env from the operator's ENTIRE ``os.environ`` (``{**os.environ}``
 / ``dict(os.environ)``) and then overlaid the platform-shipped ``config["env"]``.
-Net: the agent inherited the operator's personal shell secrets (``GH_TOKEN`` from
+Net: the agent inherited the operator's personal shell secrets (a ``GH_TOKEN`` from
 ``gh auth``, ``*_API_KEY`` exports, ``AWS_SECRET_ACCESS_KEY``, …) — readable by a
 prompt-injected agent via ``printenv`` / ``$env:``.
 
@@ -21,7 +21,8 @@ system / runtime / GUI vars (``SYSTEMROOT``, ``PATHEXT``, ``APPDATA``, ``DISPLAY
 kept so native CLIs + GUI device-MCPs (computer / browser) keep working.
 
 The platform-injected ``config["env"]`` (the curated session env carrying the
-intentional ``GH_TOKEN`` / ``PROXY_API_KEY`` / ``ANTHROPIC_API_KEY``) is
+intentional ``PROXY_API_KEY`` / ``ANTHROPIC_API_KEY``; a GitHub token is never
+among them, git and gh fetch it per command) is
 overlaid by the caller AFTER this runs, so those survive — only the operator's
 *ambient* secrets are dropped.
 """
@@ -62,6 +63,16 @@ _NESTED_CLAUDE_SESSION_VARS = frozenset({
     "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
 })
 
+# The hook flags the platform sets per spawn (proxy HOOKS.md "Environment
+# flags"): they change how a session's permission gate and trackers behave,
+# so a satellite started from a shell that carries them (an agent's shell in
+# a Codex chat) must not hand them to every session it spawns: a stray
+# OTO_HOOK_BRIDGED or OTO_HOOK_DENY_ONLY would let a Claude session's gate
+# stand aside. Dropped unconditionally, as the nested session identity is.
+_PER_SPAWN_HOOK_FLAGS = frozenset({
+    "OTO_HOOK_DENY_ONLY", "OTO_HOOK_NO_FORWARD", "OTO_HOOK_BRIDGED", "OTO_INTERACTIVE",
+})
+
 
 def _operator_keep_set() -> set:
     """Operator-extensible allow-back set (empty by default). ``OTO_ENV_KEEP`` is a
@@ -91,7 +102,7 @@ def curate_satellite_env(environ=None) -> dict:
     keep = _operator_keep_set()
     out: dict = {}
     for name, value in src.items():
-        if name.upper() in _NESTED_CLAUDE_SESSION_VARS:
+        if name.upper() in _NESTED_CLAUDE_SESSION_VARS or name.upper() in _PER_SPAWN_HOOK_FLAGS:
             continue
         if name.upper() in keep:
             out[name] = value

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useUpdateMcp, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, McpServer, McpUpdateInfo, McpSourceChange, McpSourceEnd } from '../../api/mcps'
+import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useSetHostedServiceMode, useSetNetworkAccess, useDockerAction, useDeleteMcp, useUpdateMcp, useAcceptMcpSource, useDismissMcpSourceChange, isUpdateOffer, automaticUpdateNote, McpServer, McpUpdateInfo, McpSourceChange, McpSourceEnd } from '../../api/mcps'
 import { useAgents } from '../../api/agents'
 import { useSetInfraCredentials, useCredentialSchema } from '../../api/credentials'
 import { useClientRegistrations, useForgetClientRegistration, ClientRegistration } from '../../api/oauth'
@@ -272,7 +272,9 @@ function SwitchedCard({ mcp, change }: { mcp: McpServer; change: McpSourceChange
   )
 }
 
-export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUpdateInfo }) {
+export function McpRow({ mcp, updateInfo, autoUpdateEnabled = true }: {
+  mcp: McpServer; updateInfo?: McpUpdateInfo; autoUpdateEnabled?: boolean
+}) {
   const [expanded, setExpanded] = useState(false)
   const [configValues, setConfigValues] = useState<Record<string, string>>(mcp.config_values || {})
   const [configSaved, setConfigSaved] = useState(false)
@@ -339,6 +341,8 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
   const hasConfig = mcp.config_fields.length > 0
   const hasSkills = mcp.skills.length > 0
   const dockerInfo = isDocker ? DOCKER_STATUS[mcp.docker_status || DOCKER.NOT_CHECKED] : null
+  // An update replaced the image but the container still serves the old one.
+  const restartToSwitch = isDocker && mcp.docker_status === DOCKER.RUNNING && !!mcp.docker_image_stale
   // What the last check says about this MCP: a pending source change
   // replaces the ordinary offer; a finished switch rides beside one; an
   // install ahead of the catalog is a note, not an offer.
@@ -430,8 +434,8 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
 
         {/* Docker status */}
         {dockerInfo && (
-          <span className={`text-xs font-medium ${dockerInfo.color} shrink-0`}>
-            {dockerInfo.label}
+          <span className={`text-xs font-medium ${restartToSwitch ? 'text-amber-600 dark:text-amber-400' : dockerInfo.color} shrink-0`}>
+            {restartToSwitch ? `${dockerInfo.label}, restart to switch` : dockerInfo.label}
           </span>
         )}
 
@@ -558,24 +562,34 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                       <p className="text-xs font-medium text-brand">Update Available</p>
                       <p className="text-[11px] text-p-text-secondary">
                         {ordinaryUpdate.reason === 'manifest'
-                          ? 'Integration update (manifest changed)'
+                          ? (ordinaryUpdate.rebuild
+                              ? 'Rebuild (its venv runs on an interpreter the sandbox cannot use)'
+                              : 'Integration update (manifest changed)')
                           : <>{ordinaryUpdate.current} → {ordinaryUpdate.latest}</>}
                         <span className="text-p-text-light ml-1">({ordinaryUpdate.registry})</span>
                       </p>
+                      {automaticUpdateNote(ordinaryUpdate, autoUpdateEnabled) && (
+                        <p className="text-[11px] text-p-text-light mt-0.5">
+                          {automaticUpdateNote(ordinaryUpdate, autoUpdateEnabled)}
+                        </p>
+                      )}
                     </div>
-                    <button
-                      onClick={() => {
-                        setUpdateLog('')
-                        updateMcp.mutate(mcp.name, {
-                          onSuccess: (data: any) => setUpdateLog(data.install_log || 'Updated successfully'),
-                          onError: (e: Error) => setUpdateLog(`Error: ${e.message}`),
-                        })
-                      }}
-                      disabled={updateMcp.isPending}
-                      className="text-xs px-3 py-1.5 rounded-md bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-                    >
-                      {updateMcp.isPending ? 'Updating...' : 'Update'}
-                    </button>
+                    {/* A catalog git+ source at a tag or a branch: the catalog install refuses it. */}
+                    {!(ordinaryUpdate.registry === 'git' && ordinaryUpdate.pinned_commit === false) && (
+                      <button
+                        onClick={() => {
+                          setUpdateLog('')
+                          updateMcp.mutate(mcp.name, {
+                            onSuccess: (data: any) => setUpdateLog(data.install_log || 'Updated successfully'),
+                            onError: (e: Error) => setUpdateLog(`Error: ${e.message}`),
+                          })
+                        }}
+                        disabled={updateMcp.isPending}
+                        className="text-xs px-3 py-1.5 rounded-md bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
+                      >
+                        {updateMcp.isPending ? 'Updating...' : 'Update'}
+                      </button>
+                    )}
                   </div>
                   {updateLog && (
                     <details open={updateLog.startsWith('Error')}>
@@ -616,6 +630,12 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
               {isDocker && (
                 <div className="rounded-lg border border-p-border-light/60 bg-white dark:bg-gray-800/50 p-3">
                   <p className="text-[11px] font-semibold text-p-text-light uppercase tracking-wide mb-2">Docker</p>
+                  {restartToSwitch && (
+                    <p className="text-[11px] text-amber-700 dark:text-amber-400 mb-2">
+                      Updated to v{mcp.version}. The container still runs the previous
+                      image: restart to switch.
+                    </p>
+                  )}
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'start' })}
@@ -639,6 +659,9 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                       Restart
                     </button>
                   </div>
+                  {dockerAction.error && (
+                    <p className="text-[11px] text-red-600 dark:text-red-400 mt-2">{dockerAction.error.message}</p>
+                  )}
                 </div>
               )}
 

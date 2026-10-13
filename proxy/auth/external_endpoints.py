@@ -56,6 +56,9 @@ _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
     # through the credential gateway (api/mcp/gateway.py), which binds the
     # token's session to the MCP's stored credential.
     (re.compile(r"^/v1/mcp-gateway/[^/]+/.*$"), frozenset({"GET", "POST", "DELETE"})),
+    # The call tools (call-control-mcp): a caller ends or transfers their
+    # OWN call; the binding is the token's session, the body names no call.
+    (re.compile(r"^/v1/phone/call-control$"), frozenset({"POST"})),
 ]
 
 EXTERNAL_BLOCKED_DETAIL = "This endpoint is not available to external sessions"

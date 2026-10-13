@@ -338,6 +338,53 @@ def _dropped_note(dropped: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The `help` op of write_docx and write_pptx (write_xlsx has its own, built
+# from its key catalogue): the tool descriptions stay under the CLI's
+# 2048-character cap and name every op; the parameters live here.
+# ---------------------------------------------------------------------------
+
+_HELP_OPS = frozenset({"help", "describe", "describe_ops", "catalog", "catalogue",
+                       "list_ops", "?"})
+_HELP_NAME_KEYS = ("name", "op_name", "operation_name", "topic")
+HELP_POINTER = ' ({"op": "help"} lists every operation and its keys)'
+
+
+def split_help_ops(ops: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(the help ops, every other op)."""
+    def is_help(op: dict) -> bool:
+        return str(_op_type(op)).strip().lower() in _HELP_OPS
+    return [op for op in ops if is_help(op)], [op for op in ops if not is_help(op)]
+
+
+def help_text(tool: str, groups: tuple, notes: str, help_ops: list[dict],
+              aliases: dict[str, str] | None = None) -> str:
+    """The answer to the help ops of one call: the whole catalogue, or one
+    operation's keys when the op names it (an alias the dispatcher accepts
+    answers for its operation). ``groups`` is
+    ``((group, ((op, keys), ...)), ...)``."""
+    entries = {name: keys for _, ops in groups for name, keys in ops}
+    aliases = aliases or {}
+    answers = []
+    for op in help_ops:
+        name = next((str(op[k]).strip() for k in _HELP_NAME_KEYS if op.get(k)), "")
+        name = aliases.get(name, name)
+        if not name:
+            lines = [f'{tool} operations: each is {{"op": "<name>", ...keys}}; ? marks '
+                     'an optional key. {"op": "help", "name": "<op>"} shows one.']
+            for group, ops in groups:
+                lines.append(f"\n{group}")
+                lines.extend(f"  {op_name}: {keys}" for op_name, keys in ops)
+            if notes:
+                lines.append("\n" + notes)
+            answers.append("\n".join(lines))
+        elif name in entries:
+            answers.append(f"{name}: {entries[name]}")
+        else:
+            answers.append(f"No operation named '{name}'. Valid operations: {', '.join(entries)}")
+    return "\n\n".join(answers)
+
+
+# ---------------------------------------------------------------------------
 # Writing an output: beneath the mount, no link followed
 # ---------------------------------------------------------------------------
 #

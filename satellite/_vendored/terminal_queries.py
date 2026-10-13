@@ -155,7 +155,7 @@ def strip_clipboard_writes(data: bytes) -> bytes:
 # Callers hold the partial tail back (a small carry) and prepend it to the next
 # chunk. A bare user Esc keypress parks in the carry until more bytes arrive —
 # benign for line-state (Esc never dirties a line). Satellite twin:
-# ``split_trailing_partial`` in ``satellite/terminal/terminal_queries.py``.
+# ``split_trailing_partial`` in ``satellite/_vendored/terminal_queries.py``.
 _PARTIAL_TAIL_RE = re.compile(
     rb"\x1b(?:"
     rb"\[M.{0,2}"          # legacy X10 mouse: needs exactly 3 payload bytes
@@ -179,6 +179,47 @@ def split_trailing_partial(data: bytes) -> "tuple[bytes, bytes]":
     return data[: m.start()], data[m.start():]
 
 
+# A bracketed-paste toggle (``CSI ? … 2004 … h`` on, ``… l`` off, alone or
+# among other private modes) and RIS (``ESC c``, a full reset: off after it).
+_PASTE_TOGGLE_RE = re.compile(rb"\x1b\[\?(?:\d+;)*2004(?:;\d+)*([hl])|\x1bc")
+PASTE_MODE_ON = b"\x1b[?2004h"
+# A toggle split across two reads is short; a longer unfinished tail is an
+# OSC or DCS body, never one.
+_PASTE_CARRY_MAX = 32
+
+
+class PasteModeTracker:
+    """The bracketed-paste mode a PTY's program last set, read from the
+    output a scrollback ring remembers, and whether the ring has dropped any.
+
+    A replay starts a fresh mirror, which pastes unbracketed (every line
+    break a bare CR the TUI submits) until it parses the program's
+    ``ESC[?2004h``; both TUIs send it once, at start. Once the ring has
+    trimmed that away, ``replay_prefix`` gives the mode back, written BEFORE
+    the ring (a ring can end inside an escape sequence). A program that
+    turned the mode off keeps it off; an untrimmed ring carries its own
+    toggles. Not tracked: XTSAVE/XTRESTORE of the mode."""
+
+    __slots__ = ("on", "trimmed", "_carry")
+
+    def __init__(self) -> None:
+        self.on = False
+        self.trimmed = False
+        self._carry = b""
+
+    def feed(self, data: bytes) -> None:
+        whole, partial = split_trailing_partial(self._carry + data)
+        self._carry = partial if len(partial) <= _PASTE_CARRY_MAX else b""
+        last = None
+        for last in _PASTE_TOGGLE_RE.finditer(whole):
+            pass
+        if last is not None:
+            self.on = last.group(1) == b"h"
+
+    def replay_prefix(self) -> bytes:
+        return PASTE_MODE_ON if self.trimmed and self.on else b""
+
+
 # Restores a real terminal to a sane state after mirroring a TUI that died or
 # was detached mid-flight (the inner CLI enables mouse tracking / bracketed
 # paste / focus reporting on the REAL terminal through the mirrored output and
@@ -187,7 +228,7 @@ def split_trailing_partial(data: bytes) -> "tuple[bytes, bytes]":
 # the alt screen (needed for alt-screen TUIs); note its implied cursor restore
 # (DECRC) can home the cursor on emulators that "restore" an unsaved cursor —
 # callers print any post-detach message with a leading newline. Satellite twin:
-# ``TERMINAL_MODE_RESET`` in ``satellite/terminal/terminal_queries.py``.
+# ``TERMINAL_MODE_RESET`` in ``satellite/_vendored/terminal_queries.py``.
 TERMINAL_MODE_RESET = (
     b"\x1b[0m"          # SGR reset (no color/attr leak into the shell)
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"  # mouse off

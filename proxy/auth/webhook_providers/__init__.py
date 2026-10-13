@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from auth.webhook_providers.base import WebhookProvider
 
-logger = logging.getLogger("claude-proxy.webhook-providers")
+logger = logging.getLogger("otodock.webhook-providers")
 
 
 #: Providers whose events run large (a big push, an issue with a long

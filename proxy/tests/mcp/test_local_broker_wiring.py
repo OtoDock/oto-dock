@@ -49,7 +49,8 @@ def test_claude_injects_token_and_wraps_only_bundle_mcp(tmp_path):
     # bundle MCP: token bound to (session, mcp) + command wrapped via interceptor
     tok = maps["env"]["OTO_MCP_FETCH_TOKEN"]
     assert mcp_broker.verify_token(tok) == ("sess-1", "google-maps")
-    assert maps["command"] == "python3"
+    from core.sandbox.session_config_dir import sandbox_python
+    assert maps["command"] == sandbox_python()
     assert maps["args"] == [
         "-I", "/users/alice/.claude/stdio_path_interceptor.py", "--", "python3", "s.py",
     ]

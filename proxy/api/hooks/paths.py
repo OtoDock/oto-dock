@@ -32,7 +32,7 @@ from core import layout
 if TYPE_CHECKING:
     from services.path_policy_v2 import PathResolution
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 
@@ -211,9 +211,24 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
             rel = resolution.path_ref.value
         else:
             rel = raw.lstrip("/")
-        cached = await remote_file_flow.pull_through(req.session_id, rel)
+        held: list[str] = []
+        cached = await remote_file_flow.pull_through(req.session_id, rel, held=held)
+        if held and req.writing:
+            # A write here would edit the platform copy and the push after it
+            # would overwrite the machine's, for a path the session's own
+            # writes never bring back.
+            raise HTTPException(
+                status_code=403,
+                detail=f"{raw} cannot be written from this session: its role may not "
+                       "write that folder",
+            )
         if cached is not None and cached.is_file():
             return _answer(str(cached), ctx)
+        if held:
+            # The machine's copy is never read for a path the session may
+            # not write back, and the platform has none: the lexical
+            # translator below would only name the same missing file.
+            raise HTTPException(status_code=404, detail=remote_file_flow.held_reason(raw))
         # WRITE target that doesn't exist on the satellite yet (new output
         # file): resolve to the platform creation path — the Docker MCP
         # writes there and /v1/hooks/file-written pushes it back. Without
@@ -618,10 +633,16 @@ async def _classify_and_pull(
         )
 
     ref = resolution.path_ref
+    held: list[str] = []
     if ref.kind == "satellite_host":
         pulled = await remote_file_flow.pull_through_host_path(session_id, ref.value)
     else:  # agent_tree
-        pulled = await remote_file_flow.pull_through(session_id, ref.value)
+        pulled = await remote_file_flow.pull_through(session_id, ref.value, held=held)
     if pulled is not None and pulled.is_file():
         return pulled, resolution
+    if held:
+        import dataclasses
+        return None, dataclasses.replace(
+            resolution, allowed=False, error=remote_file_flow.held_reason(raw_path),
+        )
     return None, resolution

@@ -10,7 +10,7 @@ import { useChatAudioCapability } from './useChatAudioCapability'
 import { useMyAudioPrefs } from '../api/userAudio'
 import { acquireMic, releaseMic } from '../audio/micCoordinator'
 import { setDictationActive, stopActivePlayback } from '../audio/speechActivity'
-import { browserSttLang } from '../audio/lang'
+import { browserSttLang, isAutoLanguage } from '../audio/lang'
 import { resolveSttBackend } from '../audio/resolver'
 import { platformStt } from '../audio/backends/platformStt'
 import { type STTBackend, type STTSession } from '../audio/types'
@@ -117,7 +117,13 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     }
 
     const runWith = async (b: STTBackend) => {
-      const session = b.create({ language: prefs?.stt_language || browserSttLang(), providerId: cap.stt_provider_id })
+      // No pick: the browser language. Automatic: the platform engine
+      // identifies the language; the device recognizer needs a code and
+      // keeps the browser's.
+      const stored = prefs?.stt_language
+      const language = !stored || (isAutoLanguage(stored) && b.kind === 'native')
+        ? browserSttLang() : stored
+      const session = b.create({ language, providerId: cap.stt_provider_id })
       // Set when start() fails or times out. withTimeout REJECTS but the
       // underlying start keeps running — without this flag (and the stop()
       // in the catch) a slow platform connect leaves a ZOMBIE session whose

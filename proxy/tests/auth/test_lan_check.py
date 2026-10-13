@@ -84,7 +84,7 @@ def test_bare_metal_loopback_hop_walks_to_the_real_client(monkeypatch):
 
 def test_docker_loopback_with_xff_is_ignored_and_raises_no_flag(monkeypatch, caplog):
     monkeypatch.setattr(config, "RUNNING_IN_DOCKER", True)
-    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+    with caplog.at_level(logging.WARNING, logger="otodock"):
         r = lan_check.stamp_scope(_scope("127.0.0.1", [("X-Forwarded-For", "203.0.113.7")]))
     assert r.client == "127.0.0.1" and r.case == ""
     assert lan_check.forwarding_warnings() == []
@@ -93,7 +93,7 @@ def test_docker_loopback_with_xff_is_ignored_and_raises_no_flag(monkeypatch, cap
 
 def test_the_internal_listener_never_reads_forwarding_headers(monkeypatch, caplog):
     monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 45123)
-    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+    with caplog.at_level(logging.WARNING, logger="otodock"):
         r = lan_check.stamp_scope(_scope("127.0.0.1", [("X-Forwarded-For", "203.0.113.7")],
                                          server=("127.0.0.1", 45123)))
     assert r.client == "127.0.0.1" and r.case == "" and r.shared
@@ -122,7 +122,7 @@ def test_the_docker_gateway_as_the_client_refuses_local_only(monkeypatch):
 
 
 def test_a_public_peer_with_xff_raises_no_flag(caplog):
-    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+    with caplog.at_level(logging.WARNING, logger="otodock"):
         r = lan_check.stamp_scope(_scope("198.51.100.20", [("X-Forwarded-For", "10.1.2.3")]))
     assert r.client == "198.51.100.20" and r.case == "" and not r.shared
     assert lan_check.forwarding_warnings() == []
@@ -192,7 +192,7 @@ def test_a_missing_or_non_ip_peer_is_neither_trusted_nor_local():
 def test_a_loopback_trusted_proxy_entry_is_dropped_in_docker(monkeypatch, caplog):
     monkeypatch.setattr(config, "RUNNING_IN_DOCKER", True)
     monkeypatch.setattr(config, "TRUSTED_PROXIES", ["127.0.0.0/8", _EDGE])
-    with caplog.at_level(logging.ERROR, logger="claude-proxy"):
+    with caplog.at_level(logging.ERROR, logger="otodock"):
         r = _resolve("127.0.0.1", [("X-Forwarded-For", "203.0.113.7")])
     assert r.client == "127.0.0.1"
     assert any("covers loopback" in x.getMessage() for x in caplog.records)
@@ -211,7 +211,7 @@ def test_ip_in_trusted_keeps_meaning_the_configured_list(monkeypatch):
 
 
 def test_an_untrusted_private_forwarder_logs_one_error_per_hour(caplog):
-    with caplog.at_level(logging.ERROR, logger="claude-proxy"):
+    with caplog.at_level(logging.ERROR, logger="otodock"):
         for _ in range(3):
             lan_check.stamp_scope(_scope(_EDGE, [("X-Forwarded-For", "203.0.113.7")]))
     errors = [x.getMessage() for x in caplog.records if x.levelno == logging.ERROR]
@@ -226,7 +226,7 @@ def test_an_untrusted_private_forwarder_logs_one_error_per_hour(caplog):
 def test_the_gateway_wording_carries_the_loopback_publish_condition(monkeypatch, caplog):
     monkeypatch.setattr(config, "RUNNING_IN_DOCKER", True)
     monkeypatch.setattr(lan_check, "_docker_gateway", lambda: _EDGE)
-    with caplog.at_level(logging.ERROR, logger="claude-proxy"):
+    with caplog.at_level(logging.ERROR, logger="otodock"):
         lan_check.stamp_scope(_scope(_EDGE, [("X-Forwarded-For", "203.0.113.7")]))
     (text,) = [x.getMessage() for x in caplog.records if x.levelno == logging.ERROR]
     assert "PROXY_BIND_IP=127.0.0.1" in text
@@ -279,7 +279,7 @@ def test_no_boot_row_without_an_https_container(monkeypatch, docker, url):
 
 def test_an_edge_without_xff_logs_one_warning(monkeypatch, caplog):
     monkeypatch.setattr(config, "TRUSTED_PROXIES", [_EDGE])
-    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+    with caplog.at_level(logging.WARNING, logger="otodock"):
         for _ in range(2):
             lan_check.stamp_scope(_scope(_EDGE, [("X-Forwarded-Proto", "https")]))
     warnings = [x.getMessage() for x in caplog.records if x.levelno == logging.WARNING]
@@ -420,7 +420,7 @@ def test_without_an_internal_listener_nothing_is_internal(monkeypatch):
 def test_a_local_only_login_on_the_internal_listener_is_refused(monkeypatch, caplog):
     monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", _INTERNAL)
     email = _local_only_user()
-    with caplog.at_level(logging.WARNING, logger="claude-proxy"):
+    with caplog.at_level(logging.WARNING, logger="otodock"):
         r = _internal_client().post("/auth/login/local", json={"email": email, "password": _PW})
     assert r.status_code == 403, r.text
     assert any("internal listener" in x.getMessage() for x in caplog.records)

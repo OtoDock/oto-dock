@@ -70,7 +70,7 @@ def mint_confirm_token(sub: str) -> str:
 def consume_confirm_token(token: str, sub: str) -> bool:
     """Single-use, bound to the user it was minted for."""
     entry = _confirm_tokens.pop(token or "", None)
-    return bool(entry) and entry[0] == sub and entry[1] >= time.time()
+    return entry is not None and entry[0] == sub and entry[1] >= time.time()
 
 
 async def confirm_human(u, *, password: str = "", confirm_token: str = "") -> None:

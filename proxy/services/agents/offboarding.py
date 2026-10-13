@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.offboarding")
+logger = logging.getLogger("otodock.offboarding")
 
 REMOVED = "removed"
 DEMOTED = "demoted"

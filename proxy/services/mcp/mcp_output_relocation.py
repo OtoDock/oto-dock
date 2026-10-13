@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from core import layout
 
-logger = logging.getLogger("claude-proxy.mcp-output-relocation")
+logger = logging.getLogger("otodock.mcp-output-relocation")
 
 # A media basename the tool reported producing (e.g. camoufox's
 # `screenshots/page-2026-06-27T05-11-40-812Z.png`). The character class excludes
@@ -95,6 +95,31 @@ def _session_workspace(
     if username:
         return layout.user_dir(config.AGENTS_DIR / agent_name, username) / layout.WORKSPACE
     return config.AGENTS_DIR / agent_name / layout.WORKSPACE
+
+
+def session_workspace_dir(ctx) -> Path:
+    """The host folder of a session's workspace, as its ``workspace`` path
+    role resolves it: the MOUNT decides, so a Shared-only human chat (a
+    username, an agent-scope mount) works in the agent's ``workspace``."""
+    from core.session.external_identity import external_home_of
+    return _session_workspace("", ctx.agent, ctx.mount_username, external_home_of(ctx))
+
+
+def session_workspace_shown(ctx) -> str:
+    """The same folder as the session itself names it: sandbox-virtual
+    (``/users/<u>/workspace``, ``/workspace``, ``/caller/workspace``) on the
+    platform, the machine's own path on a paired machine (no sandbox there
+    maps the virtual roots for a shell command)."""
+    from core.session.external_identity import SANDBOX_HOME, external_home_of
+    if external_home_of(ctx):
+        return f"{SANDBOX_HOME}/{layout.WORKSPACE}"
+    virtual = layout.virtual_workspace(ctx.mount_username)
+    placement = getattr(ctx, "placement", None)
+    agents_dir = getattr(placement, "agents_dir", "") if placement is not None else ""
+    if agents_dir and placement.is_remote:
+        agent_dir = agents_dir.replace("\\", "/").rstrip("/") + "/" + ctx.agent
+        return layout.host_of_virtual(virtual, agent_dir, ctx.mount_username)
+    return virtual
 
 
 def _parse_output_names(result_text: str | None) -> list[str]:
@@ -251,12 +276,7 @@ def relocate_for_tool(
 
     st = _state.get(session_id)
     start_ts = st.started_at.get(mcp_name, 0.0) if st else 0.0
-    from core.session.external_identity import external_home_of
-    _ext_home = external_home_of(ctx)
-    workspace = (
-        _session_workspace(session_id, ctx.agent, ctx.username, _ext_home)
-        if _ext_home else _session_workspace(session_id, ctx.agent, ctx.username)
-    )
+    workspace = session_workspace_dir(ctx)
     names = _parse_output_names(result_text)
     is_t2 = deployment.current_mode() == deployment.MANAGED_SOCKPROX
 

@@ -41,11 +41,12 @@ class _FakeLayer:
     doubles as proof the producer releases the lock between sends.
     """
 
-    def __init__(self, turns, on_drain=None, on_nudge_turn=None):
+    def __init__(self, turns, on_drain=None, on_nudge_turn=None, on_main_turn=None):
         self.turns = list(turns)
         self.prompts: list[str] = []
         self.on_drain = on_drain            # fn(call_no) -> progressed: bool
         self.on_nudge_turn = on_nudge_turn  # fn(nudge_no) at each nudge send
+        self.on_main_turn = on_main_turn    # fn() during the main turn
         self.drain_calls = 0
         self._locks: dict = {}
 
@@ -59,6 +60,8 @@ class _FakeLayer:
 
     async def send_message(self, session_id, prompt, **kw):
         self.prompts.append(prompt)
+        if len(self.prompts) == 1 and self.on_main_turn:
+            self.on_main_turn()
         if len(self.prompts) > 1 and self.on_nudge_turn:
             self.on_nudge_turn(len(self.prompts) - 1)
         for event in (self.turns.pop(0) if self.turns else []):
@@ -116,11 +119,13 @@ def clean_registries():
     """Unique-session tests still clean up so nothing leaks across runs."""
     created: list[str] = []
     yield created
+    from core.session import session_events
     for sid in created:
         _bg_command_registries.pop(sid, None)
         reg = get_subagent_registry(sid)
         reg.spawned.clear()
         reg.completed.clear()
+        session_events.cleanup_session(sid)
 
 
 @pytest.mark.asyncio
@@ -201,6 +206,73 @@ async def test_pending_command_drain_resolves_then_nudges(clean_registries):
 
     assert len(layer.prompts) == 2
     assert "1 background command(s)" in layer.prompts[1]
+    assert len(_nudges(events)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_the_main_turn_ends_the_run_without_a_review(clean_registries):
+    """The person stopped the run: a completion the model never saw is not
+    reviewed (the 2026-10-13 finding: the kill flushed the commands as done
+    and the nudge died on the dead CLI), and a still-running command is not
+    waited for. The run ends with the output so far."""
+    from core.session import session_events
+    sid = "tp-stopped"
+    clean_registries.append(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t1")
+    bgreg.register_spawn("cmd-b", "t2")
+    bgreg.mark_done("cmd-a", surfaced=False)
+
+    layer = _FakeLayer(turns=[[_bg_cmd_start(), _bg_cmd_start()], []],
+                       on_main_turn=lambda: session_events.note_stop(sid))
+    events = await _run(layer, sid)
+
+    assert layer.prompts == ["do the task"]
+    assert not _nudges(events)
+    assert layer.drain_calls == 0
+    assert bgreg.has_pending  # cmd-b stays with the session
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_a_review_turn_ends_the_review(clean_registries):
+    """A review turn is a plain turn: a Stop during it must not start the
+    next round over a completion that landed meanwhile."""
+    from core.session import session_events
+    sid = "tp-stopped-review"
+    clean_registries.append(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t1")
+    bgreg.register_spawn("cmd-b", "t2")
+    bgreg.mark_done("cmd-a", surfaced=False)
+
+    def _during_nudge(_n):
+        bgreg.mark_done("cmd-b", surfaced=False)
+        session_events.note_stop(sid)
+
+    layer = _FakeLayer(turns=[[_bg_cmd_start(), _bg_cmd_start()], [], []],
+                       on_nudge_turn=_during_nudge)
+    events = await _run(layer, sid)
+
+    assert len(layer.prompts) == 2
+    assert "cmd-a" not in layer.prompts[1] or "1 background command(s)" in layer.prompts[1]
+    assert len(_nudges(events)) == 1
+    assert bgreg.unsurfaced_count == 1  # cmd-b's completion is never reviewed
+
+
+@pytest.mark.asyncio
+async def test_a_stop_before_the_run_began_still_reviews(clean_registries):
+    from core.session import session_events
+    sid = "tp-stopped-earlier"
+    clean_registries.append(sid)
+    session_events.note_stop(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t1")
+    bgreg.mark_done("cmd-a", surfaced=False)
+
+    layer = _FakeLayer(turns=[[_bg_cmd_start()], []])
+    events = await _run(layer, sid)
+
+    assert len(layer.prompts) == 2
     assert len(_nudges(events)) == 1
 
 
@@ -586,3 +658,56 @@ async def test_a_machine_that_does_not_come_back_ends_the_wait(
     assert layer.prompts == ["do the task"]
     assert not _nudges(events)
     assert layer.drain_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_waiting_on_a_person_is_not_given_up(clean_registries):
+    """The REVIEW lane's shape (2026-10-07): a background subagent's call
+    waits on a person's answer. The wait is progress, not a lost subagent:
+    the run waits past its ceiling and reviews the agent once it finishes."""
+    from core.session import session_state
+    sid = "tp-sub-prompt"
+    clean_registries.append(sid)
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-p", "t1")
+    session_state.open_permission_wait("rid-p", sid)
+
+    async def answer_later():
+        await asyncio.sleep(0.5)
+        session_state.resolve_permission("rid-p", True)
+        session_state._permission_events.pop("rid-p", None)
+        session_state._session_permission_requests.pop(sid, None)
+        await asyncio.sleep(0.05)
+        reg.mark_done("sub-p")
+
+    layer = _FakeLayer(turns=[[_bg_sub_start()], []])
+    finisher = asyncio.create_task(answer_later())
+    events = await _run(layer, sid, bg_sub_ceiling=0.2)
+    await finisher
+    assert len(_nudges(events)) == 1
+    # The subagent-only wait read stdout too (a request arrives there).
+    assert layer.drain_calls > 0
+
+
+@pytest.mark.asyncio
+async def test_the_wait_counts_from_the_settle_read_start(clean_registries):
+    """The settle read and the producer's wait share one deadline: work the
+    settle already waited on is not given a second full ceiling."""
+    import time
+    from core.layers.cli import settle as cli_settle
+    sid = "tp-one-deadline"
+    clean_registries.append(sid)
+    get_bg_command_registry(sid).register_spawn("cmd-x", "t1")
+
+    class _SettledLayer(_FakeLayer):
+        async def send_message(self, session_id, prompt, **kw):
+            # As the CLI's settle read does: it started 0.25 s ago.
+            cli_settle._run_ceilings[session_id].started = time.monotonic() - 0.25
+            async for e in super().send_message(session_id, prompt, **kw):
+                yield e
+
+    layer = _SettledLayer(turns=[[_bg_cmd_start()]])
+    t0 = time.monotonic()
+    await _run(layer, sid, bg_cmd_ceiling=0.3)
+    assert time.monotonic() - t0 < 0.25
+    assert sid not in cli_settle._run_ceilings

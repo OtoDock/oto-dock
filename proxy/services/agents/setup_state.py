@@ -26,7 +26,7 @@ from storage import database as task_store
 from storage.agents import agent_store
 from core import layout
 
-logger = logging.getLogger("claude-proxy.agents")
+logger = logging.getLogger("otodock.agents")
 
 AGENT_SETUP = "setup.md"
 USER_SETUP = "user-setup.md"

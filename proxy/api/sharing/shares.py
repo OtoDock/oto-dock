@@ -47,7 +47,7 @@ from storage.sharing import share_store
 from core.session import session_kind
 from core.session.visibility import is_task_chat_owner
 
-logger = logging.getLogger("claude-proxy.shares")
+logger = logging.getLogger("otodock.shares")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -421,7 +421,10 @@ async def _create_external(req: ShareCreateRequest, u: UserContext, request: Req
 
     def _create() -> tuple[dict, str, str]:
         target = _authorized()
-        expires_at = _parse_expiry(req.expires_in or EXTERNAL_DEFAULT_EXPIRY, _max_expiry_days())
+        cap_days = _max_expiry_days()
+        # A link made with no expiry gets 30 days, or the cap when it is shorter.
+        default = f"{min(30, cap_days)}d" if cap_days else EXTERNAL_DEFAULT_EXPIRY
+        expires_at = _parse_expiry(req.expires_in or default, cap_days)
         token = secrets.token_urlsafe(32)
         share = share_store.create_external_share(
             target_kind=req.target_kind, target_id=req.target_id, created_by=u.sub,
@@ -779,7 +782,7 @@ async def accept_share(
     app's own agent is never a place: a member sees it there already."""
     u = require_human(user)
 
-    def _apply() -> tuple[dict, dict]:
+    def _apply() -> tuple[dict, dict, dict | None]:
         share = _own_app_share(u, share_id)
         agent = (req.agent or "").strip()
         if not agent:
@@ -789,6 +792,10 @@ async def accept_share(
         row = task_store.get_app(share["app_id"]) or {}
         if agent == (row.get("agent") or ""):
             raise HTTPException(status_code=400, detail="That is the app's own agent")
+        from services.agents import shared_only_members
+        target_row = shared_only_members.agent_row(agent) or {}
+        if shared_only_members.is_shared_only_row(target_row):
+            return _place_for_shared_only_agent(u, share, row, agent, target_row)
         left = share.get("placed_agent") or ""
         if not share_store.set_decision(share_id, share_store.ACCEPTED, u.sub,
                                         placed_agent=agent):
@@ -800,11 +807,92 @@ async def accept_share(
         if left and left != agent:
             # A move: the panel the app left changed too.
             targets.setdefault(u.sub, set()).add(left)
-        return _shape(fresh, u.sub), targets
+        return _shape(fresh, u.sub), targets, None
 
-    shaped, targets = await asyncio.to_thread(_apply)
+    shaped, targets, notify = await asyncio.to_thread(_apply)
     await share_inbox.send(targets)
+    if notify:
+        from services.notifications import notification_manager
+        try:
+            await notification_manager.fire_notification(
+                title=notify["title"], body=notify["body"], severity="info", scope="user",
+                target=notify["sharer"], source="share", agent_slug=notify["agent"],
+                href=notify["href"],
+            )
+        except Exception:
+            logger.exception("share notification failed")
     return {"status": "ok", "share": shaped}
+
+
+def _place_for_shared_only_agent(u: UserContext, share: dict, row: dict, agent: str,
+                                 target_row: dict) -> tuple[dict, dict, dict]:
+    """The accept into a Shared-only agent: every session there runs as the
+    agent, so a person's own listing would reach no chat of it, and the app
+    goes there as the agent's placement instead, for everyone on the agent.
+    That is an agent share, so the agent-share rule holds whole: a team app
+    (a personal app is never placed for an agent), a sharer who could make
+    that share themselves (may share the app AND is editor or above on the
+    receiving agent; the person they chose never widens it), the accepter at
+    the editor tier there too, and the switch on. The person share turns
+    into it in place (its sharer, cap and expiry kept) and the sharer is
+    told. A sharer who could not is the accepter's message to ask them."""
+    name = target_row.get("display_name") or agent
+    if row.get("username"):
+        raise HTTPException(status_code=400, detail=(
+            f"{name} is set to Shared only, so an app there goes to everyone on it, "
+            "and a personal app cannot be placed for a whole agent. Accept it into "
+            "another agent."))
+    if not u.can_edit_agent(agent):
+        raise HTTPException(status_code=403, detail=(
+            f"{name} is set to Shared only: its chats run as the agent, so an app goes "
+            "there for everyone, which takes the editor role. Accept it into another agent."))
+    if not _setting_on(SETTING_TO_AGENTS):
+        raise HTTPException(status_code=403, detail=(
+            f"{name} is set to Shared only, so an app there goes to everyone on it, and "
+            "sharing to agents is turned off by an admin. Accept it into another agent."))
+    from auth.providers import user_context_for_sub
+    sharer = user_context_for_sub(share.get("created_by") or "")
+    if sharer is None or not _can_manage(row, sharer):
+        raise HTTPException(status_code=403, detail=(
+            f"{name} is set to Shared only, so an app there goes to everyone on it, and "
+            "the person who shared it can no longer share it. Accept it into another agent."))
+    if not sharer.can_edit_agent(agent):
+        who = sharer.display_name or sharer.name or "The person who shared it"
+        raise HTTPException(status_code=403, detail=(
+            f"{name} is set to Shared only, so an app there goes to everyone on it, which "
+            f"only someone who may share with {name} can do. Ask {who} to share it with "
+            f"{name}, or accept it into another agent."))
+    already = share_store.placement_for(row["id"], agent)
+    if already and already.get("source") in (share_store.AGENT, share_store.DEPARTMENT):
+        raise HTTPException(status_code=409,
+                            detail=f"It is already in {name}'s apps for everyone there.")
+    left = share.get("placed_agent") or ""
+    try:
+        placed = share_store.place_person_share_for_agent(share["id"], u.sub, agent, u.sub)
+    except share_store.ShareExists:
+        raise HTTPException(status_code=409, detail=(
+            f"An earlier share of this app to {name} (expired or paused) holds its place. "
+            "Ask the person who made it to remove it, then accept again.")) from None
+    if not placed:
+        # Revoked, declined or expired since the read above.
+        raise HTTPException(status_code=404, detail="Share not found")
+    audience.forget(row["id"])
+    fresh = share_store.get_share(share["id"]) or share
+    targets = share_inbox.targets_for(fresh)
+    targets.setdefault(u.sub, set()).add(agent)
+    if left and left != agent:
+        targets[u.sub].add(left)
+    title = row.get("title") or row.get("slug") or "an app"
+    who = u.display_name or u.name or u.email
+    notify = {
+        "sharer": share.get("created_by") or "",
+        "title": f"{who} added “{title}” to {name}'s apps",
+        "body": (f"{name} is set to Shared only, so the app you shared with {who} "
+                 "is there for everyone on it now. Remove it from your share list "
+                 "to take it back."),
+        "agent": agent, "href": f"/apps/{row['id']}",
+    }
+    return _shape(fresh, u.sub), targets, notify
 
 
 @router.post("/v1/shares/{share_id}/decline")

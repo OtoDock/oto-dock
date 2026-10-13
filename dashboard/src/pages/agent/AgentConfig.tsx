@@ -8,6 +8,7 @@ import { MACHINE_STATE } from '../../lib/status/machine'
 import { useDepartments } from '../../api/departments'
 import { wiringSentence } from '../../lib/kinds/department'
 import { useAuth } from '../../contexts/AuthContext'
+import { useFlag } from '../../hooks/useFlag'
 import { ROLE, allowedOnSharedOnly, canManageAgent, isAdmin as isPlatformAdmin, isCreatorOrAbove, roleLabel, type AgentRole } from '../../lib/permissions'
 import { tierMarkText, tierTitle } from '../../lib/tiers'
 import {
@@ -44,6 +45,8 @@ export default function AgentConfig() {
   const { name } = useParams<{ name: string }>()
   const navigate = useNavigate()
   const { user, refreshUser } = useAuth()
+  const remoteMachinesAvailable = useFlag('remote_machines_available')
+  const interactiveTerminalEnabled = useFlag('interactive_terminal_enabled')
   const { data: info, isLoading } = useAgentInfo(name!)
   const updateAgent = useUpdateAgent()
   // The switch to Shared only has its own mutation: its answer (the removal
@@ -770,7 +773,7 @@ export default function AgentConfig() {
               target (backend enforces admin + admin-paired on save), so the
               control is hidden rather than shown-then-rejected. Also hidden
               when this build ships without the remote-machines feature. */}
-          {isAdmin && user?.feature_flags?.remote_machines_available !== false && (
+          {isAdmin && remoteMachinesAvailable && (
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
               <p className="text-sm font-medium text-p-text">Execution Target</p>
@@ -915,7 +918,7 @@ export default function AgentConfig() {
               descriptor's supports_interactive_pty), and only when the
               platform-wide interactive kill-switch is on. Manager-gated
               server-side (PATCH /v1/agents requires manage). */}
-          {defaultModelIsCliLayer && user?.feature_flags?.interactive_terminal_enabled !== false && (
+          {defaultModelIsCliLayer && interactiveTerminalEnabled && (
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
               <div>
                 <p className="text-sm font-medium text-p-text">Default Session Mode</p>

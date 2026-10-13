@@ -34,6 +34,7 @@ from services.notifications import notification_manager
 from auth.providers import acting_role_of, auth_gate, validate_session_jwt, session_cookie_current
 from auth import roles
 from ws import wire_events as wire
+from core.background import spawn
 
 # A dashboard socket outlives a single request; re-validate its session +
 # re-read the user's role/agents at most this often, on client activity and
@@ -82,7 +83,7 @@ from core.session import visibility as _vis
 from core import execution_mode
 from core.session import session_kind
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # A remote turn whose satellite event stream was severed (e.g. a reconnect
 # orphaned the session queue) leaves its producer parked on q.get() with no
@@ -1123,24 +1124,26 @@ class DashboardConnection(
             # Clean up orphaned pre-warmed session (user left without sending a message)
             if self._pre_warmed_sid:
                 orphan_sid = self._pre_warmed_sid
-                orphan_agent = self._pre_warmed_agent
+                orphan_exec_path = self._pre_warmed_exec_path
                 self._pre_warmed_sid = None
                 self._pre_warmed_agent = None
                 self._pre_warmed_exec_path = ""
                 self._pre_warmed_model = ""
-                orphan_role = self._pre_warmed_role or "manager"
                 self._pre_warmed_role = ""
-                try:
-                    orphan_layer = get_execution_layer(orphan_agent, user_sub=self.user_sub, role=orphan_role) if orphan_agent else self.layer
-                    if orphan_layer:
-                        await orphan_layer.close_session(orphan_sid)
-                    logger.info(f"WS dashboard: closed orphaned pre-warmed session {orphan_sid[:8]}")
-                except Exception:
-                    pass
-                from core.concurrency import release_chat_slot
-                release_chat_slot(orphan_sid)
+                # Ours to close only while the registry still holds it (another
+                # tab may have claimed it; the reaper closes what it took).
                 from core.session import prewarm_session_registry as _prewarm
-                await _prewarm.discard(orphan_sid)
+                if await _prewarm.claim(orphan_sid):
+                    try:
+                        from core.session.session_manager import layer_for_prewarm
+                        orphan_layer = layer_for_prewarm(orphan_sid, orphan_exec_path)
+                        if orphan_layer:
+                            await orphan_layer.close_session(orphan_sid)
+                        logger.info(f"WS dashboard: closed orphaned pre-warmed session {orphan_sid[:8]}")
+                    except Exception:
+                        pass
+                    from core.concurrency import release_chat_slot
+                    release_chat_slot(orphan_sid)
             # No release for self.session_id: its process outlives the socket,
             # so its reservation does too. The path that ends the session
             # releases it (layer close, reapers, the reconciler backstop).
@@ -1189,16 +1192,20 @@ class DashboardConnection(
                         logger.warning(
                             f"close-rescue: abort teardown failed for chat={_kcid[:8]}"
                         )
+                # No first turn: what a teammate sent while it got ready goes
+                # out on its own.
+                from core.events import input_queue
+                input_queue.first_turn_not_run(_kcid)
                 continue
             logger.info(
                 f"close-rescue: WS died with a queued server kick — running "
                 f"first turn headless for chat={_kcid[:8]}"
             )
-            asyncio.create_task(self._run_kick_headless(
+            spawn(self._run_kick_headless(
                 _kcid, _ksid, _kick.get("text", ""),
                 _kick.get("images", []), _kick.get("files", []),
                 force_headless=True,
-            ))
+            ), name="run_kick_headless", owner="dashboard")
 
     async def _receive_client_text(self) -> str:
         """The next client message: one a loop handed back first, else the

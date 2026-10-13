@@ -22,6 +22,23 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+
+_REAL_PERSON_HOLDS: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _wopi_persons_hold(monkeypatch):
+    """The WOPI routes judge the person a token names (the users row, the
+    credential timeline, the forced change): these tests mint tokens for
+    subs with no row, so the person holds unless a test asks otherwise
+    (``_REAL_PERSON_HOLDS``)."""
+    from api.media import wopi
+    _REAL_PERSON_HOLDS.setdefault("fn", wopi._person_holds_now)
+    monkeypatch.setattr(wopi, "_person_holds_now", lambda sub, iat: True)
+    wopi._holder_answers.clear()
+    yield
+    wopi._holder_answers.clear()
+
 def _encode_file_id(rel: str) -> str:
     return base64.urlsafe_b64encode(rel.encode()).decode().rstrip("=")
 
@@ -872,6 +889,40 @@ def test_a_save_naming_the_loaded_time_lands(temp_db, tmp_path, monkeypatch):
     pw.assert_awaited_once()
 
 
+def test_a_save_answers_while_its_fan_out_waits_on_a_stalled_machine(temp_db, tmp_path, monkeypatch):
+    """A machine that stalls (its socket drops after 30 s) made Collabora's
+    upload time out and retry into a refusal of its own save: the save
+    answers once its bytes are stored, the fan-out runs after the answer."""
+    import threading
+    import time as _time
+    from services.remote import workspace_fanout
+    client, target, file_id, token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
+    started, release = threading.Event(), threading.Event()
+
+    async def _stalled_fan_out(agent, rel, source, **kw):
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(workspace_fanout, "mark_fan_out_targets",
+                        AsyncMock(return_value={"m-stalled": (1, 1)}))
+    monkeypatch.setattr(workspace_fanout, "fan_out_write", _stalled_fan_out)
+    with client:
+        began = _time.monotonic()
+        resp = _save(client, file_id, token, b"the person's edit",
+                     timestamp=_loaded_time(client, file_id, token))
+        assert resp.status_code == 200
+        assert _time.monotonic() - began < 5
+        assert target.read_bytes() == b"the person's edit"
+        assert started.wait(5)              # the fan-out runs after the answer
+        assert workspace_fanout._save_fan_out_tasks
+        release.set()
+        deadline = _time.monotonic() + 5
+        while workspace_fanout._save_fan_out_tasks and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+    assert not workspace_fanout._save_fan_out_tasks
+
+
 def test_a_save_after_another_write_is_refused_and_writes_nothing(temp_db, tmp_path, monkeypatch):
     client, target, file_id, token, pw, bc = _save_rig(monkeypatch, tmp_path)
     loaded = _loaded_time(client, file_id, token)
@@ -927,7 +978,7 @@ def test_a_save_without_the_header_lands(temp_db, tmp_path, monkeypatch):
 
 def test_an_unreadable_header_saves_and_warns_once(temp_db, tmp_path, monkeypatch, caplog):
     client, target, file_id, token, pw, _bc = _save_rig(monkeypatch, tmp_path)
-    caplog.set_level("WARNING", logger="claude-proxy")
+    caplog.set_level("WARNING", logger="otodock")
     assert _save(client, file_id, token, b"one", "not a time").status_code == 200
     assert _save(client, file_id, token, b"two", "still not").status_code == 200
     assert pw.await_count == 2
@@ -948,7 +999,7 @@ def test_a_refused_closing_save_is_logged(temp_db, tmp_path, monkeypatch, caplog
     loaded = _loaded_time(client, file_id, token)
     target.write_bytes(b"the agent's rewrite")
     os.utime(target, (1_700_000_100, 1_700_000_100))
-    caplog.set_level("WARNING", logger="claude-proxy")
+    caplog.set_level("WARNING", logger="otodock")
     resp = _save(client, file_id, token, b"person bytes", loaded, **{"X-COOL-WOPI-IsExitSave": "true"})
     assert resp.status_code == 409
     assert any("closing editor" in r.getMessage() for r in caplog.records)
@@ -1094,17 +1145,20 @@ async def test_a_refused_precheck_writes_and_fans_out_nothing(temp_db, tmp_path,
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
     fo = AsyncMock()
     monkeypatch.setattr(wf, "fan_out_write", fo)
+    monkeypatch.setattr(wf, "mark_fan_out_targets", AsyncMock(return_value={"mA": (5, 1)}))
 
     async def _no():
         return False
     assert await wf.propagate_write("agent-1", "workspace/x.md", b"hello", precheck=_no) is False
     assert not (tmp_path / "agent-1" / "workspace" / "x.md").exists()
+    await wf.drain_save_fan_outs()
     fo.assert_not_awaited()
 
     async def _yes():
         return True
     assert await wf.propagate_write("agent-1", "workspace/x.md", b"hello", precheck=_yes) is True
     assert (tmp_path / "agent-1" / "workspace" / "x.md").read_bytes() == b"hello"
+    await wf.drain_save_fan_outs()
     fo.assert_awaited_once()
 
 
@@ -1485,6 +1539,13 @@ def _keyed(rel: str, generation: int) -> str:
     return _encode_file_id(f"{rel}\n{generation}")
 
 
+def _gen_token(rel: str, generation: int, **kw) -> str:
+    """An edit token for Bob opening the document of one generation."""
+    from api.media import wopi
+    return wopi.create_wopi_token(rel, "user-bob-sub", "Bob", "edit", "test-agent",
+                                  generation=generation, **kw)[0]
+
+
 def test_a_wopi_id_is_bare_or_keyed_by_digits_after_its_last_newline():
     from api.media import wopi
     rel = "test-agent/workspace/x.docx"
@@ -1500,9 +1561,10 @@ def test_a_wopi_id_is_bare_or_keyed_by_digits_after_its_last_newline():
         wopi.decode_wopi_id(base64.urlsafe_b64encode(b"\xff\xfe").decode())
 
 
-def test_a_keyed_id_answers_every_route_with_the_bare_paths_token(temp_db, tmp_path, monkeypatch):
-    client, target, _bare, token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+def test_a_keyed_id_answers_every_route_with_its_generations_token(temp_db, tmp_path, monkeypatch):
+    client, target, _bare, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
     fid = _keyed("test-agent/workspace/x.docx", 42)
+    token = _gen_token("test-agent/workspace/x.docx", 42)
     info = client.get(f"/wopi/files/{fid}?access_token={token}")
     assert info.status_code == 200
     assert info.json()["BaseFileName"] == "x.docx"
@@ -1513,6 +1575,69 @@ def test_a_keyed_id_answers_every_route_with_the_bare_paths_token(temp_db, tmp_p
     resp = _save(client, fid, token, b"person bytes", info.json()["LastModifiedTime"], **{"X-WOPI-Lock": "L1"})
     assert resp.status_code == 200
     assert target.read_bytes() == b"person bytes"
+
+
+def test_a_token_opens_only_its_own_generations_document(temp_db, tmp_path, monkeypatch):
+    """A token minted for one push's document cannot open another push's
+    (nor make Collabora open new documents of its file by varying the
+    suffix, filling the per-document tables): 403 on every route, before
+    any table is touched."""
+    from api.media import wopi
+    client, _target, bare, bare_token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    rel = "test-agent/workspace/x.docx"
+    token = _gen_token(rel, 41)
+    for tok, fid in ((token, _keyed(rel, 42)), (token, bare), (bare_token, _keyed(rel, 41))):
+        assert client.get(f"/wopi/files/{fid}?access_token={tok}").status_code == 403
+        assert client.get(f"/wopi/files/{fid}/contents?access_token={tok}").status_code == 403
+        assert _save(client, fid, tok, b"x").status_code == 403
+        lock = client.post(f"/wopi/files/{fid}?access_token={tok}",
+                           headers={"X-WOPI-Override": "LOCK", "X-WOPI-Lock": "L"})
+        assert lock.status_code == 403
+    pw.assert_not_awaited()
+    assert not wopi._stable_times and not wopi._doc_bases and not wopi._wopi_locks
+    assert client.get(f"/wopi/files/{_keyed(rel, 41)}?access_token={token}").status_code == 200
+
+
+def test_another_spelling_of_the_same_id_is_refused(temp_db, tmp_path, monkeypatch):
+    """Collabora keys a document by the id's text: leading zeros in the
+    generation, or base64's unused trailing bits, would be other documents
+    of the same path and generation. Only the encoder's own id opens."""
+    import base64
+    from api.media import wopi
+    client, _target, _bare, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    rel = "test-agent/workspace/x.docx"
+    token = _gen_token(rel, 7)
+    good = wopi.encode_wopi_id(rel, 7)
+    zeros = _encode_file_id(f"{rel}\n007")
+    raw = base64.urlsafe_b64decode(good + "=" * (-len(good) % 4))
+    alias = next(c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                 if (cand := good[:-1] + c) != good
+                 and base64.urlsafe_b64decode(cand + "=" * (-len(cand) % 4)) == raw)
+    alias_id = good[:-1] + alias
+    assert client.get(f"/wopi/files/{good}?access_token={token}").status_code == 200
+    for fid in (zeros, alias_id):
+        assert client.get(f"/wopi/files/{fid}?access_token={token}").status_code == 403
+        assert _save(client, fid, token, b"x").status_code == 403
+    pw.assert_not_awaited()
+
+
+def test_a_token_minted_before_the_claim_opens_every_generation_of_its_path(temp_db, tmp_path, monkeypatch):
+    """A 1.7.1 token (no generation claim, 4 h at most) keeps answering the
+    documents of its own path, so a document open across the upgrade keeps
+    saving; another path stays refused."""
+    import time as _time
+    import jwt
+    import config
+    client, _target, _bare, _token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
+    rel = "test-agent/workspace/x.docx"
+    now = int(_time.time())
+    legacy = jwt.encode({"purpose": "wopi", "file_path": rel, "user_sub": "user-bob-sub",
+                         "user_name": "Bob", "permissions": "edit", "agent": "test-agent",
+                         "iat": now, "exp": now + 600}, config.WOPI_SECRET, algorithm="HS256")
+    for fid in (_keyed(rel, 7), _keyed(rel, 8), _encode_file_id(rel)):
+        assert client.get(f"/wopi/files/{fid}?access_token={legacy}").status_code == 200
+    other = _encode_file_id("test-agent/workspace/other.docx")
+    assert client.get(f"/wopi/files/{other}?access_token={legacy}").status_code == 403
 
 
 def test_a_keyed_id_never_opens_a_path_beyond_the_tokens(temp_db, tmp_path, monkeypatch):
@@ -1540,27 +1665,29 @@ def test_a_keyed_id_never_opens_a_path_beyond_the_tokens(temp_db, tmp_path, monk
 def test_a_lingering_old_generation_cannot_save_over_a_new_push(temp_db, tmp_path, monkeypatch):
     # The document of an earlier push still open on another device: its save
     # after the agent's next push is refused, the new push's view saves.
-    client, target, _bare, token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    client, target, _bare, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
     rel = "test-agent/workspace/x.docx"
     old, new = _keyed(rel, 1), _keyed(rel, 2)
-    old_loaded = _loaded_time(client, old, token)
-    assert _fetch(client, old, token) == b"agent bytes"
+    old_token, new_token = _gen_token(rel, 1), _gen_token(rel, 2)
+    old_loaded = _loaded_time(client, old, old_token)
+    assert _fetch(client, old, old_token) == b"agent bytes"
     _agent_rewrite(target)
-    new_loaded = _loaded_time(client, new, token)
-    assert _fetch(client, new, token) == b"the agent's rewrite"
+    new_loaded = _loaded_time(client, new, new_token)
+    assert _fetch(client, new, new_token) == b"the agent's rewrite"
     for stamp in (old_loaded, new_loaded):
-        resp = _save(client, old, token, b"stale edits", stamp)
+        resp = _save(client, old, old_token, b"stale edits", stamp)
         assert resp.status_code == 409
         assert resp.json() == {"COOLStatusCode": 1010}
     assert target.read_bytes() == b"the agent's rewrite"
-    resp = _save(client, new, token, b"fresh edits", new_loaded)
+    resp = _save(client, new, new_token, b"fresh edits", new_loaded)
     assert resp.status_code == 200
     assert target.read_bytes() == b"fresh edits"
 
 
 def test_a_save_through_a_keyed_id_refreshes_the_chats_version(temp_db, tmp_path, monkeypatch):
-    client, _target, _bare, token, _sid, jobs, copy = _pane_save_rig(monkeypatch, tmp_path)
+    client, _target, _bare, _token, _sid, jobs, copy = _pane_save_rig(monkeypatch, tmp_path)
     fid = _keyed("test-agent/workspace/x.docx", 9)
+    token = _gen_token("test-agent/workspace/x.docx", 9, chat_id="chat-p")
     resp = _save(client, fid, token, b"edited by the person", _loaded_time(client, fid, token))
     assert resp.status_code == 200
     assert jobs == [("chat-p", "preview_version_refresh", True)]
@@ -1627,12 +1754,240 @@ def test_the_workspace_tab_opens_the_panes_document(temp_db, tmp_path, monkeypat
 
 
 def test_a_lingering_views_refused_saves_log_once_a_minute(temp_db, tmp_path, monkeypatch, caplog):
-    client, target, _bare, token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
+    client, target, _bare, _token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
     fid = _keyed("test-agent/workspace/x.docx", 1)
+    token = _gen_token("test-agent/workspace/x.docx", 1)
     loaded = _loaded_time(client, fid, token)
     _fetch(client, fid, token)
     _agent_rewrite(target)
-    with caplog.at_level("INFO", logger="claude-proxy"):
+    with caplog.at_level("INFO", logger="otodock"):
         for _ in range(3):
             assert _save(client, fid, token, b"stale", loaded).status_code == 409
     assert caplog.text.count("changed since it was loaded") == 1
+
+
+
+# ---------------------------------------------------------------------------
+# The token in the header, and the person behind it
+# ---------------------------------------------------------------------------
+
+
+def test_every_route_takes_the_token_from_the_authorization_header(temp_db, tmp_path, monkeypatch):
+    """A frame posted with ``access_header`` puts the token in no URI:
+    Collabora sends it as the bearer header alone. No token at all is 401,
+    never a validation error."""
+    client, target, file_id, token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
+    auth = {"Authorization": f"Bearer {token}"}
+    info = client.get(f"/wopi/files/{file_id}", headers=auth)
+    assert info.status_code == 200
+    assert client.get(f"/wopi/files/{file_id}/contents", headers=auth).content == b"agent bytes"
+    lock = client.post(f"/wopi/files/{file_id}",
+                       headers={**auth, "X-WOPI-Override": "LOCK", "X-WOPI-Lock": "L1"})
+    assert lock.status_code == 200
+    resp = client.post(f"/wopi/files/{file_id}/contents", content=b"edited", headers={
+        **auth, "X-WOPI-Lock": "L1", "X-COOL-WOPI-Timestamp": info.json()["LastModifiedTime"]})
+    assert resp.status_code == 200 and target.read_bytes() == b"edited"
+    for method, path in (("get", f"/wopi/files/{file_id}"), ("get", f"/wopi/files/{file_id}/contents"),
+                         ("post", f"/wopi/files/{file_id}/contents"), ("post", f"/wopi/files/{file_id}")):
+        assert getattr(client, method)(path).status_code == 401
+
+
+def _person(email="pat@t.com", **kw):
+    from storage import database as task_store
+    return task_store.create_local_user(email, "Pat Person", "Pat", "member", "x", **kw)
+
+
+def _token_for(sub, iat, rel="test-agent/workspace/x.docx"):
+    import jwt
+    import config
+    return jwt.encode({"purpose": "wopi", "file_path": rel, "generation": 0, "user_sub": sub,
+                       "user_name": "Pat", "permissions": "edit", "agent": "test-agent",
+                       "iat": iat, "exp": iat + 3600}, config.WOPI_SECRET, algorithm="HS256")
+
+
+def test_a_token_stops_at_its_persons_sign_out_everywhere(temp_db, tmp_path, monkeypatch):
+    """A sign out everywhere (the person's token epoch) ends their WOPI
+    tokens on every route, whatever reaches the WOPI host: the editor's
+    relay is not in front of Collabora's own calls."""
+    import time as _time
+    from api.media import wopi
+    from storage import database as task_store
+    client, _target, file_id, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
+    monkeypatch.setattr(wopi, "_person_holds_now", _REAL_PERSON_HOLDS["fn"])
+    sub = _person()
+    token = _token_for(sub, int(_time.time()) - 3)
+    assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 200
+    task_store.bump_token_epoch(sub)
+    wopi._holder_answers.clear()
+    assert client.get(f"/wopi/files/{file_id}?access_token={token}").status_code == 401
+    assert client.get(f"/wopi/files/{file_id}/contents?access_token={token}").status_code == 401
+    assert _save(client, file_id, token, b"x").status_code == 401
+    pw.assert_not_awaited()
+
+
+def test_a_held_or_gone_person_is_refused_and_no_person_is_not_judged(temp_db, tmp_path, monkeypatch):
+    import asyncio
+    import time as _time
+    from api.media import wopi
+    monkeypatch.setattr(wopi, "_person_holds_now", _REAL_PERSON_HOLDS["fn"])
+    held = _person("held@t.com", must_change_password=True)
+    free = _person("free@t.com")
+    now = int(_time.time())
+
+    async def _go():
+        return [await wopi.person_holds(sub, now) for sub in (
+            held, free, "gone-sub", "agent", "api-key", "session:abc", "")]
+
+    assert asyncio.run(_go()) == [False, True, False, True, True, True, False]
+    assert asyncio.run(wopi.person_holds(free, None)) is False
+
+
+def test_a_person_whose_sub_spells_a_principal_is_still_judged(monkeypatch):
+    """An identity provider's raw sub could be "agent": a users row bearing
+    the sub is a person, judged on their timeline and their gate."""
+    import time as _time
+    from storage import database as task_store
+    monkeypatch.setattr(task_store, "get_user", lambda sub: {
+        "sub": sub, "auth_provider": "local", "must_change_password": True} if sub == "agent" else None)
+    now = int(_time.time())
+    assert _REAL_PERSON_HOLDS["fn"]("agent", now) is False
+    assert _REAL_PERSON_HOLDS["fn"]("api-key", now) is True
+    assert _REAL_PERSON_HOLDS["fn"]("gone", now) is False
+
+
+@pytest.mark.asyncio
+async def test_the_person_is_read_once_per_issue_time_and_a_failure_is_not_kept(monkeypatch):
+    import asyncio
+    from api.media import wopi
+    calls = []
+
+    def _slow(sub, iat):
+        calls.append((sub, iat))
+        import time as _time
+        _time.sleep(0.05)
+        return True
+
+    monkeypatch.setattr(wopi, "_person_holds_now", _slow)
+    answers = await asyncio.gather(*(wopi.person_holds("pat", 7) for _ in range(20)))
+    assert answers == [True] * 20 and calls == [("pat", 7)]
+    assert await wopi.person_holds("pat", 7) is True and len(calls) == 1
+
+    def _down(sub, iat):
+        calls.append("down")
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(wopi, "_person_holds_now", _down)
+    assert await wopi.person_holds("pat", 8) is False
+    assert await wopi.person_standing("pat", 8) is None
+    assert calls.count("down") == 2          # a failure refuses, and is read again
+    # Every answer expires: the forced change can clear with the same cookie.
+    wopi._holder_answers[("pat", 7)] = (True, 0.0)
+    assert await wopi.person_holds("pat", 7) is False
+    # An epoch bump can drop a person's kept answers at once.
+    wopi._holder_answers[("pat", 9)] = (True, float("inf"))
+    wopi._holder_answers[("kim", 9)] = (True, float("inf"))
+    wopi.forget_person("pat")
+    assert ("pat", 9) not in wopi._holder_answers and ("kim", 9) in wopi._holder_answers
+    # The sites that bump an epoch call the holder cache's forget once; the
+    # WOPI cache hears it from there.
+    from auth import token_holder
+    token_holder.forget("kim")
+    assert ("kim", 9) not in wopi._holder_answers
+
+
+@pytest.mark.asyncio
+async def test_a_forget_during_a_read_in_flight_keeps_nothing(monkeypatch):
+    """The read may predate the change that caused the forget: its answer
+    reaches the requests that waited for it and no one else, and a request
+    arriving after the forget starts its own read."""
+    import asyncio
+    import threading
+    from api.media import wopi
+    wopi._holder_answers.clear()
+    wopi._holder_reads.clear()
+    started = threading.Event()                      # the reads run on the DB executor's threads
+    release = threading.Event()
+    calls = []
+
+    def _slow(sub, iat):
+        calls.append((sub, iat))
+        started.set()
+        release.wait(5)
+        return True
+
+    async def _reading():
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+
+    monkeypatch.setattr(wopi, "_person_holds_now", _slow)
+    first = asyncio.ensure_future(wopi.person_standing("pat", 7))
+    await _reading()
+    wopi.forget_person("pat")                        # the epoch moved under the read
+    started.clear()
+    second = asyncio.ensure_future(wopi.person_standing("pat", 7))
+    await _reading()                                 # the late request reads for itself
+    release.set()
+    assert await first is True and await second is True
+    assert calls == [("pat", 7), ("pat", 7)]
+    assert wopi._holder_answers[("pat", 7)][0] is True   # the late read's answer is the one kept
+    assert not wopi._holder_reads
+
+
+def test_the_mints_claim_the_generation_their_url_opens(temp_db, tmp_path, monkeypatch):
+    import urllib.parse
+    import jwt
+    import config
+    from api.hooks import preview
+    app = _make_url_app(monkeypatch, tmp_path, role="manager", username="alice")
+    _seed_file(tmp_path, "workspace/x.docx")
+    fid = _encode_file_id("test-agent/workspace/x.docx")
+    preview.note_pushed_generation(fid, 77, "abc")
+    body = _ask_url(app, "workspace/x.docx").json()
+    src = urllib.parse.parse_qs(urllib.parse.urlparse(body["wopi_url"]).query)["WOPISrc"][0]
+    claims = jwt.decode(body["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    assert src.rsplit("/", 1)[-1] == _keyed("test-agent/workspace/x.docx", 77)
+    assert claims["generation"] == 77
+
+
+def test_the_per_document_tables_stay_bounded(monkeypatch, tmp_path):
+    """The lock table, the answered times and the document bases are kept
+    per document (raw id): each stays at its bound, the expired locks and
+    then the oldest entries out first."""
+    import os as _os
+    import time as _time
+    from api.media import wopi
+    monkeypatch.setattr(wopi, "_WOPI_LOCKS_MAX", 8)
+    monkeypatch.setattr(wopi, "_STABLE_TIMES_MAX", 8)
+    for i in range(20):
+        wopi._set_lock(f"id-{i}", f"L{i}")
+    assert len(wopi._wopi_locks) == 8 and "id-19" in wopi._wopi_locks and "id-0" not in wopi._wopi_locks
+    wopi._wopi_locks["id-12"]["expires"] = _time.time() - 1
+    wopi._set_lock("id-new", "Ln")
+    assert "id-12" not in wopi._wopi_locks and "id-13" in wopi._wopi_locks
+    for i in range(20):
+        wopi._note_doc_base(f"id-{i}", f"h{i}")
+    assert list(wopi._doc_bases) == [f"id-{i}" for i in range(12, 20)]
+    (tmp_path / "f").write_bytes(b"bytes")
+    fd = _os.open(tmp_path / "f", _os.O_RDONLY)
+    try:
+        st = _os.fstat(fd)
+        for i in range(20):
+            wopi._stable_last_modified(f"id-{i}", fd, st)
+    finally:
+        _os.close(fd)
+    assert len(wopi._stable_times) == 8 and "id-19" in wopi._stable_times
+
+
+def test_a_file_on_the_sessions_machine_is_edited_only_by_its_person():
+    """A host-cache document is a file on the session's own machine: a
+    teammate who can open the chat (an agent-scope run's chat opens to
+    every user of the agent) views it, and a run with no person edits
+    nothing there."""
+    from api.media.wopi import live_permissions
+    rule = lambda user, role, person: live_permissions(  # noqa: E731
+        "x.docx", role, user, "agent-1", host_cache=True, session_person=person)
+    assert rule("alice", "editor", "alice") == "edit"
+    assert rule("bob", "manager", "alice") == "view"
+    assert rule("alice", "viewer", "alice") == "view"
+    assert rule("alice", "editor", "") == "view"
+    assert rule("", "editor", "") == "view"

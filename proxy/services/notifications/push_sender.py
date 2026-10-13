@@ -17,7 +17,7 @@ import config
 from services.infra.outbound_url import validate_outbound_url
 from storage.automation import notification_store
 
-logger = logging.getLogger("claude-proxy.push")
+logger = logging.getLogger("otodock.push")
 
 
 def _endpoint_is_public(endpoint: str) -> bool:
@@ -37,10 +37,15 @@ def _endpoint_is_public(endpoint: str) -> bool:
 def _no_redirect_session():
     """The session a Web Push POST goes through: a redirect raises instead
     of being followed, so a validated public endpoint cannot bounce the
-    request to an internal address."""
+    request to an internal address, and its https connections go only to
+    public addresses, resolved at the dial (``pinned_http``), so a name that
+    answers differently after the check above is refused there."""
     import requests
+
+    from services.infra import pinned_http
     session = requests.Session()
     session.max_redirects = 0
+    session.mount("https://", pinned_http.PublicHTTPSAdapter())
     return session
 
 

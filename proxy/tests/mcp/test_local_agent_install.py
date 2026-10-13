@@ -13,10 +13,12 @@ Covers the three things that make this route safe to expose to an LLM:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -703,3 +705,416 @@ class TestProvenance:
             "demo-template", MEMBER_SUB, "viewer",
         )
         assert counts["notifications"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A session on a remote machine
+# ---------------------------------------------------------------------------
+
+class _FakeMachine:
+    """The session's remote machine: its own copy of the agent tree, the
+    file list it answers (everything, so the endpoint's own skip rules are
+    what keeps a file out; ``extra`` entries first) and the pulls it serves,
+    a pull past its ``max_bytes`` failing with nothing written, as the real
+    transfer does."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.alice = root / "users" / "alice" / "workspace"
+        self.alice.mkdir(parents=True)
+        self.online = True
+        self.held_for = "host-agent"
+        self.pulled: list[str] = []
+        self.landed: list[str] = []
+        self.refused: list[str] = []
+        self.caps: list[int] = []
+        self.fail: set[str] = set()
+        self.grow: dict[str, bytes] = {}
+        self.extra: list[dict] = []
+        self.listed = 0
+        self.listed_size: int | None = None
+        self.list_delay = 0.0
+        self.pull_delay = 0.0
+        self.prune_hidden = False
+
+    async def list_entries(self, session_id, rel_prefix, *, agent=""):
+        assert agent == "host-agent"
+        self.listed += 1
+        if self.list_delay:
+            await asyncio.sleep(self.list_delay)
+        if not self.online or self.held_for != agent:
+            return None
+        prefix = rel_prefix.strip("/") + "/"
+        out = [
+            {"path": p.relative_to(self.root).as_posix(), "size": p.stat().st_size}
+            for p in sorted(self.root.rglob("*")) if p.is_file()
+        ]
+        if self.prune_hidden:   # the real listing never enters a dot-folder
+            out = [e for e in out
+                   if not any(p.startswith(".") for p in e["path"].split("/")[:-1])]
+        if self.listed_size is not None:
+            out = [{**e, "size": self.listed_size} for e in out]
+        return self.extra + [e for e in out if e["path"].startswith(prefix)]
+
+    def _bytes(self, rel_path: str) -> bytes:
+        return self.grow.get(rel_path) or (self.root / rel_path).read_bytes()
+
+    async def pull_into(self, session_id, rel_path, dest, *, agent="", max_bytes=None):
+        # 0 or None would be no cap at all to the real transfer.
+        assert agent == "host-agent" and 0 < max_bytes <= 1024 * 1024, max_bytes
+        self.pulled.append(rel_path)
+        self.caps.append(max_bytes)
+        # Without a delay the pulls run one after the other, in list order.
+        if self.pull_delay:
+            await asyncio.sleep(self.pull_delay)
+        if rel_path in self.fail:
+            return False
+        data = self._bytes(rel_path)
+        if len(data) > max_bytes:
+            self.refused.append(rel_path)
+            return False
+        # The real transfer creates the destination's parent, as here.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        self.landed.append(rel_path)
+        return True
+
+    async def stat(self, session_id, rel_path):
+        if rel_path not in self.grow and not (self.root / rel_path).is_file():
+            return {"exists": False, "size": 0, "mtime_ns": 0}
+        return {"exists": True, "size": len(self._bytes(rel_path)), "mtime_ns": 0}
+
+
+TEMPLATE_REL = "users/alice/workspace/demo-template"
+
+
+@pytest.fixture
+def machine(tmp_path, monkeypatch):
+    import tempfile
+    from core.remote import remote_file_flow
+    from services.delegation import file_transfer
+
+    m = _FakeMachine(tmp_path / "machine" / "host-agent")
+    monkeypatch.setattr(remote_file_flow, "is_remote_session", lambda sid: sid == SESSION_ID)
+    monkeypatch.setattr(remote_file_flow, "list_remote_entries", m.list_entries)
+    monkeypatch.setattr(remote_file_flow, "pull_into", m.pull_into)
+    monkeypatch.setattr(remote_file_flow, "stat_probe", m.stat)
+    monkeypatch.setattr(remote_file_flow, "remote_session_agent",
+                        lambda sid: m.held_for if sid == SESSION_ID else "")
+
+    async def _label(session_id):
+        return "'laptop'"
+
+    monkeypatch.setattr(file_transfer, "remote_source_label", _label)
+    # Snapshots land here, so a test can see none is left behind.
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    return m
+
+
+def _validate(app, path=f"/{TEMPLATE_REL}"):
+    return TestClient(app).post("/v1/agents/local-template/validate", json={"path": path})
+
+
+class TestRemoteMachine:
+    """What the agent wrote this turn reaches the platform only at the turn's
+    end, so a remote session's folder is read from its machine."""
+
+    def test_a_folder_only_on_the_machine_validates(self, tmp_path, monkeypatch, temp_db, machine):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice)
+        resp = _validate(app)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True and body["slug"] == "demo-template", body
+        assert sorted(machine.pulled) == [
+            f"{TEMPLATE_REL}/{n}" for n in ("README.md", "agent.json", "agent.md", "mcps.json")
+        ]
+        # The read lands only in the private snapshot, never in the agent tree.
+        assert not (_agent_root(agents_dir) / "demo-template").exists()
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_the_machine_copy_wins_over_the_platform(self, tmp_path, monkeypatch, temp_db, machine):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(_agent_root(agents_dir))
+        d = _write_template(machine.alice)
+        (d / "context").mkdir()
+        (d / "context" / "company.md").write_text("# Company\n")
+        body = _validate(app).json()
+        assert body["ok"] is True, body
+        assert body["seeds"]["context_files"] == 1
+
+    def test_create_agent_installs_the_machine_copy(self, tmp_path, monkeypatch, temp_db, machine):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(machine.alice)
+        (d / "agent.md").write_text("# Persona\n\nWritten on the laptop.\n")
+        resp = TestClient(app).post(
+            "/v1/agents/install-from-local-template", json={"path": f"/{TEMPLATE_REL}"},
+        )
+        assert resp.status_code == 200, resp.text
+        persona = agents_dir / "demo-template" / "config" / "agent.md"
+        assert "Written on the laptop." in persona.read_text()
+
+    def test_a_machine_that_does_not_answer_is_a_retry(self, tmp_path, monkeypatch, temp_db, machine):
+        """Never a silent read of the platform's older copy: the machine is
+        where the agent writes."""
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(_agent_root(agents_dir))
+        machine.online = False
+        resp = _validate(app)
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "'laptop' did not list the template folder, retry in a moment"
+        assert machine.pulled == []
+
+    def test_a_session_held_for_another_agent_is_not_a_retry(self, tmp_path, monkeypatch, temp_db, machine):
+        """The machine runs this session for another agent: no retry would
+        change the answer, so it is a 409, not the 503's endless retry."""
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(_agent_root(agents_dir))
+        machine.held_for = "other-agent"
+        resp = _validate(app)
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "This session runs other-agent on 'laptop', not host-agent"
+        assert machine.pulled == []
+
+    def test_one_deadline_covers_the_listing_and_the_pulls(self, tmp_path, monkeypatch, temp_db, machine):
+        """Each step alone fits the budget, the two together do not: the
+        read is a 503 and leaves nothing on disk."""
+        from api.mcp import local_templates
+        monkeypatch.setattr(local_templates, "_REMOTE_READ_BUDGET_S", 0.4)
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice)
+        machine.list_delay = machine.pull_delay = 0.25
+        resp = _validate(app)
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == (
+            "Reading the template folder from 'laptop' took too long, retry in a moment"
+        )
+        assert machine.pulled and machine.landed == []
+        assert list((tmp_path / "tmp").iterdir()) == []
+        machine.pulled.clear()
+        machine.list_delay = 1.0
+        assert _validate(app).status_code == 503
+        assert machine.pulled == []
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_a_folder_under_a_dot_folder_says_why(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice / ".drafts")
+        machine.prune_hidden = True
+        resp = _validate(app, "/users/alice/workspace/.drafts/demo-template")
+        assert resp.status_code == 400
+        assert "starts with '.'" in resp.json()["detail"]
+
+    def test_a_refused_path_never_reaches_the_machine(self, tmp_path, monkeypatch, temp_db, machine):
+        """Another person's tree and the agent's config (owner tier) are
+        refused by the session's own policy before the machine is asked."""
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        from auth.path_policy import SecurityContext
+        from core.session import session_state
+        editor = SecurityContext(role="editor", username="alice", agent="host-agent",
+                                 is_admin_agent=False)
+        monkeypatch.setattr(session_state, "get_session_security",
+                            lambda sid: editor if sid == SESSION_ID else None)
+        for path in ("/users/bob/workspace/demo-template", "/config/demo-template"):
+            assert _validate(app, path).status_code == 403, path
+        assert machine.listed == 0 and machine.pulled == []
+
+    def test_a_folder_only_the_platform_holds_is_read_there(self, tmp_path, monkeypatch, temp_db, machine):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(_agent_root(agents_dir))
+        assert _validate(app).json()["ok"] is True
+        assert machine.pulled == []
+
+    def test_nothing_on_either_side_names_the_machine(self, tmp_path, monkeypatch, temp_db, machine):
+        """The machine may hold the folder with nothing it reads in it (only
+        dependency or dot folders): the message says what it leaves out."""
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        resp = _validate(app)
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            f"Not a directory: /{TEMPLATE_REL} (not on the platform, and 'laptop' holds "
+            "no file there that it reads: generated, dependency and dot folders are not read)"
+        )
+
+    def test_the_caps_hold_before_any_pull(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(machine.alice)
+        (d / "context").mkdir()
+        (d / "context" / "big.md").write_text("x" * (1024 * 1024 + 10))
+        resp = _validate(app)
+        assert resp.status_code == 400 and "too large" in resp.json()["detail"]
+        (d / "context" / "big.md").unlink()
+        for i in range(305):
+            (d / "context" / f"f{i}.md").write_text("x")
+        resp = _validate(app)
+        assert resp.status_code == 400 and "too many files" in resp.json()["detail"]
+        assert machine.pulled == []
+
+    def test_what_a_release_drops_is_never_pulled(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(
+            machine.alice,
+            agent_json_extra={"collaborative": False, "default_scope": "user"},
+            user_apps={"home": {"title": "Home"}},
+        )
+        deps = d / "user-apps" / "home" / "node_modules" / "left-pad"
+        deps.mkdir(parents=True)
+        for i in range(320):
+            (deps / f"f{i}.js").write_text("x")
+        (d / "user-apps" / "home" / "data").mkdir()
+        (d / "user-apps" / "home" / "data" / "app.db").write_text("x")
+        (d / "user-apps" / "home" / ".env").write_text("SECRET=1")
+        (d / ".git").mkdir()
+        (d / ".git" / "HEAD").write_text("ref")
+        body = _validate(app).json()
+        assert body["ok"] is True, body
+        assert not [p for p in machine.pulled if "node_modules" in p or "/data/" in p
+                    or "/." in p]
+
+    def test_a_listed_path_outside_the_folder_is_refused(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice)
+        machine.extra = [{"path": f"{TEMPLATE_REL}/../../../../config/agent.md", "size": 3}]
+        resp = _validate(app)
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "The machine listed an invalid path in the template folder: "
+            "'../../../../config/agent.md'"
+        )
+        assert machine.pulled == []
+
+    @pytest.mark.parametrize("extra, named", [
+        # Listed twice.
+        ([{"path": f"{TEMPLATE_REL}/agent.md", "size": 3}],
+         "The machine listed agent.md twice in the template folder"),
+        # A file, then the folder of a later file.
+        ([{"path": f"{TEMPLATE_REL}/context", "size": 3}],
+         "The machine listed context as both a file and a folder in the template folder"),
+        # The folder of an earlier file, then a file.
+        ([{"path": f"{TEMPLATE_REL}/agent.md/notes.md", "size": 3}],
+         "The machine listed agent.md as both a file and a folder in the template folder"),
+    ])
+    def test_a_listing_the_snapshot_cannot_hold_is_refused_by_name(
+            self, tmp_path, monkeypatch, temp_db, machine, extra, named):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(machine.alice)
+        (d / "context").mkdir()
+        (d / "context" / "company.md").write_text("# Company\n")
+        machine.extra = extra
+        resp = _validate(app)
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == named
+        assert machine.pulled == []
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_a_name_over_255_bytes_is_refused_by_name(self, tmp_path, monkeypatch, temp_db, machine):
+        """Counted in UTF-8 bytes: 128 two-byte letters are 256 bytes."""
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice)
+        name = "\u00e9" * 128
+        machine.extra = [{"path": f"{TEMPLATE_REL}/context/{name}", "size": 3}]
+        resp = _validate(app)
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail.startswith("A name in context/\u00e9") and "longer than 255 bytes" in detail
+        assert machine.pulled == []
+        machine.extra = [{"path": f"{TEMPLATE_REL}/context/{name[:127]}", "size": 3}]
+        machine.fail = {f"{TEMPLATE_REL}/context/{name[:127]}"}
+        assert _validate(app).status_code == 503     # 254 bytes: pulled
+
+    def test_a_failed_pull_fails_the_read(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice)
+        machine.fail = {f"{TEMPLATE_REL}/agent.md"}
+        resp = _validate(app)
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "agent.md could not be read from 'laptop', retry in a moment"
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_a_file_that_grew_past_the_cap_is_refused(self, tmp_path, monkeypatch, temp_db, machine):
+        """The pull fails at the cap; the machine's size says why, so the
+        read is a 400 (a retry would fail the same way), not a 503."""
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(machine.alice)
+        machine.grow[f"{TEMPLATE_REL}/agent.md"] = b"x" * (1024 * 1024 + 10)
+        resp = _validate(app)
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "agent.md is too large (max 1024 KB per file)"
+        assert machine.refused == [f"{TEMPLATE_REL}/agent.md"]
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_a_file_that_grew_past_the_folder_budget_is_refused(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(machine.alice)
+        (d / "context").mkdir()
+        for i in range(19):
+            (d / "context" / f"f{i:02}.md").write_bytes(b"x" * (1024 * 1024))
+        # Pulled last, under what is left of the 20 MB: less than 1 MiB.
+        machine.grow[f"{TEMPLATE_REL}/mcps.json"] = b"x" * (1024 * 1024)
+        resp = _validate(app)
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "The template folder is too large (max 20 MB total)"
+        assert machine.refused == [f"{TEMPLATE_REL}/mcps.json"]
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_the_folder_cap_counts_what_landed_not_what_was_listed(self, tmp_path, monkeypatch, temp_db, machine):
+        """A machine that lists every size as 0 (the listing's answer for a
+        size it lacks) still stops at 20 MB, and a pull is never sent
+        without a cap."""
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        context = machine.alice / "demo-template" / "context"
+        context.mkdir(parents=True)
+        for i in range(25):
+            (context / f"f{i:02}.md").write_bytes(b"x" * (1024 * 1024))
+        machine.listed_size = 0
+        resp = _validate(app)
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "The template folder is too large (max 20 MB total)"
+        assert len(machine.landed) == 20 and len(machine.pulled) == 20
+        assert min(machine.caps) > 0
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_a_worker_that_fails_stops_its_siblings(self, tmp_path, monkeypatch, machine):
+        """A name this platform cannot store fails the read with a 400 naming
+        it; the pulls still running are cancelled and awaited before the
+        snapshot goes, and nothing writes it back afterwards."""
+        from fastapi import HTTPException
+        from api.mcp import local_templates as lt
+        from auth.providers import UserContext
+        _write_template(machine.alice)
+        # Every name fits; the whole path is past what the platform takes.
+        deep = "/".join(["a" * 250] * 17) + "/x.md"
+        machine.extra = [{"path": f"{TEMPLATE_REL}/{deep}", "size": 3}]
+        machine.pull_delay = 0.2
+        user = UserContext(
+            sub=ADMIN_SUB, email="alice@test.com", name="Alice", role="admin",
+            agents=["host-agent"], agent_roles={"host-agent": "manager"},
+            is_api_key=True, session_id=SESSION_ID, agent="host-agent",
+        )
+        folder = lt._Folder(raw=f"/{TEMPLATE_REL}", rel=TEMPLATE_REL,
+                            platform=tmp_path / "not-on-the-platform", agent="host-agent")
+
+        async def _read():
+            with pytest.raises(HTTPException) as e:
+                await lt._snapshot_folder(user, folder)
+            # Long enough for an orphan worker to finish its pull and start
+            # the next one.
+            await asyncio.sleep(0.6)
+            return e.value
+
+        err = asyncio.run(_read())
+        assert err.status_code == 400
+        assert err.detail.startswith("a" * 100) and err.detail.endswith(
+            "... cannot be stored here: File name too long")
+        assert len(machine.pulled) == 3 and machine.landed == []
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    def test_template_errors_name_the_file_not_the_snapshot(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(machine.alice)
+        (d / "agent.md").unlink()
+        body = _validate(app).json()
+        assert body["ok"] is False
+        assert body["errors"][0].startswith("Missing required file: agent.md"), body
+        assert "oto-local-template" not in body["errors"][0]

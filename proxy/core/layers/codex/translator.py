@@ -85,6 +85,24 @@ def _completed_tool_output(item_type: str, item: dict) -> "tuple[str, bool] | No
         return (body, item.get("status") == "failed") if body else None
     return None
 
+# The MCP content block kinds that carry bytes (the MCP schema's words).
+_MCP_FILE_BLOCKS = ("image", "resource")
+
+
+def _completed_tool_files(item: dict) -> list[dict]:
+    """A completed ``mcpToolCall``'s image blocks and embedded resources
+    (MCP content blocks, as the server sent them). The pump hands them to
+    ``services/mcp/result_files.keep``, which keeps them only for a tool its
+    MCP opts in, and pops them before any frame or record sees them."""
+    if item.get("error"):
+        return []
+    result = item.get("result") or {}
+    return [
+        blk for blk in (result.get("content") or [])
+        if isinstance(blk, dict) and blk.get("type") in _MCP_FILE_BLOCKS
+    ]
+
+
 # turn.status values that terminate a turn without success.
 _TURN_PLAN_STATUS = {"pending": "pending", "inProgress": "in_progress",
                      "completed": "completed"}
@@ -117,7 +135,7 @@ _SUPPRESSED_METHODS = frozenset({
 
 
 # ``TurnError.codexErrorInfo`` values that end a turn for a reason the
-# platform names (app-server schema of Codex 0.160.0): (reason, detail).
+# platform names (app-server schema of Codex 0.160.0 and 0.162.1): (reason, detail).
 _ENDING_INFO = {
     "usageLimitExceeded": (turn_ending.LIMIT, ""),
     "cyberPolicy": (turn_ending.DECLINED, "cyber"),
@@ -596,6 +614,12 @@ class CodexEventTranslator:
             output = _completed_tool_output("mcpToolCall", item)
             if output is not None:
                 data["result_content"], data["is_error"] = output
+            blocks = _completed_tool_files(item)
+            if blocks:
+                # The session the files belong to: a meeting's pump renders
+                # under its own id, the files go to the participant's.
+                data["result_blocks"] = blocks
+                data["result_session_id"] = self._session_id
             self._record_tool(tool_name, item_id, item, bool(data.get("is_error")))
             return [CommonEvent(type=TOOL_RESULT, data=data)]
 
@@ -816,13 +840,13 @@ class CodexEventTranslator:
 
         cost = 0.0
         if self._model:
-            provider = app_config.get_model_provider(self._model)
-            p_in, p_out, p_cw, p_cr = app_config.get_model_pricing(self._model, provider)
-            cost = (
-                plain_input * p_in / 1_000_000
-                + cache_write * p_cw / 1_000_000
-                + cached * p_cr / 1_000_000
-                + output_tokens * p_out / 1_000_000
+            # The registry's long-context tier applies past its line (OpenAI's
+            # 272K: the whole request at 2x input / 1.5x output). A window past
+            # the line is OpenAI's catalog for this Codex, not a platform choice.
+            cost = app_config.price_usage(
+                self._model, app_config.get_model_provider(self._model),
+                input_tokens=plain_input, output_tokens=output_tokens,
+                cache_write_tokens=cache_write, cache_read_tokens=cached,
             )
 
         # Context gauge: Codex app-server reports the last turn's prompt size +

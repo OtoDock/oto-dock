@@ -32,7 +32,7 @@ import config
 from auth.request_path import has_traversal
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.auth")
+logger = logging.getLogger("otodock.auth")
 
 COOKIE_NAME = "otodock_render"
 PURPOSE = "app_render"

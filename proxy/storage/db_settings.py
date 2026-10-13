@@ -49,7 +49,7 @@ def seed_platform_timezone_if_unset() -> None:
     the UTC fallback (``config.SCHEDULER_TIMEZONE``) untouched.
     """
     import logging
-    log = logging.getLogger("claude-proxy.database")
+    log = logging.getLogger("otodock.database")
     try:
         if get_platform_setting("platform_timezone"):
             return  # already set (prior install or admin choice) — never touch

@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import { SHARE_TARGET, type ShareInboxItem } from '../../api/shares'
 import type { AgentSummary } from '../../api/agents'
-import { ROLE, roleLabel } from '../../lib/permissions'
+import { ROLE, canEditAgent, roleLabel } from '../../lib/permissions'
+import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
+import { useAuth } from '../../contexts/AuthContext'
 import SwipeableRow from '../chat/notifications/SwipeableRow'
 
 /**
@@ -37,9 +39,17 @@ function DecisionRow({ item, agents, busy, onAccept, onDecline }: {
   item: ShareInboxItem; agents: AgentSummary[]; busy: boolean
   onAccept: (agent: string) => void; onDecline: () => void
 }) {
-  const choices = agents.filter((a) => a.name !== item.agent)
+  const user = useAuth()?.user ?? null
+  // A Shared-only agent's chats all run as the agent, so an app accepted
+  // there goes to everyone on it (the agent's placement), which takes the
+  // editor role: below it the agent is not offered, and at it the row says
+  // what Accept does (SHARING.md "Accepting into a Shared-only agent").
+  const sharedOnly = (a: AgentSummary) => isSharedOnly(modeOfAgent(a))
+  const choices = agents.filter((a) => a.name !== item.agent && (!sharedOnly(a) || canEditAgent(user, a.name)))
   const [agent, setAgent] = useState(() => choices[0]?.name ?? '')
   const pick = choices.some((a) => a.name === agent) ? agent : (choices[0]?.name ?? '')
+  const picked = choices.find((a) => a.name === pick)
+  const forEveryone = !!picked && sharedOnly(picked)
   return (
     <div className="border-l-[3px] border-l-p-accent-teal px-3 py-2.5" data-testid="share-inbox-decision">
       <div className="text-sm font-medium text-p-text truncate">{item.title || 'an app'}</div>
@@ -53,12 +63,16 @@ function DecisionRow({ item, agents, busy, onAccept, onDecline }: {
             {/* A native select: the panel closes on a press outside it, and a
                 portaled list would count as outside. */}
             <select value={pick} onChange={(e) => setAgent(e.target.value)} aria-label="Place in"
-              className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-1.5 py-1 text-xs pointer-coarse:text-base text-p-text focus:border-brand focus:outline-none">
-              {choices.map((a) => <option key={a.name} value={a.name}>{a.display_name || a.name}</option>)}
+              className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-1.5 py-1 text-xs text-p-text focus:border-brand focus:outline-none">
+              {choices.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {(a.display_name || a.name) + (sharedOnly(a) ? ' (for everyone there)' : '')}
+                </option>
+              ))}
             </select>
             <button type="button" disabled={busy || !pick} onClick={() => onAccept(pick)}
               className="rounded-md bg-brand px-2.5 py-1 text-xs font-medium text-white hover:bg-brand-hover disabled:opacity-50">
-              Accept
+              {forEveryone ? 'Add for everyone' : 'Accept'}
             </button>
           </>
         ) : (
@@ -69,6 +83,12 @@ function DecisionRow({ item, agents, busy, onAccept, onDecline }: {
           Decline
         </button>
       </div>
+      {forEveryone && (
+        <p className="mt-1 text-[11px] text-p-text-light" data-testid="share-inbox-for-everyone">
+          {picked.display_name || picked.name} is Shared only: its chats run as the agent, so the app goes
+          to its apps for everyone there, and {item.shared_by_name || 'the person who shared it'} is told.
+        </p>
+      )}
     </div>
   )
 }

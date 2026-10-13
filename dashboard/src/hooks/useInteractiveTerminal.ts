@@ -8,7 +8,6 @@ import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { openTerminalLink } from '../lib/openExternal'
 import { createPtyBrandFilter } from '../lib/ptyBrandColors'
 import { applyCtrlHold } from '../lib/terminalCtrlHold'
-import { pasteModePrefix } from '../lib/ptyPasteMode'
 import { WIRE, type WireType } from '../api/wireEvents'
 
 /**
@@ -381,13 +380,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         // ambiguous (empty buffer / mid-relayout).
         const buf = term.buffer.active
         const following = buf.viewportY >= buf.baseY
+        // A replay that a trimmed ring cut short arrives with the program's
+        // bracketed-paste mode in front of it (the proxy's ring tracks it).
         const bytes = b64ToBytes(m.data || '')
-        // A replay is a fresh mirror: restore the bracketed paste a trimmed
-        // ring dropped, or a pasted line break submits (lib/ptyPasteMode).
-        if (m.replay) {
-          const prefix = pasteModePrefix(bytes)
-          if (prefix) term.write(prefix)
-        }
         term.write(brand.push(bytes))
         if (following || Date.now() < pinBottomUntil) term.scrollToBottom()
         lastOutputAt = Date.now()

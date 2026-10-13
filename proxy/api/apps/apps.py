@@ -51,7 +51,7 @@ from storage import database as task_store
 from storage import db_apps
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 # Static action-runtime extension (NEVER per-row interpolation — see

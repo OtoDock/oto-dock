@@ -22,6 +22,25 @@ def _api(limit):
     return api
 
 
+def test_a_pin_cooldown_refuses_the_dial(monkeypatch):
+    """A PIN-gated route whose number (or route) is in a cooldown: refused
+    before the dial, or the person would be rung to hear the lockout phrase."""
+    from calls import pin_failures
+    store = pin_failures.PinFailureStore()
+    monkeypatch.setattr(pin_failures, "store", store)
+    cfg = ConfigManager()
+    cfg.load({"settings": {}, "routes": [
+        {"id": "r-1", "direction": "outbound", "agent": "a", "pin": "123456", "enabled": True}]})
+    api = OutboundCallAPI(SimpleNamespace(active_count=lambda: 0), cfg)
+    api._calls_limiter = _RateLimiter(10, 60.0)
+    body = {"phone_number": "+302101234567", "task_description": "t", "route_id": "r-1"}
+    for _ in range(pin_failures.NUMBER_LIMIT):
+        store.record_failure("+302101234567", "r-other")
+    resp = asyncio.run(api._create_call(_Req(body)))
+    assert resp.status == 429 and b"cooldown" in resp.body
+    assert not store.route_locked("r-1")
+
+
 def test_invalid_bodies_do_not_consume_the_limiter():
     api = _api(1)
     for _ in range(3):

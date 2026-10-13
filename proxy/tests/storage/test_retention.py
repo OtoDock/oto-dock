@@ -321,6 +321,25 @@ def test_codex_junk_skips_busy_home_and_young_files(temp_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Recover bin: rows whose bytes are gone
+# ---------------------------------------------------------------------------
+
+def test_recover_bin_rows_without_bytes_are_pruned_by_the_sweep(temp_db, monkeypatch, tmp_path):
+    from storage.files import recover_bin_store as rb
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    monkeypatch.setattr(config, "RECOVER_BIN_DIR", tmp_path / "recover-bin")
+    kept = rb.capture("a1", "workspace/kept.txt", b"kept", "deleted")
+    gone = rb.capture("a1", "workspace/gone.txt", b"gone", "deleted")
+    (config.RECOVER_BIN_DIR / "a1" / gone["entry_id"]).unlink()
+
+    assert _sweep(dry_run=True)["recover_bin_rows_pruned"] == 1
+    assert rb.get(gone["entry_id"]) is not None
+    stats = _sweep()
+    assert stats["recover_bin_rows_pruned"] == 1 and stats["errors"] == 0
+    assert rb.get(gone["entry_id"]) is None and rb.get(kept["entry_id"]) is not None
+
+
+# ---------------------------------------------------------------------------
 # Dry run / toggle / Pass D / settings
 # ---------------------------------------------------------------------------
 

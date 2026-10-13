@@ -301,6 +301,43 @@ def test_prewarm_synthesizes_enabled_route_combos(monkeypatch):
     assert cache.get_thinking(("2", "v-el", "el", 8000)) is not None
 
 
+def test_a_route_voice_pins_the_call_and_its_fillers(make_pipeline):
+    """A route's own voice wins over the provider's per-language map at
+    construction and again at the language lock; the filler key carries it."""
+    route = make_route(direction="inbound", language="en")
+    route.voice_id = "v-route"
+    p = make_pipeline(route=route, cfg=_cfg_with_providers())
+    assert p.tts.voice_id == "v-route" and p._filler_key[1] == "v-route"
+    p._select_tts("el")
+    assert p.tts.voice_id == "v-route"
+
+
+def test_prewarm_warms_two_routes_with_different_pinned_voices(monkeypatch):
+    """Two routes on one provider and language with different pinned voices
+    are two combos: both warm, neither is pruned on the next push."""
+    from fillers import FillerCache
+    from pipeline import providers as plproviders
+
+    monkeypatch.setattr(plproviders, "get_provider_class", lambda kind, name: FakeTTS)
+    cache = FillerCache()
+    monkeypatch.setattr(plproviders, "filler_cache", cache)
+
+    cfg = _prewarm_cfg([
+        {"id": "r1", "direction": "inbound", "agent": "x", "language": "en",
+         "enabled": True, "audiosocket_uuid": "u1", "voice_id": "v-one"},
+        {"id": "r2", "direction": "inbound", "agent": "x", "language": "en",
+         "enabled": True, "audiosocket_uuid": "u2", "voice_id": "v-two"},
+        {"id": "r3", "direction": "inbound", "agent": "x", "language": "en",
+         "enabled": True, "audiosocket_uuid": "u3"},
+    ])
+    asyncio.run(plproviders.prewarm_fillers(cfg))
+    for voice in ("v-one", "v-two", "v-en"):
+        assert cache.is_ready(("2", voice, "en", 8000)), voice
+    asyncio.run(plproviders.prewarm_fillers(cfg))
+    for voice in ("v-one", "v-two", "v-en"):
+        assert cache.is_ready(("2", voice, "en", 8000)), voice
+
+
 def test_prewarm_prunes_combo_when_route_removed(monkeypatch):
     """A combo no route uses anymore is pruned on the next pre-warm."""
     from fillers import FillerCache
@@ -552,23 +589,36 @@ def test_proxy_ws_barge_in_aborts_interrupt_style(make_pipeline):
     assert p.state._aborted_turn_text is None
 
 
-def test_proxy_http_fallback_barge_in_does_not_abort(make_pipeline):
-    """The HTTP-SSE fallback has no abort channel — the pipeline lets the
-    turn drain; no abort call, no aborted-turn state."""
-    llm = FakeLLM(llm_mode="proxy", ws_connected=False,
-                  responses=[["Hello ", "there "]])
+def test_a_call_the_proxy_cannot_serve_ends_with_the_apology(make_pipeline):
+    """No socket, no other transport: the turn yields nothing and marks the
+    proxy lost, and the pipeline plays the cannot_continue phrase and hangs
+    up instead of speaking an error line."""
+    class LostLLM(FakeLLM):
+        async def send_message(self, text):
+            self.prompts.append(text)
+            self.proxy_lost = True
+            if False:
+                yield ""
+
+    llm = LostLLM(llm_mode="proxy", ws_connected=False)
     p = make_pipeline(route=make_route(llm_mode="proxy"), llm=llm,
                       cfg=_fast_cfg())
     p.state._warmup_done.set()
+    p.state._running = True
+    p._install_call_control()
 
-    def _on_token(prompt, i, token):
-        if i == 1:
-            p.state._utterance_cancelled = True
-    llm.on_token = _on_token
-
-    asyncio.run(p._process_utterance("hi"))
-    assert llm.aborts == 0
-    assert p.state._aborted_turn_text is None
+    async def run():
+        p.state._utterance_task = asyncio.current_task()
+        await p._process_utterance("hi")
+        for _ in range(3):
+            await asyncio.sleep(0)
+    asyncio.run(run())
+    assert llm.prompts == ["hi"] and llm.aborts == 0
+    assert p.conn.hangups == 1 and p.state._running is False
+    assert p.state.call_outcome == "error"
+    spoken = "".join(text for text, _ in p.tts.text_chunks)
+    assert "Sorry" not in spoken
+    assert p.conn.sent_audio, "the apology played"
 
 
 def test_duplex_rate_transport_drives_pipeline_format(make_pipeline):
@@ -644,3 +694,144 @@ def test_turn_dispatch_hook_fires_per_loop_iteration(make_pipeline):
     assert dispatches[0] == "whats the weather"
     assert len(dispatches) == 2 and "patras" in dispatches[1]
     assert len(llm.prompts) == 2  # both turns really dispatched upstream
+
+
+# ── Turn segments: a partial the provider kept is never a second segment ──
+
+async def _no_wait(segments):
+    return 0.0
+
+
+def _dg_result(text, final, *, start=0.0, end=1.0):
+    """A Deepgram live result, text only (the call path reads no timings)."""
+    class _Alt:
+        transcript = text
+        words = []
+
+    class _Chan:
+        alternatives = [_Alt()]
+
+    class _Res:
+        channel = _Chan()
+        is_final = final
+    _Res.start, _Res.duration = start, end - start
+    return _Res()
+
+
+def test_a_final_leaves_no_partial_for_the_dispatch_drain(make_pipeline):
+    """The provider and the drains together: a partial, then its final; the
+    speech end appends one segment and the drain before the dispatch finds
+    no final and no partial, so the model hears the words once (every call
+    of 2026-10-11 dispatched "Καλησπέρα μας και Καλησπέρα Καλησπέρα")."""
+    from audio.providers.stt.deepgram import DeepgramSTT
+    llm = FakeLLM(responses=[["Γεια σας!"]])
+    p = make_pipeline(llm=llm)
+    p.stt = DeepgramSTT(api_key="k")
+    p.state._stt_active = True
+    p.state._warmup_done.set()
+    p._classify_turn = _no_wait
+
+    async def run():
+        await p.stt._on_transcript(None, _dg_result("καλησπέρα", False))
+        await p.stt._on_transcript(None, _dg_result("Καλησπέρα μας και", True, end=1.4))
+        await p._process_speech_end()
+        assert p.state._turn_segments == ["Καλησπέρα μας και"]
+        p._cancel_turn_timer()                    # the test drives the dispatch itself
+        p.state._user_silent.set()
+        await p._turn_timeout_handler("Καλησπέρα μας και")
+        for _ in range(3):
+            await asyncio.sleep(0)
+    asyncio.run(run())
+    assert llm.prompts == ["Καλησπέρα μας και"]
+
+
+def test_interim_segments_that_repeat_the_last_are_dropped_finals_never(make_pipeline):
+    p = make_pipeline()
+    assert p._append_turn_segment("Καλησπέρα μας και") is True
+    assert p._append_turn_segment("Καλησπέρα", source="interim") is False       # a leading part of the last
+    assert p._append_turn_segment("καλησπέρα μας και.", source="interim") is False   # the same words
+    assert p.state._turn_segments == ["Καλησπέρα μας και"]
+    # A repeated FINAL is the caller repeating a word: it stays.
+    assert p._append_turn_segment("ναι") is True and p._append_turn_segment("ναι") is True
+    assert p.state._turn_segments == ["Καλησπέρα μας και", "ναι", "ναι"]
+    # An interim that extends the last segment replaces it, as before.
+    assert p._append_turn_segment("ναι είπα", source="interim") is True
+    assert p.state._turn_segments[-1] == "ναι είπα"
+
+
+def test_the_turn_classifier_loads_in_the_background_and_a_turn_waits_bounded(make_pipeline, monkeypatch):
+    """The Smart Turn load runs off the loop and the pipeline never waits on
+    it at the call's start: a turn classifies by the heuristic while the
+    model loads and by the classifier once it is there."""
+    import time
+    from pipeline import providers as plproviders, turn as plturn
+
+    def slow_prewarm(cfg):
+        time.sleep(0.3)
+
+    class Clf:
+        def needs_audio(self, lang):
+            return False
+
+        async def classify(self, **kw):
+            return True
+
+    monkeypatch.setattr(plproviders, "prewarm_turn_classifier", slow_prewarm)
+    monkeypatch.setattr(plproviders, "build_dispatcher", lambda **kw: Clf())
+    monkeypatch.setattr(plturn, "TURN_CLASSIFIER_WAIT_S", 0.05)
+    p = make_pipeline()
+
+    async def run():
+        p.state._turn_clf_task = asyncio.create_task(plproviders.build_turn_classifier(p.cfg))
+        t0 = time.monotonic()
+        await asyncio.sleep(0.02)
+        assert time.monotonic() - t0 < 0.2                      # the loop stayed free
+        assert await p._classify_turn(["hello"]) == p.cfg.turn_complete_timeout_s   # heuristic meanwhile
+        await asyncio.sleep(0.4)
+        assert await p._classify_turn(["hello"]) == p.cfg.turn_classifier_grace_s   # the classifier, loaded
+        assert isinstance(p._turn_clf, Clf)
+    asyncio.run(run())
+
+
+def test_the_interim_fallback_records_only_what_it_appended(make_pipeline):
+    """A stale partial the fallback drops is not remembered as dispatched
+    text, so a real final arriving later is never mistaken for its twin."""
+    llm = FakeLLM(responses=[["ok"]])
+    p = make_pipeline(llm=llm)
+    p.state._stt_active = True
+    p.state._warmup_done.set()
+    p._classify_turn = _no_wait
+    p.stt.latest_interim = "hello"
+    p.state._turn_segments.append("hello there")
+
+    async def run():
+        p.state._user_silent.set()
+        await p._turn_timeout_handler("hello there")
+        for _ in range(3):
+            await asyncio.sleep(0)
+    asyncio.run(run())
+    assert llm.prompts == ["hello there"]
+    assert p.state._interim_fallback_text == ""
+
+
+def test_the_debug_switch_saves_the_outgoing_audio_of_a_call(make_pipeline, monkeypatch, tmp_path):
+    """debug_outgoing_audio=on: the call's outgoing frames land in a WAV
+    under debug-audio when it ends; absent, the call runs without a tap."""
+    import wave
+    from pipeline import core as plcore
+
+    monkeypatch.setattr(plcore.config, "BASE_DIR", tmp_path)
+    p = make_pipeline(llm=FakeLLM(), conn=FakeConn(), cfg=_cfg(debug_outgoing_audio="on"))
+    asyncio.run(p.run())                                   # no frames: hangs up after the greeting
+    files = list((tmp_path / "debug-audio").glob("*-uuid-test-out.wav"))
+    assert len(files) == 1
+    sent = b"".join(p.conn.sent_audio)
+    with wave.open(str(files[0])) as w:
+        assert w.getframerate() == 8000
+        assert sent and w.getnframes() * 2 >= len(sent)    # silence only ever adds
+    assert p.state._audio_tap is None                      # handed over at cleanup
+
+    q = make_pipeline(llm=FakeLLM(), conn=FakeConn())
+    asyncio.run(q.run())
+    assert q.state._audio_tap is None
+    assert len(list((tmp_path / "debug-audio").glob("*.wav"))) == 1

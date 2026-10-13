@@ -17,7 +17,7 @@ CONCURRENTLY with the frame-read loop — Twilio's inbound queue is 100 frames
 drop-oldest, so a sequential prompt would starve the queue and lose
 type-ahead digits.
 
-Security posture (see dev ROADMAP + phone SECURITY doc): constant-time
+Security posture (the phone's security page in the internal docs): constant-time
 compare over fixed-width padding; wrong attempts feed the per-number
 cooldown and per-route circuit breaker in ``calls.pin_failures``; digits and
 PINs are never logged and never stored — only attempt counts and outcomes.
@@ -74,8 +74,12 @@ class PinGateMixin:
             )
         except asyncio.TimeoutError:
             # A silent redial must not be a free probe — the timeout counts
-            # one failure toward the cooldown windows.
-            store.record_failure(caller, self.route.id)
+            # one failure toward the cooldown windows. Not on an outbound
+            # call: a silent answer there is a voicemail or a wrong pickup,
+            # and a window would refuse the user's own number next.
+            if not self._is_outbound:
+                store.record_failure(caller, self.route.id)
+                self.state.pin_failures += 1
             logger.info(
                 f"[{peer}] PIN gate: entry timed out "
                 f"({self._pin_counts_note()})"
@@ -99,7 +103,11 @@ class PinGateMixin:
             f"{self.state.pin_attempts} attempts "
             f"({self._pin_counts_note()})"
         )
-        self.state.call_outcome = "pin_failed"
+        # An outbound line that never entered a digit is a voicemail or a
+        # wrong pickup, not a wrong code: the record says so, and the
+        # lockout seed after a restart counts nothing for it.
+        self.state.call_outcome = (
+            "pin_timeout" if self._is_outbound and not self.state.pin_failures else "pin_failed")
         await self._pin_say("pin_fail_goodbye")
         await self._pin_hangup()
         return False
@@ -125,7 +133,11 @@ class PinGateMixin:
             if self._pin_matches(entered):
                 store.clear_number(caller)
                 return True
-            store.record_failure(caller, self.route.id)
+            # An outbound call counts a wrong code only (a silent entry is
+            # a voicemail), an inbound call every attempt.
+            if entered or not self._is_outbound:
+                store.record_failure(caller, self.route.id)
+                self.state.pin_failures += 1
             logger.info(
                 f"[{self.conn.peer_addr}] PIN gate: wrong code "
                 f"(attempt {attempt}/{max_attempts})"

@@ -10,7 +10,7 @@ from email.mime.text import MIMEText
 from storage import database as db
 from storage.identity.credential_store import _encrypt, _decrypt
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 @dataclass

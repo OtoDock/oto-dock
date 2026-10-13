@@ -202,6 +202,19 @@ class OpenAIAdapter(ProviderAdapter):
         thinking switch)."""
         return {}
 
+    def _wire_effort(self, effort: str) -> str | None:
+        """The OpenAI-scale level for a platform effort, folded onto the
+        effort scale the Direct engine declares for this provider (Groq
+        documents low / medium / high, so its ``xhigh`` is sent as
+        ``high``). A provider with no declared scale is sent the map's
+        level unchanged."""
+        mapped = _effort_to_openai(effort) if effort else None
+        if not mapped:
+            return None
+        from core.execution_layer import fold_effort
+        from core.layers.direct.layer import declared_effort_scale
+        return fold_effort(mapped, declared_effort_scale(self.provider_name))
+
     def _effort_allowed_with_tools(self) -> bool:
         """Chat Completions only: whether ``reasoning_effort`` may accompany
         function tools. OpenAI's ``/v1/chat/completions`` REJECTS the pair
@@ -482,7 +495,7 @@ class OpenAIAdapter(ProviderAdapter):
             # for the encrypted items so the tool loop keeps the chain of
             # thought; the effort itself only when the agent set one.
             kwargs["include"] = list(_RESPONSES_INCLUDE)
-            mapped = _effort_to_openai(effort) if effort else None
+            mapped = self._wire_effort(effort)
             if mapped:
                 reasoning: dict = {"effort": mapped}
                 if not self._summary_unsupported:
@@ -759,7 +772,7 @@ class OpenAIAdapter(ProviderAdapter):
         # OpenAI's /v1/chat/completions rejects reasoning_effort next to
         # function tools — see _effort_allowed_with_tools.
         if effort and (not openai_tools or self._effort_allowed_with_tools()):
-            openai_effort = _effort_to_openai(effort)
+            openai_effort = self._wire_effort(effort)
             if openai_effort and app_config.model_supports_reasoning(model):
                 api_kwargs["reasoning_effort"] = openai_effort
 

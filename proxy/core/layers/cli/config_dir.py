@@ -21,7 +21,7 @@ from pathlib import Path
 
 from core.sandbox import session_config_dir as scd
 
-logger = logging.getLogger("claude-proxy.sandbox")
+logger = logging.getLogger("otodock.sandbox")
 
 
 # Claude Code CLI built-in tools that are denied on this platform.
@@ -122,13 +122,15 @@ def build_settings(sandbox_claude_dir: str) -> dict:
     future build flips enabled back on and the inner sandbox can't
     initialise.
     """
-    # Each hook runs the sandbox's python in isolated mode (no PYTHON*
-    # variable, no user site, no script directory on the path), so nothing
-    # the agent sets in its environment changes what a hook executes.
-    gate = f'python3 -I "{sandbox_claude_dir}/permission_gate.py"'
-    forwarder = f'python3 -I "{sandbox_claude_dir}/tool_result_forwarder.py"'
-    subagent = f'python3 -I "{sandbox_claude_dir}/subagent_tracker.py"'
-    stop = f'python3 -I "{sandbox_claude_dir}/stop_tracker.py"'
+    # Each hook runs the sandbox's python, named by its resolved path (a
+    # bare name would take a directory earlier on PATH) in isolated mode (no
+    # PYTHON* variable, no user site, no script directory on the path), so
+    # nothing the agent sets in its environment changes what a hook executes.
+    py = scd.sandbox_python()
+    gate = f'{py} -I "{sandbox_claude_dir}/permission_gate.py"'
+    forwarder = f'{py} -I "{sandbox_claude_dir}/tool_result_forwarder.py"'
+    subagent = f'{py} -I "{sandbox_claude_dir}/subagent_tracker.py"'
+    stop = f'{py} -I "{sandbox_claude_dir}/stop_tracker.py"'
 
     return {
         "sandbox": {
@@ -155,8 +157,9 @@ def build_settings(sandbox_claude_dir: str) -> dict:
         "autoUpdates": False,
         # The platform is the only skill SOURCE: with the Skill tool
         # allowed, plugin skills must not activate outside
-        # install/approval/version-pinning. This settings.json is rewritten
-        # every session start, so plugin enablement is platform-owned state:
+        # install/approval/version-pinning. This settings.json is restored
+        # at every session start and read-only inside the sandbox, so plugin
+        # enablement is platform-owned state:
         # no marketplace plugin is enabled, and every built-in but the four
         # the platform keeps is off by name (DISABLED_BUILTIN_PLUGINS). The
         # spawns read this file alone (--setting-sources user), so a plugin
@@ -173,6 +176,12 @@ def build_settings(sandbox_claude_dir: str) -> dict:
         # satellite/sessions/cli_session.py::_write_cli_hooks.
         "syncClaudeAiSkills": False,
         "syncClaudeAiPlugins": False,
+        # The signed-in claude.ai account's connectors (Claude Docs, Google
+        # Drive, …) load as MCP servers in every Claude Code session too, and
+        # their tools act on the pool owner's account (a headless chat's init
+        # frame listed the account's Claude Docs connector as connected); off
+        # for the same reason. The platform's own MCPs ride --mcp-config.
+        "disableClaudeAiConnectors": True,
         "permissions": {
             "deny": list(DISALLOWED_BUILTIN_TOOLS),
         },
@@ -183,6 +192,12 @@ def build_settings(sandbox_claude_dir: str) -> dict:
                     "type": "command",
                     "command": gate,
                     "timeout": scd.LONG_HOOK_TIMEOUT_S,
+                    # 2.1.295+: a gate that cannot start, times out or exits
+                    # non-zero blocks the call instead of letting it through
+                    # (older CLIs ignore the key). The gate alone: on the
+                    # other three events exit 2 means "keep going", the
+                    # unsafe side of a tracker failure.
+                    "onFailure": "block",
                 }],
             }],
             "PostToolUse": [{
@@ -261,8 +276,8 @@ def ensure_persistent_claude_dir(
                 shutil.rmtree(mem_dir, ignore_errors=True)
 
     settings = build_settings(sandbox_claude_dir)
-    scd.write_no_follow(claude_dir / "settings.json",
-                        (json.dumps(settings, indent=2) + "\n").encode())
+    scd.write_if_changed(claude_dir / "settings.json",
+                         (json.dumps(settings, indent=2) + "\n").encode())
     scd.install_hook_scripts(claude_dir)
 
     # Reconcile the platform-managed on-demand skills dir (fail-soft — a

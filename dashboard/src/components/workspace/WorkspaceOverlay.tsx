@@ -11,11 +11,17 @@ import {
   useZipAgentPaths,
   useRecoverBin,
   batchFailureMessage,
+  invalidateAfterDelete,
   type FileNode,
 } from '../../api/agents'
 import { useAuth } from '../../contexts/AuthContext'
-import { uploadWithProgress } from '../../lib/uploadWithProgress'
-import { useTransferStore, useTransfersForSection, isTransferActive } from '../../store/transferStore'
+import { useFlag } from '../../hooks/useFlag'
+import {
+  collectDropped, collectPicked, emptyCollected,
+  FOLDER_PICKER_ATTRS, type CollectedItems, type DropRoot,
+} from '../../lib/droppedItems'
+import { useTransfersForSection, isTransferActive } from '../../store/transferStore'
+import { uploadCollected as uploadBatch } from './uploadCollected'
 import TransferPopup from './TransferPopup'
 import { emptyTypeAhead, pushChar, findMatch } from '../../lib/typeAhead'
 import { searchSection, pruneTree, expandedDirsOf } from '../../lib/workspaceSearch'
@@ -144,9 +150,11 @@ export default function WorkspaceOverlay({
   // new/edited files appear. Any open Collabora preview reloads independently
   // via useCollaboraLiveReload. Safe + non-destructive — just a refetch.
   // Once per burst: a sync of many files arrives as one frame per file and
-  // the tree is walked once for them.
+  // the tree is walked once for them. The recover bin follows too: a delete
+  // or an overwritten conflict elsewhere adds an entry to it.
   const refetchTree = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['agent-files', agent] })
+    qc.invalidateQueries({ queryKey: ['agent-recover-bin', agent] })
   }, [agent, qc])
   useFileUpdateBurst(agent, refetchTree)
 
@@ -185,14 +193,18 @@ export default function WorkspaceOverlay({
   // ---- Esc: selection-mode first, then preview, then workspace ----
   // Selection-mode handler is pushed on top of the workspace-close handler
   // so it fires first while the user is in selection mode (LIFO stack).
+  // Keyed on the two callbacks, not on ``actions``: the parent hands a new
+  // object on every render, and re-pushing would put this handler back on
+  // top of a menu's while the menu is open.
+  const { closeWorkspace, exitSelectionMode } = actions
   useEffect(() => {
     if (!state.open || state.preview) return
-    return pushEscHandler(() => actions.closeWorkspace())
-  }, [state.open, state.preview, actions])
+    return pushEscHandler(() => closeWorkspace())
+  }, [state.open, state.preview, closeWorkspace])
   useEffect(() => {
     if (!state.selectionMode) return
-    return pushEscHandler(() => actions.exitSelectionMode())
-  }, [state.selectionMode, actions])
+    return pushEscHandler(() => exitSelectionMode())
+  }, [state.selectionMode, exitSelectionMode])
 
   // ---- Android system back integration for selection mode ----
   // MainActivity reads these globals inside the JS evaluation it runs on
@@ -281,6 +293,8 @@ export default function WorkspaceOverlay({
   }, [initialRecover, onRecoverConsumed])
   // Hidden file input used by the empty-space context menu's "Upload" item.
   const emptyUploadInputRef = useRef<HTMLInputElement>(null)
+  // …and the one behind its "Upload Folder" item.
+  const emptyUploadFolderInputRef = useRef<HTMLInputElement>(null)
 
   // ---- Helpers ----
 
@@ -314,42 +328,35 @@ export default function WorkspaceOverlay({
     await createDir.mutateAsync({ agent, path })
   }, [activeSection, state.path, agent, createDir])
 
-  const handleUpload = useCallback(
-    async (files: FileList) => {
+  // One upload batch into the folder on show (./uploadCollected: each
+  // top-level folder reserved on the server, one Cancel, one summary).
+  const uploadCollected = useCallback(
+    async (collected: CollectedItems) => {
       if (!activeSection || !activeSection.canWrite) return
-      const dir = state.path || activeSection.pathPrefix
-      const ts = useTransferStore.getState()
-      // Sequential on purpose: preserves server-side conflict-suffix
-      // ordering and keeps failure attribution per-file; the progress list
-      // makes the sequencing visible instead of confusing.
-      for (const file of Array.from(files)) {
-        // NOT crypto.randomUUID(): that's secure-context-only, and plenty of
-        // self-hosted installs serve the dashboard over plain http on a LAN.
-        const clientId = `local:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-        ts.beginLocalUpload({
-          clientId, agent, targetDir: dir,
-          filename: file.name, bytesTotal: file.size,
-        })
-        try {
-          const res = await uploadWithProgress(file, agent, dir, (sent) =>
-            useTransferStore.getState().updateLocalUpload(clientId, sent),
-          )
-          useTransferStore.getState().linkUpload(clientId, {
-            transferId: res.transfer_id,
-            relPath: res.path,
-            remotePush: res.remote_push,
-          })
-        } catch (e) {
-          useTransferStore.getState().failLocalUpload(clientId)
-          // eslint-disable-next-line no-console
-          console.error('upload failed', file.name, e)
-        }
-        // Refresh after EACH file so big multi-file batches appear as they
-        // land, not only at the end.
-        qc.invalidateQueries({ queryKey: ['agent-files', agent] })
-      }
+      await uploadBatch(collected, {
+        agent,
+        dir: state.path || activeSection.pathPrefix,
+        createDir: (path) => createDir.mutateAsync({ agent, path }),
+        refresh: () => qc.invalidateQueries({ queryKey: ['agent-files', agent] }),
+      })
     },
-    [activeSection, state.path, agent, qc],
+    [activeSection, state.path, agent, qc, createDir],
+  )
+
+  const handleUpload = useCallback(
+    (files: FileList) =>
+      uploadCollected(emptyCollected(Array.from(files).map((file) => ({ file, relDir: '' })))),
+    [uploadCollected],
+  )
+
+  const handleUploadFolder = useCallback(
+    (files: FileList) => uploadCollected(collectPicked(files)),
+    [uploadCollected],
+  )
+
+  const handleDropItems = useCallback(
+    async (roots: DropRoot[]) => uploadCollected(await collectDropped(roots)),
+    [uploadCollected],
   )
 
   const handleOpen = useCallback(
@@ -365,7 +372,7 @@ export default function WorkspaceOverlay({
 
   const handleRefresh = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['agent-files', agent] })
-    qc.invalidateQueries({ queryKey: ['recover-bin', agent] })
+    qc.invalidateQueries({ queryKey: ['agent-recover-bin', agent] })
   }, [qc, agent])
 
   // Explorer-style type-ahead: printable chars accumulate (1s reset) and
@@ -511,7 +518,7 @@ export default function WorkspaceOverlay({
     [actions, movePaths, copyPaths, agent],
   )
 
-  const binCap = user?.feature_flags?.recover_bin_max_bytes ?? 100 * 1024 * 1024
+  const binCap = useFlag('recover_bin_max_bytes')
   const queueDelete = useCallback((nodes: FileNode[]) => {
     if (nodes.length === 0) return
     const totalDescendants = nodes.reduce(
@@ -567,6 +574,7 @@ export default function WorkspaceOverlay({
         handleNewFolder,
         handlePaste,
         emptyUploadInputRef,
+        emptyUploadFolderInputRef,
         onRefresh: handleRefresh,
       }),
     [activeSection, state.path, actions.clipboard, handleNewFile, handleNewFolder, handlePaste, handleRefresh],
@@ -581,7 +589,7 @@ export default function WorkspaceOverlay({
         // the dir is non-empty), so a `recursive=false` request would 400.
         // The user already confirmed via the dialog — recursion is intent.
         const recursive = n.type === 'dir'
-        return deletePath.mutateAsync({ agent, path: n.path, recursive })
+        return deletePath.mutateAsync({ agent, path: n.path, recursive, skipInvalidate: true })
       }),
     )
     const failed = settled.filter((r) => r.status === 'rejected').length
@@ -589,7 +597,8 @@ export default function WorkspaceOverlay({
       // eslint-disable-next-line no-console
       console.warn(`Delete: ${failed} of ${pendingDelete.nodes.length} failed`)
     }
-    qc.invalidateQueries({ queryKey: ['agent-files', agent] })
+    // Once for the whole batch: the listing, open file contents, the bin.
+    invalidateAfterDelete(qc, agent)
     actions.clearSelection()
     // Drop deleted paths from the clipboard so a follow-up paste doesn't
     // 404 on the now-missing sources.
@@ -702,6 +711,7 @@ export default function WorkspaceOverlay({
             onNewFile={handleNewFile}
             onNewFolder={handleNewFolder}
             onUpload={handleUpload}
+            onUploadFolder={handleUploadFolder}
             targetDisplay={targetDisplay}
             recoverCount={recoverEntries.length}
             onOpenRecover={() => setShowRecover(true)}
@@ -735,7 +745,7 @@ export default function WorkspaceOverlay({
                   }
                 }}
                 placeholder={`Search ${activeSection.label}…`}
-                className="flex-1 min-w-0 px-2 py-1 text-xs pointer-coarse:text-base rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light focus:outline-none focus:border-brand/60"
+                className="flex-1 min-w-0 px-2 py-1 text-xs rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light focus:outline-none focus:border-brand/60"
               />
               {searchQuery && (
                 <button
@@ -869,9 +879,9 @@ export default function WorkspaceOverlay({
                 onClearSelection={() => actions.clearSelection()}
                 onContextMenu={(node, point) => setMenu({ node, point })}
                 onLongPress={(node) => actions.enterSelectionMode(node.path)}
-                onDropFiles={
+                onDropItems={
                   activeSection.canWrite
-                    ? (files) => void handleUpload(files)
+                    ? (roots) => void handleDropItems(roots)
                     : undefined
                 }
                 onMoveDrop={
@@ -969,6 +979,16 @@ export default function WorkspaceOverlay({
         className="hidden"
         onChange={(e) => {
           if (e.target.files?.length) void handleUpload(e.target.files)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={emptyUploadFolderInputRef}
+        type="file"
+        className="hidden"
+        {...FOLDER_PICKER_ATTRS}
+        onChange={(e) => {
+          if (e.target.files?.length) void handleUploadFolder(e.target.files)
           e.target.value = ''
         }}
       />

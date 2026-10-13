@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -35,7 +37,7 @@ from services.mcp import mcp_registry
 from storage import database as task_store
 from storage.mcp import mcp_store
 
-logger = logging.getLogger("claude-proxy.mcp-updater")
+logger = logging.getLogger("otodock.mcp-updater")
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,15 @@ def auto_update_enabled() -> bool:
 HOLD_MARKER = ".hold"
 
 
+def _is_git(manifest) -> bool:
+    """A community MCP installed from a ``git+`` source: its updates are the
+    catalog's (a new ref under a new version). The weekly job builds one only
+    when the catalog pins a full commit (``pinned_commit`` on the offer); an
+    admin's Update builds any ref the catalog install accepts."""
+    source = getattr(getattr(manifest, "server", None), "source", "")
+    return isinstance(source, str) and source.startswith("git+")
+
+
 def is_held(manifest) -> bool:
     """Whether this MCP's install dir carries the auto-update hold marker."""
     mcp_dir = getattr(manifest, "mcp_dir", None)
@@ -78,6 +89,7 @@ def is_held(manifest) -> bool:
 
 def pin_local_manifest(
     mcp_dir: Path, registry: str, package: str, resolved_version: str,
+    *, extras: tuple[str, ...] = (),
 ) -> None:
     """Pin a node/python install's LOCAL manifest to the resolved version.
 
@@ -91,12 +103,15 @@ def pin_local_manifest(
     itself). Proxy-side only — the satellite receives an already-pinned manifest.
 
     No-op-safe: callers pass a non-empty ``resolved_version`` for npm/pypi only;
-    docker/git+ manifests are never passed here.
+    docker/git+ manifests are never passed here. A PyPI source keeps its
+    ``extras``: ``pypi:name[a,b]@1.2.3``.
     """
+    from services.mcp.mcp_installer import ParsedSource
     manifest_path = mcp_dir / "manifest.json"
     data = json.loads(manifest_path.read_text())
     data["version"] = resolved_version
-    data.setdefault("server", {})["source"] = f"{registry}:{package}@{resolved_version}"
+    data.setdefault("server", {})["source"] = ParsedSource(
+        registry, package, "", tuple(extras)).pinned(resolved_version)
     manifest_path.write_text(json.dumps(data, indent=2))
 
 
@@ -229,6 +244,154 @@ async def resolve_latest_in_bound(
 
 
 # ---------------------------------------------------------------------------
+# The waiting period — what the weekly job may apply
+# ---------------------------------------------------------------------------
+#
+# The weekly job applies an npm/pypi release only once it has been public for
+# RELEASE_MIN_AGE, so a compromised or broken upstream release has a week to
+# be noticed and pulled before it reaches an install. An admin's Update never
+# waits (resolve_latest_in_bound): that is how an upstream security fix goes
+# in at once.
+
+RELEASE_MIN_AGE = timedelta(days=7)
+# The full npm document carries every version's publish time and can run to
+# tens of MB; past this (decompressed) the probe answers without times.
+_REGISTRY_DOC_CAP = 64 * 1024 * 1024
+
+
+@dataclass
+class Release:
+    """What a registry offers within a bound: ``latest`` (what an admin's
+    Update installs), ``settled`` (the newest stable version, not above
+    ``latest``, public for at least ``RELEASE_MIN_AGE``: what the weekly job
+    applies) and ``latest_at`` (when ``latest`` was released, "" unknown)."""
+    latest: str | None
+    settled: str | None = None
+    latest_at: str = ""
+
+
+def _read_capped(url: str, accept: str) -> dict | None:
+    """GET a JSON document, gzip accepted, its decompressed body capped at
+    ``_REGISTRY_DOC_CAP``. ``None`` on any error or a body over the cap."""
+    import urllib.request
+    import zlib
+    req = urllib.request.Request(url, headers={"Accept": accept, "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read(_REGISTRY_DOC_CAP + 1)
+        if len(raw) > _REGISTRY_DOC_CAP:
+            return None
+        if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+            inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            raw = inflate.decompress(raw, _REGISTRY_DOC_CAP + 1)
+            if len(raw) > _REGISTRY_DOC_CAP or inflate.unconsumed_tail:
+                return None
+    doc = json.loads(raw)
+    return doc if isinstance(doc, dict) else None
+
+
+async def _registry_doc(registry: str, package: str) -> dict | None:
+    """The full npm document (``versions``, ``time``, ``dist-tags``) or the
+    PyPI JSON (``info``, ``releases``). ``None`` on any failure."""
+    if registry == "npm":
+        url, accept = f"https://registry.npmjs.org/{package}", "application/json"
+    else:
+        url, accept = f"https://pypi.org/pypi/{package}/json", "application/json"
+    try:
+        return await asyncio.to_thread(_read_capped, url, accept)
+    except Exception:
+        return None
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_time(value) -> datetime | None:
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+
+
+def _release_times(registry: str, doc: dict) -> dict[str, datetime | None]:
+    """Every published version and when it was released (``None`` unknown).
+    npm: the ``versions`` map, its ``time`` entry. PyPI: releases with a file
+    that is not yanked, timed by their NEWEST such file (a wheel added to an
+    old release waits as a new release would)."""
+    out: dict[str, datetime | None] = {}
+    if registry == "npm":
+        times = doc.get("time") if isinstance(doc.get("time"), dict) else {}
+        for version in (doc.get("versions") or {}):
+            out[str(version)] = _parse_time(times.get(version))
+        return out
+    for version, files in (doc.get("releases") or {}).items():
+        live = [f for f in (files or []) if isinstance(f, dict) and not f.get("yanked")]
+        if not live:
+            continue
+        stamps = [_parse_time(f.get("upload_time_iso_8601") or f.get("upload_time")) for f in live]
+        out[str(version)] = None if None in stamps else max(stamps)
+    return out
+
+
+async def resolve_release(
+    registry: str, package: str, constraint: str | None, *, now: datetime | None = None,
+) -> Release:
+    """``latest`` by today's rule (the registry's latest when unbounded, the
+    newest stable version in bound otherwise) and the newest version the
+    waiting period allows. A version whose release time is missing or in the
+    future never settles. When the registry document cannot be read, the
+    answer is ``latest`` alone (nothing settles: the job waits for an admin)."""
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import InvalidVersion, Version
+
+    doc = await _registry_doc(registry, package)
+    if doc is None:
+        return Release(latest=await resolve_latest_in_bound(registry, package, constraint))
+    try:
+        spec = SpecifierSet(constraint or "")
+    except InvalidSpecifier:
+        logger.warning("Invalid version_constraint %r for %s — ignoring", constraint, package)
+        spec, constraint = SpecifierSet(""), ""
+    times = _release_times(registry, doc)
+    usable = [v for v in times if _is_stable_in_bound(registry, v, spec)]
+    if constraint:
+        latest = str(max(usable, key=Version)) if usable else None
+    elif registry == "npm":
+        latest = (doc.get("dist-tags") or {}).get("latest")
+    else:
+        latest = (doc.get("info") or {}).get("version")
+    if not latest:
+        return Release(latest=None)
+    now = now or _utcnow()
+    try:
+        ceiling = Version(str(latest))
+    except InvalidVersion:
+        return Release(latest=str(latest))
+    settled_ok = [
+        v for v in usable
+        if Version(v) <= ceiling and times[v] is not None and times[v] <= now - RELEASE_MIN_AGE
+    ]
+    at = times.get(str(latest))
+    return Release(
+        latest=str(latest),
+        settled=str(max(settled_ok, key=Version)) if settled_ok else None,
+        latest_at=at.isoformat() if at else "",
+    )
+
+
+def _waiting_fields(rel: Release, current: str) -> dict:
+    """The offer's fields for the weekly job: ``settled`` (the version it
+    would apply now, "" none newer than the install) and, while ``latest``
+    waits, ``auto_after`` (when it settles, "" when its time is unknown)."""
+    fields = {"settled": rel.settled if _is_pkg_newer(rel.settled, current) else ""}
+    if rel.settled != rel.latest:
+        at = _parse_time(rel.latest_at) if rel.latest_at else None
+        fields["auto_after"] = (at + RELEASE_MIN_AGE).isoformat() if at else ""
+    return fields
+
+
+# ---------------------------------------------------------------------------
 # Detection — "what updates are available?"
 # ---------------------------------------------------------------------------
 
@@ -296,13 +459,18 @@ async def detect_available_updates() -> dict:
         ``version_constraint`` (absolute latest when unbounded);
       * **manifest** — the catalog integration manifest changed (``manifest_hash``
         differs from the installed one), so the install should converge.
-    Docker MCPs compare the installed version against the catalog version tag.
-    The catalog ``registry.json`` is fetched ONCE up front; on failure both
-    bound + manifest signals degrade off (the npm/pypi package probe still runs),
-    so a transient outage never breaks the caller.
+    An npm/pypi offer also carries what the weekly job may apply under the
+    waiting period (``settled``, ``auto_after``; ``resolve_release``), and
+    ``held`` / ``rebuild`` when they apply. Docker and git+ MCPs compare the
+    installed version against the catalog version (``registry`` "catalog" or
+    "git"); a git+ offer carries ``pinned_commit``, whether the catalog's
+    source pins a full commit (the weekly job builds only that, and the
+    catalog install refuses anything else). The catalog ``registry.json`` is fetched ONCE up front; on failure
+    both bound + manifest signals degrade off (the npm/pypi package probe still
+    runs), so a transient outage never breaks the caller.
     """
-    from services.community import community_catalog
-    from services.mcp import mcp_installer
+    from services.community import community_catalog, community_installer
+    from services.mcp import mcp_installer, mcp_venv_bootstrap
 
     from services.community import mcp_source_swap
 
@@ -357,6 +525,14 @@ async def detect_available_updates() -> dict:
                 out[cname] = None
         return out
     installed_hashes = await asyncio.to_thread(_installed_hashes)
+    # A venv on an interpreter the session sandbox does not bind is rebuilt by
+    # the converge at the installed version (the admin's Update repairs it).
+    outside = await asyncio.to_thread(
+        lambda: {n for n, m, _r, _p in checks if _r == "pypi"
+                 and mcp_venv_bootstrap.venv_outside_sandbox(Path(m.mcp_dir))})
+    now = _utcnow()
+    # Each probe may read a registry document of tens of MB: a few at a time.
+    registry_reads = asyncio.Semaphore(4)
 
     async def _check_one(mcp_name, m, registry, package):
         entry = catalog.get(mcp_name)
@@ -366,19 +542,34 @@ async def detect_available_updates() -> dict:
             constraint = entry.get("version_constraint", "") or ""
         else:
             constraint = getattr(m.server, "version_constraint", "") or ""
-        target = await resolve_latest_in_bound(registry, package, constraint)
+        async with registry_reads:
+            rel = await resolve_release(registry, package, constraint, now=now)
+        target = rel.latest
         pkg_newer = _is_pkg_newer(target, m.version)
         catalog_hash = entry.get("manifest_hash") if entry else None
         installed_hash = installed_hashes.get(mcp_name)
         manifest_changed = bool(catalog_hash) and bool(installed_hash) and installed_hash != catalog_hash
-        if not pkg_newer and not manifest_changed:
+        if entry is not None and community_catalog.source_detail_differs(
+                m.server.source, entry.get("source")):
+            manifest_changed = True
+        # A rebuild converges through the catalog: an MCP no longer there has none.
+        rebuild = mcp_name in outside and entry is not None
+        if not pkg_newer and not manifest_changed and not rebuild:
             return None
+        manifest_changed = manifest_changed or rebuild
         reason = "both" if (pkg_newer and manifest_changed) else ("package" if pkg_newer else "manifest")
-        return (mcp_name, {
+        info = {
             "current": m.version,
             "latest": target if pkg_newer else m.version,
             "registry": registry, "package": package, "reason": reason,
-        })
+        }
+        if pkg_newer:
+            info.update(_waiting_fields(rel, m.version))
+        if rebuild:
+            info["rebuild"] = True
+        if is_held(m):
+            info["held"] = True
+        return (mcp_name, info)
 
     for result in await asyncio.gather(
         *[_check_one(*c) for c in checks], return_exceptions=True,
@@ -387,16 +578,19 @@ async def detect_available_updates() -> dict:
             mcp_name, info = result
             results[mcp_name] = info
 
-    # Docker MCPs — compare the installed version against the catalog version
-    # tag, then the integration manifest (a catalog edit under the same image
-    # tag: the converge re-fetches the folder and recreates the container).
-    # Community only, same rationale as above (a custom docker MCP —
-    # file-tools — updates via platform releases, and a name collision with a
-    # catalog entry must never produce a converge offer for it).
+    # Catalog-pinned MCPs — a container (its image tag) and a git+ source (its
+    # ref): the installed version against the catalog version, then the
+    # integration manifest (a catalog edit under the same version: the
+    # converge re-fetches the folder; a git+ ref that moved under the same
+    # version counts too, the hash leaves the source out). Community only,
+    # same rationale as above (a custom docker MCP — file-tools — updates via
+    # platform releases, and a name collision with a catalog entry must never
+    # produce a converge offer for it). The weekly job builds a git+ offer only
+    # when the catalog pins a full commit (``pinned_commit``).
     docker_targets = [
         (name, m) for name, m in manifests.items()
-        if m.category == "community" and _mt.is_container(m.server)
-        and name not in source_changes
+        if m.category == "community" and name not in source_changes
+        and (_mt.is_container(m.server) or _is_git(m))
     ]
 
     def _docker_hashes() -> dict:
@@ -410,6 +604,10 @@ async def detect_available_updates() -> dict:
         return out
     docker_hashes = await asyncio.to_thread(_docker_hashes) if docker_targets else {}
 
+    git_outside = await asyncio.to_thread(
+        lambda: {n for n, m in docker_targets
+                 if _is_git(m) and mcp_venv_bootstrap.venv_outside_sandbox(Path(m.mcp_dir))})
+
     docker_checked = 0
     for name, m in docker_targets:
         docker_checked += 1
@@ -418,15 +616,23 @@ async def detect_available_updates() -> dict:
         catalog_hash = entry.get("manifest_hash") if entry else None
         installed_hash = docker_hashes.get(name)
         relation = _catalog_relation(latest, m.version)
-        if relation == REL_SAME and catalog_hash and installed_hash and catalog_hash != installed_hash:
+        kind = "git" if _is_git(m) else "catalog"
+        changed = bool(catalog_hash and installed_hash and catalog_hash != installed_hash)
+        if entry is not None and kind == "git" and community_catalog.source_detail_differs(
+                m.server.source, entry.get("source")):
+            changed = True
+        rebuild = name in git_outside and entry is not None
+        if relation == REL_SAME and (changed or rebuild):
             results[name] = {
                 "current": m.version, "latest": m.version,
-                "registry": "catalog", "package": name, "reason": "manifest",
+                "registry": kind, "package": name, "reason": "manifest",
             }
+            if rebuild:
+                results[name]["rebuild"] = True
         elif relation == REL_UPDATE:
             results[name] = {
                 "current": m.version, "latest": latest,
-                "registry": "catalog", "package": name, "reason": "package",
+                "registry": kind, "package": name, "reason": "package",
             }
         elif relation == REL_AHEAD:
             # An install past the catalog (an out-of-band deploy, a newer
@@ -434,12 +640,19 @@ async def detect_available_updates() -> dict:
             # the admin may revert it on purpose through the Update route.
             results[name] = {
                 "current": m.version, "latest": latest,
-                "registry": "catalog", "package": name, "reason": "ahead",
+                "registry": kind, "package": name, "reason": "ahead",
             }
             logger.info(
                 "MCP %s: installed %s is ahead of the catalog %s; left alone",
                 name, m.version, latest,
             )
+        if name in results and is_held(m):
+            results[name]["held"] = True
+        if kind == "git" and name in results and entry is not None:
+            catalog_source = entry.get("source")
+            results[name]["pinned_commit"] = community_installer.git_ref_is_commit(catalog_source)
+            parsed_ref = mcp_installer.parse_source(catalog_source) if isinstance(catalog_source, str) else None
+            results[name]["catalog_ref"] = parsed_ref.version if parsed_ref is not None else ""
 
     # Standalone skill packages (category "skill", runtime none) — the skills
     # catalog's version moves an install forward only (``_catalog_relation``,
@@ -624,24 +837,29 @@ async def _catalog_entry(name: str) -> dict | None:
     )
 
 
-async def _update_node_python_mcp(name: str, manifest) -> dict:
+async def _update_node_python_mcp(name: str, manifest, *, settled_only: bool = False) -> dict:
     """Update an npm/pypi MCP by **converging it to the catalog folder**.
 
     The catalog is the source of truth for both axes:
       * **package** — install the latest version WITHIN the catalog
         ``version_constraint`` (absolute latest when unbounded), pinned into the
-        local manifest;
+        local manifest; with ``settled_only`` (the weekly job) the newest one
+        public for ``RELEASE_MIN_AGE``;
       * **integration** — re-fetch + re-apply the catalog manifest + skills + files
-        so a contributor's args/oauth/skill fix reaches installs.
+        so a contributor's args/oauth/skill fix reaches installs (a changed
+        hash, the extras of the catalog's source, or a venv the session sandbox
+        cannot run, which the converge rebuilds).
 
     The two axes are decoupled: a manifest-only change re-pins the SAME package
     version (``install_version=cur``) — it never downgrades the package to a
-    tightened bound. The whole-dir backup + rollback lives in
-    ``install_from_extracted_folder``; running stdio sessions keep their already
-    spawned subprocess, new sessions pick up the converged install.
+    tightened bound. With ``settled_only``, a manifest change beside a package
+    release that has not settled waits whole (``status: waiting``): the edit
+    may be written for the new package. The whole-dir backup + rollback lives
+    in ``install_from_extracted_folder``; running stdio sessions keep their
+    already spawned subprocess, new sessions pick up the converged install.
     """
     from services.community import community_catalog, community_installer
-    from services.mcp import mcp_installer
+    from services.mcp import mcp_installer, mcp_venv_bootstrap
 
     parsed = mcp_installer.parse_source(manifest.server.source)
     if not parsed or parsed.registry not in ("npm", "pypi"):
@@ -657,34 +875,66 @@ async def _update_node_python_mcp(name: str, manifest) -> dict:
         constraint = getattr(manifest.server, "version_constraint", "") or ""
         catalog_hash = None
 
-    target = await resolve_latest_in_bound(registry, package, constraint)
+    rel: Release | None = None
+    if settled_only:
+        rel = await resolve_release(registry, package, constraint)
+        target = rel.settled
+    else:
+        target = await resolve_latest_in_bound(registry, package, constraint)
     pkg_newer = _is_pkg_newer(target, cur)
 
-    manifest_changed = False
+    edited = False
     if catalog_hash:
         try:
             mf = Path(manifest.mcp_dir) / "manifest.json"
             data = await asyncio.to_thread(lambda: json.loads(mf.read_text()))
-            manifest_changed = community_catalog.normalized_manifest_hash(data) != catalog_hash
+            edited = community_catalog.normalized_manifest_hash(data) != catalog_hash
         except Exception:
-            manifest_changed = False
+            edited = False
+    if entry is not None and community_catalog.source_detail_differs(
+            manifest.server.source, entry.get("source")):
+        edited = True
+    rebuild = registry == "pypi" and await asyncio.to_thread(
+        mcp_venv_bootstrap.venv_outside_sandbox, Path(manifest.mcp_dir))
+    manifest_changed = edited or rebuild
 
+    latest_waits = rel is not None and _is_pkg_newer(rel.latest, cur) and rel.settled != rel.latest
     if not pkg_newer and not manifest_changed:
+        # A newer release the job may not apply yet (or a registry it could
+        # not read): the offer stays on the page.
+        if latest_waits:
+            return {"status": "waiting", "name": name, "version": cur}
         return {"status": "already_latest", "name": name, "version": cur}
+    if edited and latest_waits:
+        # The catalog edit may be written for the release that has not
+        # settled: the whole converge waits (a rebuild alone never does).
+        return {"status": "waiting", "name": name, "version": cur}
 
     # Package axis only moves forward; a manifest-only converge keeps the version.
     install_version = target if pkg_newer else cur
-    return await community_installer.install_from_catalog(name, install_version=install_version)
+    result = await community_installer.install_from_catalog(name, install_version=install_version)
+    if rel is not None and _is_pkg_newer(rel.latest, install_version):
+        # The newer release still waits: the page keeps showing it.
+        result["pending_offer"] = {
+            "current": install_version, "latest": rel.latest,
+            "registry": registry, "package": package, "reason": "package",
+            **_waiting_fields(rel, install_version),
+        }
+    return result
 
 
-async def update_one(name: str) -> dict:
+async def update_one(name: str, *, settled_only: bool = False) -> dict:
     """Update a single MCP, holding the per-MCP install lock so it can't race a
     concurrent install/update of the same MCP.
 
-    Docker MCPs re-fetch from the community catalog (image tag); npm/pypi MCPs
-    converge to the catalog folder + install the latest version within the catalog
-    bound. Raises ``HTTPException`` (404/400/500/502) — callers that want
-    best-effort behaviour (the weekly job) catch it per-MCP.
+    Docker MCPs re-fetch from the community catalog (image tag); git+ MCPs
+    converge to the catalog folder and build its ref; npm/pypi MCPs converge to
+    the catalog folder + install the latest version within the catalog bound
+    (``settled_only``: the newest past the waiting period, for the weekly job,
+    which builds a git+ source only at a catalog-pinned commit, with no wait:
+    the catalog's bump is a reviewed change). Raises ``HTTPException``
+    (404/400/409/500/502) — callers that want best-effort behaviour (the weekly
+    job) catch it per-MCP.
     """
     from core.credentials import catalog_install_registry
 
@@ -702,10 +952,38 @@ async def update_one(name: str) -> dict:
             result = await skills_installer.install_skill_package_from_catalog(name)
         elif _mt.is_container(manifest.server):
             result = await _update_docker_mcp(name)
+        elif _is_git(manifest):
+            from services.community import community_installer
+            if settled_only:
+                entry = await _catalog_entry(name)
+                if entry is None or not community_installer.git_ref_is_commit(entry.get("source")):
+                    raise HTTPException(
+                        409, f"'{name}' builds from a git source the catalog does not pin to a "
+                             "commit: automatic updates never build a tag or a branch",
+                    )
+            # The catalog install refuses a ref that is not a commit, which
+            # also covers a catalog that moved since the check above.
+            result = await community_installer.install_from_catalog(name)
         else:
-            result = await _update_node_python_mcp(name, manifest)
-        await asyncio.to_thread(_forget_check_result, name)
+            result = await _update_node_python_mcp(name, manifest, settled_only=settled_only)
+        if result.get("status") == "waiting":
+            return result
+        offer = result.pop("pending_offer", None)
+        if offer:
+            await asyncio.to_thread(_keep_check_result, name, offer)
+        else:
+            await asyncio.to_thread(_forget_check_result, name)
         return result
+
+
+def _keep_check_result(name: str, info: dict) -> None:
+    """A settled apply below the newest release rewrites the persisted offer
+    (the newer release still waits) instead of retiring it. Best effort."""
+    from storage.mcp import mcp_update_state_store as state_store
+    try:
+        state_store.put_check_result(name, info)
+    except Exception:
+        logger.warning("The persisted check result of %s could not be rewritten", name)
 
 
 def _forget_check_result(name: str) -> None:

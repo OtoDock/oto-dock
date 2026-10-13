@@ -62,14 +62,14 @@ import os
 import re
 
 from core.session.history_seed import strip_seed_prefix
-from core.session.transcript_tailer import author_sub_for
+from core.session.transcript_tailer import line_time, author_sub_for
 from core.session.transcript_tool_events import (
     TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
     persist_event, record_batch_usage,
 )
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.codex_rollout_tailer")
+logger = logging.getLogger("otodock.codex_rollout_tailer")
 
 
 def _record_rate_limits(session_id: str, snapshot: dict, timestamp) -> None:
@@ -293,11 +293,15 @@ def _extract_text(content) -> str:
     return ""
 
 
-# Injected prelude line(s): the `[Current time: ...]` stamp and the viewer
-# focus line — twin of ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored
-# exact shapes only).
+# Injected prelude line(s): the `[Current time: ...]` stamp, the viewer
+# focus line and the parallel-activity line — twin of
+# ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored exact shapes only;
+# a satellite single-lines the launch-argument prompt, so a prelude may end
+# in spaces instead of a line break).
 _TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
 
@@ -331,7 +335,8 @@ def _title_from_prompt(text: str) -> str:
 # the next line's words, not by a newline — hence ``\s*`` where the title
 # regex above demands the line end.
 _ROW_PRELUDE_RE = re.compile(
-    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\]\s*"
+    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]\s*"
 )
 
 
@@ -729,6 +734,8 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
     # turn), "tool_use" (agent output mid-turn, no completion yet),
     # "end_turn" (task_complete), None (nothing turn-relevant).
     last_signal: str | None = None
+    # The rollout line behind ``last_signal``: its own time (transcript_tailer).
+    last_signal_at: float | None = None
     # request_user_input call_ids fired this batch and not yet answered. The
     # TUI blocks on the bottom-pane picker (no further items until the
     # function_call_output), so an id still open at batch end means the CLI
@@ -817,6 +824,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             # Per-turn completion marker — the agent finished this turn.
             saw_task_complete = True
             last_signal = "end_turn"
+            last_signal_at = line_time(obj)
             lam = payload.get("last_agent_message")
             if lam:
                 last_agent_message = lam
@@ -827,6 +835,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             # task_complete follows. Close the turn WITHOUT the completion
             # signal (the user stopped it themselves; no finished ping).
             last_signal = "end_turn"
+            last_signal_at = line_time(obj)
             continue
 
         if otype == "compacted":
@@ -860,6 +869,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
                 # signal, but the question fold below keys on "tool_use"
                 # (Claude parity — its question tool_use sets the same).
                 last_signal = "tool_use"
+                last_signal_at = line_time(obj)
             continue
         if ptype in ("function_call_output", "custom_tool_call_output"):
             open_questions.discard(payload.get("call_id") or "")
@@ -945,6 +955,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
         # Turn-relevant either way — a prefix-skipped record is still the
         # batch's latest turn state (a resume's first tail re-reads history).
         last_signal = "user" if role == "user" else "tool_use"
+        last_signal_at = line_time(obj)
 
         # Prefix-merge: already persisted (resume/restart) → consume + skip.
         if ptr < len(prefix) and _same_persisted_row(prefix[ptr], role, text):
@@ -1003,6 +1014,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
         "turn_complete": saw_task_complete,
         "last_message": last_agent_message,
         "last_signal": last_signal,
+        "last_signal_at": last_signal_at,
         # Turn parked on an unanswered request_user_input (folded to end_turn
         # above) — interactive_session rewords the ping + gates injection.
         "question_pending": question_pending,

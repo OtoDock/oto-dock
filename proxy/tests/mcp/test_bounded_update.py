@@ -246,16 +246,31 @@ class TestAugmentManifestChange:
         )
         assert out["update_available"] is False
 
-    def test_git_and_remote_sources_never_flag_via_manifest_hash(self):
-        # No converge path for these: a hash mismatch would badge an update
-        # nobody can run.
-        for source in ("git+https://example.com/x.git@v1", "remote:mcp.example.com"):
-            out = community_catalog.augment_entry(
-                self._entry(runtime="python", version="1.0.0", source=source),
-                installed_versions={"notion-mcp": "1.0.0"},
-                enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "bbbb"},
-            )
-            assert out["update_available"] is False, source
+    def test_remote_sources_never_flag_via_manifest_hash(self):
+        # No converge path: a hash mismatch would badge an update nobody can run.
+        out = community_catalog.augment_entry(
+            self._entry(runtime="python", version="1.0.0", source="remote:mcp.example.com"),
+            installed_versions={"notion-mcp": "1.0.0"},
+            enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "bbbb"},
+        )
+        assert out["update_available"] is False
+
+    def test_a_git_source_flags_a_manifest_change_under_the_same_version_only(self):
+        # A git+ entry converges on an admin's Update; an install ahead of the
+        # catalog is never offered a move back.
+        git = "git+https://example.com/x.git@" + "a" * 40
+        same = community_catalog.augment_entry(
+            self._entry(runtime="python", version="1.0.0", source=git),
+            installed_versions={"notion-mcp": "1.0.0"},
+            enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "bbbb"},
+        )
+        assert same["update_available"] is True
+        ahead = community_catalog.augment_entry(
+            self._entry(runtime="python", version="1.0.0", source=git),
+            installed_versions={"notion-mcp": "1.1.0"},
+            enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "bbbb"},
+        )
+        assert ahead["update_available"] is False
 
 
 class TestDetectionScopedToCommunity:
@@ -313,6 +328,10 @@ class TestDetectionScopedToCommunity:
         async def _fake_latest(registry, package, constraint):
             return "2.0.0"  # newer than every installed npm version
         monkeypatch.setattr(mcp_updater, "resolve_latest_in_bound", _fake_latest)
+
+        async def _no_doc(registry, package):
+            return None  # no release times: the offer carries nothing settled
+        monkeypatch.setattr(mcp_updater, "_registry_doc", _no_doc)
 
         out = await mcp_updater.detect_available_updates()
         updates = out["updates"]

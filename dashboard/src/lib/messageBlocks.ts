@@ -294,11 +294,16 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
  */
 export function attachmentBlocks(
   images?: Array<{ name: string; path?: string }> | null,
-  files?: Array<{ name: string; path?: string }> | null,
+  files?: Array<{ name: string; path?: string; folder?: boolean }> | null,
 ): MessageBlock[] {
   const blocks: MessageBlock[] = []
   if (Array.isArray(files) && files.length) {
-    blocks.push({ type: 'file_attachments', files: files.map(f => ({ name: f.name, path: f.path })) })
+    blocks.push({
+      type: 'file_attachments',
+      files: files.map(f => ({
+        name: f.name, path: f.path, ...(f.folder === true ? { folder: true } : {}),
+      })),
+    })
   }
   if (Array.isArray(images) && images.length) {
     blocks.push({
@@ -717,7 +722,12 @@ export function lastTurnPrompt(messages: DisplayMessage[]):
       })
     } else if (b.type === 'file_attachments') {
       for (const f of b.files) {
-        if (f.path) files.push({ id: `again-file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path })
+        if (f.path) {
+          files.push({
+            id: `again-file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path,
+            ...(f.folder ? { folder: true } : {}),
+          })
+        }
       }
     }
   }

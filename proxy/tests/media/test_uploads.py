@@ -564,3 +564,360 @@ def test_single_shot_never_writes_through_a_planted_link(app_with_router, tmp_pa
     assert resp.status_code == 200 and resp.json()["filename"] == "note_1.txt"
     assert target.read_bytes() == b"untouched"
     assert (landed / "note_1.txt").read_bytes() == b"hello"
+
+
+# ---------------------------------------------------------------------------
+# A folder attached in chat: a fresh folder in the chat's landing dir
+# ---------------------------------------------------------------------------
+
+
+def test_a_chat_folder_is_reserved_fresh_and_its_files_land_in_it(app_with_router):
+    """The first folder takes its name, a second of the same name takes
+    ``_1`` (never merged into the first), and an upload into the reserved
+    folder's subfolder creates the subfolder."""
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    first = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "mesitis"})
+    assert first.status_code == 200, first.text
+    assert first.json() == {"path": "users/alice/workspace/uploads/files/mesitis", "name": "mesitis"}
+    second = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "mesitis"})
+    assert second.json()["path"] == "users/alice/workspace/uploads/files/mesitis_1"
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("agent.json", BytesIO(b"{}"), "application/json")},
+        data={"agent": "test-agent", "target_dir": f"{second.json()['path']}/context"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == "users/alice/workspace/uploads/files/mesitis_1/context/agent.json"
+    assert (agents_dir / "test-agent" / resp.json()["path"]).read_bytes() == b"{}"
+
+
+def test_a_landed_upload_and_a_reserved_folder_refresh_the_open_trees(app_with_router, monkeypatch):
+    """The uploader's own workspace view (a folder attached in chat shows
+    without a Refresh) and a teammate's hear ``file_updated``: once per
+    landed file and once per reserved folder, the uploader never excluded."""
+    from unittest.mock import AsyncMock
+    from services.notifications import notification_manager
+    told = AsyncMock()
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", told)
+    app, _ = app_with_router
+    client = TestClient(app)
+    assert _post_file(client, name="note.txt").status_code == 200
+    folder = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "pics"})
+    assert folder.status_code == 200, folder.text
+    assert told.await_args_list == [
+        (("test-agent", "users/alice/workspace/uploads/files/note.txt"), {"source": "disk"}),
+        (("test-agent", "users/alice/workspace/uploads/files/pics"), {"source": "disk"}),
+    ]
+
+
+def test_a_chat_folder_name_never_makes_a_hidden_or_nested_folder(app_with_router):
+    app, _ = app_with_router
+    client = TestClient(app)
+    hidden = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": ".drafts"})
+    assert hidden.json()["path"] == "users/alice/workspace/uploads/files/drafts"
+    nested = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "../../config"})
+    assert nested.status_code == 200
+    assert nested.json()["path"].startswith("users/alice/workspace/uploads/files/")
+    assert "/" not in nested.json()["name"]
+
+
+def test_a_chat_folder_in_a_shared_chat_needs_the_workspace_tier(app_with_internal_agent):
+    app, _, user = app_with_internal_agent
+    user.agent_roles["internal-bot"] = "viewer"
+    user.role = "member"
+    resp = TestClient(app).post("/v1/upload/folder", json={"agent": "internal-bot", "name": "t"})
+    assert resp.status_code == 403
+
+
+def test_a_chat_folder_in_a_shared_chat_takes_a_contributor(app_with_internal_agent):
+    app, agents_dir, user = app_with_internal_agent
+    user.agent_roles["internal-bot"] = "contributor"
+    user.role = "member"
+    resp = TestClient(app).post("/v1/upload/folder", json={"agent": "internal-bot", "name": "site"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == "workspace/uploads/files/site"
+    assert (agents_dir / "internal-bot" / "workspace" / "uploads" / "files" / "site").is_dir()
+
+
+def test_a_viewer_of_a_per_user_agent_uploads_into_their_own_workspace(app_with_router):
+    """A viewer writes their own user directory and nothing else: a chat
+    upload and a chat folder land; the shared workspace is refused."""
+    app, agents_dir = app_with_router
+    from auth.providers import UserContext, get_current_user
+    viewer = UserContext(
+        sub="user-test-sub", email="alice@test.com", name="Alice",
+        role="member", agents=["test-agent"], agent_roles={"test-agent": "viewer"},
+    )
+
+    async def _viewer():
+        return viewer
+    app.dependency_overrides[get_current_user] = _viewer
+    client = TestClient(app)
+    assert _post_file(client).json()["path"] == "users/alice/workspace/uploads/files/note.txt"
+    folder = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "mine"})
+    assert folder.json()["path"] == "users/alice/workspace/uploads/files/mine"
+    shared = client.post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "x", "target_dir": "workspace"})
+    assert shared.status_code == 403
+    assert not (agents_dir / "test-agent" / "workspace").exists()
+
+
+def test_every_upload_route_refuses_an_anonymous_caller(app_with_router):
+    app, _ = app_with_router
+    from auth.providers import get_current_user
+
+    async def _nobody():
+        return None
+    app.dependency_overrides[get_current_user] = _nobody
+    client = TestClient(app)
+    assert _post_file(client).status_code == 401
+    assert client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "x"}).status_code == 401
+    assert client.post("/v1/upload/chunked/init", json={
+        "agent": "test-agent", "filename": "a", "size": 1}).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Names: bytes, not characters; a name the file system refuses is a 400
+# ---------------------------------------------------------------------------
+
+
+def test_a_long_multibyte_name_lands_cut_to_bytes(app_with_router):
+    """90 CJK characters are 270 bytes, past NAME_MAX: the stem is cut to
+    200 bytes on a character boundary and the extension kept."""
+    app, agents_dir = app_with_router
+    resp = _post_file(TestClient(app), name="文" * 90 + ".txt")
+    assert resp.status_code == 200, resp.text
+    name = resp.json()["filename"]
+    assert name == "文" * 66 + ".txt"
+    assert (agents_dir / "test-agent" / resp.json()["path"]).read_bytes() == b"hello"
+
+
+def test_sanitize_filename_caps_stem_and_extension_by_bytes():
+    from api.media.uploads import _sanitize_filename
+    assert _sanitize_filename("a" * 300 + ".md") == "a" * 200 + ".md"
+    # A longer "extension" is part of the stem.
+    long_ext = "report." + "x" * 30
+    assert _sanitize_filename(long_ext) == long_ext
+    assert len(_sanitize_filename("r." + "é" * 200).encode("utf-8")) <= 200
+    assert _sanitize_filename("é" * 150 + ".pdf") == "é" * 100 + ".pdf"
+
+
+def test_a_target_dir_component_over_name_max_is_a_400(app_with_router):
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    long_dir = "users/alice/workspace/" + "d" * 256
+    resp = client.post("/v1/upload", files={"file": ("a.txt", BytesIO(b"x"))},
+                       data={"agent": "test-agent", "target_dir": long_dir})
+    assert resp.status_code == 400 and "too long" in resp.json()["detail"]
+    resp = client.post("/v1/upload/chunked/init", json={
+        "agent": "test-agent", "filename": "a.txt", "size": 1, "target_dir": long_dir})
+    assert resp.status_code == 400
+    resp = client.post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "x", "target_dir": long_dir})
+    assert resp.status_code == 400
+    assert _no_partials(agents_dir) == []
+
+
+def test_a_name_the_file_system_refuses_is_a_400_never_a_500(app_with_router, monkeypatch):
+    """ENAMETOOLONG at the temp open, at the final rename and at a folder
+    reservation answers a plain 400; no temp is left behind."""
+    import errno
+    from api.media import uploads
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+
+    def _too_long(*a, **kw):
+        raise OSError(errno.ENAMETOOLONG, "File name too long")
+    real_open = uploads._open_landing_temp
+    monkeypatch.setattr(uploads, "_open_landing_temp", _too_long)
+    resp = _post_file(client)
+    assert resp.status_code == 400 and "too long" in resp.json()["detail"]
+    monkeypatch.setattr(uploads, "_open_landing_temp", real_open)
+
+    monkeypatch.setattr(uploads, "_rename_to_free_name", _too_long)
+    resp = _post_file(client)
+    assert resp.status_code == 400 and "too long" in resp.json()["detail"]
+    assert _no_partials(agents_dir) == []
+
+    monkeypatch.setattr(uploads, "_reserve_folder", _too_long)
+    resp = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "x"})
+    assert resp.status_code == 400 and "too long" in resp.json()["detail"]
+
+
+def test_a_chunked_complete_refused_for_its_name_is_a_400(app_with_router, tmp_path, monkeypatch):
+    import errno
+    import config
+    from api.media import uploads
+    app, _agents_dir = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_STAGING_DIR", tmp_path / "upload-staging")
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 8, raising=False)
+    uploads._chunk_locks.clear()
+    client = TestClient(app)
+    init = client.post("/v1/upload/chunked/init", json={
+        "agent": "test-agent", "filename": "big.bin", "size": 8}).json()
+    assert client.put(f"/v1/upload/chunked/{init['upload_id']}/0", content=b"x" * 8).status_code == 200
+
+    def _too_long(*a, **kw):
+        raise OSError(errno.ENAMETOOLONG, "File name too long")
+    monkeypatch.setattr(uploads, "_finalize_staged_file", _too_long)
+    resp = client.post(f"/v1/upload/chunked/{init['upload_id']}/complete")
+    assert resp.status_code == 400 and "too long" in resp.json()["detail"]
+
+
+def test_a_control_character_in_the_target_dir_is_a_400(app_with_router):
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    resp = client.post("/v1/upload", files={"file": ("a.txt", BytesIO(b"x"))},
+                       data={"agent": "test-agent", "target_dir": "users/alice/workspace/a\x01b"})
+    assert resp.status_code == 400
+    resp = client.post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "x", "target_dir": "users/alice/workspace/\nx"})
+    assert resp.status_code == 400
+    assert not (agents_dir / "test-agent" / "users").exists()
+
+
+def test_409_once_a_hundred_names_are_taken(app_with_router):
+    app, agents_dir = app_with_router
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    landed.mkdir(parents=True)
+    (landed / "note.txt").write_bytes(b"0")
+    (landed / "t").mkdir()
+    for i in range(1, 100):
+        (landed / f"note_{i}.txt").write_bytes(b"0")
+        (landed / f"t_{i}").mkdir()
+    client = TestClient(app)
+    resp = _post_file(client)
+    assert resp.status_code == 409, resp.text
+    assert _no_partials(agents_dir) == []
+    assert client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "t"}).status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# A folder dropped or picked in the workspace: reserved where it goes
+# ---------------------------------------------------------------------------
+
+
+def test_a_workspace_folder_is_reserved_in_its_target_dir(app_with_router):
+    """Two drops of one folder land as ``A`` and ``A_1`` in the folder on
+    show; the name keeps its spaces and brackets and loses leading dots."""
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    body = {"agent": "test-agent", "name": "My Folder (2)", "target_dir": "workspace/research"}
+    first = client.post("/v1/upload/folder", json=body)
+    second = client.post("/v1/upload/folder", json=body)
+    assert first.status_code == 200, first.text
+    assert first.json() == {"path": "workspace/research/My Folder (2)", "name": "My Folder (2)"}
+    assert second.json()["path"] == "workspace/research/My Folder (2)_1"
+    hidden = client.post("/v1/upload/folder", json={**body, "name": ".config"})
+    assert hidden.json()["path"] == "workspace/research/config"
+    assert (agents_dir / "test-agent" / "workspace" / "research" / "My Folder (2)_1").is_dir()
+
+
+@pytest.mark.parametrize("target_dir", ["users/bob/workspace", "config/../users/bob"])
+def test_a_workspace_folder_is_refused_outside_the_callers_scope(app_with_router, target_dir):
+    app, agents_dir = app_with_router
+    from auth.providers import UserContext, get_current_user
+    editor = UserContext(
+        sub="user-test-sub", email="alice@test.com", name="Alice",
+        role="member", agents=["test-agent"], agent_roles={"test-agent": "editor"},
+    )
+
+    async def _editor():
+        return editor
+    app.dependency_overrides[get_current_user] = _editor
+    resp = TestClient(app).post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "x", "target_dir": target_dir})
+    assert resp.status_code in (400, 403), resp.text
+    assert not (agents_dir / "test-agent" / "users" / "bob").exists()
+
+
+def test_a_folder_reservation_never_lands_through_a_symlinked_folder(app_with_router, tmp_path):
+    app, agents_dir = app_with_router
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ws = agents_dir / "test-agent" / "users" / "alice" / "workspace"
+    ws.mkdir(parents=True)
+    os.symlink(outside, ws / "uploads")
+    os.symlink(outside, ws / "linked")
+    client = TestClient(app)
+    chat = client.post("/v1/upload/folder", json={"agent": "test-agent", "name": "x"})
+    assert chat.status_code == 403, chat.text
+    picked = client.post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "x", "target_dir": "users/alice/workspace/linked"})
+    assert picked.status_code == 403, picked.text
+    assert list(outside.iterdir()) == []
+
+
+def test_a_link_named_like_the_folder_is_passed_over_never_followed(app_with_router):
+    """``workspace/A`` is a link into the caller's own folder: the dropped
+    ``A`` is reserved as ``workspace/A_1``, never where the link points."""
+    app, agents_dir = app_with_router
+    deep = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "deep" / "B"
+    deep.mkdir(parents=True)
+    (agents_dir / "test-agent" / "workspace").mkdir()
+    os.symlink(deep, agents_dir / "test-agent" / "workspace" / "A")
+    resp = TestClient(app).post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "A", "target_dir": "workspace"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["path"] == "workspace/A_1"
+    assert list(deep.iterdir()) == []
+
+
+def test_a_reservation_judges_the_folder_it_made(app_with_router):
+    """A viewer may write its own ``users/alice`` folder, but asking for a
+    folder named ``alice`` in ``users/`` would make ``users/alice_1``, which
+    it may not write: refused, and nothing is left behind."""
+    app, agents_dir = app_with_router
+    from auth.providers import UserContext, get_current_user
+    viewer = UserContext(
+        sub="user-test-sub", email="alice@test.com", name="Alice",
+        role="member", agents=["test-agent"], agent_roles={"test-agent": "viewer"},
+    )
+
+    async def _viewer():
+        return viewer
+    app.dependency_overrides[get_current_user] = _viewer
+    (agents_dir / "test-agent" / "users" / "alice").mkdir(parents=True)
+    resp = TestClient(app).post("/v1/upload/folder", json={
+        "agent": "test-agent", "name": "alice", "target_dir": "users"})
+    assert resp.status_code == 403, resp.text
+    assert sorted(p.name for p in (agents_dir / "test-agent" / "users").iterdir()) == ["alice"]
+
+
+def test_a_lone_surrogate_is_dropped_from_a_name_and_refused_in_a_path(app_with_router):
+    """A name from a Windows machine can carry a lone surrogate, which JSON
+    passes as an escape: dropped from a folder name, a 400 in a path."""
+    app, _agents_dir = app_with_router
+    client = TestClient(app)
+
+    def post(raw: str):
+        return client.post("/v1/upload/folder", content=raw,
+                           headers={"Content-Type": "application/json"})
+    named = post('{"agent": "test-agent", "name": "a\\ud800b", "target_dir": "workspace"}')
+    assert named.status_code == 200, named.text
+    assert named.json()["name"] == "ab"
+    pathed = post('{"agent": "test-agent", "name": "x", "target_dir": "workspace/a\\ud800b"}')
+    assert pathed.status_code == 400, pathed.text
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("My Folder (2)", "My Folder (2)"),
+    ("a/b\\c", "a_b_c"),
+    ("tab\there\x7f", "tabhere"),
+    ("  . .hidden  ", "hidden"),
+    ("..", None),
+    (".", None),
+    ("   ", None),
+    ("\x00\x01", None),
+    ("文" * 100, "文" * 66),
+])
+def test_folder_name_rules(raw, expected):
+    from fastapi import HTTPException
+    from api.media.uploads import _folder_name
+    if expected is None:
+        with pytest.raises(HTTPException) as exc:
+            _folder_name(raw)
+        assert exc.value.status_code == 400
+    else:
+        assert _folder_name(raw) == expected

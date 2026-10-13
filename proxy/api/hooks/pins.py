@@ -29,7 +29,7 @@ from auth import roles
 from ws import wire_events as wire
 from core import layout
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 

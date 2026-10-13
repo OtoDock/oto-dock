@@ -18,10 +18,10 @@ from storage.agents import agent_store
 from storage.mcp import mcp_store
 from storage import database as task_store
 from services.mcp import mcp_registry
-from services.oauth import oauth_account_store
+from services.oauth import credential_resolver, oauth_account_store
 from auth.providers import UserContext, get_current_user, require_admin, require_auth, require_user
 
-logger = logging.getLogger("claude-proxy.credential-api")
+logger = logging.getLogger("otodock.credential-api")
 router = APIRouter(dependencies=[Depends(require_user)])
 
 
@@ -269,6 +269,12 @@ async def list_my_integrations(
                 "is_default": acc["is_default"],
                 "created_at": acc["created_at"],
                 "configured_keys": list(acc_creds.keys()),
+                # Required fields the saved account lacks (a field the
+                # manifest added later): the MCP stays out of its sessions.
+                "missing_required": (
+                    [] if not cred_info or cred_info.get("oauth")
+                    else credential_resolver.missing_required_labels(cred_info, acc_creds)
+                ),
                 "connected_services": connected_services,
                 "agent_overrides": sorted(
                     bindings_by_account.get(acc["account_label"], [])
@@ -327,7 +333,7 @@ async def list_my_integrations(
             "display_name": (cred_info.get("label", "") if cred_info else "") or (manifest.label if manifest else mcp_name),
             "description": (cred_info.get("description", "") if cred_info else "") or (manifest.description if manifest else ""),
             "configured": bool(accounts),  # any account counts as configured
-            "required_keys": [f["key"] for f in cred_info.get("fields", [])] if cred_info else [],
+            "required_keys": credential_resolver.required_field_keys(cred_info) if cred_info else [],
             "fields": cred_info.get("fields", []) if cred_info else [],
             "oauth": cred_info.get("oauth", False) if cred_info else False,
             "oauth_services": cred_info.get("oauth_services", []) if cred_info else [],
@@ -367,20 +373,24 @@ async def set_my_integration(
     if cred_info.get("oauth"):
         raise HTTPException(400, f"'{mcp_name}' uses OAuth — connect via Settings page")
 
-    # Validate required keys are present
-    required = {f["key"] for f in cred_info.get("fields", [])}
-    provided = set(body.credentials.keys())
-    missing = required - provided
+    # Every required field must be in this save or already on the account
+    # (an edit that adds an optional field alone keeps the rest); a field
+    # declaring "required": false may stay unset.
+    label = (body.account_label or "default").strip()
+    stored = await asyncio.to_thread(
+        credential_store.get_user_credentials, user.sub, mcp_name, label,
+    )
+    required = set(credential_resolver.required_field_keys(cred_info))
+    missing = required - set(body.credentials) - set(stored or {})
     if missing:
-        raise HTTPException(400, f"Missing required credentials: {', '.join(missing)}")
+        raise HTTPException(400, f"Missing required credentials: {', '.join(sorted(missing))}")
 
     # Filter to only allow known keys
-    allowed_keys = required | {
+    allowed_keys = {f["key"] for f in cred_info.get("fields", [])} | {
         f["key"] for f in cred_info.get("server_config_fields", [])
     }
     filtered = {k: v for k, v in body.credentials.items() if k in allowed_keys}
 
-    label = (body.account_label or "default").strip()
     await asyncio.to_thread(
         credential_store.set_user_credentials,
         user.sub, mcp_name, filtered, label,
@@ -904,14 +914,16 @@ async def remove_bearer_allowlist(
     row_id: int,
     user: UserContext = Depends(get_current_user),
 ):
-    """Revoke a (provider, host) pair. Future bearer injections to that
-    host are dropped (existing sessions keep their cached header until
-    refresh)."""
+    """Revoke a (provider, host) pair. The gateway refuses the host at the
+    next request (the table's generation moved), and a paired machine
+    holding a pushed token for it is told now, not at the lease's end."""
     require_admin(user)
+    from core.remote import mcp_gateway_push
     from storage.identity import bearer_allowlist
     ok = await asyncio.to_thread(bearer_allowlist.delete_allowed, row_id)
     if not ok:
         raise HTTPException(404, "Allowlist entry not found")
+    mcp_gateway_push.tick_soon()
     return {"status": "ok"}
 
 

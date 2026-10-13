@@ -50,6 +50,7 @@ from core.layers.codex.session import _TOOL_ITEM_TYPES, CodexEvent
 from core.layers.codex.translator import CodexEventTranslator
 from core.layers.cli.remote import _lost_events, _satellite_error_events
 from core.session import session_kind
+from core.background import spawn
 
 if TYPE_CHECKING:
     from core.remote.remote_session_info import RemoteSessionInfo
@@ -215,6 +216,23 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 "(< 0.5.118) — no PreToolUse permission floor for this unattended "
                 "session until it updates at its next reconnect"
             )
+        # An attended app-server chat (satellite >= 0.5.143) runs the same
+        # hook on every thread, judging the turns Codex runs under `never`
+        # (Don't Ask, auto) while the bridge asks in the others — the local
+        # session's rule (session.py, OTO_HOOK_BRIDGED). An older satellite
+        # ignores the field: warn, never refuse.
+        attended_floor = not floor and not config.interactive
+        payload["codex_attended_floor"] = attended_floor
+        attended_floor_supported = cm.satellite_supports_codex_attended_floor(machine_id)
+        if attended_floor and not attended_floor_supported:
+            logger.warning(
+                f"Remote Codex chat {ctx.session_id[:8]}: "
+                f"{cm.satellite_name(machine_id)} runs satellite "
+                f"{cm.satellite_version(machine_id) or 'unknown'} "
+                "(< 0.5.143) — no permission floor in Don't Ask and auto, and "
+                "none outside plan mode on a machine paired with full access, "
+                "until it updates at its next reconnect"
+            )
         if local_model_provider:
             payload["local_model_provider"] = local_model_provider
             # Tell a local model the truth about its MCP tools for its
@@ -253,11 +271,15 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         )
         # The satellite's plan collaboration mode follows a shipped
         # ``permission_mode`` (0.5.123) and otherwise the live sandbox
-        # (read-only ⟺ plan). A mode change mid-session carries the sandbox
-        # alone (``control_request``), so a shipped mode would freeze plan
-        # at its start value: only a judge ships it, read-only without plan
-        # and never changed.
-        payload["permission_mode"] = "judge" if _mode_for_sandbox == "judge" else ""
+        # (read-only ⟺ plan). From 0.5.143 the mode is shipped live (the
+        # approval policy follows it too) and every mode change carries it
+        # (``control_request``); an older satellite would freeze plan at a
+        # shipped start value, so only a judge ships it there, read-only
+        # without plan and never changed.
+        if attended_floor_supported:
+            payload["permission_mode"] = _mode_for_sandbox
+        else:
+            payload["permission_mode"] = "judge" if _mode_for_sandbox == "judge" else ""
         # The ChatGPT login's auth.json (popped from env; the satellite writes
         # it verbatim into the session's CODEX_HOME).
         delivered = False
@@ -360,11 +382,12 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         info.used_mcps = {server_to_name.get(key, key) for key in info.used_mcps}
         self._build_state(info, info.model, cm)
         if info.mode:
-            asyncio.create_task(self.control_request(
-                info, cm, "set_permission_mode", mode=info.mode))
+            spawn(self.control_request(
+                info, cm, "set_permission_mode", mode=info.mode),
+                  name="control_request", owner="remote")
         if info.model:
-            asyncio.create_task(self.control_request(
-                info, cm, "set_model", model=info.model))
+            spawn(self.control_request(
+                info, cm, "set_model", model=info.model), name="control_request", owner="remote")
 
     def _build_state(self, info: "RemoteSessionInfo", model: str, cm) -> None:
         state = CodexRemoteState(translator=CodexEventTranslator(
@@ -659,15 +682,20 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         ``CodexSession.send_control_request`` applies ``set_model`` and
         ``set_permission_mode`` as per-turn overrides on the next
         ``turn/start`` (every released satellite honours both). The mode
-        travels as the SANDBOX mode: the satellite re-derives approvalPolicy
-        from it and rebuilds the per-turn sandboxPolicy (the proxy-side gate
-        verdict already follows the new mode via set_session_mode)."""
+        travels as the SANDBOX mode and, from 0.5.143, as the platform mode:
+        the satellite re-derives approvalPolicy and the plan collaboration
+        mode from them and rebuilds the per-turn sandboxPolicy (the
+        proxy-side gate verdict already follows the new mode via
+        set_session_mode). An older satellite reads the sandbox alone."""
         if subtype == "set_model":
             frame_kwargs = {"model": kwargs.get("model", "")}
         elif subtype == "set_permission_mode":
+            mode = kwargs.get("mode", "")
             frame_kwargs = {"sandbox_mode": permission_to_sandbox(
-                kwargs.get("mode", ""), allow_full_fs=info.allow_full_fs,
+                mode, allow_full_fs=info.allow_full_fs,
             )}
+            if cm.satellite_supports_codex_attended_floor(info.machine_id):
+                frame_kwargs["permission_mode"] = mode
         else:
             return False  # no other control subtype has a Codex meaning
         await cm.send_fire_and_forget(info.machine_id, {
@@ -699,7 +727,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         # A photo attached to the steer must be on the machine before the
         # daemon reads its path — the same barrier the turn dispatch runs.
         from core.remote import upload_inflight
-        await upload_inflight.wait_settled(info.agent_name)
+        await upload_inflight.wait_settled(info.agent_name, machine_id=info.machine_id)
         try:
             ack = await cm.send_command(info.machine_id, {
                 "type": STEER_FRAME,

@@ -35,7 +35,7 @@ from .._vendored.codex_approvals import approval_for_sandbox
 from ..sessions.codex_session import (
     _validate_config_toml, _write_codex_hook_scripts, _write_codex_hooks,
 )
-from ..config import otodock_dir
+from ..config import otodock_dir, session_tools_env, write_command_wrappers
 from .._vendored import layout
 from ..sessions.codex_session import (
     CODEX_TOOLS_TABLE, chmod_private, local_provider_toml, write_or_drop_auth_json,
@@ -130,6 +130,17 @@ def _build_codex_config_toml(
             esc = key.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'[projects."{esc}"]')
             parts.append('trust_level = "trusted"')
+    if codex_dir is not None:
+        # Codex 0.162's managed worktrees (the TUI's create_worktree and
+        # list_worktrees tools) check out under $CODEX_HOME/worktrees by
+        # default: the .codex dir the proxy's path policy protects and whose
+        # children the sync manifest does not prune. The hidden sibling at the
+        # scope root is neither protected nor synced. Satellite-absolute, as
+        # Codex requires (twin of the proxy's [desktop] table).
+        root = os.path.abspath(str(Path(codex_dir).parent / ".codex-worktrees"))
+        esc_root = root.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append("[desktop]")
+        parts.append(f'git-worktree-root = "{esc_root}"')
     if provider_table:
         parts.append(provider_table)
     if mcp_toml.strip():
@@ -209,6 +220,7 @@ class CodexPtySession(BasePtySession):
 
         # --- write the .codex/ config tree (mirror CodexSession.start) --------
         _write_codex_hook_scripts(self._codex_dir, self.config.get("hook_scripts", {}))
+        write_command_wrappers(self._codex_dir, self.config.get("command_wrappers", {}))
         (self._codex_dir / "AGENTS.md").write_text(
             self.config.get("agents_md_content", self.config.get("system_prompt", ""))
         )
@@ -268,7 +280,7 @@ class CodexPtySession(BasePtySession):
         # Interpreter for the Windows .cmd hook wrappers (codex_hook_command)
         # — the batch text stays ASCII by resolving python through the env.
         env["OTO_HOOK_PY"] = sys.executable
-        env = self._translate_env(env)
+        env = session_tools_env(self._translate_env(env), self._codex_dir)
 
         # --- build the INTERACTIVE command ------------------------------------
         from ..host.cli_versions import resolve_spawn_bin_async

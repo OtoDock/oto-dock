@@ -18,7 +18,6 @@ from transport.base import FRAME_AUDIO, FRAME_HANGUP, MediaTransport, TransportE
 from audio.providers.vad.base import VadEvent, VadState
 from audio.providers.vad.silero import SileroVad
 from audio.providers.tts.base import TTSProvider
-from audio.providers.turn.dispatcher import build_dispatcher
 from audio.streaming.lang import base_lang
 from ambience import load_ambience
 from breath import load_breath
@@ -29,18 +28,22 @@ from config_manager import ConfigManager, PhoneRoute
 from fillers import filler_cache
 
 from .state import CallState
-from .providers import build_stt, build_tts, filler_key_for
+from .audio_tap import OutgoingAudioTap
+from .providers import build_stt, build_tts, build_turn_classifier, filler_key_for
 from .vad_serial import SerializedVad
 from .playback import PlaybackMixin
 from .turn import TurnMixin
 from .outbound import OutboundMixin
 from .llm import LlmStreamingMixin
 from .pin_gate import PinGateMixin
+from .call_control import CallControlMixin
+from .language import LanguageMixin
 
 logger = logging.getLogger("pipeline")
 
 
-class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStreamingMixin):
+class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin, TurnMixin,
+                   OutboundMixin, LlmStreamingMixin):
     """Orchestrates a single phone call through the voice AI pipeline."""
 
     def __init__(
@@ -53,8 +56,15 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         llm_backend=None,
         audiosocket_uuid: str = "",
         caller_info: dict | None = None,
+        transfer=None,
     ):
         self.conn = conn
+        # How this call's caller can be handed to a colleague
+        # (telephony/transfer.py); None = the line cannot transfer.
+        self._transfer = transfer
+        # A call that runs inside the calling agent's own chat (no agent
+        # waits for questions there).
+        self._in_session = False
         # Audio format from the transport: telephony is 8 kHz both ways;
         # duplex is 16 kHz mic in / 24 kHz TTS out.
         self._rate_in = conn.sample_rate_in
@@ -106,6 +116,10 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         # for the call's language selected (English fallback if that language has
         # no configured voice — see TTSProvider.select_voice).
         self.tts: TTSProvider = build_tts(self._route_settings.tts_provider)
+        # A voice the route pins (an admin's pick for this line) wins over
+        # the provider's per-language map for the whole call.
+        if getattr(self.route, "voice_id", ""):
+            self.tts.pin_voice(self.route.voice_id)
         self.tts.select_voice(self._locked_language)
         # Fillers are cached per (provider, voice, language) so they always match
         # this route's TTS voice (see fillers.py); same key the pre-warm uses.
@@ -152,6 +166,9 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         # each other.  Collaborators (conn/cfg/route/stt/vad/tts/llm/providers)
         # stay as direct attributes above.
         self.state = CallState()
+        # The route's language is the call's unless the route identifies the
+        # caller's (pipeline/language.py locks it on the first utterance).
+        self.state._language_locked = not getattr(self.route, "language_detect", False)
 
     async def run(self) -> None:
         """Run the full call pipeline until hangup or timeout."""
@@ -160,6 +177,11 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
             f"[{self.conn.peer_addr}] Pipeline started "
             f"(agent={self.agent_model}, outbound={self._is_outbound})"
         )
+
+        # The debug switch: every outgoing frame of this call, saved as a
+        # WAV at cleanup (pipeline/audio_tap.py).
+        if self.cfg.debug_outgoing_audio:
+            self.state._audio_tap = OutgoingAudioTap(self._rate_out, self._frame_bytes_out)
 
         # Ambience runs for the whole call (greeting through hangup) so the
         # line never goes dead-quiet between exchanges.
@@ -173,13 +195,20 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
             await self.tts.connect(output_sample_rate=self._rate_out)
             self._select_tts(self._locked_language)
 
-            # Inbound PIN gate — deliberately BEFORE filler ensure, the turn
+            # The PIN gate (an inbound route's; an outbound route's tied to a
+            # user, where the person who answered enters it before the agent
+            # speaks) — deliberately BEFORE filler ensure, the turn
             # classifier, STT pre-connect, and the LLM/warmup: a call that
             # fails the PIN pays for none of them, and a cold filler cache
             # (seconds of REST synthesis) must not delay the prompt.
-            if (not self._is_outbound and self.route.direction == "inbound"
-                    and self.route.pin):
+            if self.route.pin and (self._is_outbound or self.route.direction == "inbound"):
                 if not await self._pin_gate():
+                    if self._is_outbound:
+                        # The pre-warmed client becomes the call's own so the
+                        # record and the chat learn why it ended; the cleanup
+                        # closes it.
+                        await self._settle_unadopted_outbound(adopt=True)
+                        await self._finalize_outbound_call()
                     return
 
             # Ensure this route's filler clips exist (per provider+voice+language).
@@ -195,17 +224,13 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
             except Exception as e:
                 logger.warning(f"[{self.conn.peer_addr}] Filler cache init failed: {e}")
 
-            # Load turn classifier from config (per-call, not module-level)
-            self._turn_clf = build_dispatcher(
-                smart_turn_enabled=self.cfg.smart_turn_enabled,
-                smart_turn_threshold=self.cfg.smart_turn_threshold,
-                smart_turn_onnx_threads=self.cfg.smart_turn_onnx_threads,
-                smart_turn_audio_window_s=self.cfg.smart_turn_audio_window_s,
-                groq_api_key=self.cfg.groq_api_key,
-                groq_base_url=self.cfg.groq_base_url,
-                lang_map=self.cfg.lang_backend_map,
-                default_backend=self.cfg.turn_classifier_default_backend,
-            )
+            # The turn classifier, built in the background: the Smart Turn
+            # load runs off the loop (seconds on a process's first load) and
+            # the first classification waits for it, bounded
+            # (TurnMixin._turn_classifier). A call that lands during a
+            # warm-up keeps reading its frames meanwhile; the one that paid
+            # the load here lost its first two seconds of audio.
+            self.state._turn_clf_task = asyncio.create_task(build_turn_classifier(self.cfg))
 
             # Pre-connect STT if the provider benefits from early connection
             # (e.g., cloud providers with expensive WebSocket setup).
@@ -240,6 +265,10 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
             # lookups against CRMs) resolve ``${trigger.*}``.
             if self.llm is None:
                 call_type = "outbound" if self._is_outbound else "inbound"
+                # An in-session call keeps its attach: never a session of
+                # its own (an attach the chat refuses ends the call).
+                _call = (self._call_manager.get_call(self._outbound_call_id)
+                         if self._is_outbound and self._call_manager else None)
                 self.llm = await create_llm_backend(
                     self.route, call_type=call_type,
                     audiosocket_uuid=self._audiosocket_uuid,
@@ -247,8 +276,13 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                     caller_did=self._caller_info.get("did", ""),
                     dial_event=self._caller_info.get("dial_event") or None,
                     pin_verified=self.state.pin_verified,
+                    attach=getattr(_call, "in_session", None),
+                    transfer_available=self._can_transfer(),
                 )
             self._is_direct = getattr(self.llm, 'llm_mode', 'proxy') == 'direct'
+            # The call tools' frames reach this pipeline from here on (the
+            # pre-warm client answered them for the opening until now).
+            self._install_call_control()
             logger.info(
                 f"[{self.conn.peer_addr}] LLM backend: "
                 f"{'direct' if self._is_direct else 'proxy'} "
@@ -291,9 +325,11 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                 await self._play_greeting()
         except TransportError as e:
             logger.info(f"[{self.conn.peer_addr}] AudioSocket closed: {e}")
+            self._note_remote_hangup()
             # Finalize outbound call on remote hangup (callee hung up)
             if self._is_outbound:
                 try:
+                    await self._adopt_before_finalize()
                     await self._finalize_outbound_call()
                 except Exception as fin_err:
                     logger.error(
@@ -303,11 +339,29 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
             logger.error(f"[{self.conn.peer_addr}] Pipeline error: {e}", exc_info=True)
             if self._is_outbound:
                 try:
+                    await self._adopt_before_finalize()
                     await self._finalize_outbound_call()
                 except Exception as fin_err:
                     logger.debug("Finalize after pipeline error failed: %s", fin_err)
         finally:
             await self._cleanup()
+
+    def _note_remote_hangup(self) -> None:
+        """The person put the phone down on a call the agent had not ended:
+        the outcome the call log and the record read. An end the agent asked
+        for (the marker, ``end_call``), a transfer, the gate's verdict and an
+        error keep their own word, whoever hung up first."""
+        if (self.state.call_outcome == "completed" and not self.state._call_complete
+                and not self._control_pending_end()):
+            self.state.call_outcome = "hangup"
+
+    async def _adopt_before_finalize(self) -> None:
+        """A call that ends before it adopted its pre-warmed client (a hangup
+        during the PIN gate) takes it now, as a refused code does: the resume
+        note of an in-session call and the record then say how the call
+        ended, instead of the chat's generic fallback; the cleanup closes it."""
+        if self.llm is None:
+            await self._settle_unadopted_outbound(adopt=True)
 
     async def _play_greeting(self) -> None:
         """Play greeting via streaming TTS path (supports barge-in).
@@ -463,6 +517,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
 
             if frame_type == FRAME_HANGUP:
                 logger.info(f"[{self.conn.peer_addr}] Hangup received")
+                self._note_remote_hangup()
                 break
 
             if frame_type != FRAME_AUDIO:
@@ -477,6 +532,9 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                 # Cap at max window size
                 if len(self.state._speech_audio_buf) > self._speech_audio_max_bytes:
                     self.state._speech_audio_buf = self.state._speech_audio_buf[-self._speech_audio_max_bytes:]
+                    # A language identification of this buffer hears the
+                    # turn's tail only: its text never replaces the turn's.
+                    self.state._speech_audio_truncated = True
                 # Mute-session evidence for the STT guard: speech time the
                 # provider has heard but not answered (guard resets this the
                 # moment any result arrives). A paused playback feeds the
@@ -516,6 +574,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                 # Clear audio buffer if starting a fresh turn (no prior segments)
                 if not self.state._turn_segments:
                     self.state._speech_audio_buf.clear()
+                    self.state._speech_audio_truncated = False
 
                 # Cancel turn continuation timer — user is still talking
                 if self.state._turn_timer and not self.state._turn_timer.done():
@@ -570,7 +629,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                     await self.stt.start(language=self._locked_language, sample_rate=self._rate_in, interim_results=True)
                     self.state._stt_active = True
 
-                await self.stt.send_audio(payload)
+                await self._stt_feed(payload)
                 self.state._stt_last_fed = time.monotonic()
 
             elif event == VadEvent.SPEECH_END:
@@ -588,7 +647,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                     self.state._stt_active = True
                 if self.stt.supports_early_unmute:
                     self.state._stt_early_unmuted = True
-                await self.stt.send_audio(payload)
+                await self._stt_feed(payload)
                 self.state._stt_last_fed = time.monotonic()
                 # Also capture audio for Smart Turn (onset prosody during barge-in)
                 self.state._speech_audio_buf.extend(payload)
@@ -605,7 +664,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                 if (not self.state._tts_playing
                         or self.state._playback_paused
                         or self.state._stt_early_unmuted):
-                    await self.stt.send_audio(payload)
+                    await self._stt_feed(payload)
                 else:
                     await self.stt.feed_during_tts(payload)
                 self.state._stt_last_fed = time.monotonic()
@@ -623,6 +682,10 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         # End-to-end stamp: written ONLY here (see state.py note) —
         # dispatch captures the latest one for the turn line.
         self.state._t_speech_end = self.state._speech_end_time
+        # The caller's language, once (pipeline/language.py): the buffered
+        # utterance goes to the identification when it is long enough.
+        if not synthetic:
+            self._consider_language_identification()
 
         # Barge-in pause: the speech episode over a paused playback
         # just ended. A SHORT episode (< bargein_timer_s — the same
@@ -660,6 +723,9 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                     all_text = " ".join(self.state._turn_segments)
                     self.state._turn_segments.clear()
                     self._cancel_turn_timer()
+                    # The turn is taken: a language identification of its
+                    # audio that lands later keeps nothing for a later turn.
+                    self._note_turn_taken()
                     logger.info(
                         f"[{self.conn.peer_addr}] Queuing speech "
                         f"(LLM busy): {all_text}"
@@ -738,6 +804,28 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         self.state._running = False
         logger.info(f"[{self.conn.peer_addr}] Pipeline cleanup")
 
+        # A transfer whose request went out as the media leg closed under
+        # it: its outcome is recorded before anything is cancelled.
+        await self._settle_transfer()
+
+        # An outbound call that never adopted its pre-warmed client (a hangup
+        # during the PIN gate, the max duration): nothing stays open.
+        if self._is_outbound and self.llm is None:
+            await self._settle_unadopted_outbound(adopt=False)
+
+        # A classifier build still running is cancelled (the model load it
+        # started lands in the process cache anyway); one that finished
+        # unobserved is taken so its spend is drained and it is closed.
+        task = self.state._turn_clf_task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            elif self._turn_clf is None and not task.cancelled() and task.exception() is None:
+                self._turn_clf = task.result()
+            self.state._turn_clf_task = None
+
         # Capture this call's turn-classifier (Groq) token spend BEFORE teardown, so it
         # can be reported for local per-agent cost tracking after resources are freed.
         # Drain is pure-sync; None-safe if run() threw before the dispatcher was built.
@@ -757,6 +845,16 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                 await self.state._warmup_task
             self.state._warmup_task = None
 
+        # A call action raised between turns and not yet completed, and a
+        # language identification still in flight
+        for attr in ("_control_between_turns", "_language_task"):
+            task = getattr(self.state, attr)
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                setattr(self.state, attr, None)
+
         # Stop the VAD inference worker (no-op for bare fakes in tests)
         if hasattr(self.vad, "shutdown"):
             self.vad.shutdown()
@@ -772,6 +870,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         self._cancel_turn_timer()
         self.state._turn_segments.clear()
         self.state._speech_audio_buf.clear()
+        self.state._speech_audio_truncated = False
 
         # Cancel barge-in pause machinery (confirm backstop + resume grace).
         # A paused playback keeps _tts_playing True, so the _cancel_tts below
@@ -820,6 +919,21 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.warning(f"Cleanup error [{i}]: {result}")
+
+        # The debug tap's file, written off the loop once the transport is
+        # closed; a failure is logged and nothing else of the call is affected.
+        tap, self.state._audio_tap = self.state._audio_tap, None
+        if tap is not None and tap.frame_count:
+            # (a call that sent nothing, the TTS connect failed say, writes
+            # no file: an empty one would only push a useful one out)
+            try:
+                path = await asyncio.wait_for(asyncio.to_thread(
+                    tap.write, config.BASE_DIR / "debug-audio",
+                    self._audiosocket_uuid or self.conn.peer_addr), timeout=15.0)
+                logger.info(f"[{self.conn.peer_addr}] Outgoing audio saved: "
+                            f"{path} ({tap.frame_count} frames)")
+            except Exception as e:
+                logger.warning(f"[{self.conn.peer_addr}] Outgoing audio save failed: {e}")
 
         # Report the call's turn-classifier spend (one row per call). Awaited with a
         # tight timeout and all errors swallowed inside the helper — never blocks or

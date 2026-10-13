@@ -234,6 +234,26 @@ class TestCrossAgent:
                             requested_scope="agent", source_agent=COLLAB_AGENT)
         assert exc.value.status_code == 403
 
+    def test_only_the_master_key_names_its_source(self, delegation_env):
+        """``X-Agent-Name`` and the body's ``source_agent`` name the
+        delegating agent for the master key alone; a cookie delegates as
+        the target itself, whatever it claims."""
+        user = _real_user(COLLAB_AGENT, "manager")
+        for kw in ({"x_agent_name": COLLAB_USER}, {"source_agent": COLLAB_USER}):
+            authz = authorize_spawn(user, target_agent=COLLAB_AGENT,
+                                    requested_scope="agent", **kw)
+            assert authz.source_agent == COLLAB_AGENT, kw
+        agent_store.set_delegation_targets(COLLAB_USER, [COLLAB_AGENT])
+        authz = authorize_spawn(_master_key(), target_agent=COLLAB_AGENT,
+                                requested_scope="agent", x_agent_name=COLLAB_USER)
+        assert authz.source_agent == COLLAB_USER
+
+    def test_the_callers_visibility_anchor_ignores_a_cookies_header(self, delegation_env):
+        from api.tasks.delegation import _caller_visibility
+        user = _real_user(COLLAB_AGENT, "manager")
+        assert _caller_visibility(user, COLLAB_USER)[0] == ""
+        assert _caller_visibility(_master_key(), COLLAB_USER)[0] == COLLAB_USER
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Per-creator spawn cap
@@ -264,6 +284,17 @@ class TestSpawnCap:
         for _ in range(4):
             _add_active_run("user-alice")
         _denied(_real_user(COLLAB_USER, "editor"), 403)
+
+    def test_a_zero_limit_allows_no_worker(self, delegation_env):
+        mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "0"})
+        with pytest.raises(HTTPException) as exc:
+            authorize_spawn(_real_user(COLLAB_USER, "manager"), target_agent=COLLAB_USER,
+                            requested_scope="user")
+        assert exc.value.status_code == 403 and "limited to 0" in exc.value.detail
+        for raw in ("-1", ""):
+            mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": raw})
+            from services.delegation.spawn_authz import _max_parallel_spawns
+            assert _max_parallel_spawns() == 4, raw
 
     def test_invalid_config_value_falls_back(self, delegation_env):
         mcp_store.set_mcp_config_values("delegation-mcp", {"MAX_PARALLEL_SPAWNS": "lots"})

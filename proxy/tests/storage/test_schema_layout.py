@@ -48,6 +48,7 @@ EXPECTED_ORDER = [
     "init_file_transfers",
     "init_knowledge_libraries",
     "init_checks",
+    "init_schema_meta",
 ]
 
 HOMES = {
@@ -69,7 +70,7 @@ HOMES = {
     "storage.schema": [
         "init_storage_quotas", "init_remote_machines", "init_pinned_apps",
         "init_pinned_app_user_hides", "init_app_state", "init_app_handler_deliveries",
-        "init_app_secrets",
+        "init_app_secrets", "init_schema_meta",
     ],
 }
 

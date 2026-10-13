@@ -28,6 +28,8 @@ conversation.
   Both Scheduled Tasks pages show the effective model per task as a chip carrying the
   tier dots (the word in the tooltip); both Triggers pages show the linked task's model
   beside the task name; an app-handler task row carries no model (no LLM turn).
+- Every run's first prompt carries the current time in the task's zone and the agent's
+  other running tasks, so a run knows when it is and what else is going on.
 - Tasks sharing a fire time have their session starts spaced a few seconds apart
   automatically; fire times stay exact. Runs that die on an engine/provider error are
   reported **failed** with the provider message — never a silent empty success. A turn
@@ -83,7 +85,9 @@ through the agent in chat.
   user trigger links only to a personal subscription, an agent trigger only to that
   agent's; the trigger form's picker lists just the matching ones. Deleting a
   subscription that triggers still fire from asks twice; the triggers stay but stop
-  receiving events. Delivery is asynchronous — wait ~10–15 s before judging a test.
+  receiving events. Delivery is asynchronous — wait ~10–15 s before judging a test. A
+  GitHub event that reaches the install twice (a repository's and its organization's
+  subscription, or two accounts) wakes an action once.
 - Extras: per-trigger debounce; pause/resume; test-fire from chat; the trigger rows and
   webhook URLs live on **Agent Settings → Monitoring → Triggers**.
 

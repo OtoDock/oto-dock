@@ -32,6 +32,7 @@ from core.execution_layer import DEFAULT_EXECUTION_PATH
 from core import placement
 from core.session import session_kind
 from auth.providers import effective_role_of
+from core.background import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -451,4 +452,5 @@ def detach_local_session(session_id: str) -> None:
     # Server prompts held for the satellite injection path now belong to the
     # proxy path (the backstop would get there within seconds; this is prompt).
     if sess._prompt_queue:
-        sess._loop.create_task(sess._try_drain_prompt_queue())
+        spawn(sess._try_drain_prompt_queue(),
+              name="try_drain_prompt_queue", owner="otodock_session")

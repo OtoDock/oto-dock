@@ -44,7 +44,7 @@ from services.infra.path_confinement import (
 from storage import database as task_store
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.uploads")
+logger = logging.getLogger("otodock.uploads")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -119,6 +119,26 @@ _TEMP_STEM_BYTES = 120
 _WRITE_BATCH_BYTES = 1024 * 1024
 # Free-name candidates tried for one landing name (``name``, ``name_1``, …).
 _MAX_NAME_TRIES = 100
+# Landing names are measured in encoded bytes (NAME_MAX is 255 bytes, and a
+# multibyte name cut by characters still overflows it): the stem and the
+# folder name leave room for a ``_99`` suffix, the extension is a short tail.
+_NAME_MAX_BYTES = 200
+_EXT_MAX_BYTES = 16
+_COMPONENT_MAX_BYTES = 255
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# A lone UTF-16 surrogate (a name from a Windows machine can carry one): no
+# UTF-8 file system holds it.
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
+_NAME_TOO_LONG = "A file or folder name is too long for the file system: shorten it"
+
+
+def _cut_utf8(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` UTF-8 bytes on a character boundary."""
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
+def _name_too_long(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno == errno.ENAMETOOLONG
 
 
 def _sanitize_filename(name: str) -> str:
@@ -129,15 +149,42 @@ def _sanitize_filename(name: str) -> str:
     name = re.sub(r"[^\w.\- ]", "_", name)
     # Collapse multiple underscores/spaces
     name = re.sub(r"[_ ]{2,}", "_", name).strip("_ ")
-    # Limit length (preserve extension)
-    stem = Path(name).stem[:180]
-    ext = Path(name).suffix
+    # Limit length by bytes (preserve a short extension; a longer one is
+    # part of the stem)
+    stem, ext = Path(name).stem, Path(name).suffix
+    if len(ext.encode("utf-8")) > _EXT_MAX_BYTES:
+        stem, ext = name, ""
+    stem = _cut_utf8(stem, _NAME_MAX_BYTES)
     return f"{stem}{ext}" if stem else f"file{ext}"
+
+
+def _folder_name(name: str) -> str:
+    """The name a reserved folder takes: separators become ``_``, control
+    characters go, leading dots and spaces are stripped (a hidden folder
+    never syncs to a machine) and so are trailing spaces, cut to 200 bytes.
+    Every other character stays (``My Folder (2)`` is kept as typed). 400
+    when nothing is left."""
+    name = _CONTROL_CHARS.sub("", name.replace("/", "_").replace("\\", "_"))
+    name = _SURROGATES.sub("", name)
+    # Leading dots go, so no dot name (``.``, ``..``) can be left.
+    name = _cut_utf8(re.sub(r"^[\s.]+", "", name).rstrip(), _NAME_MAX_BYTES).rstrip()
+    if not name:
+        raise HTTPException(status_code=400, detail="The folder needs a name")
+    return name
+
+
+def _check_target_dir(target_dir: str) -> None:
+    """400 for a target dir no file system takes: a control character, or a
+    component over NAME_MAX bytes (it would fail deep in the landing write)."""
+    if _CONTROL_CHARS.search(target_dir) or _SURROGATES.search(target_dir):
+        raise HTTPException(status_code=400, detail="The folder path has a character no file system takes")
+    if any(len(part.encode("utf-8")) > _COMPONENT_MAX_BYTES for part in target_dir.split("/")):
+        raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
 
 
 def _resolve_upload_destination(
     user: UserContext, agent: str, target_dir: str, safe_name: str,
-    *, create: bool,
+    *, create: bool, landing_is_target: bool = False,
 ) -> tuple[Path, Path]:
     """Authorize + resolve the landing directory for an upload.
 
@@ -152,8 +199,15 @@ def _resolve_upload_destination(
     the file-commit thread through ``safe_fs`` (``create`` keeps the plain
     mkdir for the callers that still want it).
 
+    ``landing_is_target``: the landing dir is ``target_dir`` itself, never
+    where ``target_dir/safe_name`` resolves (a folder reservation creates a
+    fresh name there by an exclusive mkdir; a link already holding the name
+    must not move the folder elsewhere).
+
     Returns ``(upload_dir, agent_dir)``.
     """
+    if target_dir:
+        _check_target_dir(target_dir)
     if not agent_store.agent_exists(agent):
         raise HTTPException(status_code=400, detail=f"Unknown agent: {agent}")
 
@@ -178,7 +232,7 @@ def _resolve_upload_destination(
         target_file, _ = safe_agent_path(
             agent_dir, agent, str(Path(target_dir)) + "/" + safe_name, user, writing=True,
         )
-        upload_dir = target_file.parent
+        upload_dir = agent_dir / Path(target_dir) if landing_is_target else target_file.parent
     elif is_agent_scoped:
         # Agent-scoped chat upload — a shared-workspace write, so the
         # workspace tier (contributor and up). Path policy
@@ -390,6 +444,8 @@ async def upload_file(
     except safe_fs.SafeFsError:
         raise HTTPException(status_code=403, detail="Path outside agent directory")
     except OSError as e:
+        if _name_too_long(e):
+            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
         logger.error(f"Upload failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Upload failed")
     total_bytes = 0
@@ -419,6 +475,8 @@ async def upload_file(
     except safe_fs.SafeFsError:
         raise HTTPException(status_code=403, detail="Path outside agent directory")
     except Exception as e:
+        if _name_too_long(e):
+            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
         logger.error(f"Upload failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Upload failed")
     finally:
@@ -449,6 +507,7 @@ async def upload_file(
         agent, rel_path, target,
         transfer_id=transfer_id, origin_user_sub=user.sub,
     )
+    await _announce_landed(agent, rel_path)
 
     return {
         "path": rel_path,
@@ -460,6 +519,15 @@ async def upload_file(
         # phase-2 events that will never come.
         "remote_push": pushed,
     }
+
+
+async def _announce_landed(agent_slug: str, rel_path: str) -> None:
+    """The open workspace views refresh on a landed upload (a file or a
+    reserved folder): the uploader's own, so a folder attached in chat shows
+    in the tree without a Refresh, and a teammate's on a shared agent. The
+    uploader is never excluded; best effort, queued, never raises."""
+    from services.notifications import notification_manager
+    await notification_manager.broadcast_file_updated(agent_slug, rel_path, source="disk")
 
 
 def _schedule_upload_push(
@@ -881,6 +949,78 @@ def staged_bytes_for(sub: str) -> int:
         return 0
 
 
+class UploadFolderRequest(BaseModel):
+    agent: str
+    name: str
+    # The folder it goes in, agent-relative; empty is the chat's landing dir.
+    target_dir: str = ""
+
+
+def _reserve_folder(landing_rel: str, name: str) -> str:
+    """Create ``name`` (else ``name_1``, ``name_2``…) beneath the landing dir,
+    each candidate by an exclusive mkdir, so a taken name is never merged
+    into. Returns the folder's rel beneath ``AGENTS_DIR``. Executor-side."""
+    safe_fs.mkdirs_beneath(config.AGENTS_DIR, landing_rel)
+    for i in range(_MAX_NAME_TRIES):
+        rel = f"{landing_rel}/{name if i == 0 else f'{name}_{i}'}"
+        try:
+            safe_fs.mkdirs_beneath(config.AGENTS_DIR, rel, exist_ok=False)
+            return rel
+        except FileExistsError:
+            continue
+    raise HTTPException(status_code=409, detail="Too many folders with this name")
+
+
+@router.post("/v1/upload/folder")
+async def reserve_upload_folder(
+    body: UploadFolderRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """A fresh folder for a folder upload, named after it: in the chat's own
+    landing dir (``uploads/files``) for a folder attached in chat, in
+    ``target_dir`` for one dropped or picked in the workspace (the same
+    role check as a file written there). The caller then uploads the
+    folder's files into it through ``/v1/upload`` with an explicit
+    ``target_dir``, which role-checks every file. Returns the folder's
+    agent-relative path."""
+    user = require_auth(user)
+    require_agent_access(user, body.agent)
+    name = _folder_name(body.name)
+    upload_dir, _agent_root = await run_db(
+        _resolve_upload_destination, user, body.agent, body.target_dir, name, create=False,
+        landing_is_target=True,
+    )
+    try:
+        landing_rel = _landing_rel(upload_dir)
+        rel = await file_commit.run(_reserve_folder, landing_rel, name)
+    except safe_fs.SafeFsError:
+        raise HTTPException(status_code=403, detail="Path outside agent directory")
+    except OSError as e:
+        if _name_too_long(e):
+            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
+        logger.error(f"Folder reservation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="The folder could not be created")
+    created = rel.rsplit("/", 1)[-1]
+    if body.target_dir and created != name:
+        # The role check judged ``name``; the folder made may be ``name_N``
+        # (``users/alice`` taken → ``users/alice_1``): judge that one too,
+        # and take back an empty folder the caller may not write.
+        try:
+            await run_db(_check_reserved, user, body.agent, body.target_dir, created)
+        except HTTPException:
+            await file_commit.run(safe_fs.rmtree_beneath, config.AGENTS_DIR, rel, missing_ok=True)
+            raise
+    await _announce_landed(body.agent, _rel_to_agent_path(rel))
+    return {"path": _rel_to_agent_path(rel), "name": created}
+
+
+def _check_reserved(user: UserContext, agent: str, target_dir: str, created: str) -> None:
+    """The role check of a file written in the folder a reservation made
+    (``HTTPException`` 403 when refused). Store reads: run it on ``run_db``."""
+    from api.agents.agents import safe_agent_path
+    safe_agent_path(safe_agent_dir(agent), agent, f"{target_dir}/{created}/x", user, writing=True)
+
+
 @router.post("/v1/upload/chunked/init")
 async def chunked_upload_init(
     body: ChunkedInitRequest,
@@ -1185,6 +1325,8 @@ async def chunked_upload_complete(
         except safe_fs.SafeFsError:
             raise HTTPException(status_code=403, detail="Path outside agent directory")
         except OSError as e:
+            if _name_too_long(e):
+                raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
             logger.error(f"Chunked upload finalize failed ({upload_id}): {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Upload failed")
         _chunk_locks.pop(upload_id, None)
@@ -1202,6 +1344,7 @@ async def chunked_upload_complete(
         meta["agent"], rel_path, target,
         transfer_id=transfer_id, origin_user_sub=user.sub,
     )
+    await _announce_landed(meta["agent"], rel_path)
     return {
         "path": rel_path,
         "filename": target.name,

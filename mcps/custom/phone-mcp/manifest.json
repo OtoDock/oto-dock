@@ -3,7 +3,7 @@
   "server_name": "make-call",
   "label": "Phone Calls",
   "description": "Outbound phone call initiation and management",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "category": "custom",
   "server": {
     "runtime": "python",

@@ -301,11 +301,10 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
         agent=target.agent, prompt=prompt, timeout_seconds=timeout,
         created_by=target.user_sub or None, scope=scope, notification_mode="none",
         # A pin the boot remap never sees: a retired judge model follows its
-        # successor at read time (nothing validates a task's model at spawn —
-        # a stale id would run on the legacy model, priced at the provider
-        # default because its row is gone).
+        # successor at read time (config.live_model_id, the rule the run's
+        # spawn applies too), so the run's task names the model it runs.
         task_type=task_kinds.CHECK,
-        override_model=config.successor_model(judge.get("model") or "") or None,
+        override_model=config.live_model_id(judge.get("model") or "") or None,
         override_execution_path=judge.get("engine") or None, judge=spec,
         execution_target_override=target_override,
     )

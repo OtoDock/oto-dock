@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse, Response
 
 import config
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 # Static-asset extensions whose responses must stay cacheable — never attach a
@@ -85,6 +85,9 @@ _ROUTE_CAPS = (
     ("POST", re.compile(r"^/v1/audio/transcribe$"), _backstop),
     # base64 images in JSON, parsed on the loop
     ("POST", re.compile(r"^/v1/hooks/images$"), lambda: 64 * _MB),
+    # a kept tool result's pictures and blobs (the hook script sends at most
+    # 40 MB of base64; ``services/mcp/result_files.py``)
+    ("POST", re.compile(r"^/v1/hooks/tool-result$"), lambda: 64 * _MB),
     # WOPI PutFile / PutRelativeFile: the token is checked before the read
     ("POST", re.compile(r"^/wopi/files/[^/]+(/contents)?$"), _backstop),
     # Collabora's insert-file upload, held in memory and forwarded
@@ -138,7 +141,9 @@ def credential_state(request: Request, cookies: dict, path: str) -> str:
     else ``none``. Pinned to the validators, not to the signature (the same
     secret signs the 2FA step, reset, invite and link tokens): a dashboard
     session cookie, the master key or a session token as the bearer, and on
-    WOPI and Collabora paths a WOPI ``access_token``."""
+    WOPI and Collabora paths a WOPI token (the bearer, else ``access_token``:
+    Collabora sends both, and the header alone for an editor frame posted
+    with ``access_header``)."""
     from auth.external_endpoints import session_token_claims
     from auth.service_endpoints import extract_master_key
     presented = request.headers.get("authorization", "") != ""
@@ -151,7 +156,8 @@ def credential_state(request: Request, cookies: dict, path: str) -> str:
         if validate_session_jwt(session) is not None:
             return "valid"
     if path.startswith(("/wopi/", "/collabora/")):
-        token = request.query_params.get("access_token", "")
+        from api.media.wopi import request_wopi_token
+        token = request_wopi_token(request, request.query_params.get("access_token", ""))
         if token:
             presented = True
             from api.media.wopi import validate_wopi_token

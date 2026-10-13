@@ -3,6 +3,10 @@ aiohttp>=3.14.3
 psutil>=5.9
 setproctitle>=1.3.3
 
+# Security floors (the 2026-10 sweep) for transitive deps, held here so a
+# churn-minimizing recompile cannot resolve below the patched versions.
+multidict>=6.9.1
+
 # TOML parser for the 3.10 host floor (tomllib is 3.11+): the Codex session
 # writers validate the config.toml they generate (sessions/codex_session.py).
 tomli>=2.0 ; python_version < "3.11"

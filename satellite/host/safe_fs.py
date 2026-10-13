@@ -50,7 +50,7 @@ __all__ = [
     "SafeFsError", "UnsafePathError", "SymlinkRefused", "NotRegularFile", "FileTooLarge",
     "Root", "open_root", "atomic_write_beneath", "open_append_beneath", "mkdirs_beneath",
     "unlink_beneath", "rmdir_beneath", "rename_beneath", "lstat_beneath",
-    "open_regular_for_read", "read_bytes_beneath", "commit_partial",
+    "open_regular_for_read", "read_bytes_beneath", "commit_partial", "is_link_like",
 ]
 
 
@@ -235,6 +235,15 @@ def _w_rmdir(path: str) -> None:
 
 def _is_surrogate(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_reparse_tag", 0) & _NAME_SURROGATE)
+
+
+def is_link_like(path) -> bool:
+    """Is ``path`` itself a symlink, a junction or a mount point (a name
+    that stands for another place)? False when it cannot be stat'ed."""
+    try:
+        return _is_surrogate(os.lstat(path))
+    except OSError:
+        return False
 
 
 def _w_check_dir(path: str, shown: str) -> None:

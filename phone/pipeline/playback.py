@@ -61,6 +61,15 @@ class PlaybackMixin:
         self.tts.select_voice(base_lang(lang))
         return self.tts
 
+    def _send_frame(self, frame: bytes) -> None:
+        """Hand one outgoing frame to the transport. Every sender goes
+        through here so the debug tap, when the call has one, sees the
+        whole outgoing side: voice, fillers, the bed and hold silence."""
+        self.conn.send_audio(frame)
+        tap = self.state._audio_tap
+        if tap is not None:
+            tap.add(frame)
+
     def _out_frame(self, frame: bytes) -> bytes:
         """Prepare one outgoing voice frame: texture the voice (grain + early
         reflections, when the route has a bed), mix the ambience bed under
@@ -106,7 +115,7 @@ class PlaybackMixin:
                         self._voice_senders == 0
                         or since_voice >= self._BED_RESUME_GAP_S):
                     try:
-                        self.conn.send_audio(self._ambience.next_frame())
+                        self._send_frame(self._ambience.next_frame())
                         await self.conn.drain()
                     except asyncio.CancelledError:
                         raise
@@ -196,7 +205,7 @@ class PlaybackMixin:
                         gain = 1.0 - (i + 1) / fade_frames
                         samples = np.frombuffer(chunk, dtype=np.int16).copy()
                         samples = (samples * gain).astype(np.int16)
-                        self.conn.send_audio(self._out_frame(samples.tobytes()))
+                        self._send_frame(self._out_frame(samples.tobytes()))
                         await self.conn.drain()
                         offset += self._frame_bytes_out
                         elapsed = time.monotonic() - fade_start
@@ -206,7 +215,7 @@ class PlaybackMixin:
                     return
 
                 chunk = pcm_data[offset : offset + self._frame_bytes_out]
-                self.conn.send_audio(self._out_frame(chunk))
+                self._send_frame(self._out_frame(chunk))
                 drain_t0 = time.monotonic()
                 await self.conn.drain()
                 drain_s = time.monotonic() - drain_t0
@@ -263,7 +272,7 @@ class PlaybackMixin:
 
                 frame_start = time.monotonic()
                 chunk = pcm_data[offset : offset + self._frame_bytes_out]
-                self.conn.send_audio(self._out_frame(chunk))
+                self._send_frame(self._out_frame(chunk))
                 await self.conn.drain()
                 offset += self._frame_bytes_out
 
@@ -871,6 +880,9 @@ class PlaybackMixin:
         was_paused = self.state._playback_paused
         self.state._tts_playing = False
         self.state._utterance_cancelled = True
+        # The caller spoke over the farewell: an end the agent asked for is
+        # dropped (the call resumes); a transfer still goes through.
+        self._clear_call_control("barge-in", keep_transfer=True)
         # Clear a pause FIRST (flag + timers), then wake the parked sender —
         # it re-checks _tts_playing and exits without a fade (nothing is
         # audible mid-pause, a fade would blip).

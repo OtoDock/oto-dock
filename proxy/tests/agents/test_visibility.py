@@ -187,3 +187,27 @@ def test_unknown_agent_safe_defaults(temp_db):
     assert v.available_scopes == ("user", "agent")
     assert v.mount_scope == "user"
     assert v.history_owner == "s"
+
+
+def test_an_unreadable_mode_fails_closed(temp_db, monkeypatch):
+    """A read ERROR (not a missing row) has no mode that is narrow for every
+    session, so a session build refuses; the history helpers answer per-user
+    (a chat files under its person, never into a shared pool)."""
+    import pytest
+
+    from core.session import visibility
+    from core.session.visibility import (
+        VisibilityUnavailable, chat_history_owner, is_shared_only,
+    )
+
+    _seed_modes()
+
+    def _down(name):
+        raise RuntimeError("database unavailable")
+    monkeypatch.setattr(agent_store, "get_agent", _down)
+    with pytest.raises(VisibilityUnavailable):
+        resolve_visibility("so", username="", user_role="manager")
+    with pytest.raises(VisibilityUnavailable):
+        visibility.resolve_visibility("ps", username="alice", user_role="manager")
+    assert is_shared_only("so") is False
+    assert chat_history_owner("so", "alice-sub") == "alice-sub"

@@ -123,7 +123,10 @@ export function useInteractiveHandlers({
           st.addPendingImages(draftKey, images.map(i => ({ id: `img-${i.path}`, path: i.path, name: i.name })))
         }
         if (files.length) {
-          st.addPendingFiles(draftKey, files.map(f => ({ id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path })))
+          st.addPendingFiles(draftKey, files.map(f => ({
+            id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path,
+            ...(f.folder ? { folder: true } : {}),
+          })))
         }
       }
       setEditText(combined)

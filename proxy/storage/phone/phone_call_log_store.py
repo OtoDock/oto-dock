@@ -14,9 +14,12 @@ from datetime import datetime, timezone
 from storage.pg import get_conn
 
 #: The daemon reports these; anything else is coerced to "failed" at the API.
+#: ``transfer_failed`` is a transfer whose Dial the carrier or the colleague
+#: refused after the caller moved (Twilio's action callback says so).
 VALID_OUTCOMES = {
     "completed", "pin_failed", "pin_cooldown", "pin_timeout", "hangup",
-    "no_answer", "busy", "failed", "error", "rejected_capacity",
+    "no_answer", "busy", "failed", "error", "rejected_capacity", "transferred",
+    "transfer_failed",
 }
 
 
@@ -66,6 +69,22 @@ def insert_call(data: dict, *, prune_before: str | None = None) -> int:
         return int(row["id"])
 
 
+def update_outcome(call_uuid: str, *, outcome: str, only_from: str) -> int:
+    """The newest row of ``call_uuid`` whose outcome reads ``only_from`` takes
+    ``outcome``; the count updated (0 when no such row: the daemon's report
+    may land after the Dial's answer, and then reads the outcome itself)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE phone_call_log SET outcome = %s
+               WHERE id = (SELECT id FROM phone_call_log
+                           WHERE call_uuid = %s AND outcome = %s
+                           ORDER BY id DESC LIMIT 1)""",
+            (outcome, call_uuid, only_from),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
 def prune_older_than(cutoff_iso: str) -> int:
     """Delete the rows that started before ``cutoff_iso``; returns the count."""
     with get_conn() as conn:
@@ -95,19 +114,25 @@ def delete_all() -> int:
         return cur.rowcount
 
 
-def list_pin_attempts(since_iso: str, *, limit: int = 5000) -> list[dict]:
-    """The inbound calls that started at or after ``since_iso`` and entered
-    the PIN gate (``pin_attempts > 0``), oldest first: what the daemon
-    replays into its lockout windows after a restart. Counts and outcomes
-    only; no digit is ever stored."""
+def list_pin_attempts(since_iso: str, *, outbound: str, limit: int = 5000) -> list[dict]:
+    """The calls that started at or after ``since_iso`` and entered the PIN
+    gate (``pin_attempts > 0``), oldest first: what the daemon replays into
+    its lockout windows after a restart. ``from_number`` is the number the
+    daemon keyed the window on: the caller's on an inbound call, the
+    callee's on an outbound one (the ingest fills an outbound row's own
+    ``from_number`` with the route's caller ID); ``outbound`` is the
+    direction word, passed in by the caller that owns it. Counts and
+    outcomes only; no digit is ever stored."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT from_number, route_id, outcome, pin_attempts, started_at, ended_at
+            """SELECT CASE WHEN direction = %s THEN to_number ELSE from_number END
+                          AS from_number,
+                      route_id, outcome, pin_attempts, started_at, ended_at
                FROM phone_call_log
-               WHERE started_at >= %s AND pin_attempts > 0 AND direction = 'inbound'
+               WHERE started_at >= %s AND pin_attempts > 0
                ORDER BY started_at, id
                LIMIT %s""",
-            (since_iso, limit),
+            (outbound, since_iso, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

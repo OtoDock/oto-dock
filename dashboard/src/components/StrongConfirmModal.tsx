@@ -4,10 +4,9 @@ import { useState } from 'react'
  * Reusable type-the-slug confirmation modal for destructive actions.
  *
  * Used by:
- *   - Agent deletion (AgentConfig)
- *   - "Clear all memory" buttons (admin Platform page)
- *   - "Clear my memory" button (UserSettings)
- *   - Admin git revert action
+ *   - Stop sharing an agent and switching its visibility mode (AgentConfig)
+ *   - "Clear the shared agent memory" (AgentConfig.memory)
+ *   - "Clear my memory" (UserSettings)
  */
 export default function StrongConfirmModal({
   title,

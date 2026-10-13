@@ -654,6 +654,15 @@ def test_check_and_preview_never_touch_the_live_release(agent_tree):
     assert client.get(f"/v1/apps/{row['id']}").status_code == 404  # personal row
 
 
+async def _may_write_back(session_id, agent, rel_path):
+    return True
+
+
+def _entries(paths: list[str]) -> list[dict]:
+    """The listing as ``list_remote_entries`` shapes it."""
+    return [{"path": p, "size": 1} for p in paths]
+
+
 def test_pull_folder_brings_the_satellite_tree_within_the_caps(agent_tree, monkeypatch):
     from core.remote import remote_file_flow as rff
     listing = ["users/alice/workspace/apps/board/app.json",
@@ -663,8 +672,8 @@ def test_pull_folder_brings_the_satellite_tree_within_the_caps(agent_tree, monke
                "users/alice/workspace/apps/board/server/node_modules/x.js"]
     pulled: list[str] = []
 
-    async def fake_list(sid, prefix):
-        return listing
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        return _entries(listing)
 
     async def fake_pull(sid, rel):
         pulled.append(rel)
@@ -676,9 +685,11 @@ def test_pull_folder_brings_the_satellite_tree_within_the_caps(agent_tree, monke
     class Info:
         agent_name = AGENT
 
-    monkeypatch.setattr(rff, "list_remote_files", fake_list)
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
     root = agent_tree / "users/alice/workspace/apps/board"
     _write(root, {"client/stale.js": "gone on the satellite"})
     n = asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board"))
@@ -705,8 +716,8 @@ def test_pull_folder_refuses_a_missing_or_empty_folder_and_keeps_the_copy(
         agent_tree, monkeypatch, listing):
     from core.remote import remote_file_flow as rff
 
-    async def fake_list(sid, prefix):
-        return listing
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        return _entries(listing)
 
     async def fake_pull(sid, rel):
         raise AssertionError("nothing is pulled from an empty folder")
@@ -714,7 +725,8 @@ def test_pull_folder_refuses_a_missing_or_empty_folder_and_keeps_the_copy(
     class Info:
         agent_name = AGENT
 
-    monkeypatch.setattr(rff, "list_remote_files", fake_list)
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
     root = agent_tree / "users/alice/workspace/apps/board"
@@ -728,7 +740,102 @@ def test_pull_folder_never_drops_data_dotfiles_or_node_modules(agent_tree, monke
     from core.remote import remote_file_flow as rff
     listing = ["users/alice/workspace/apps/board/app.json"]
 
-    async def fake_list(sid, prefix):
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        return _entries(listing)
+
+    async def fake_pull(sid, rel):
+        p = agent_tree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}")
+        return p
+
+    class Info:
+        agent_name = AGENT
+
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
+    monkeypatch.setattr(rff, "pull_through", fake_pull)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
+    root = agent_tree / "users/alice/workspace/apps/board"
+    kept = {"data/app.db": "db", "server/data/cache.json": "{}", ".env": "K=v",
+            "server/node_modules/x.js": "x"}
+    _write(root, kept)
+    assert asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board")) == 1
+    for rel in kept:
+        assert (root / rel).is_file(), rel
+
+
+def test_pull_folder_refuses_a_folder_the_session_may_not_write_back(agent_tree, monkeypatch):
+    """The pulls replace platform files and the step after them removes the
+    ones the machine lacks, so a folder the session may not write back
+    (the turn-end sync's own rule) refuses before either."""
+    from core.remote import remote_file_flow as rff
+
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        return _entries(["workspace/apps/board/app.json", "workspace/apps/board/client/index.html"])
+
+    async def fake_pull(sid, rel):
+        raise AssertionError("nothing is pulled into a folder the session may not write")
+
+    async def held(session_id, agent, rel_path):
+        return False
+
+    class Info:
+        agent_name = AGENT
+
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
+    monkeypatch.setattr(rff, "pull_through", fake_pull)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    monkeypatch.setattr(rff, "write_back_allowed", held)
+    root = agent_tree / "workspace/apps/board"
+    _write(root, {"app.json": '{"title": "Board"}', "client/old.js": "kept"})
+    with pytest.raises(app_deploy.DeployError, match="may not copy files from your machine"):
+        asyncio.run(app_deploy.pull_folder("sid", "workspace/apps/board"))
+    assert (root / "app.json").is_file() and (root / "client" / "old.js").is_file()
+
+
+def test_pull_folder_removes_only_what_the_session_may_write_back(agent_tree, monkeypatch):
+    """A removal is a write-back of the machine's absence: each removed
+    path is judged by the same gate as the pulls."""
+    from core.remote import remote_file_flow as rff
+
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        return _entries(["users/alice/workspace/apps/board/app.json"])
+
+    async def fake_pull(sid, rel):
+        return agent_tree / rel
+
+    async def gate(session_id, agent, rel_path):
+        return not rel_path.endswith("keep.js")
+
+    class Info:
+        agent_name = AGENT
+
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
+    monkeypatch.setattr(rff, "pull_through", fake_pull)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    monkeypatch.setattr(rff, "write_back_allowed", gate)
+    root = agent_tree / "users/alice/workspace/apps/board"
+    _write(root, {"app.json": "{}", "client/keep.js": "held", "client/gone.js": "x"})
+    assert asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board")) == 1
+    assert (root / "client" / "keep.js").is_file() and not (root / "client" / "gone.js").exists()
+
+
+def test_pull_folder_keeps_what_the_machine_could_not_read(agent_tree, monkeypatch):
+    """A file the machine cannot read, and everything under a folder it
+    cannot list, is neither pulled nor taken for gone; a folder above the
+    deploy's own that it cannot read refuses the deploy."""
+    from core.remote import remote_file_flow as rff
+    board = "users/alice/workspace/apps/board"
+    listing = [{"path": f"{board}/app.json", "size": 1},
+               {"path": f"{board}/client/locked.js", "size": 0, "skipped": "unreadable"},
+               {"path": f"{board}/server", "size": 0, "skipped": "unreadable_dir", "dir": True}]
+
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        assert report_skipped is True
         return listing
 
     async def fake_pull(sid, rel):
@@ -740,16 +847,51 @@ def test_pull_folder_never_drops_data_dotfiles_or_node_modules(agent_tree, monke
     class Info:
         agent_name = AGENT
 
-    monkeypatch.setattr(rff, "list_remote_files", fake_list)
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: True)
     monkeypatch.setattr(rff, "pull_through", fake_pull)
     monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
-    root = agent_tree / "users/alice/workspace/apps/board"
-    kept = {"data/app.db": "db", "server/data/cache.json": "{}", ".env": "K=v",
-            "server/node_modules/x.js": "x"}
-    _write(root, kept)
-    assert asyncio.run(app_deploy.pull_folder("sid", "users/alice/workspace/apps/board")) == 1
-    for rel in kept:
-        assert (root / rel).is_file(), rel
+    monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
+    root = agent_tree / board
+    _write(root, {"client/locked.js": "locked", "client/stale.js": "gone", "server/index.ts": "kept",
+                  "server/lib/x.ts": "kept"})
+    assert asyncio.run(app_deploy.pull_folder("sid", board)) == 1
+    assert (root / "client" / "locked.js").read_text() == "locked"
+    assert (root / "server" / "index.ts").is_file() and (root / "server" / "lib" / "x.ts").is_file()
+    assert not (root / "client" / "stale.js").exists()
+    listing.append({"path": "users/alice/workspace/apps", "size": 0, "skipped": "unreadable_dir", "dir": True})
+    with pytest.raises(app_deploy.DeployError, match="cannot read the folder"):
+        asyncio.run(app_deploy.pull_folder("sid", board))
+    assert (root / "app.json").is_file()
+
+
+def test_pull_folder_removes_nothing_when_the_listing_cannot_vouch_for_absence(agent_tree, monkeypatch):
+    """A satellite whose listing may leave out files it has (the Windows
+    hash bug): the pulls land, the platform's other files stay."""
+    from core.remote import remote_file_flow as rff
+    board = "users/alice/workspace/apps/board"
+
+    async def fake_list(sid, prefix, *, report_skipped=False):
+        return [{"path": f"{board}/app.json", "size": 1}]
+
+    async def fake_pull(sid, rel):
+        p = agent_tree / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}")
+        return p
+
+    class Info:
+        agent_name = AGENT
+
+    monkeypatch.setattr(rff, "list_remote_entries", fake_list)
+    monkeypatch.setattr(rff, "absence_is_reliable", lambda sid: False)
+    monkeypatch.setattr(rff, "pull_through", fake_pull)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: Info())
+    monkeypatch.setattr(rff, "write_back_allowed", _may_write_back)
+    root = agent_tree / board
+    _write(root, {"client/maybe.js": "unlisted"})
+    assert asyncio.run(app_deploy.pull_folder("sid", board)) == 1
+    assert (root / "client" / "maybe.js").read_text() == "unlisted"
 
 
 @_needs_runtime

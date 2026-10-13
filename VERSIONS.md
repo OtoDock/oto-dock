@@ -9,7 +9,7 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.7.1
+OTODOCK_VERSION=1.8.0
 ```
 
 The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).
@@ -19,12 +19,12 @@ The platform's own version. Bumped on every minor/major release. Released versio
 ## Docker base images
 
 ```
-POSTGRES_IMAGE=postgres:16.15-alpine
-PYTHON_IMAGE=python:3.13.16-slim-bookworm
-NODE_IMAGE=node:24.21.0-slim
+POSTGRES_IMAGE=postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+NODE_IMAGE=node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 ```
 
-Pinned to exact minor+patch. For CI gold standard, bump these to digest pins (`@sha256:...`) when the deployment matures.
+Pinned to the exact version AND the digest of its manifest list (`<image>:<tag>@sha256:<digest>`, the digest Docker Hub serves for the tag and `docker buildx imagetools inspect <image>:<tag>` prints): a build resolves exactly these bytes on either architecture, and a tag the upstream rebuilds under the same name (a patched base) changes nothing until the digest is bumped on purpose. The versions sweep compares each digest with the one the tag serves today and reports DIGEST when the tag moved; the tag part is compared with upstream as before.
 
 ## Published image architectures
 
@@ -54,8 +54,8 @@ UV_VERSION=0.12.23
 NPM_VERSION=11.19.0
 PNPM_VERSION=11.28.2
 SYMPY_VERSION=1.14.0
-CLAUDE_CODE_VERSION=2.1.289
-CODEX_VERSION=0.160.0
+CLAUDE_CODE_VERSION=2.1.296
+CODEX_VERSION=0.162.1
 GH_VERSION=2.102.0
 BUBBLEWRAP_VERSION=0.6.1
 BUBBLEWRAP_MIN_VERSION=0.6.0
@@ -69,8 +69,8 @@ Notes:
 - **Node**: minimum is 22 LTS. We default to 24.21.0 (the "Krypton" LTS line as of 1.7.1; it enters maintenance on 2026-10-20 and Node 26 becomes LTS on 2026-10-28, a major for its own pass). Capacitor 8 requires Node 22+. `NPM_VERSION` is the npm that `NODE_VERSION` bundles (11.19.0 with 24.21.0, per the `npm` field of nodejs.org's dist index): nothing installs npm by version, and the image's npm comes from `NODE_IMAGE`. A host whose owner moved npm to 12 still installs the CLIs: the installers and the satellite allow the CLI package's own install scripts (`--allow-scripts`), which npm 12 blocks by default.
 - **pnpm**: installed via `npm install -g pnpm@${PNPM_VERSION}` by the installer, which also upgrades an older copy to the pin (faster Node package manager for some MCP authors / agent workflows). The pinned major is 11 (new store format + supply-chain defaults).
 - **sympy**: symbolic maths in the agents' python (the file-tools maths workflow). Installed by the baseline installers pip-first into whatever `python3` resolves to (exact pin); externally-managed system pythons (PEP 668) fall back to the distro package (`python3-sympy` / brew `sympy`), whose version floats with the distro — presence beats an exact pin there. The Windows installer runs `pip install --user sympy==<pin>` on the real Python on every run (no distro fallback).
-- **Claude Code**: 2.1.289 (2026-10-04; the 2.1.281 → 2.1.289 review is in `CLAUDE-CODE-CLI.md`). Claude Opus 5.5 — the engine's declared default since 2026-09-24 — REQUIRES ≥2.1.280 (older CLIs answer `unrecognized_model`), as Fable 5.1 required ≥2.1.251. Claude Sonnet 5.5, the Direct LLM default since 2026-10-04, needs 2.1.284 or newer (an older CLI runs it with a 200K compaction window). Satellites reconcile installed CLIs to this pin on reconnect (pin-and-freeze), so a pin bump here propagates to the fleet without a satellite release.
-- **Codex**: 0.160.0 (2026-10-04; the 0.156.1 → 0.160.0 review is in `CODEX.md`). GPT-6.1 Sol, the Codex default since 2026-10-04, needs 0.159.1 or newer (an older catalog refuses the id).
+- **Claude Code**: 2.1.296 (2026-10-13; the 2.1.289 → 2.1.296 review is in `CLAUDE-CODE-CLI.md`). Claude Opus 5.5 — the engine's declared default since 2026-09-24 — REQUIRES ≥2.1.280 (older CLIs answer `unrecognized_model`), as Fable 5.1 required ≥2.1.251. Claude Sonnet 5.5, the Direct LLM default since 2026-10-04, needs 2.1.284 or newer (an older CLI runs it with a 200K compaction window); Claude Haiku 5.5, a builtin on this engine and Direct LLM since 2026-10-13, needs 2.1.293 or newer the same way and 2.1.296 for its token counts. Satellites reconcile installed CLIs to this pin on reconnect (pin-and-freeze), so a pin bump here propagates to the fleet without a satellite release.
+- **Codex**: 0.162.1 (2026-10-13; the 0.160.0 → 0.162.1 review is in `CODEX.md`). GPT-6.1 Sol, the Codex default since 2026-10-04, needs 0.159.1 or newer (an older catalog refuses the id).
 - **GitHub CLI**: `GH_VERSION` is a reference value only — the installer adds the cli.github.com apt repo and installs the **latest** `gh` (no pin).
 - **Bubblewrap**: distro-provided (`apt install bubblewrap`), **not** pinned to an exact version — `BUBBLEWRAP_VERSION` is an informational reference (Ubuntu 22.04 LTS ships 0.6.1; Debian 12 ships ~0.8; latest upstream is 0.11.2). `BUBBLEWRAP_MIN_VERSION` (0.6.0) is the **documented floor** — the realistic oldest supported host (Ubuntu 22.04 LTS ships 0.6.1) for the namespace/seccomp/mount features the sandbox uses. It is documentation, *not* yet a runtime gate (no `bwrap --version` preflight); adding one is an optional polish. Don't raise it higher (0.8+ would exclude Ubuntu 22.04 LTS, still supported to 2027).
 - **passt / pasta**: provides the user-mode network stack that wraps **every** local agent sandbox in an isolated network namespace (always on — there is no toggle). Date-versioned upstream (`YYYY_MM_DD.<short-sha>`); `PASST_MIN_VERSION` is a *feature* floor (the build must support `--no-map-gw` + per-port `-T` forwarding), not a staleness pin — leave it unless a needed feature lands in a newer build. The startup preflight checks pasta's **presence** + that an unprivileged user+net namespace can be created (hard-fails the proxy boot if `pasta`/`ip`/`bwrap` are missing or namespaces are blocked), not its version. **Not in Ubuntu 22.04 (jammy) main** — `scripts/install-baseline-tools.sh` installs it as a HARD requirement, auto-fetching the upstream **static** build from `https://passt.top/builds/` on jammy; Debian 12 (bookworm) / Ubuntu 23.10+ ship it as `apt install passt`. The proxy Dockerfile installs `passt iproute2 bubblewrap`.
@@ -84,10 +84,10 @@ runtime path. Each pin documents its reason at the pin site.
 
 | Pin | Where | Why it's locked |
 |-----|-------|-----------------|
-| `playwright==1.59.0` + `@playwright/mcp@0.0.68` | `mcps/community/camoufox/Dockerfile` | camoufox 0.4.11's Firefox launch driver needs `browserServerImpl` (playwright-core **1.60+ dropped** it), and `@playwright/mcp@0.0.68`'s MCP code lives in a nightly playwright-core (`1.59.0-alpha-…`). The Dockerfile pins `playwright==1.59.0` and **overwrites** camoufox's driver `playwright-core` with the MCP's bundled alpha core so both ends speak the same connect protocol. Newer/mismatched pairs fail to launch the browser. |
+| `camoufox==0.5.8` + `playwright==1.62.0` + `@playwright/mcp@0.0.78` | the community catalog's `camoufox/Dockerfile` (`ARG`s) | `@playwright/mcp`'s MCP code lives in the nightly playwright-core it bundles (`1.62.0-alpha-…`), and camoufox caps Playwright (below 1.63 for 0.5.8). The Dockerfile **overwrites** camoufox's driver `playwright-core` with the MCP's bundled alpha core so both ends speak the same connect protocol. The three move together; the catalog's weekly upstream report computes the newest set that fits. |
 | `cartesia>=3.2,<4.0` (lock 3.2.0) | `audio/pyproject.toml`, `phone/requirements.txt` | Cartesia 3.x exposes the public context/push API with a dict `output_format`; the old private `cartesia._types.OutputFormat` import (≤2.x) is gone and 4.x is a future break. The audio TTS provider is written against 3.x. |
 | `audio/models/silero_vad.onnx` (Silero VAD v5.1.2, vendored) | `audio/models/README.md` | Not a package pin but a locked file: VAD behaviour is runtime semantics (the phone's endpointing tuning depends on these exact weights and the no-context feed in `audio/providers/vad/silero_model.py`). Swapping the model file is a tuning change; prove equivalence against the previous file, or re-tune, before shipping. |
-| Base images: `postgres:16.15-alpine`, `python:3.13.16-slim-bookworm`, `node:24.21.0-slim` | (this file) | Exact for reproducible image builds; bump deliberately, not opportunistically. |
+| Base images: `postgres:16.15-alpine`, `python:3.13.16-slim-bookworm`, `node:24.21.0-slim`, each with its manifest-list digest | (this file) | Exact for reproducible image builds; bump the tag or the digest deliberately, not opportunistically. |
 
 > **Per-MCP SDK version spread is expected, not drift.** Each MCP has its own
 > venv (`mcps/{cat}/{name}/venv/`), so different `mcp` / `uvicorn` / `starlette`
@@ -165,7 +165,7 @@ Tagged releases of the `OtoDock/community-mcps` and `OtoDock/community-agents` r
 ## Protocol versions
 
 ```
-SATELLITE_VERSION=0.5.138
+SATELLITE_VERSION=0.5.147
 MIN_SATELLITE_VERSION=0.5.76
 ```
 
@@ -186,7 +186,7 @@ cascade (a bump is rarely a one-line edit). The short form:
 
 1. **Update this file**.
 2. **Regenerate any affected lockfiles** (Python deps via `uv pip compile --python-version <ver>`, dashboard via `npm install`) — and, on a **Python minor** bump, the `mcps/custom/*` lockfiles too (a Python patch release changes no lockfile; a `UV_VERSION` bump recompiles every lockfile once, with no upgrade flag).
-3. **Mirror toolchain pins into the install scripts** where they're carried as defaults (the Docker build runs `install-baseline-tools.sh` before VERSIONS.md is in the image; the `.ps1` carries its own defaults for Windows hosts): `UV_VERSION`, `PNPM_VERSION`, `BUN_VERSION`, `SYMPY_VERSION`, `NODE_VERSION` (the `.sh` takes its major for the NodeSource line), `CLAUDE_CODE_VERSION`, `CODEX_VERSION`; `proxy/tests/execution/test_engine_descriptor.py` holds every one equal to its row. The image pins have mirrored defaults too: the `ARG PYTHON_IMAGE` / `ARG NODE_IMAGE` of the three Dockerfiles, the `${POSTGRES_IMAGE:-…}` literals of both compose files and `scripts/dev-setup.sh`, CI's Postgres service images and `dev-setup.sh`'s `PYTHON_VERSION`/`NODE_VERSION` fallbacks (`test_the_image_defaults_mirror_the_pins`, same file).
+3. **Mirror toolchain pins into the install scripts** where they're carried as defaults (the Docker build runs `install-baseline-tools.sh` before VERSIONS.md is in the image; the `.ps1` carries its own defaults for Windows hosts): `UV_VERSION`, `PNPM_VERSION`, `BUN_VERSION`, `SYMPY_VERSION`, `NODE_VERSION` (the `.sh` takes its major for the NodeSource line), `CLAUDE_CODE_VERSION`, `CODEX_VERSION`; `proxy/tests/execution/test_engine_descriptor.py` holds every one equal to its row. The image pins (tag and digest) have mirrored defaults too: the `ARG PYTHON_IMAGE` / `ARG NODE_IMAGE` of the three Dockerfiles, the `${POSTGRES_IMAGE:-…}` literals of both compose files and `scripts/dev-setup.sh`, CI's Postgres service images and `dev-setup.sh`'s `PYTHON_VERSION`/`NODE_VERSION` fallbacks (`test_the_image_defaults_mirror_the_pins`, same file).
 4. **Test** end-to-end: base images → rebuild + offline smoke; CLI versions → a dashboard chat through that path.
    - Satellite bumps: pair a fresh satellite, run a turn.
 5. **Bump `OTODOCK_VERSION`** on a breaking change. **Tag a release** (`git tag v0.X.Y && git push --tags`).
@@ -197,6 +197,6 @@ cascade (a bump is rarely a one-line edit). The short form:
 in their own files (one place to *see* them, but not owned here):
 
 - **Library deps** — `proxy/`, `phone/`, `satellite/requirements.txt`, `audio/pyproject.toml`, `mcps/custom/*/requirements.txt` (all `==`, regenerated from `requirements.in` via `uv pip compile`); `dashboard/package-lock.json` (npm-managed). **Regenerate, never hand-edit.** Watch for **major** bumps: backend `fastapi`/`starlette`/`sse-starlette`/`pydantic`; frontend `react`/`vite`/`tailwindcss`/`typescript`.
-- **Third-party compose images** — pinned directly in `docker-compose.yml` (not via a `*_IMAGE` var): `collabora/code:25.04.10.3.1` (document preview; `mcps/custom/file-tools-mcp/docker-compose.yml` carries the same tag for a native install's Collabora, and the two move together; both turn background save off, as a forked save on 25.04.10.3.1 could hang past its timeout and drop the edit), `tecnativa/docker-socket-proxy:v0.5.0` (Docker-socket allowlist shim — the Docker-access **security boundary**; v0.5.0 moves the engine to haproxy 3.4 and adds pause and unpause flags that default off, which changes nothing here: `CONTAINERS=1` with `POST=1` passes those two paths as before. The allowlist env semantics — `CONTAINERS/IMAGES/NETWORKS/VOLUMES/POST` + default-deny — are unchanged; verified by an allowlist-matrix + real container-lifecycle smoke before each bump (v0.5.0: the same answers on 32 probes as v0.4.2, a community Docker MCP installed, restarted and removed through it). Note the tag is `v`-prefixed from 0.4.x on. Bump deliberately + re-smoke the boundary, never opportunistically). Bump deliberately, not opportunistically.
-- **Docker-MCP runtimes** — each Docker MCP carries its own runtime, independent of the platform (the startup reconciliation skips them): `mcps/custom/file-tools-mcp` (its Python base is `PYTHON_IMAGE`, passed by the release build, the Dockerfile's `ARG` default held equal to the row; plus **Playwright `playwright==1.62.0` with its `chromium-headless-shell` build** under `/opt/ms-playwright` — the headless browser behind the apps' rendered checks (`POST /render`); tracked here under `mcps/custom/`; the browser build is the one the pinned package asks for, so a Playwright bump is the `requirements.in` edit, the lockfile regeneration and an image rebuild; independent of camoufox's locked 1.59.0, a different image with a different driver), `mcps/community/camoufox` (python:3.12 in the published GHCR image — **3.13 update pending a community-repo CI republish**; playwright 1.59.0 — locked; **sourced from the `OtoDock/community-mcps` repo + CI→GHCR**, the `mcps/community/` copy here is a gitignored runtime artifact), `mcps/community/github-mcp` (go1.25 + python:3.12), `m365-mcp`, etc. Only file-tools + camoufox are *ours* to track (file-tools in-repo; camoufox via the community repo); the rest are community MCPs wrapped for compat.
+- **Third-party compose images** — pinned directly in `docker-compose.yml` (not via a `*_IMAGE` var), each by tag and manifest-list digest like the base images: `collabora/code:25.04.10.3.1` (document preview; `mcps/custom/file-tools-mcp/docker-compose.yml` carries the same tag for a native install's Collabora, and the two move together; both turn background save off, as a forked save on 25.04.10.3.1 could hang past its timeout and drop the edit), `tecnativa/docker-socket-proxy:v0.5.0` (Docker-socket allowlist shim — the Docker-access **security boundary**; v0.5.0 moves the engine to haproxy 3.4 and adds pause and unpause flags that default off, which changes nothing here: `CONTAINERS=1` with `POST=1` passes those two paths as before. The allowlist env semantics — `CONTAINERS/IMAGES/NETWORKS/VOLUMES/POST` + default-deny — are unchanged; verified by an allowlist-matrix + real container-lifecycle smoke before each bump (v0.5.0: the same answers on 32 probes as v0.4.2, a community Docker MCP installed, restarted and removed through it). Note the tag is `v`-prefixed from 0.4.x on. Bump deliberately + re-smoke the boundary, never opportunistically). Bump deliberately, not opportunistically.
+- **Docker-MCP runtimes** — each Docker MCP carries its own runtime, independent of the platform (the startup reconciliation skips them): `mcps/custom/file-tools-mcp` (its Python base is `PYTHON_IMAGE`, passed by the release build, the Dockerfile's `ARG` default held equal to the row; plus **Playwright `playwright==1.63.0` with its `chromium-headless-shell` build** under `/opt/ms-playwright` — the headless browser behind the apps' rendered checks (`POST /render`); tracked here under `mcps/custom/`; the browser build is the one the pinned package asks for, so a Playwright bump is the `requirements.in` edit, the lockfile regeneration and an image rebuild; independent of camoufox's locked 1.62.0, a different image with a different driver), `mcps/community/camoufox` (python:3.13; camoufox, playwright and `@playwright/mcp` pinned together; **sourced from the `OtoDock/community-mcps` repo + CI→GHCR**, the `mcps/community/` copy here is a gitignored runtime artifact), `m365-mcp` (the vendor's own image), etc. Only file-tools + camoufox are *ours* to track (file-tools in-repo; camoufox via the community repo); the rest are community MCPs wrapped for compat.
 - **Custom MCP system requirements** — each MCP's `manifest.json` `system_requirements` (`node_min` + OS packages; no `python_min` — that comes from the package's upstream `requires-python`).

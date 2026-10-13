@@ -44,13 +44,14 @@ from services.mcp import mcp_registry
 from services.webhooks.event_normalizer import (
     match_event_filter,
     resolve_catalog_keys,
+    vendor_event_key,
     walk_path,
 )
 from storage.automation import trigger_store
 from storage.automation import webhook_subscription_store
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.webhook-dispatcher")
+logger = logging.getLogger("otodock.webhook-dispatcher")
 
 # The pre-auth executor job (the row, the manifest check, the secret): this
 # many in flight, this many waiting, the rest answered 503 at once.
@@ -564,13 +565,23 @@ async def _process_subscription_events(
             trigger_source=(
                 f"webhook:{provider_id}/{subscription_id}/{event.event_type}"
             ),
+            # One key per vendor event across every subscription that sees it
+            # (a repository hook and its organization's, two accounts, relay
+            # fan-in): the action it wakes runs once.
+            event_id=vendor_event_key(provider_id, event.global_event_id),
         )
         total_fired += fired
         all_errors.extend(errors)
+        # What neither fired nor failed was a duplicate: another
+        # subscription's delivery of the same event woke the action first.
+        dupes = len(matching_triggers) - fired - len(errors)
+        all_dupes = dupes > 0 and not fired and not errors
+        duplicate_count += int(all_dupes)
         per_event_results.append({
             "event_type": event.event_type,
-            "status": "ok",
+            "status": "duplicate" if all_dupes else "ok",
             "fired": fired,
+            **({"duplicates": dupes} if dupes > 0 else {}),
             **({"errors": errors} if errors else {}),
         })
 
@@ -832,26 +843,33 @@ def _matching_triggers(rows: list[dict], event: NormalizedEvent) -> list[dict]:
     return matches
 
 
+_DUPLICATE = "duplicate"
+
+
 async def _fan_out_fire(
     *,
     triggers: list[dict],
     body: dict,
     event: NormalizedEvent,
     trigger_source: str,
+    event_id: str = "",
 ) -> tuple[int, list[str]]:
-    """Fire all matching triggers concurrently. Returns (fired_count, errors)."""
+    """Fire all matching triggers concurrently. Returns (fired_count,
+    errors); a fire whose only action was a duplicate of this event (the
+    same ``event_id`` already woke that action) counts in neither."""
     # Lazy import to avoid circular: trigger_manager imports scheduler which
     # imports a lot.
     from services.scheduler import trigger_manager
 
     async def fire_one(trigger_row: dict) -> str | None:
         try:
-            await trigger_manager.fire_trigger(
+            res = await trigger_manager.fire_trigger(
                 trigger_row, body,
                 trigger_source=trigger_source,
                 vendor_event=event,
+                event_id=event_id,
             )
-            return None
+            return _DUPLICATE if (res or {}).get("actions") == [_DUPLICATE] else None
         except Exception as e:
             return f"trigger {trigger_row.get('id')}: {type(e).__name__}: {e}"
 
@@ -859,6 +877,6 @@ async def _fan_out_fire(
         *[fire_one(t) for t in triggers],
         return_exceptions=False,
     )
-    errors = [r for r in results if r]
-    fired = len(triggers) - len(errors)
+    errors = [r for r in results if r and r != _DUPLICATE]
+    fired = sum(1 for r in results if r is None)
     return (fired, errors)

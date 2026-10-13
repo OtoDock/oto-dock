@@ -455,6 +455,37 @@ class TestLaneCollection:
         assert out == "borrowed"
 
 
+    def test_own_prompt_matched_through_the_runs_preludes(self, temp_db):
+        # An interactive run's first prompt carries the time and
+        # parallel-activity lines; the transcript keeps them, the caller
+        # holds the raw prompt. A satellite single-lines a Codex launch
+        # prompt, so the lines may end in spaces.
+        parallel = ("[Parallel activity — for awareness only, no action needed: "
+                    "background tasks running: 'Inbox' (dyn-1). Check one only if your "
+                    "work depends on it (peek_session / get_task_result).]")
+        stamp = "[Current time: Friday, October 09, 2026 06:00 (6:00 AM) UTC (UTC+00:00)]"
+        task_store.create_chat("lane-4", "user-1", "pa")
+        task_store.add_chat_message("lane-4", "user", f"{stamp}\n\n{parallel}\n\ndo the work")
+        task_store.add_chat_message("lane-4", "assistant", "answer")
+        task_store.create_chat("lane-5", "user-1", "pa")
+        task_store.add_chat_message("lane-5", "user", f"{stamp} {parallel} do the work")
+        task_store.add_chat_message("lane-5", "assistant", "answer")
+
+        # A multi-line prompt reaches the Claude TUI as a paste, journaled
+        # wrapped (with whitespace before the preludes).
+        task_store.create_chat("lane-6", "user-1", "pa")
+        task_store.add_chat_message(
+            "lane-6", "user",
+            f'  <pasted_content id="b1"> {stamp} {parallel} do the\n  work\nplease '
+            '</pasted_content id="b1">')
+        task_store.add_chat_message("lane-6", "assistant", "answer")
+
+        for chat in ("lane-4", "lane-5"):
+            assert scheduler._collect_lane_output_since(chat, 0, 0, "do the work") == "answer"
+        assert scheduler._collect_lane_output_since(
+            "lane-6", 0, 0, "do the work\nplease") == "answer"
+
+
 class TestLaneQuiescence:
     def test_quiet_lane_returns_immediately(self, temp_db):
         import time as _time
@@ -1141,10 +1172,12 @@ class TestPumpedEchoTurn:
     def test_a_parked_echo_turn_tells_its_person(self, temp_db, monkeypatch):
         """The echo turn on a live process runs in the chat's own mode: when
         its next step parks a prompt nobody sees, the delivery's person (else
-        the chat's owner) is notified once, linked to the chat."""
+        the chat's owner) is notified once, linked to the chat; the pump's own
+        "needs your input" ping stands down for it."""
         from services.notifications import notification_manager
         task_store.create_chat("chat-park", "user-1", "pa")
         fired: list[dict] = []
+        tells: list[bool] = []
 
         async def _fire(title, body, **kw):
             fired.append({"title": title, **kw})
@@ -1152,6 +1185,7 @@ class TestPumpedEchoTurn:
         monkeypatch.setattr(notification_manager, "fire_notification", _fire)
 
         async def _watch(layer, pump, run_id, chat_id, session_id, *, on_parked=None):
+            tells.append(pump.driver_tells_parked)
             await on_parked()
             await pump._task
         monkeypatch.setattr(lanes, "_watch_task_pump", _watch)
@@ -1161,6 +1195,7 @@ class TestPumpedEchoTurn:
             _FakeEchoLayer(), "sess-park", "chat-park", "pa", "review"))
         assert [(f["target"], f["chat_id"], f["scope"]) for f in fired] == [
             ("user-2", "chat-park", "user"), ("user-1", "chat-park", "user")]
+        assert tells == [True, True]
 
     def test_refuses_when_chat_already_pumping(self, temp_db):
         from core.events.stream_pump import _active_pumps
@@ -1609,3 +1644,120 @@ class TestResultFiles:
         assert first["files"] == second["files"] and first["prompt"] == second["prompt"]
         from storage.automation import db_result_files
         assert len(db_result_files.list_for_run("run-rf-d5")) == 2
+
+
+class TestWorkLeftRunning:
+    def test_a_report_that_leaves_work_running_says_so(self, monkeypatch):
+        """A run that ended with background work still running: the callback
+        says its results are not in the report and how to collect them, and
+        the delegate_result event carries the count."""
+        captured: dict = {}
+
+        async def fake_do_deliver(session_id, agent, result_prompt, task, **kw):
+            captured.update(prompt=result_prompt, **kw)
+
+        monkeypatch.setattr(delivery, "_do_deliver", fake_do_deliver)
+        monkeypatch.setattr(delivery.task_store, "get_dynamic_task", lambda tid: {
+            "on_complete_agent": "pa", "on_complete_session_id": "sess-1",
+            "on_complete_chat_id": None, "on_complete_prompt": "Output:\n{{output}}"})
+
+        async def run():
+            await delivery._deliver_task_result(_task(), "completed", "the reviewers run",
+                                                background_pending=2)
+            for _ in range(100):
+                if captured:
+                    return
+                await asyncio.sleep(0.01)
+
+        asyncio.run(run())
+        assert "2 background job(s) still running" in captured["prompt"]
+        assert "their results are not in this report" in captured["prompt"]
+        assert captured["background_pending"] == 2
+
+    def test_a_parked_run_tells_the_people_who_may_answer(self, monkeypatch):
+        """A run's turn waits on a person while nobody views it: a user-scope
+        task's creator is told; an agent-scope run tells the agent's editors
+        and managers, never its members."""
+        from services.notifications import notification_manager
+        import auth.providers as providers
+        told: list[tuple[str, str]] = []
+
+        async def fake_fire(title, body, **kw):
+            told.append((kw["target"], title))
+
+        monkeypatch.setattr(notification_manager, "fire_notification", fake_fire)
+        monkeypatch.setattr(lanes.task_store, "get_agent_users", lambda agent: [
+            {"sub": "ed"}, {"sub": "mem"}, {"sub": "mgr"}])
+        roles_by_sub = {"ed": "editor", "mem": "member", "mgr": "manager"}
+        monkeypatch.setattr(providers, "acting_role_of", lambda sub, agent: roles_by_sub[sub])
+
+        user_task = _task()
+        user_task.scope, user_task.created_by = "user", "creator-1"
+        asyncio.run(lanes.tell_run_parked(user_task, "chat-1"))
+        assert told == [("creator-1", "A delegated worker waits on your answer")
+                        if user_task.on_complete_agent else ("creator-1", "A task run waits on your answer")]
+
+        told.clear()
+        agent_task = _task()
+        agent_task.scope, agent_task.created_by = "agent", ""
+        asyncio.run(lanes.tell_run_parked(agent_task, "chat-1"))
+        assert sorted(sub for sub, _ in told) == ["ed", "mgr"]
+
+
+class TestWakeReplayAtAPumpsEnd:
+    """A wake stored while another turn had the chat (a phone, voice or
+    meeting turn, a queued delivery) is replayed when that chat's next pump
+    ends, not left for the chat's next warmup."""
+
+    @pytest.mark.asyncio
+    async def test_a_wake_stored_during_a_turn_replays_at_its_end(self, temp_db, monkeypatch):
+        from core.events import stream_pump
+        from core.events.common_events import PRODUCER_DONE, CommonEvent
+        task_store.create_chat("wk-1", "user-admin", "agent-a")
+        replayed: list[str] = []
+
+        async def _fake_redeliver(chat):
+            replayed.append(chat["id"])
+            return True
+        monkeypatch.setattr(delivery, "_redeliver_chat", _fake_redeliver)
+        gate = asyncio.Event()
+        eq: asyncio.Queue = asyncio.Queue()
+
+        async def _produce():
+            await gate.wait()
+            await eq.put(CommonEvent(type=PRODUCER_DONE, data={}))
+        pump = stream_pump.ChatStreamPump(
+            chat_id="wk-1", session_id="s-wk-1", producer=asyncio.create_task(_produce()),
+            event_queue=eq, perm_queue=None)
+        stream_pump._active_pumps["wk-1"] = pump
+        pump.start()
+        assert stream_pump.store_chat_wake("wk-1", "the worker's result", "user-admin")
+        assert "wk-1" in stream_pump._stored_wake_chats
+        gate.set()
+        await asyncio.wait_for(pump._task, timeout=5)
+        for _ in range(100):
+            if replayed:
+                break
+            await asyncio.sleep(0.02)
+        assert replayed == ["wk-1"]
+        assert "wk-1" not in stream_pump._stored_wake_chats
+
+    @pytest.mark.asyncio
+    async def test_a_wake_every_rung_refused_is_marked_for_the_replay(self, temp_db, monkeypatch):
+        from core.events import stream_pump
+        task_store.create_chat("wk-2", "user-admin", "agent-a")
+        stream_pump._stored_wake_chats.discard("wk-2")
+        assert await delivery._store_undelivered_wakes("wk-2", ["r1"], person="user-admin")
+        assert "wk-2" in stream_pump._stored_wake_chats
+        stream_pump._stored_wake_chats.discard("wk-2")
+
+    def test_a_wake_waits_while_another_starter_holds_the_chat(self):
+        from core.events import input_queue
+        q = input_queue.get("wk-3")
+        claim = q.try_claim()
+        try:
+            assert delivery._wake_superseded("", "wk-3")
+        finally:
+            q.release(claim)
+        assert not delivery._wake_superseded("", "wk-3")
+        input_queue._registry.pop("wk-3", None)

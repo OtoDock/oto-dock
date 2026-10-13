@@ -13,7 +13,7 @@ from storage import database as task_store
 from auth.password import HashBusy, check_password_strength_async, hash_password_async
 from auth.providers import create_session_jwt, apply_session_cookie
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 _SETUP_DONE = "Setup already completed"

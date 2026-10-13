@@ -31,6 +31,7 @@ Key distinction the rest of the codebase must honor:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from auth import roles
@@ -39,6 +40,8 @@ from auth.roles import OWNER_TIER
 # The two scopes a session mounts and an automation is stored in
 # (``agents.default_scope``, ``tasks.scope`` and its siblings): the person's
 # own tree, or the agent's shared one.
+logger = logging.getLogger("otodock.visibility")
+
 SCOPE_USER = "user"
 SCOPE_AGENT = "agent"
 SCOPES = (SCOPE_USER, SCOPE_AGENT)
@@ -76,22 +79,35 @@ class VisibilityResolution:
     history_owner: str        # "agent::{slug}" (shared-only) or the real user_sub
 
 
-def _read_agent_mode(agent_name: str) -> tuple[bool, str]:
-    """Return ``(collaborative, default_scope)`` for an agent, best-effort.
+class VisibilityUnavailable(RuntimeError):
+    """The agent's mode could not be read, so no session is built on it."""
 
-    Soft-fails to the collaborative / user-default (the safe, widest mode) so a
-    missing row or a startup-time lookup race never blocks session start.
+
+def _read_agent_mode(agent_name: str, *, strict: bool = False) -> tuple[bool, str]:
+    """Return ``(collaborative, default_scope)`` for an agent.
+
+    A missing row reads as the column defaults (collaborative, user), what a
+    new agent row holds. A read ERROR has no safe mode for every session (a
+    personal-only answer gives a no-user session an agent mount with user-only
+    scopes), so a session builder (``strict``) raises
+    ``VisibilityUnavailable`` and starts nothing; the history helpers answer
+    per-user, which files a chat under its person and never into a shared pool.
     """
     try:
         from storage.agents import agent_store
         row = agent_store.get_agent(agent_name) or {}
-        collaborative = bool(row.get("collaborative", True))
-        default_scope = row.get("default_scope") or SCOPE_USER
-        if default_scope not in SCOPES:
-            default_scope = SCOPE_USER
-        return collaborative, default_scope
-    except Exception:
-        return True, SCOPE_USER
+    except Exception as e:
+        if strict:
+            raise VisibilityUnavailable(
+                f"the visibility mode of agent {agent_name!r} could not be read") from e
+        logger.warning("visibility: mode of %s unreadable (%s); answering per-user",
+                       agent_name, type(e).__name__)
+        return False, SCOPE_USER
+    collaborative = bool(row.get("collaborative", True))
+    default_scope = row.get("default_scope") or SCOPE_USER
+    if default_scope not in SCOPES:
+        default_scope = SCOPE_USER
+    return collaborative, default_scope
 
 
 def _read_memory_toggles(agent_name: str) -> tuple[bool, bool]:
@@ -249,7 +265,7 @@ def resolve_visibility(
     Returns:
         A fully-populated :class:`VisibilityResolution`.
     """
-    collaborative, default_scope = _read_agent_mode(agent_name)
+    collaborative, default_scope = _read_agent_mode(agent_name, strict=True)
     master_user, master_agent = _read_memory_toggles(agent_name)
 
     available = available_scopes_for(collaborative, default_scope)

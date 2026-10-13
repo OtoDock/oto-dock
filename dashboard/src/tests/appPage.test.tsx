@@ -28,14 +28,15 @@ vi.mock('@/api/apps', async (importOriginal) => ({
 const authUser = vi.hoisted(() => ({ current: { role: 'member', agents: ['dev'] } as any }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: authUser.current }) }))
 const hideShare = vi.hoisted(() => vi.fn())
-const patchShare = vi.hoisted(() => vi.fn())
+const patchShare = vi.hoisted(() => vi.fn(async () => ({})))
 vi.mock('@/api/shares', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/shares')>()),
   useHideShare: () => ({ mutate: hideShare }),
-  usePatchShare: () => ({ mutate: patchShare }),
+  usePatchShare: () => ({ mutate: patchShare, mutateAsync: patchShare }),
 }))
 
 import AppPage from '@/pages/apps/AppPage'
+import { onAppToast } from '@/lib/appToasts'
 
 function mkApp(over: Partial<PinnedApp> = {}): PinnedApp & { agent: string; chat_id: string } {
   return {
@@ -209,6 +210,35 @@ describe('AppPage — an app a share placed for this viewer (SHARING.md)', () =>
     expect(patchShare).toHaveBeenCalledWith({ id: 'sh-9', revoke: true })
     expect(hideShare).not.toHaveBeenCalled()
     expect(screen.getByTestId('loc').textContent).toContain('/chat/lite')
+  })
+
+  it('a Remove for me the server refuses says so after the page left', async () => {
+    patchShare.mockClear()
+    patchShare.mockRejectedValueOnce(new Error('Share not found'))
+    const toasts: unknown[] = []
+    const off = onAppToast((t) => toasts.push(t))
+    authUser.current = { role: 'member', agents: ['lite'] }
+    appRow.current = mkApp({
+      agent: 'ops', can_manage: false, can_approve: false,
+      placement: { kind: 'person', share_id: 'sh-9', from_agent: 'ops', from_agent_name: 'Ops Desk', agent: 'lite', role_cap: 'viewer', shared_by: 'u-nora', shared_by_name: 'Nora', can_remove: false },
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/apps/app-1']}>
+          <Routes>
+            <Route path="/apps/:appId" element={<><AppPage /><LocationProbe /></>} />
+            <Route path="/chat/:name" element={<LocationProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+    fireEvent.click(screen.getByLabelText('Options for Morning brief'))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove for me' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Remove for me' })) })
+    off()
+    expect(screen.getByTestId('loc').textContent).toContain('/chat/lite')
+    expect(toasts).toEqual([{ title: '“Morning brief” was not removed', body: 'Share not found', severity: 'warning' }])
   })
 
   it('the page\'s Remove for me reads whole without the sharer\'s name', () => {

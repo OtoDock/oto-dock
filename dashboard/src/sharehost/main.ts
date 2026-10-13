@@ -7,6 +7,9 @@
 
 import { batchUrl, classify, frameSrc, linkQuery, openAllowed, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
 import { WIRE } from '../api/wireEvents'
+import { fitViewportToDevice } from '../lib/device/viewport'
+
+fitViewportToDevice()
 
 const root = document.getElementById('root')
 const cfg = readConfig(document.getElementById('share-config')?.textContent, location.pathname)

@@ -65,8 +65,10 @@ exten => s,1,Answer()
 # secret are minted server-side and auto-wired into the server's credentials,
 # so the admin only pastes — no typing back). IP-locked to the proxy's
 # PBX-facing address (same host the dialplan dials for media/register).
-# ``call,originate`` ride along by default so flipping a server to outbound
-# later doesn't need a PBX revisit; inbound-only operators can trim them.
+# ``originate`` rides along by default so flipping a server to outbound
+# later doesn't need a PBX revisit; inbound-only operators can trim it.
+# ``call`` stays: ``Redirect`` (a transfer on the call tools) is a call-class
+# action, so a user without it answers every transfer with a permission error.
 # ``dtmf`` read is REQUIRED for the daemon's DTMF event listener (PIN entry
 # on RFC2833/SIP-INFO trunks): AMI delivers read-perms ∩ EventMask, so a
 # user without the class silently yields zero digit events while login and
@@ -78,7 +80,7 @@ deny = 0.0.0.0/0.0.0.0
 permit = __PROXY_HOST__/255.255.255.255
 read = system,call,originate,dtmf
 write = system,call,originate
-; remove call,originate if this server never places outbound calls
+; remove originate if this server never places outbound calls (call stays: transfers need it)
 """
 
 

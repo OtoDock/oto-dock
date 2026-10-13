@@ -284,3 +284,59 @@ def test_history_reload_reloads_the_deferred_tools_used_in_the_chat(monkeypatch)
     names = [t["name"] for t in s.tools]
     assert LIST["name"] in names and SCHED["name"] not in names
     assert s.catalog.loaded == [LIST["name"]]
+
+
+def test_a_resumed_worker_rebuilds_every_round_and_skips_this_rounds_prompt(monkeypatch):
+    """A Direct LLM worker's continue keeps its conversation: the rounds of
+    the runs on the session, each in its own chat, in start order; the
+    round's own prompt row is left out by its id (a message that landed
+    after it stays), and an aborted turn is trimmed in its own chat only."""
+    from core.layers.direct.layer import _rebuild_history_from_db
+    s = _session(monkeypatch, [MEM])
+    s.model = "test-model"
+    chats = {
+        "run-1": {"id": "run-1", "last_turn_aborted": False},
+        "run-2": {"id": "run-2", "last_turn_aborted": True},
+        "run-3": {"id": "run-3", "last_turn_aborted": False},
+    }
+    rows = {
+        "run-1": [{"id": 1, "role": "user", "content": "draft the plan"},
+                  {"id": 2, "role": "assistant", "content": "plan v1"}],
+        "run-2": [{"id": 3, "role": "user", "content": "add costs"},
+                  {"id": 4, "role": "assistant", "content": "plan v2"},
+                  {"id": 5, "role": "user", "content": "and a timeline"},
+                  {"id": 6, "role": "assistant", "content": "partial"}],
+        "run-3": [{"id": 7, "role": "user", "content": "now the summary"},
+                  {"id": 8, "role": "user", "content": "a person's note"}],
+    }
+    monkeypatch.setattr("storage.database.round_chats_of_session",
+                        lambda sid: ["run-1", "run-2", "run-3"])
+    monkeypatch.setattr("storage.database.get_chat", lambda cid: chats[cid])
+    monkeypatch.setattr("storage.database.get_chat_messages", lambda cid: rows[cid])
+    monkeypatch.setattr("core.layers.direct.layer.app_config.get_model_context_window",
+                        lambda m: 100_000)
+    _rebuild_history_from_db(s, s.session_id, chat_id="run-3", skip_row=7)
+    assert s.messages == [
+        {"role": "user", "content": "draft the plan"},
+        {"role": "assistant", "content": "plan v1"},
+        {"role": "user", "content": "add costs"},
+        {"role": "assistant", "content": "plan v2"},
+        {"role": "user", "content": "a person's note"},
+    ]
+
+
+def test_the_rounds_of_a_session_are_its_runs_chats_in_start_order(temp_db):
+    from storage import database as task_store
+    from storage.pg import get_conn
+    for run_id, chat_id, started in (("r-b", "chat-b", "2026-10-08T10:05:00+00:00"),
+                                     ("r-a", "chat-a", "2026-10-08T10:00:00+00:00"),
+                                     ("r-a2", "chat-a", "2026-10-08T10:10:00+00:00"),
+                                     ("r-x", "chat-x", "2026-10-08T09:00:00+00:00")):
+        task_store.create_run(run_id, "t-1", "agent-a", "delegate", None, "p")
+        with get_conn() as conn:
+            conn.execute("UPDATE task_runs SET session_id=%s, chat_id=%s, started_at=%s "
+                         "WHERE id=%s",
+                         ("s-other" if run_id == "r-x" else "s-1", chat_id, started, run_id))
+            conn.commit()
+    assert task_store.round_chats_of_session("s-1") == ["chat-a", "chat-b"]
+    assert task_store.round_chats_of_session("") == []

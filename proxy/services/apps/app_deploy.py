@@ -41,7 +41,7 @@ from storage.pg import run_db
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 # The deploy answer's ``status`` (core-seams phase 8): what ``deploy_folder``
 # and the approve / reject routes return, what the hooks forward to the
@@ -863,11 +863,26 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
     cannot tell a missing folder from an emptied one, and dropping the
     platform copy on either would lose the app."""
     from core.remote import remote_file_flow
-    listing = await remote_file_flow.list_remote_files(session_id, rel_dir)
+    listing = await remote_file_flow.list_remote_entries(session_id, rel_dir, report_skipped=True)
     if listing is None:
         raise DeployError("could not list the folder on your machine — is the connection up?")
     wanted = []
-    for rel in listing:
+    # What the machine could not read is neither pulled nor taken for gone:
+    # the platform's copy of such a file, and of everything under such a
+    # folder, stays as it is.
+    unread: set[str] = set()
+    unread_dirs: list[str] = []
+    for entry in listing:
+        rel = entry["path"]
+        if entry.get("skipped"):
+            if entry.get("dir"):
+                if not rel or rel_dir.startswith(rel.rstrip("/") + "/") or rel == rel_dir:
+                    raise DeployError(f"your machine cannot read the folder {rel_dir}; "
+                                      "nothing was changed")
+                unread_dirs.append(rel[len(rel_dir):].lstrip("/").rstrip("/") + "/")
+            else:
+                unread.add(rel[len(rel_dir):].lstrip("/"))
+            continue
         inner = rel[len(rel_dir):].lstrip("/")
         parts = inner.split("/")
         if any(p.startswith(".") for p in parts) or "node_modules" in parts or parts[0] == "data":
@@ -881,6 +896,14 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
                           "(node_modules and data are never counted)")
     info = remote_file_flow._get_remote_session_info(session_id)
     agent_dir = config.get_agent_dir(info.agent_name) if info else None
+    # The pulls below replace the platform's files and the step after them
+    # removes the ones the machine lacks: all or nothing, by the turn-end
+    # write-back's own rule.
+    for rel, _inner in wanted:
+        if not await remote_file_flow.write_back_allowed(
+                session_id, info.agent_name if info else "", rel):
+            raise DeployError(f"this session may not copy files from your machine into "
+                              f"{rel_dir}; nothing was changed")
     total = 0
     pulled = 0
     for rel, _inner in wanted:
@@ -892,27 +915,36 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
             total += path.stat().st_size
         if total > PULL_MAX_BYTES:
             raise DeployError(f"the folder is larger than {PULL_MAX_BYTES // (1024 * 1024)} MB")
-    if agent_dir is not None:
+    # A satellite whose listing may leave out files it has (the Windows hash
+    # bug) says nothing about absence: the pulls land, nothing is removed.
+    if agent_dir is not None and remote_file_flow.absence_is_reliable(session_id):
         try:
             root = path_confinement.join_under(agent_dir, rel_dir)
         except path_confinement.PathOutsideRoot:
             raise DeployError("the folder is outside your workspace")
-        keep = {inner for _rel, inner in wanted}
+        keep = {inner for _rel, inner in wanted} | unread
 
-        def _drop_absent() -> None:
+        def _absent() -> list[str]:
             present = releases.walk_tree(root) if root.is_dir() else []
-            for rel_path, _p in present:
-                if rel_path not in keep:
-                    try:
-                        agents_root, rel = releases.agents_rel(root / rel_path)
-                        safe_fs.unlink_beneath(agents_root, rel, missing_ok=True)
-                    except OSError as e:
-                        logger.warning("App deploy: %s was not removed (%s)", rel_path, e.strerror or e)
+            return [rel_path for rel_path, _p in present
+                    if rel_path not in keep and not any(rel_path.startswith(d) for d in unread_dirs)]
+
+        def _drop(rel_paths: list[str]) -> None:
+            for rel_path in rel_paths:
+                try:
+                    agents_root, rel = releases.agents_rel(root / rel_path)
+                    safe_fs.unlink_beneath(agents_root, rel, missing_ok=True)
+                except OSError as e:
+                    logger.warning("App deploy: %s was not removed (%s)", rel_path, e.strerror or e)
 
         try:
-            await asyncio.to_thread(_drop_absent)
+            absent = await asyncio.to_thread(_absent)
         except releases.ReleaseInvalid as e:
             raise DeployError(str(e))
+        # A removal is a write-back of the machine's absence: the same gate.
+        removable = [p for p in absent if await remote_file_flow.write_back_allowed(
+            session_id, info.agent_name if info else "", f"{rel_dir}/{p}")]
+        await asyncio.to_thread(_drop, removable)
     return pulled
 
 

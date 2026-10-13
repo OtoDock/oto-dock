@@ -1143,7 +1143,7 @@ def test_every_turn_start_is_reviewed_for_a_machine_that_is_reconnecting():
         ("dashboard_server_events.py", "_run_server_turn", "_start_new_stream"),
         ("dashboard_server_events.py", "_handle_server_notification", "_run_server_turn"),
         ("dashboard_server_events.py", "_run_server_turn_or_keep", "_run_server_turn"),
-        ("dashboard_server_events.py", "_run_kick_headless", "_run_server_turn"),
+        ("dashboard_server_events.py", "_run_kick_headless_turn", "_run_server_turn"),
     }
 
 
@@ -1399,10 +1399,10 @@ def test_a_platform_turn_waits_while_a_queued_delivery_holds_the_chat(temp_db, m
             go = asyncio.Event()
             real_push = ChatSendMixin._push_batch_attachments
 
-            async def _paused(agent, batch):
+            async def _paused(agent, batch, session_id):
                 in_start.set()
                 await go.wait()
-                return await real_push(agent, batch)
+                return await real_push(agent, batch, session_id)
             monkeypatch.setattr(ChatSendMixin, "_push_batch_attachments", staticmethod(_paused))
             q = await input_queue.loaded(chat_id)
             await q.add("q-1", "user-admin", TurnInput("queued"),
@@ -1451,4 +1451,514 @@ def test_a_server_turn_is_kept_as_the_wake_while_another_starter_holds_the_chat(
             wakes = await asyncio.to_thread(task_store.claim_pending_wake_records, chat_id)
             assert [w.get("prompt") for w in wakes] == ["the job's review"]
             q.release(claim)
+    run_ws_scenario(scenario)
+
+
+class _ReachConnection(_CancelConnection):
+    """A connection viewing ``chat_id`` that names another chat in a frame."""
+
+    def __init__(self, sub: str, role: str, chat_id: str):
+        super().__init__(sub, role, chat_id)
+        from ws.dashboard_dispatch import ClientMessageDispatcher
+        self._may_reach_chat = ClientMessageDispatcher._may_reach_chat.__get__(self)
+        self._on_cancel_all_queued = ClientMessageDispatcher._on_cancel_all_queued.__get__(self)
+
+    def _viewer_context(self):
+        return "viewer"
+
+    def _cancel_artifacts(self, cid):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_frame_for_a_chat_the_person_cannot_open_loads_nothing(temp_db,
+                                                                             monkeypatch):
+    """A cancel with no stream for a chat other than the viewed one asks the
+    REST rule first: a chat the person cannot open, or none at all, is
+    refused and never loaded into the registry."""
+    import api.agents.chats as chats_api
+    monkeypatch.setattr(chats_api, "can_access_chat", lambda ctx, chat: False)
+    temp_db.create_chat("chat-other", "user-admin", "agent-a", "default")
+    conn = _ReachConnection("user-viewer", "member", "chat-mine")
+    await conn._on_cancel_queued({"queue_id": "x", "chat_id": "chat-other"})
+    await conn._on_cancel_all_queued({"chat_id": "chat-other"})
+    await conn._on_cancel_queued({"queue_id": "x", "chat_id": "no-such-chat"})
+    assert "chat-other" not in input_queue._registry
+    assert "no-such-chat" not in input_queue._registry
+    assert len(conn.errors) == 3
+
+
+def test_the_registry_forgets_idle_chats_past_its_cap(monkeypatch):
+    """Past the cap the least recently touched idle queues go; a queue with a
+    waiting message or a claim stays whatever its age."""
+    monkeypatch.setattr(input_queue, "IDLE_EVICT_S", 0.0)
+    waiting = input_queue.get("chat-waiting")
+    waiting.items.append(input_queue.QueuedInput(
+        queue_id="w1", chat_id="chat-waiting", author_sub="a", item=TurnInput("x")))
+    claimed = input_queue.get("chat-claimed")
+    token = claimed.try_claim()
+    for i in range(input_queue.REGISTRY_CAP + 200):
+        input_queue.get(f"chat-{i}")
+    assert len(input_queue._registry) <= input_queue.REGISTRY_CAP
+    assert "chat-waiting" in input_queue._registry and "chat-claimed" in input_queue._registry
+    claimed.release(token, rearm=False)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_put_back_after_a_drop_keeps_the_dropped_out(temp_db, monkeypatch):
+    """``drop_where`` racing a batch a delivery already took: the delivery's
+    deferral puts the batch back, the dropped author's messages stay gone."""
+    from services.notifications import notification_manager
+    monkeypatch.setattr(notification_manager, "push_live", lambda *a, **k: 1)
+    cid = "chat-drop-race"
+    temp_db.create_chat(cid, "user-admin", "agent-a", "default")
+    q = await input_queue.loaded(cid)
+    await q.add("a1", "user-a", TurnInput("one"))
+    await q.add("b1", "user-b", TurnInput("two"))
+    await chat_writer.drain(cid, timeout=2)
+    taken = q.take("user-a")
+    await input_queue.drop_where(author_sub="user-a")
+    q.put_back(taken)
+    assert [qi.queue_id for qi in q.items] == ["b1"]
+    assert [r["queue_id"] for r in task_store.list_chat_input_queue(cid)] == ["b1"]
+
+
+@pytest.mark.asyncio
+async def test_a_starter_waits_for_the_claim_within_its_bound(monkeypatch):
+    """``claim_when_free`` takes the claim once its holder lets go, gives up at
+    its bound, and with ``supersede`` passes a running pump (the caller
+    replaces its own) but never another starter's claim."""
+    from types import SimpleNamespace
+    q = input_queue.get("chat-cwf")
+    held = q.try_claim()
+
+    async def free():
+        await asyncio.sleep(0.2)
+        q.release(held, rearm=False)
+    freer = asyncio.create_task(free())
+    got = await input_queue.claim_when_free("chat-cwf", timeout=2)
+    await freer
+    assert got is not None and q.claimed
+    assert await input_queue.claim_when_free("chat-cwf", timeout=0.2) is None
+    q.release(got, rearm=False)
+
+    monkeypatch.setitem(stream_pump._active_pumps, "chat-sup", SimpleNamespace(
+        is_done=False, _return_upto=None, source_type="phone"))
+    assert await input_queue.claim_when_free("chat-sup", timeout=0.2) is None
+    own = await input_queue.claim_when_free("chat-sup", timeout=0.2, supersede=True)
+    assert own is not None
+    assert await input_queue.claim_when_free("chat-sup", timeout=0.2, supersede=True) is None
+    input_queue.get("chat-sup").release(own, rearm=False)
+
+
+def test_a_send_deferred_after_its_heal_keeps_its_batch_as_one_card(temp_db, monkeypatch):
+    """A5: the machine drops between the heal and the start of a send that
+    took the person's waiting messages ahead of itself: their rows are
+    written, nothing reached the engine, so one undelivered card keeps every
+    message of the batch for a re-send."""
+    from ws.dashboard_chat_send import ChatSendMixin
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+    real_heal = ChatSendMixin._heal_viewed_session
+    dropped: list[str] = []
+
+    async def _heal(self, msg):
+        out = await real_heal(self, msg)
+        if not dropped and self.session_id:
+            dropped.append(self.session_id)
+            _reconnecting(layer, self.session_id)
+        return out
+    monkeypatch.setattr(ChatSendMixin, "_heal_viewed_session", _heal)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            q = await input_queue.loaded(chat_id)
+            await q.add("q-early", "user-admin", TurnInput("early"))
+            ws.client_send({"type": "chat", "text": "typed", "chat_id": chat_id})
+            await _until(ws, "done")
+            await chat_writer.drain(chat_id, timeout=5)
+            assert layer.messages == []
+            [card] = _cards(chat_id)
+            assert "early" in card["message"] and "typed" in card["message"]
+    run_ws_scenario(scenario)
+
+
+def test_a_busy_send_queues_behind_the_same_persons_waiting_message(temp_db, monkeypatch):
+    """A steer never overtakes the same author's earlier waiting message: it
+    queues behind it, so the engine reads them in the order they were sent."""
+    layer, gate, slug = _setup(monkeypatch)
+    layer.steer_accepts = True
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await _start(ws, layer, slug)
+            q = await input_queue.loaded(chat_id)
+            await q.add("q-first", "user-admin", TurnInput("first"))
+            ws.client_send({"type": "chat", "text": "second", "chat_id": chat_id,
+                            "queue_id": "q-second"})
+            frame = await _until(ws, "queued")
+            while frame["queue_id"] != "q-second":
+                frame = await _until(ws, "queued")
+            assert layer.steered == []
+            assert [qi.queue_id for qi in q.items] == ["q-first", "q-second"]
+            gate.set()
+            await _until(ws, "done")
+    run_ws_scenario(scenario)
+
+
+def test_a_drain_a_teammates_terminal_refuses_keeps_the_messages_marked(temp_db,
+                                                                        monkeypatch):
+    """Edge case (a): the heal refused this person because a teammate's live
+    terminal is open on the chat. Nothing was typed: the messages stay in the
+    queue, marked as waiting for that terminal, and no turn starts."""
+    from ws.dashboard_chat_send import ChatSendMixin
+    from ws.dashboard_chat_text import HEAL_REFUSED
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def _refused(self, msg):
+        return HEAL_REFUSED
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            monkeypatch.setattr(ChatSendMixin, "_heal_viewed_session", _refused)
+            q = await input_queue.loaded(chat_id)
+            await q.add("q-1", "user-admin", TurnInput("mine"))
+            ws.client_send({"type": "resume_chat", "chat_id": chat_id})
+            await _wait_for(lambda: q.items and q.items[0].waiting == input_queue.WAITING_TERMINAL)
+            assert layer.messages == []
+            assert not q.claimed
+            assert [r["queue_id"] for r in task_store.list_chat_input_queue(chat_id)] == ["q-1"]
+            # The terminal's close clears the mark and arms the delivery.
+            input_queue.clear_waiting(chat_id, input_queue.WAITING_TERMINAL)
+            assert q.items[0].waiting == ""
+    run_ws_scenario(scenario)
+
+
+@pytest.mark.asyncio
+async def test_a_queued_turns_attachments_go_only_where_they_are_missing(tmp_path, monkeypatch):
+    """A7: before a headless queued turn, a photo or file goes only to the
+    chat's own machine and only when that machine lacks it; a session the
+    remote layer does not hold pushes nothing."""
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout
+    from ws.dashboard_chat_send import ChatSendMixin
+    agent_dir = tmp_path / "agent"
+    (agent_dir / "workspace").mkdir(parents=True)
+    (agent_dir / "workspace" / "held.png").write_bytes(b"x" * 10)
+    (agent_dir / "workspace" / "new.pdf").write_bytes(b"y" * 20)
+    monkeypatch.setattr(config, "get_agent_dir", lambda agent: agent_dir)
+    held = {"workspace/held.png": {"exists": True, "size": 10, "mtime_ns": 0}}
+
+    async def _probe(sid, rel):
+        return held.get(rel, {"exists": False})
+    pushes: list[tuple[str, str | None]] = []
+
+    async def _fan_out(agent, rel, source, **kw):
+        pushes.append((rel, kw.get("only_machine_id")))
+    monkeypatch.setattr(remote_file_flow, "stat_probe", _probe)
+    monkeypatch.setattr(workspace_fanout, "fan_out_write", _fan_out)
+    batch = TurnInput("t", image_meta=[{"path": "workspace/held.png", "name": "held.png"}],
+                      files=[{"path": "workspace/new.pdf", "name": "new.pdf"}])
+    monkeypatch.setattr(remote_file_flow, "remote_machine_id", lambda sid: "m-1")
+    await ChatSendMixin._push_batch_attachments("agent-a", batch, "sid-remote")
+    assert pushes == [("workspace/new.pdf", "m-1")]
+    pushes.clear()
+    monkeypatch.setattr(remote_file_flow, "remote_machine_id", lambda sid: "")
+    await ChatSendMixin._push_batch_attachments("agent-a", batch, "sid-local")
+    assert pushes == []
+
+
+def test_a_send_while_the_chat_gets_ready_waits_behind_its_first_turn(temp_db, monkeypatch):
+    """Every send typed during "Getting ready" is kept: it waits in the
+    chat's queue (no ``done``, no turn of its own) and goes out after the
+    first message, as the next turn, in the order it was typed."""
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            layer.start_gate = asyncio.Event()
+            ws.client_send({"type": "warmup", "agent": slug, "text": "first"})
+            chat_id = (await _until(ws, "warmup_started"))["chat_id"]
+            for n in (2, 3):
+                ws.client_send({"type": "chat", "text": f"send {n}", "chat_id": chat_id,
+                                "queue_id": f"q-{n}", "queue_only": True})
+                assert (await _until(ws, "queued"))["queue_id"] == f"q-{n}"
+            assert input_queue.getting_ready(chat_id)
+            assert await input_queue.deliver(chat_id) is False
+            assert layer.messages == []
+            layer.start_gate.set()
+            await _wait_for(lambda: len(layer.messages) >= 2)
+            await asyncio.sleep(0.3)
+            assert "first" in layer.messages[0][1]
+            # The person's waiting messages ride one turn, in order.
+            assert len(layer.messages) == 2
+            assert layer.messages[1][1].index("send 2") < layer.messages[1][1].index("send 3")
+            assert not input_queue.getting_ready(chat_id)
+            assert input_queue.peek(chat_id) == []
+    run_ws_scenario(scenario)
+
+
+def test_a_second_tabs_send_while_the_chat_gets_ready_is_queued_and_frees_its_composer(
+        temp_db, monkeypatch):
+    """A page that is not in the warmup's "Getting ready" (a second tab)
+    sends a turn of its own: it is queued behind the first turn all the same,
+    and ``done`` ends that page's streaming state."""
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            layer.start_gate = asyncio.Event()
+            ws.client_send({"type": "warmup", "agent": slug, "text": "first"})
+            chat_id = (await _until(ws, "warmup_started"))["chat_id"]
+            ws.client_send({"type": "chat", "text": "from tab two", "chat_id": chat_id,
+                            "queue_id": "q-tab2"})
+            seen: dict = {}
+            while not {"queued", "done"} <= seen.keys():
+                frame = await ws.next_frame(8.0)
+                seen.setdefault(frame.get("type"), frame)
+            assert seen["queued"]["queue_id"] == "q-tab2"
+            assert seen["done"]["chat_id"] == chat_id
+            layer.start_gate.set()
+            await _wait_for(lambda: len(layer.messages) >= 2)
+            assert "first" in layer.messages[0][1]
+            assert layer.messages[1][1] == "from tab two"
+    run_ws_scenario(scenario)
+
+
+def test_a_failed_warmup_hands_the_sends_back(temp_db, monkeypatch):
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+    real_start = layer.start_session
+
+    async def failing_start(sid, agent_cfg):
+        await real_start(sid, agent_cfg)
+        raise RuntimeError("spawn failed")
+    layer.start_session = failing_start
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            layer.start_gate = asyncio.Event()
+            ws.client_send({"type": "warmup", "agent": slug, "text": "first"})
+            chat_id = (await _until(ws, "warmup_started"))["chat_id"]
+            ws.client_send({"type": "chat", "text": "second", "chat_id": chat_id,
+                            "queue_id": "q-2", "queue_only": True})
+            await _until(ws, "queued")
+            layer.start_gate.set()
+            cleared = await _until(ws, "queue_cleared", timeout=8)
+            assert cleared["queue_ids"] == ["q-2"] and cleared["returned"] is True
+            assert cleared["text"] == "second" and cleared["reason"] == "turn_failed"
+            assert input_queue.peek(chat_id) == []
+            assert not input_queue.getting_ready(chat_id)
+            assert layer.messages == []
+    run_ws_scenario(scenario)
+
+
+def test_stop_during_the_warmup_hands_the_sends_back(temp_db, monkeypatch):
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            layer.start_gate = asyncio.Event()
+            ws.client_send({"type": "warmup", "agent": slug, "text": "first"})
+            chat_id = (await _until(ws, "warmup_started"))["chat_id"]
+            ws.client_send({"type": "chat", "text": "second", "chat_id": chat_id,
+                            "queue_id": "q-2", "queue_only": True})
+            await _until(ws, "queued")
+            ws.client_send({"type": "abort"})
+            seen: dict = {}
+            while len(seen) < 2:
+                frame = await ws.next_frame(5)
+                if frame["type"] in ("queue_cleared", "aborted"):
+                    seen[frame["type"]] = frame
+            assert seen["queue_cleared"]["reason"] == "stopped"
+            assert seen["queue_cleared"]["returned"] is True
+            layer.start_gate.set()
+            await asyncio.sleep(0.5)
+            assert layer.messages == []
+            assert input_queue.peek(chat_id) == []
+    run_ws_scenario(scenario)
+
+
+def test_the_first_turn_hold_ends_when_it_starts_or_never_runs(monkeypatch):
+    input_queue.hold_first_turn("c-hold")
+    assert input_queue.getting_ready("c-hold")
+    assert input_queue.first_turn_started("c-hold") is True
+    assert not input_queue.getting_ready("c-hold")
+    assert input_queue.first_turn_started("c-hold") is False
+    # A kick that never ran: the queue's own delivery takes what waits,
+    # whether the hold was still set or had lapsed, unless a pump drives
+    # the chat (its end drains it).
+    armed: list[str] = []
+    monkeypatch.setattr(input_queue, "arm", armed.append)
+    monkeypatch.setattr(input_queue, "peek", lambda cid: ["waiting"])
+    input_queue.hold_first_turn("c-hold")
+    input_queue.first_turn_not_run("c-hold")
+    assert armed == ["c-hold"] and not input_queue.getting_ready("c-hold")
+    input_queue.first_turn_not_run("c-hold")
+    assert armed == ["c-hold", "c-hold"]
+
+    class _Live:
+        is_done = False
+    monkeypatch.setitem(stream_pump._active_pumps, "c-hold", _Live())
+    input_queue.first_turn_not_run("c-hold")
+    assert armed == ["c-hold", "c-hold"]
+    # A hold whose kick never came stops counting.
+    monkeypatch.setattr(input_queue, "FIRST_TURN_HOLD_S", 0.0)
+    input_queue.hold_first_turn("c-hold")
+    assert not input_queue.getting_ready("c-hold")
+
+
+def test_two_authors_on_a_personal_chat_ride_its_next_turn(temp_db, monkeypatch):
+    """A personal chat's producer drains every waiting message, whoever
+    typed it: a teammate's (through a share) and the owner's go out as one
+    turn after the running one."""
+    layer, gate, slug = _setup(monkeypatch)
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await _start(ws, layer, slug)
+            q = await input_queue.loaded(chat_id)
+            await q.add("q-team", "user-manager", TurnInput("from a teammate"))
+            ws.client_send({"type": "chat", "text": "from me", "chat_id": chat_id,
+                            "queue_id": "q-me"})
+            await _until(ws, "queued")
+            gate.set()
+            await _wait_for(lambda: len(layer.messages) >= 2)
+            await asyncio.sleep(0.3)
+            assert len(layer.messages) == 2
+            second = layer.messages[1][1]
+            assert second.index("from a teammate") < second.index("from me")
+            assert input_queue.peek(chat_id) == []
+    run_ws_scenario(scenario)
+
+
+def test_on_a_shared_only_chat_each_queued_message_runs_as_its_author(temp_db, monkeypatch):
+    """A Shared-only chat runs every message as the person who typed it: the
+    producer drains its own person's, and the delivery at its end sends the
+    teammate's as the teammate."""
+    gate = asyncio.Event()
+    calls = {"n": 0}
+    layer = FakeExecutionLayer()
+    layer.turn_events = _gated_turns(gate, calls)
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent(default_scope="agent", collaborative=False)
+    set_username("user-admin", "admin")
+    set_username("user-manager", "manager")
+    task_store.set_user_agents("user-manager", [slug], "user-admin",
+                               agent_roles={slug: "manager"})
+
+    async def scenario():
+        teammate = session_cookie(sub="user-manager", email="manager@test.com",
+                                  name="Manager User", role="creator")
+        async with dashboard_connection(session_cookie()) as ws, \
+                dashboard_connection(teammate) as ws2:
+            await drain_startup(ws)
+            await drain_startup(ws2)
+            chat_id, _sid = await _start(ws, layer, slug)
+            ws2.client_send({"type": "chat", "text": "from a teammate", "chat_id": chat_id,
+                             "queue_id": "q-team"})
+            await _until(ws2, "queued")
+            ws.client_send({"type": "chat", "text": "from me", "chat_id": chat_id,
+                            "queue_id": "q-me"})
+            # Every socket of the chat sees each chip: wait for this one's.
+            while (await _until(ws, "queued")).get("queue_id") != "q-me":
+                pass
+            gate.set()
+            await _wait_for(lambda: len(layer.messages) >= 3, timeout=8)
+            assert "from me" in layer.messages[1][1]
+            assert "from a teammate" not in layer.messages[1][1]
+            assert "from a teammate" in layer.messages[2][1]
+            await chat_writer.drain(chat_id, timeout=5)
+            authors = {m["content"]: m.get("author_sub")
+                       for m in task_store.get_chat_messages(chat_id) if m["role"] == "user"}
+            assert authors["from me"] == "user-admin"
+            assert authors["from a teammate"] == "user-manager"
+    run_ws_scenario(scenario)
+
+
+def test_a_send_typed_while_the_chat_got_ready_never_stops_or_steers_its_first_turn(
+        temp_db, monkeypatch):
+    """A send the page marks ``queue_only`` (typed during "Getting ready")
+    that reaches the proxy after the first turn started follows that turn:
+    no steer into it, no stop-and-send interrupt of it."""
+    layer, gate, slug = _setup(monkeypatch)
+    layer.steer_accepts = True
+    layer.interrupt_for_queued_accepts = True
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await _start(ws, layer, slug)
+            ws.client_send({"type": "chat", "text": "after the first", "chat_id": chat_id,
+                            "queue_id": "q-after", "queue_only": True})
+            assert (await _until(ws, "queued"))["queue_id"] == "q-after"
+            await asyncio.sleep(0.2)
+            assert layer.steered == [] and layer.queued_interrupts == []
+            gate.set()
+            await _wait_for(lambda: len(layer.messages) == 2)
+            assert layer.messages[1][1] == "after the first"
+    run_ws_scenario(scenario)
+
+
+class _OwnTerminal:
+    """A live terminal the queued messages' author drives."""
+
+    def __init__(self, chat_id: str, sid: str):
+        self.chat_id = chat_id
+        self.session_id = sid
+        self.alive = True
+        self.typed: list[bytes] = []
+
+    def may_drive(self, sub):
+        return True
+
+    def deliver_dashboard_input(self, data, *, composer=False, sender_sub=""):
+        self.typed.append(data)
+
+
+def test_a_delivery_types_the_authors_batch_into_their_own_terminal(temp_db, monkeypatch):
+    """Sends queued while the person's interactive warmup got ready go into
+    the terminal it opened (one paste for the batch, one row for it), never
+    left waiting for that terminal to close."""
+    from core.session import interactive_session
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            q = await input_queue.loaded(chat_id)
+            held = q.try_claim()
+            ws.client_send({"type": "chat", "text": "into the terminal", "chat_id": chat_id,
+                            "queue_id": "q-term"})
+            await _until(ws, "queued")
+            term = _OwnTerminal(chat_id, sid)
+            monkeypatch.setattr(interactive_session, "find_live_for_chat",
+                                lambda cid: term if cid == chat_id else None)
+            q.release(held)
+            await _wait_for(lambda: term.typed)
+            assert b"into the terminal" in term.typed[0]
+            assert term.typed[0].startswith(b"\x1b[200~") and term.typed[0].endswith(b"\r")
+            sent = await _until(ws, "queue_sent")
+            assert sent["queue_ids"] == ["q-term"]
+            await chat_writer.drain(chat_id, timeout=5)
+            assert ("user", "into the terminal") in _rows(chat_id)
+            assert task_store.list_chat_input_queue(chat_id) == []
+            assert layer.messages == []
     run_ws_scenario(scenario)

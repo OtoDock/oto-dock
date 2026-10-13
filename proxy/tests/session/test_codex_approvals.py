@@ -339,15 +339,51 @@ def test_attended_chats_ask_for_every_command_and_patch():
     ``never`` (nothing asks), and the fallback trigger recognises a daemon
     that retired the wire value."""
     from core.layers.codex.codex_approvals import (
-        UNTRUSTED_FALLBACK, UNTRUSTED_POLICY, is_untrusted_policy_rejection,
+        UNTRUSTED_FALLBACK, UNTRUSTED_POLICY, approval_policy, is_untrusted_policy_rejection,
     )
-    assert approval_for_sandbox("workspace-write", attended=True) == UNTRUSTED_POLICY
-    assert approval_for_sandbox("read-only", attended=True) == UNTRUSTED_POLICY
-    assert approval_for_sandbox("danger-full-access", attended=True) == "never"
+    assert approval_policy("default", "workspace-write", attended=True) == UNTRUSTED_POLICY
+    assert approval_policy("acceptEdits", "workspace-write", attended=True) == UNTRUSTED_POLICY
+    assert approval_policy("plan", "read-only", attended=True) == UNTRUSTED_POLICY
+    assert approval_policy("dontAsk", "danger-full-access", attended=True) == "never"
+    assert approval_policy("auto", "danger-full-access", attended=True) == "never"
     assert UNTRUSTED_FALLBACK == "on-request"
     assert is_untrusted_policy_rejection("invalid params: unknown variant `untrusted`")
     assert is_untrusted_policy_rejection(RuntimeError("approvalPolicy: UnlessTrusted is not supported"))
     assert not is_untrusted_policy_rejection("thread not found")
+
+
+def test_the_mode_not_the_sandbox_picks_an_attended_chats_policy():
+    """A machine paired with full access runs default and acceptEdits under
+    danger-full-access: the chat still asks through the bridge there, and
+    only dontAsk / auto run under never, where the hook judges (HOOKS.md
+    "Attended Codex chats"). Unattended sessions and a proxy that ships no
+    mode keep the sandbox rule."""
+    from core.layers.codex.codex_approvals import (
+        NO_PROMPT_MODES, UNTRUSTED_POLICY, approval_policy,
+    )
+    assert NO_PROMPT_MODES == {"dontAsk", "auto"}
+    for mode in ("default", "acceptEdits"):
+        assert approval_policy(mode, "danger-full-access", attended=True) == UNTRUSTED_POLICY
+    assert approval_policy("dontAsk", "workspace-write", attended=True) == "never"
+    # Unattended: the sandbox decides, whatever the mode (a judge included).
+    assert approval_policy("default", "danger-full-access", attended=False) == "never"
+    assert approval_policy("default", "workspace-write", attended=False) == "on-request"
+    assert approval_policy("judge", "read-only", attended=False) == "on-request"
+    assert approval_policy("auto", "danger-full-access", attended=False) == "never"
+    # No mode shipped (an older proxy on a 0.5.143 satellite): as before.
+    assert approval_policy("", "danger-full-access", attended=True) == "never"
+    assert approval_policy("", "workspace-write", attended=True) == UNTRUSTED_POLICY
+
+
+def test_the_untrusted_fallback_never_leaves_a_full_access_chat_unjudged():
+    """A daemon that refuses ``untrusted``: on-request where a sandbox
+    escape still reaches the bridge; never under danger-full-access, where
+    on-request would run every command with no judge and never hands the
+    call to the hook."""
+    from core.layers.codex.codex_approvals import UNTRUSTED_FALLBACK, untrusted_fallback
+    assert untrusted_fallback("workspace-write") == UNTRUSTED_FALLBACK
+    assert untrusted_fallback("read-only") == UNTRUSTED_FALLBACK
+    assert untrusted_fallback("danger-full-access") == "never"
 
 
 def test_sandbox_policy_danger_full_access():

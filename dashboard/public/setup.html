@@ -4,8 +4,30 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 <title>Connect to Server</title>
-<link href="https://fonts.googleapis.com/css2?family=Comfortaa:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+  /* The page loads nothing from another host: the fonts are the build's own
+     copies (dist/setup-fonts, vite.config.ts), which cap sync puts beside this
+     page in the app's assets. */
+  @font-face {
+    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 400;
+    src: url(setup-fonts/comfortaa-latin-400-normal.woff2) format('woff2');
+    unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+  }
+  @font-face {
+    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 400;
+    src: url(setup-fonts/comfortaa-greek-400-normal.woff2) format('woff2');
+    unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+  }
+  @font-face {
+    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 600;
+    src: url(setup-fonts/comfortaa-latin-600-normal.woff2) format('woff2');
+    unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+  }
+  @font-face {
+    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 600;
+    src: url(setup-fonts/comfortaa-greek-600-normal.woff2) format('woff2');
+    unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: 'Comfortaa', system-ui, sans-serif;
@@ -122,6 +144,17 @@
     cursor: pointer;
   }
   .btn-link:hover { color: #fff; }
+  .privacy-link {
+    display: none;
+    margin: 1.5rem auto 0;
+    background: transparent;
+    border: none;
+    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-size: 0.75rem;
+    color: #888;
+    text-decoration: underline;
+    cursor: pointer;
+  }
   /* "Server unreachable" → switch to another installation */
   .installs-picker { display: none; margin-bottom: 1rem; text-align: left; }
   .installs-picker.visible { display: block; }
@@ -191,6 +224,8 @@
     <button id="cancel-btn" class="btn-link" onclick="cancelAdd()" style="display:none">
       Cancel
     </button>
+
+    <button id="privacy-link" class="privacy-link" type="button" onclick="openPrivacyPolicy()">Privacy policy</button>
   </div>
 
 <script>
@@ -217,6 +252,20 @@
       document.getElementById('cancel-btn').style.display = 'block';
     }
   })();
+
+  // Inside the app only: the app opens OtoDock's privacy policy in the
+  // system browser (the stores require a link to it within the app).
+  (function() {
+    try {
+      if (typeof Android.openPrivacyPolicy === 'function') {
+        document.getElementById('privacy-link').style.display = 'inline-block';
+      }
+    } catch (e) { /* not native */ }
+  })();
+
+  function openPrivacyPolicy() {
+    try { Android.openPrivacyPolicy(); } catch (e) { /* not native */ }
+  }
 
   function cancelAdd() {
     try { Android.cancelAddInstallation(); } catch (e) { /* not native */ }

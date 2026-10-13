@@ -13,7 +13,7 @@ import logging
 
 import config
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 
 # Hard max-time backstop for an interactive task run:

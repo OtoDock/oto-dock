@@ -61,13 +61,25 @@ from core.session.transcript_tool_events import (
 )
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.transcript_tailer")
+logger = logging.getLogger("otodock.transcript_tailer")
 
 
 # The batch's ``last_signal`` words that leave a turn open (both engines'
 # tailers report the same): a prompt opened one, or a tool call is under way.
 SIGNAL_PROMPT = "user"
 SIGNAL_TOOL_USE = "tool_use"
+
+
+def line_time(obj: dict) -> float | None:
+    """A transcript line's own time (its ISO ``timestamp``, the clock of the
+    host the CLI runs on), or None for a line without one."""
+    raw = obj.get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def leaves_turn_open(last_signal: str | None) -> bool:
@@ -187,12 +199,16 @@ def resolve_and_tail(session_id: str, chat_id: str) -> dict:
     return tail_transcript(session_id, chat_id, path)
 
 
-# Injected prelude line(s) — the `[Current time: ...]` stamp and the viewer
-# focus line (APPS.md "Live apps") the platform prepends to interactive
-# prompts; the PTY transcript persists them verbatim. Twin of the dashboard's
-# transcriptCleanup.ts matcher: start-anchored exact shapes only.
+# Injected prelude line(s) — the `[Current time: ...]` stamp, the viewer
+# focus line (APPS.md "Live apps") and the parallel-activity line
+# (``sibling_awareness``) the platform prepends to interactive prompts; the
+# PTY transcript persists them verbatim. Twin of the dashboard's
+# transcriptCleanup.ts matcher: start-anchored exact shapes only, ending in
+# a line break or, on a single-lined satellite prompt, in spaces.
 _TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
 # Twin of ``ws/dashboard_chat._APP_ACTION_HEADER_RE`` — see there.
@@ -505,6 +521,9 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     # "tool_use" (mid-turn), "end_turn" (turn closed), None (nothing
     # turn-relevant in the batch — tool_result-only lines don't count).
     last_signal: str | None = None
+    # The journal time of the line that set ``last_signal`` (the CLI host's
+    # clock): a terminal parked on a dialog ignores a reopen from before it.
+    last_signal_at: float | None = None
     # AskUserQuestion / ExitPlanMode ids asked this batch and not yet
     # answered. The harness BLOCKS the turn on the dialog (no further
     # assistant lines until the tool_result), so an id still open at batch
@@ -574,16 +593,9 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
             # persisted (and usage-recorded) when it originally happened.
             # Lines without a timestamp (mode/meta records) pass through; real
             # turn-content lines always carry one.
-            ts_raw = obj.get("timestamp")
-            if isinstance(ts_raw, str) and ts_raw:
-                try:
-                    line_ts = datetime.fromisoformat(
-                        ts_raw.replace("Z", "+00:00")).timestamp()
-                except ValueError:
-                    line_ts = None
-                if line_ts is not None and \
-                        line_ts < min_line_ts - _ATTACH_TS_SKEW_S:
-                    continue
+            line_ts = line_time(obj)
+            if line_ts is not None and line_ts < min_line_ts - _ATTACH_TS_SKEW_S:
+                continue
         msg = obj.get("message") or {}
         content = msg.get("content")
 
@@ -664,6 +676,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                         buf.pending.pop(tuid, None)
                         reg.mark_done(tuid, buffer=False)
                 last_signal = "end_turn"
+                last_signal_at = line_time(obj)
                 continue
             if text.strip():
                 cleaned = _strip_command_noise(text)
@@ -688,6 +701,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                         buf.pending.pop(tuid, None)
                         reg.mark_done(tuid, buffer=False)
                 last_signal = "user"
+                last_signal_at = line_time(obj)
                 if first_user_text is None:
                     first_user_text = cleaned
                 if consume_sent_prompt(chat_id, cleaned):
@@ -767,6 +781,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                 last_stop_reason = sr
                 last_assistant_text = "".join(msg_text_parts)
                 last_signal = "end_turn" if sr == "end_turn" else "tool_use"
+                last_signal_at = line_time(obj)
 
     # Question fold: an AskUserQuestion or ExitPlanMode still unanswered at
     # batch end means the harness is blocked on the dialog — close the turn
@@ -828,6 +843,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
         "turn_complete": last_stop_reason == "end_turn",
         "last_message": last_assistant_text,
         "last_signal": last_signal,
+        "last_signal_at": last_signal_at,
         # Turn parked on an unanswered AskUserQuestion (folded to end_turn
         # above) — the session words the end-of-turn ping as a question.
         "question_pending": question_pending,

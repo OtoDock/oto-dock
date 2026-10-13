@@ -94,3 +94,4 @@ The `satellite` and `phone` jobs run those two suites in each service's own
 environment (its lockfile plus the test tools from `proxy/requirements-test.txt`),
 the way a paired machine and the phone image install them. The private
 workflow runs all four Python suites in one environment instead.
+

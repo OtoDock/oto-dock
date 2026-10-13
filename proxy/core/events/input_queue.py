@@ -27,8 +27,9 @@ import asyncio
 import functools
 import json
 import logging
+import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,7 +39,7 @@ from storage import database as task_store
 from storage.pg import run_db
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 #: Waiting messages a chat holds at most (a client cannot grow the table
 #: without bound by spamming ``chat`` while a turn streams).
@@ -66,6 +67,16 @@ DELIVERY_DEFERRED = "deferred"
 #: ``waiting``, FROZEN wire): held in memory on the item, cleared when the
 #: machine is back.
 WAITING_RECONNECT = "reconnect"
+#: A message waits for a teammate's live terminal on its chat to close (its
+#: author may not drive that terminal): cleared, and the queue armed, when the
+#: terminal closes.
+WAITING_TERMINAL = "terminal"
+
+#: Chats the registry holds before it evicts idle ones, and how long an entry
+#: stays untouched before it counts as idle (its ``accepted`` memory answers a
+#: re-send after a reconnect, which comes within seconds).
+REGISTRY_CAP = 4096
+IDLE_EVICT_S = 600.0
 
 #: The return reasons the server decides: the author also gets the card,
 #: since the live frame that restores the composer can be lost.
@@ -140,6 +151,10 @@ class ChatInputQueue:
     _seq: int = 0
     _loaded: bool = False
     _loading: "asyncio.Future | None" = None
+    # Queue ids ``drop_where`` removed: a batch a delivery took before the
+    # drop and puts back after a deferral leaves them out.
+    _dropped: set = field(default_factory=set)
+    touched: float = field(default_factory=time.monotonic)
 
     async def load(self) -> bool:
         """The rows and the chat's owner and agent, once per process (a
@@ -211,6 +226,10 @@ class ChatInputQueue:
     @property
     def claimed(self) -> bool:
         return self._claim is not None
+
+    def holds(self, token: object | None) -> bool:
+        """``token`` is the claim the chat is held by."""
+        return token is not None and self._claim is token
 
     def try_claim(self) -> object | None:
         """The chat for one turn starter: its token when no pump drives the
@@ -306,9 +325,17 @@ class ChatInputQueue:
         return taken
 
     def put_back(self, taken: list[QueuedInput]) -> None:
-        """Entries a taker could not send go back ahead of the rest."""
-        self.items[:0] = taken
+        """Entries a taker could not send go back ahead of the rest (an
+        entry dropped meanwhile stays gone)."""
+        self.items[:0] = [qi for qi in taken if qi.queue_id not in self._dropped]
         self.items.sort(key=lambda qi: qi.seq)
+
+    @property
+    def idle(self) -> bool:
+        """Nothing waits, nobody holds or loads it, and it was not touched
+        for ``IDLE_EVICT_S``: the registry may forget it."""
+        return (not self.items and self._claim is None and self._loading is None
+                and time.monotonic() - self.touched > IDLE_EVICT_S)
 
     def accept_job(self, taken: list[QueuedInput], *, extra_meta: dict | None = None,
                    ) -> asyncio.Future:
@@ -345,8 +372,53 @@ class ChatInputQueue:
         return chat_writer.submit(cid, _job, label="queue_drop")
 
 
-_registry: dict[str, ChatInputQueue] = {}
+_registry: "OrderedDict[str, ChatInputQueue]" = OrderedDict()
 _tasks: set[asyncio.Task] = set()
+
+#: A warmup's server-kicked first turn, enqueued and not yet started, per chat
+#: (the monotonic time it was enqueued). A kick starts within seconds of it;
+#: past ``FIRST_TURN_HOLD_S`` the hold no longer counts (a kick that never ran).
+_first_turns: dict[str, float] = {}
+FIRST_TURN_HOLD_S = 120.0
+
+
+def hold_first_turn(chat_id: str) -> None:
+    """The chat's first turn is enqueued: a message sent now, and the queued
+    delivery, wait behind it (its producer drains them after it)."""
+    _first_turns[chat_id] = time.monotonic()
+
+
+def first_turn_started(chat_id: str) -> bool:
+    """The first turn started, failed or was stopped: the hold ends (True
+    when one was held)."""
+    return _first_turns.pop(chat_id, None) is not None
+
+
+def first_turn_not_run(chat_id: str) -> None:
+    """The kick ended without a first turn running on the chat (its start
+    failed or was refused, or it was dropped): what was sent while the chat
+    got ready has no producer to drain it, so the queue's own delivery takes
+    it (whether the hold was still set or had already lapsed)."""
+    from core.events.stream_pump import _active_pumps
+    first_turn_started(chat_id)
+    live = _active_pumps.get(chat_id)
+    if peek(chat_id) and (live is None or live.is_done):
+        arm(chat_id)
+
+
+def getting_ready(chat_id: str) -> bool:
+    """The chat is warming, or its enqueued first turn has not started: what
+    is sent now waits in the queue behind that first turn."""
+    from core.session import warmup_registry
+    if warmup_registry.get(chat_id) is not None:
+        return True
+    at = _first_turns.get(chat_id)
+    if at is None:
+        return False
+    if time.monotonic() - at > FIRST_TURN_HOLD_S:
+        _first_turns.pop(chat_id, None)
+        return False
+    return True
 
 
 def _frozen() -> bool:
@@ -369,7 +441,52 @@ def get(chat_id: str) -> ChatInputQueue:
     if q is None:
         q = ChatInputQueue(chat_id=chat_id)
         _registry[chat_id] = q
+        _evict_idle()
+    else:
+        _registry.move_to_end(chat_id)
+    q.touched = time.monotonic()
     return q
+
+
+def _evict_idle() -> None:
+    """Past ``REGISTRY_CAP`` entries, forget the least recently touched
+    idle ones; a queue with items, a claim or a load in flight stays (the
+    table holds a forgotten queue's rows anyway, loaded again on its next
+    touch)."""
+    if len(_registry) <= REGISTRY_CAP:
+        return
+    for cid in list(_registry):
+        if len(_registry) <= REGISTRY_CAP:
+            break
+        if _registry[cid].idle:
+            del _registry[cid]
+
+
+async def claim_when_free(chat_id: str, *, timeout: float, supersede: bool = False,
+                          ) -> object | None:
+    """The chat's claim for a starter that may wait for it: polled until no
+    other starter holds it and (unless ``supersede``: the caller replaces its
+    own pump, as a phone call's next turn does) no pump drives the chat, or
+    ``timeout`` passes (None)."""
+    from core.events.stream_pump import _active_pumps
+    q = get(chat_id)
+    deadline = time.monotonic() + timeout
+    while True:
+        if supersede:
+            if q._claim is None:
+                q._claim = object()
+                return q._claim
+        else:
+            claim = q.try_claim()
+            if claim is not None:
+                return claim
+        if time.monotonic() >= deadline:
+            live = _active_pumps.get(chat_id)
+            logger.info(f"chat={chat_id[:8]}: no claim after {timeout:.0f}s "
+                        f"({'a starter holds it' if q.claimed else 'a turn runs'}"
+                        f"{'' if live is None else ', pump ' + str(live.source_type)})")
+            return None
+        await asyncio.sleep(0.1)
 
 
 async def loaded(chat_id: str) -> ChatInputQueue:
@@ -392,6 +509,18 @@ def busy(chat_id: str) -> bool:
     """Something of the chat's queue is still to go out (lane quiescence)."""
     q = _registry.get(chat_id)
     return q is not None and (bool(q.items) or q.claimed)
+
+
+def chats_queued_by(author_sub: str) -> list[str]:
+    """The chats whose queue in this process holds a message of
+    ``author_sub``."""
+    return [q.chat_id for q in _registry.values() if q.of(author_sub)]
+
+
+def is_claimed(chat_id: str) -> bool:
+    """A turn starter holds the chat for the turn it is bringing up."""
+    q = _registry.get(chat_id)
+    return q is not None and q.claimed
 
 
 def mint_queue_id() -> str:
@@ -454,10 +583,11 @@ def fan_out_snapshot(chat_id: str) -> None:
             authors=tuple({qi.author_sub for qi in q.items}))
 
 
-def clear_waiting(chat_id: str) -> None:
-    """The chat's machine is back: no chip keeps saying it is reconnecting.
-    The mark lives in memory only, so a queue not loaded here has none."""
-    marked = [qi for qi in peek(chat_id) if qi.waiting]
+def clear_waiting(chat_id: str, reason: str = WAITING_RECONNECT) -> None:
+    """What a chip waited for is over (the chat's machine is back, or a
+    teammate's terminal closed: ``reason``): no chip keeps saying it. The mark
+    lives in memory only, so a queue not loaded here has none."""
+    marked = [qi for qi in peek(chat_id) if qi.waiting == reason]
     for qi in marked:
         qi.waiting = ""
     if marked:
@@ -534,6 +664,9 @@ async def drop_where(*, conn_id: str = "", author_sub: str = "", chat_id: str = 
     by_chat: dict[str, list[str]] = {}
     for r in rows:
         by_chat.setdefault(r["chat_id"], []).append(r["queue_id"])
+    for r in rows:
+        if r["chat_id"] in _registry:
+            _registry[r["chat_id"]]._dropped.add(r["queue_id"])
     for q in list(_registry.values()):
         if chat_id and q.chat_id != chat_id:
             continue
@@ -541,6 +674,7 @@ async def drop_where(*, conn_id: str = "", author_sub: str = "", chat_id: str = 
                 if (not conn_id or qi.origin_conn == conn_id)
                 and (not author_sub or qi.author_sub == author_sub)]
         if gone:
+            q._dropped.update(qi.queue_id for qi in gone if qi.queue_id)
             ids = {id(qi) for qi in gone}
             q.items[:] = [qi for qi in q.items if id(qi) not in ids]
             known = by_chat.setdefault(q.chat_id, [])
@@ -630,6 +764,8 @@ async def deliver(chat_id: str) -> bool:
     if _frozen():
         return False
     q = await loaded(chat_id)
+    if getting_ready(chat_id):
+        return False   # its first turn drains them; the warmup's end arms the rest
     for author in list(dict.fromkeys(qi.author_sub for qi in q.items)):
         live = _active_pumps.get(chat_id)
         if live is not None and not live.is_done:

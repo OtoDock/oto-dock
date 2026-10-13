@@ -15,10 +15,11 @@ Account routing:
     auto-labels from ``userinfo.email``. Every account is persisted under
     the connecting user (there is no platform service-account tier).
 
-Mobile flow:
-  * Same start endpoint; pass ``mobile=true`` and the callback redirects
-    to ``otodock://oauth/{provider}/complete?email=...`` instead of
-    returning HTML.
+The app's flow:
+  * Same start endpoint with ``mobile=true``; the callback exchanges nothing
+    and redirects the vendor's code and the state to
+    ``otodock://oauth/{provider}/complete?code=...&state=...``, and the app's
+    ``/exchange``, under its own login, completes the connect.
 
 This module owns no business logic — it's a thin wrapper around
 ``services/oauth_engine`` (state issuance + exchange orchestration) and
@@ -29,10 +30,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
+import hmac
 import html
 import logging
 import uuid
 from urllib.parse import quote
+
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -48,7 +53,7 @@ from storage.pg import run_db
 from auth.oauth_providers import canonical_provider_id, get_provider
 from auth.providers import UserContext, get_current_user, require_admin, require_human
 
-logger = logging.getLogger("claude-proxy.oauth-api")
+logger = logging.getLogger("otodock.oauth-api")
 router = APIRouter()
 
 
@@ -166,6 +171,108 @@ def _error_html(provider: str, message: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# A connect completes in the browser that started it: the start answers with
+# a cookie naming the state (a ring of the latest four, so two connects
+# started side by side both complete), HttpOnly, alive for the state's life;
+# the web callback refuses, before any exchange, a state the cookie does not
+# name. Lax, since every callback here is a top-level redirect. On https the
+# name takes the ``__Host-`` prefix at the root path, as the login's state
+# cookie does, so a sibling subdomain or another path cannot plant one; over
+# plain http (where browsers ignore the prefix) it keeps a path of its own.
+# The app's connect is bound by its own exchange instead (the system browser
+# shares no jar with the WebView).
+_CONNECT_COOKIE = "oto_oauth_connect"
+_CONNECT_COOKIE_PATH = "/v1/oauth/"
+_CONNECT_RING_MAX = 4
+_EXPIRED = (
+    "This connect expired or was already used (a connect must finish within "
+    "five minutes of clicking Connect, and a platform restart ends it). Close "
+    "this window and click Connect again."
+)
+
+
+def _connect_cookie() -> tuple[str, str]:
+    """The binding cookie's name and path for this install."""
+    if config.COOKIE_SECURE:
+        return f"__Host-{_CONNECT_COOKIE}", "/"
+    return _CONNECT_COOKIE, _CONNECT_COOKIE_PATH
+
+
+def _connect_ring_cookie(request: Request) -> str | None:
+    return request.cookies.get(_connect_cookie()[0])
+
+
+def _state_hash(state: str) -> str:
+    return hashlib.sha256(state.encode()).hexdigest()
+
+
+def _connect_ring(cookie: str | None) -> list[str]:
+    return [h for h in (cookie or "").split(".") if h]
+
+
+def _bound_response(payload: dict, prior: str | None, state: str) -> JSONResponse:
+    """The start's answer, with the browser's ring of states extended by
+    this one."""
+    ring = (_connect_ring(prior) + [_state_hash(state)])[-_CONNECT_RING_MAX:]
+    name, path = _connect_cookie()
+    resp = JSONResponse(payload)
+    resp.set_cookie(
+        name, ".".join(ring), max_age=oauth_engine.STATE_TTL_SECONDS,
+        httponly=True, secure=config.COOKIE_SECURE, samesite="lax", path=path,
+    )
+    return resp
+
+
+def _connect_bound(cookie: str | None, state: str) -> bool:
+    want = _state_hash(state)
+    return any(hmac.compare_digest(h, want) for h in _connect_ring(cookie))
+
+
+def _other_browser_text() -> str:
+    origin = _popup_origin()
+    where = f"on the dashboard at {origin}" if origin != "*" else "on the dashboard"
+    return (
+        "This browser did not start this connect, so nothing was saved. A "
+        f"connect must finish in the browser that started it, {where}. Open "
+        "it there and click Connect again."
+    )
+
+
+def _origin_key(url: str) -> str:
+    """``scheme://host[:port]`` of ``url``, lower-cased, a default port
+    dropped, for comparing the page's origin with the install's."""
+    parts = urlsplit(url.strip())
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None or (scheme, port) in (("http", 80), ("https", 443)):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def _refuse_another_address(request: Request, mobile: bool) -> None:
+    """A connect started from a page open at another address of this
+    install than ``DASHBOARD_PUBLIC_URL`` (the LAN IP where a hostname is
+    configured, ``localhost`` on the server) can never finish: the vendor
+    sends the browser back to the configured address, where the binding
+    cookie set for the page's address is not presented. Refused at the
+    start, with the address to use, instead of at the callback. The app's
+    connect (bound by its exchange) and a caller that sends no ``Origin``
+    are not judged."""
+    origin = request.headers.get("origin")
+    public = _popup_origin()
+    if mobile or not origin or public == "*":
+        return
+    if _origin_key(origin) != _origin_key(public):
+        raise HTTPException(
+            409,
+            f"Accounts connect from {public}, this install's sign-in callback "
+            f"address (DASHBOARD_PUBLIC_URL), and this page is open at {origin}. "
+            f"Open the dashboard at {public}, or ask an admin to set "
+            "DASHBOARD_PUBLIC_URL to the address you use.",
+        )
+
+
 def _redirect_uri(provider: str) -> str:
     """Public callback URL for this provider, derived from DASHBOARD_PUBLIC_URL."""
     base = config.DASHBOARD_PUBLIC_URL.rstrip("/") if config.DASHBOARD_PUBLIC_URL else ""
@@ -217,9 +324,14 @@ def _validate_provider_for_mcp(mcp_name: str, provider_id: str) -> None:
 async def oauth_start(
     provider: str,
     body: OAuthStartRequest,
+    request: Request,
     user: UserContext = Depends(get_current_user),
+    connect_ring: str | None = Depends(_connect_ring_cookie),
 ):
-    """Initiate the OAuth flow. Returns ``{url}`` for the consent popup."""
+    """Initiate the OAuth flow. Returns ``{url}`` for the consent popup, with
+    the cookie that binds the callback to this browser; 409 when the page is
+    open at another address of the install than the one the vendor will
+    send the browser back to."""
     require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
     _validate_services_against_manifest(body.mcp_name, body.services)
@@ -239,15 +351,17 @@ async def oauth_start(
     manifest = mcp_registry.get_manifest(body.mcp_name)
     oauth_block = manifest.credentials.oauth or {}
     redirect_uri = _redirect_uri(provider)
+    _refuse_another_address(request, body.mobile)
 
     # The MCP server names its own authorization server: the install signs
     # in through the client it registered there (or registers first). The
     # rule (`registered_client_mode`) also decides which token files count
     # as connected, so the two never disagree.
     if await run_db(mcp_authorization.registered_client_mode, manifest):
-        return await _start_registered_client(
+        url, state = await _start_registered_client(
             provider, body, manifest, oauth_block, redirect_uri, user,
         )
+        return _bound_response({"url": url}, connect_ring, state)
 
     # HOSTED: no install-side app credential. Mint state for the install's
     # CSRF, then ask the relay for the vendor consent URL. The relay holds
@@ -279,7 +393,7 @@ async def oauth_start(
             # The relay rejected the connect (e.g. seat_exceeded — the install is
             # over its licensed user cap). Surface the mapped, user-facing message.
             raise HTTPException(403, relay_client.relay_error_message(e.code))
-        return {"url": url}
+        return _bound_response({"url": url}, connect_ring, state)
 
     # SELF-MANAGED: confirm OAuth app credentials are configured (DB lookup).
     app_cred = oauth_block.get("app_credential", "")
@@ -376,13 +490,13 @@ async def oauth_start(
         client_id=client_id,
         extra=extra or None,
     )
-    return {"url": url}
+    return _bound_response({"url": url}, connect_ring, state)
 
 
 async def _start_registered_client(
     provider: str, body: OAuthStartRequest, manifest, oauth_block: dict,
     redirect_uri: str, user: UserContext,
-) -> dict:
+) -> tuple[str, str]:
     """The consent URL of a connect through the client this install
     registered at the MCP server's own authorization server
     (``credentials.oauth.authorization_server``).
@@ -447,7 +561,7 @@ async def _start_registered_client(
         client_id=registration["client_id"], redirect_uri=redirect_uri,
         scope=scope, state=state, code_challenge=challenge, resource=server.resource,
     )
-    return {"url": url}
+    return url, state
 
 
 @router.get("/v1/oauth/{provider}/callback")
@@ -483,8 +597,35 @@ async def oauth_callback(
     if not code or not state:
         return HTMLResponse(_error_html(provider, "Missing code or state parameter"))
 
-    # We can't pre-validate state without consuming it. Peek by validating;
-    # validate_state is one-shot, so the rest of the flow must succeed.
+    identity = oauth_engine.peek_state_identity(state)
+    if identity is None:
+        # Unknown, spent or older than the state's life (the binding cookie
+        # cannot outlive it): nothing to judge, nothing to exchange.
+        logger.info("OAuth callback with an expired or spent state (provider=%s)", provider)
+        return HTMLResponse(_error_html(provider, _EXPIRED))
+    if identity[1]:
+        # The app started it: no exchange here. The code and the state go
+        # back to the app through the deep link (tagged with the source
+        # install, so the multi-installation app routes it to the server
+        # that started the flow), and its own exchange, under its login,
+        # completes the connect for the person the state names.
+        from services.billing.relay_client import get_install_id
+        return RedirectResponse(
+            f"otodock://oauth/{provider}/complete"
+            f"?code={quote(code)}&state={quote(state)}&iss={quote(iss or '')}"
+            f"&install={quote(get_install_id())}"
+        )
+    if not _connect_bound(_connect_ring_cookie(request), state):
+        # Another browser (a consent URL handed over, another address of
+        # this install): nothing is exchanged, and the state is spent.
+        oauth_engine.discard_state(state)
+        logger.warning(
+            "OAuth callback refused (provider=%s): the connect was started in "
+            "another browser", provider,
+        )
+        return HTMLResponse(_error_html(provider, _other_browser_text()))
+
+    # The exchange is one-shot: the rest of the flow must succeed.
     try:
         result = await oauth_engine.do_oauth_exchange(
             code=code, state_token=state, iss=iss or "",
@@ -498,15 +639,6 @@ async def oauth_callback(
             f"Token exchange failed ({type(e).__name__}). "
             "Check the proxy logs for details.",
         ))
-
-    if result.state.mobile:
-        # Tag the source install so the multi-installation Android app routes the
-        # callback back to the server that started the flow.
-        from services.billing.relay_client import get_install_id
-        return RedirectResponse(
-            f"otodock://oauth/{provider}/complete"
-            f"?email={quote(result.email or '')}&install={quote(get_install_id())}"
-        )
     return HTMLResponse(_success_html(provider, result.email))
 
 
@@ -516,17 +648,22 @@ async def oauth_exchange(
     body: OAuthExchangeRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Mobile deep-link JSON exchange path.
-
-    The mobile app receives the auth code via the otodock:// deep link and
-    POSTs it here. State carries user_sub and is verified to match.
+    """The app's half of a connect it started: the deep link brought the
+    vendor's code and the state back to the app, which posts them here
+    under its own login. Only a state the app started is taken (a web
+    state completes in the browser that holds its cookie), and only by the
+    person it was minted for, both judged before any exchange.
     """
     require_human(user)
-
-    # Peek at state's user_sub before consuming — but validate_state is
-    # one-shot. We need to consume + check + (if mismatched) raise.
-    # Acceptable: state is single-use anyway; mismatch means the legitimate
-    # user must retry, which is the correct UX.
+    identity = oauth_engine.peek_state_identity(body.state)
+    if identity is None:
+        raise HTTPException(400, "Invalid or expired OAuth state")
+    state_sub, mobile = identity
+    if not mobile:
+        raise HTTPException(403, "This connect completes in the browser that started it")
+    if state_sub != user.sub:
+        oauth_engine.discard_state(body.state)
+        raise HTTPException(403, "State was issued for a different user")
     try:
         result = await oauth_engine.do_oauth_exchange(
             code=body.code, state_token=body.state, iss=body.iss or "",
@@ -536,9 +673,6 @@ async def oauth_exchange(
         # or a store error. The log has it.
         logger.exception("OAuth exchange failed (provider=%s)", provider)
         raise HTTPException(400, f"Token exchange failed ({type(e).__name__})") from e
-
-    if result.state.user_sub != user.sub:
-        raise HTTPException(403, "State was issued for a different user")
     return {"status": "ok", "email": result.email, "account_label": result.account_label}
 
 
@@ -720,6 +854,10 @@ async def _disconnect_locked(
         "OAuth disconnected: provider=%s mcp=%s user=%s account=%s",
         provider, body.mcp_name, user.sub[:8], body.account_label,
     )
+    # A paired machine holding this account's token under a lease is told
+    # now, not at the lease's end.
+    from core.remote import mcp_gateway_push
+    mcp_gateway_push.tick_soon()
     return {"status": "ok"}
 
 
@@ -1130,7 +1268,9 @@ class AdminConsentStartRequest(BaseModel):
 @router.post("/v1/oauth/microsoft/admin-consent/start")
 async def admin_consent_start(
     body: AdminConsentStartRequest,
+    request: Request,
     user: UserContext = Depends(get_current_user),
+    connect_ring: str | None = Depends(_connect_ring_cookie),
 ):
     """Build a Microsoft tenant-admin consent URL.
 
@@ -1167,6 +1307,7 @@ async def admin_consent_start(
         f"{_redirect_uri('microsoft').rsplit('/callback', 1)[0]}"
         "/admin-consent/callback"
     )
+    _refuse_another_address(request, body.mobile)
     state = oauth_engine.create_admin_consent_state(
         user_sub=user.sub,
         mcp_name=body.mcp_name,
@@ -1182,7 +1323,7 @@ async def admin_consent_start(
         redirect_uri=redirect_uri,
         client_id=client_id,
     )
-    return {"url": url}
+    return _bound_response({"url": url}, connect_ring, state)
 
 
 @router.get("/v1/oauth/microsoft/admin-consent/callback")
@@ -1192,6 +1333,7 @@ async def admin_consent_callback(
     tenant: str = Query(None),
     error: str = Query(None),
     error_description: str = Query(None),
+    connect_ring: str | None = Depends(_connect_ring_cookie),
 ):
     """Receive Microsoft's tenant-admin consent callback.
 
@@ -1214,6 +1356,10 @@ async def admin_consent_callback(
             "Missing or invalid admin_consent / state parameter",
         ))
 
+    identity = oauth_engine.peek_admin_consent_identity(state)
+    if identity is not None and not identity[1] and not _connect_bound(connect_ring, state):
+        oauth_engine.discard_admin_consent_state(state)
+        return HTMLResponse(_error_html("microsoft", _other_browser_text()))
     ctx = oauth_engine.validate_admin_consent_state(state)
     if ctx is None:
         return HTMLResponse(_error_html(

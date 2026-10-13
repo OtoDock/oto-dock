@@ -281,7 +281,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Provider model override (e.g. ElevenLabs 'eleven_v3' for maximum "
                                        "expressiveness, 'eleven_multilingual_v2' for long-form consistency; "
-                                       "Cartesia 'sonic-3.5'). Omit for the provider's configured model.",
+                                       "Cartesia 'sonic-3.6'). Omit for the provider's configured model.",
                     },
                     "stability": {**_setting, "description": "Voice stability 0-1 (lower = more emotional range). Provider-specific."},
                     "similarity_boost": {**_setting, "description": "Voice similarity 0-1. Provider-specific."},

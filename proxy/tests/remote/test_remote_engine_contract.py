@@ -313,6 +313,7 @@ def _snapshot_layer() -> RemoteExecutionLayer:
     cm.satellite_supports_codex_hooks_floor.return_value = True
     cm.satellite_supports_hook_parity.return_value = True
     cm.satellite_supports_checks.return_value = True
+    cm.satellite_supports_codex_attended_floor.return_value = False
     cm.satellite_version.return_value = "0.5.123"
     cm.satellite_name.return_value = "drill-sat"
     return lay
@@ -402,18 +403,25 @@ class TestControlFrames:
         # The live defect: the remote layer sent NOTHING for a Codex model
         # change while the satellite's CodexSession has honoured set_model as
         # a per-turn override in every release.
+        # A 0.5.143 satellite also gets the platform mode (its approval
+        # policy follows it); an older one the sandbox alone.
         from core.layers.codex.helpers import permission_to_sandbox
-        layer, info = self._layer_with("codex-cli")
-        await layer.change_model("s-1", "gpt-5.6-sol")
-        await layer.change_mode("s-1", "plan")
-        frames = [c.args[1] for c in layer._cm.send_fire_and_forget.call_args_list]
-        assert frames == [
-            {"type": "control_request", "session_id": "s-1", "subtype": "set_model",
-             "kwargs": {"model": "gpt-5.6-sol"}},
-            {"type": "control_request", "session_id": "s-1", "subtype": "set_permission_mode",
-             "kwargs": {"sandbox_mode": permission_to_sandbox("plan", allow_full_fs=True)}},
-        ]
-        assert (info.model, info.mode) == ("gpt-5.6-sol", "plan")
+        for supported in (True, False):
+            layer, info = self._layer_with("codex-cli")
+            layer._cm.satellite_supports_codex_attended_floor.return_value = supported
+            await layer.change_model("s-1", "gpt-5.6-sol")
+            await layer.change_mode("s-1", "plan")
+            frames = [c.args[1] for c in layer._cm.send_fire_and_forget.call_args_list]
+            mode_kwargs = {"sandbox_mode": permission_to_sandbox("plan", allow_full_fs=True)}
+            if supported:
+                mode_kwargs["permission_mode"] = "plan"
+            assert frames == [
+                {"type": "control_request", "session_id": "s-1", "subtype": "set_model",
+                 "kwargs": {"model": "gpt-5.6-sol"}},
+                {"type": "control_request", "session_id": "s-1", "subtype": "set_permission_mode",
+                 "kwargs": mode_kwargs},
+            ]
+            assert (info.model, info.mode) == ("gpt-5.6-sol", "plan")
 
     @pytest.mark.asyncio
     async def test_a_codex_start_never_freezes_the_plan_mode(self, tmp_path):

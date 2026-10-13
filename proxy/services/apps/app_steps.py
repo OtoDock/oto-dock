@@ -42,7 +42,7 @@ from core import layout
 from services.infra import safe_fs
 from services.infra.path_confinement import join_under
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 # The lease and the claim outlive the script by a margin; the sweep never
 # reclaims a running step and the script's last call still verifies.
@@ -157,31 +157,22 @@ def placement_for(row: dict, identity) -> str:
 def credential_env_for(row: dict, identity) -> dict[str, str]:
     """The OAuth environment of the providers the app ``requires``, for the
     identity the step runs as (the agent's service account for a shared
-    app, the owner's for a personal one) — only the ``env_injection``
-    names (``GH_TOKEN``, ``GIT_CONFIG_*``), only when the token may leave
-    the platform: a personal app's owner's own token, or a shared app's
-    service account on manager provenance (Q2 of the plan)."""
+    app, the owner's for a personal one): the ``env_injection`` names with
+    the token and the manifest's own git helper entries, the self-contained
+    shape a step script needs (it runs with no credential helper beside it,
+    unlike a session's shell), only when the token may leave the platform:
+    a personal app's owner's own token, or a shared app's service account
+    on manager provenance (Q2 of the plan)."""
     providers = [p for p in (_mf.parse_requires(row).get("providers") or []) if isinstance(p, str)]
     if not providers:
         return {}
     if not row.get("username") and not approver_grants(row):
         return {}
-    from services.mcp import mcp_registry
     from services.oauth import credential_resolver
-    agent = row.get("agent") or ""
-    creds = credential_resolver.resolve_credentials(
-        agent, identity.creds_user_sub or None, task_scope=identity.scope)
-    out: dict[str, str] = {}
-    for m in (mcp_registry.get_agent_mcps(agent, placement=placement.LOCAL_PLACEMENT) or []):
-        manifest = getattr(m, "manifest", None) or m
-        decl = getattr(manifest, "credentials", None)
-        oauth = (getattr(decl, "oauth", None) or {}) if decl else {}
-        if not oauth or (oauth.get("provider_id") or "") not in providers:
-            continue
-        for k, v in (creds.env_by_mcp.get(m.name) or {}).items():
-            if k in creds.bash_env_keys and isinstance(v, str):
-                out[k] = v
-    return out
+    return credential_resolver.cli_token_env(
+        row.get("agent") or "", identity.creds_user_sub or None,
+        task_scope=identity.scope, providers=providers,
+    )
 
 
 def read_script(row: dict, step: dict) -> bytes:

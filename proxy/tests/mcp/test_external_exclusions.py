@@ -239,7 +239,7 @@ def test_shipped_manifest_declares_the_external_opt_out(name):
     path = PROXY_DIR.parent / "mcps" / "custom" / name / "manifest.json"
     if not path.exists():
         # Not every MCP is in every cut (the public snapshot leaves out the
-        # ones that ride the Android beat); the hard set below still binds.
+        # ones staged with the mobile apps); the hard set below still binds.
         pytest.skip(f"{name} is not part of this tree")
     manifest = json.loads(path.read_text())
     assert "external" in manifest.get("exclude_from", []), name

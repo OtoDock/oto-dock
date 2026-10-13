@@ -39,13 +39,18 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from core.background import spawn
 from storage import database as task_store
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # A closing pump's tail: what is left to forward once its producer is done.
 _PUMP_END_WAIT_S = 30.0
+# Another turn starter bringing the chat's turn up (a queued message's
+# delivery, a typed send, a wake): how long an utterance waits for it.
+_CLAIM_WAIT_S = 5.0
+_BUSY_LINE = "The previous turn is still ending; say it again in a moment."
 
 
 @dataclass
@@ -252,7 +257,7 @@ async def _focus_for(bridge) -> str:
         return ""
 
 
-async def run_utterance(bridge, frame: dict) -> None:
+async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
     """One daemon utterance → one chat turn (or a queue onto a live one)."""
     turn = int(frame.get("turn") or 0)
     text = str(frame.get("text") or "").strip()
@@ -311,25 +316,49 @@ async def run_utterance(bridge, frame: dict) -> None:
         await _after_pump_end(bridge, own, frame, turn)
         return
 
-    # New turn — no live pump to ride, so the session process must actually
-    # exist. The dashboard heals a dead process at its turn chokepoint
-    # (_resume_dead_session_for_chat); voice has no warmup path, so without
-    # this every utterance after a hard abort / idle reap errors into the
-    # corpse (incident 2026-08-12).
-    try:
-        await _ensure_live_session(bridge, st)
-    except Exception as e:
-        logger.error(
-            "duplex %s: dead-session heal failed: %s",
-            bridge.duplex_id[:8], e, exc_info=True,
-        )
+    # New turn: the chat's turn starters take turns. Another starter bringing
+    # a turn up is waited for, then the utterance is dispatched again: the
+    # pump it brought up takes it through the branches above.
+    from core.events import input_queue
+    q = input_queue.get(bridge.chat_id)
+    claim = q.try_claim()
+    if claim is None:
+        if not waited:
+            deadline = asyncio.get_running_loop().time() + _CLAIM_WAIT_S
+            while q.claimed and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+            await run_utterance(bridge, frame, waited=True)
+            return
         st.active_turn = None
         await _engine_send(bridge, {
-            "type": wire.ERROR, "turn": turn, "data": {"message": "session_dead"},
+            "type": wire.ERROR, "turn": turn,
+            "data": {"message": _BUSY_LINE},
         })
         return
+    try:
+        # No live pump to ride, so the session process must actually exist.
+        # The dashboard heals a dead process at its turn chokepoint
+        # (_resume_dead_session_for_chat); voice has no warmup path, so
+        # without this every utterance after a hard abort / idle reap errors
+        # into the corpse (incident 2026-08-12).
+        try:
+            await _ensure_live_session(bridge, st)
+        except Exception as e:
+            logger.error(
+                "duplex %s: dead-session heal failed: %s",
+                bridge.duplex_id[:8], e, exc_info=True,
+            )
+            st.active_turn = None
+            await _engine_send(bridge, {
+                "type": wire.ERROR, "turn": turn, "data": {"message": "session_dead"},
+            })
+            return
 
-    await _run_new_turn(bridge, st, turn, text, barge_in_chars)
+        await _run_new_turn(bridge, st, turn, text, barge_in_chars)
+    finally:
+        # Held until the pump is registered: from then on the pump is what
+        # other starters see.
+        q.release(claim)
 
 
 async def _ensure_live_session(bridge, st: _AttachState) -> None:
@@ -442,7 +471,8 @@ def on_interactive_batch(chat_id: str, *, persisted: int, turn_open: bool) -> No
     st = _states.get(getattr(bridge, "duplex_id", ""))
     if st is None or st.active_turn is None:
         return
-    asyncio.create_task(_feed_interactive(bridge, st, persisted, turn_open))
+    spawn(_feed_interactive(bridge, st, persisted, turn_open),
+          name="feed-interactive", owner="duplex_attach")
 
 
 async def _feed_interactive(
@@ -635,7 +665,7 @@ async def _after_pump_end(bridge, pump, frame: dict, turn: int) -> None:
     if not pump.is_done or _active_pumps.get(bridge.chat_id) is pump:
         await _engine_send(bridge, {
             "type": wire.ERROR, "turn": turn,
-            "data": {"message": "The previous turn is still ending; say it again in a moment."},
+            "data": {"message": _BUSY_LINE},
         })
         return
     await run_utterance(bridge, frame)

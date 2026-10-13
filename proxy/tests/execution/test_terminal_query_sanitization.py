@@ -281,3 +281,49 @@ async def test_replay_strips_osc52_clipboard_write():
             assert ok
         finally:
             I._sessions.clear()
+
+
+def test_the_paste_mode_tracker_follows_the_programs_last_toggle():
+    """A replay of a ring that dropped the TUI's ``ESC[?2004h`` gets the
+    mode back in front; a program that turned it off keeps it off; RIS
+    resets it; a toggle split across two reads still counts."""
+    from core.terminal_queries import PASTE_MODE_ON, PasteModeTracker
+
+    t = PasteModeTracker()
+    t.feed(b"\x1b[?1049h\x1b[?2004h prompt")
+    assert t.on and t.replay_prefix() == b""          # nothing dropped yet
+    t.trimmed = True
+    assert t.replay_prefix() == PASTE_MODE_ON
+    t.feed(b"vim starts \x1b[?2004l")
+    assert not t.on and t.replay_prefix() == b""
+    t.feed(b"\x1b[?1000;2004;1006h")
+    assert t.on
+    t.feed(b"\x1bc")
+    assert not t.on
+    t.feed(b"text \x1b[?20")
+    t.feed(b"04h more")
+    assert t.on
+    t.feed(b"\x1b]52;c;" + b"A" * 100)                 # an OSC body in flight
+    t.feed(b"\x07 \x1b[?2004l")
+    assert not t.on
+
+
+async def test_a_trimmed_remote_ring_replays_the_mode_it_dropped():
+    from core.remote import remote_pty as R
+    from core.terminal_queries import PASTE_MODE_ON
+
+    rp = R.RemotePtyProcess(
+        machine_id="m1", session_id="rpaste", rows=24, cols=80,
+        on_output=lambda _b: None, on_exit=None, scrollback_limit=64,
+    )
+    try:
+        rp._feed_output(b"\x1b[?2004h")
+        assert rp.scrollback() == b"\x1b[?2004h"       # the toggle is still in the ring
+        for _ in range(8):
+            rp._feed_output(b"x" * 32)
+        assert rp.scrollback().startswith(PASTE_MODE_ON)
+        assert rp.scrollback()[len(PASTE_MODE_ON):] == b"x" * 64
+        rp._feed_output(b"\x1b[?2004l")
+        assert not rp.scrollback().startswith(PASTE_MODE_ON)
+    finally:
+        R._remote_ptys.pop(("m1", "rpaste"), None)

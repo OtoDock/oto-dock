@@ -13,11 +13,10 @@ built and checked here before any request leaves.
   egress proxy that the environment names for the URL, the proxy resolves
   the name: only a literal address is judged here.
 * Redirects are never followed (httpx's default, kept by the callers).
-
-Check-then-connect: the HTTP client resolves the name again when it
-connects, so a record that answers differently between the two lookups is
-not caught; pinning the checked address into the transport would break an
-egress proxy that resolves names itself.
+* The call goes through ``client``: it connects only to public addresses,
+  resolved again at the dial (``pinned_http``), so an answer that changes
+  after this check is judged where it is used. Behind an egress proxy the
+  plain client is kept and the proxy resolves the name.
 """
 
 from __future__ import annotations
@@ -26,10 +25,12 @@ import asyncio
 import ipaddress
 import json
 import re
-import urllib.request
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+import httpx
+
+from services.infra import pinned_http
 from services.infra.outbound_url import ip_blocked, validate_outbound_url
 
 # The same token syntax as webhook_template._TOKEN_RE.
@@ -62,18 +63,8 @@ def url_from_template(template: str, subs: dict[str, Any]) -> str:
     return _TOKEN_RE.sub(repl, template)
 
 
-def _proxied(url: str) -> bool:
-    """Whether the environment sends ``url`` through an HTTP proxy (the
-    variables httpx honours)."""
-    parts = urlsplit(url)
-    proxies = urllib.request.getproxies()
-    if not proxies.get(parts.scheme) and not proxies.get("all"):
-        return False
-    return not urllib.request.proxy_bypass(parts.hostname or "")
-
-
 def _refusal(url: str) -> str | None:
-    if _proxied(url):
+    if pinned_http.proxied(url):
         parts = urlsplit(url)
         if (parts.scheme or "").lower() != "https":
             return "the URL must be https"
@@ -92,3 +83,9 @@ async def check_url(url: str) -> None:
     reason = await asyncio.to_thread(_refusal, url)
     if reason:
         raise VendorURLRefused(reason)
+
+
+def client(url: str, *, timeout: float) -> httpx.AsyncClient:
+    """The client for one vendor call to ``url``: public addresses only, at
+    the dial; the plain client behind an egress proxy."""
+    return pinned_http.checked_client(url, timeout=timeout)

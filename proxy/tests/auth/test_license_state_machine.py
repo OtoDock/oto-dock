@@ -27,6 +27,16 @@ def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
+def _tamper(token: str) -> str:
+    """``token`` with one bit of its signature flipped. Replacing its last
+    base64url characters leaves it valid about once in a thousand: they
+    carry the signature's top bits, which an Ed25519 signature leaves zero."""
+    payload, sig = token.rsplit(".", 1)
+    raw = bytearray(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)))
+    raw[0] ^= 0x01
+    return payload + "." + _b64u(bytes(raw))
+
+
 def _iso(days: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
@@ -248,8 +258,21 @@ def test_receipt_tampered_rejected(store, sign, monkeypatch):
     _connected(monkeypatch)
     key = _key(sign, mode="subscription")
     store["license_key"] = key
-    store["license_activation_receipt"] = _receipt(sign, key)[:-3] + "AAA"  # break sig
+    store["license_activation_receipt"] = _tamper(_receipt(sign, key))
     assert L.get_current_license().status == "unactivated"
+
+
+def test_the_tamper_breaks_every_signature():
+    """2000 fresh keys, every tampered token refused (setting the last
+    three characters to AAA instead passes about twice in that many)."""
+    from cryptography.exceptions import InvalidSignature
+
+    payload = b'{"license_key": "k", "install_id": "test-install"}'
+    for _ in range(2000):
+        sk = Ed25519PrivateKey.generate()
+        _, sig = _tamper(_b64u(payload) + "." + _b64u(sk.sign(payload))).rsplit(".", 1)
+        with pytest.raises(InvalidSignature):
+            sk.public_key().verify(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)), payload)
 
 
 # ---------------------------------------------------------------------------

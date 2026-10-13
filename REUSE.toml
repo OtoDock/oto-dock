@@ -1,0 +1,92 @@
+# Copyright and licensing of every file in this repository, in the REUSE
+# format (https://reuse.software, spec 3.2). `reuse lint` checks it in CI.
+#
+# OtoDock is fair source under the Functional Source License, Version 1.1,
+# ALv2 Future License (LICENSE). The few files that come from other projects
+# keep their own licences and are listed after the first annotation: when
+# several annotations match a file the last one applies, and `override`
+# means a header inside a file never changes what is written here. The
+# licence texts are in LICENSES/.
+version = 1
+
+[[annotations]]
+path = "**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Dimitrios Mourtzis <legal@otodock.io>"
+SPDX-License-Identifier = "FSL-1.1-ALv2"
+
+# The bundled MCPs' icons: a Lucide glyph on OtoDock's tile.
+[[annotations]]
+path = "mcps/custom/*/icon.png"
+precedence = "override"
+SPDX-FileCopyrightText = [
+    "2026 Dimitrios Mourtzis <legal@otodock.io>",
+    "2026 Lucide Icons and Contributors",
+]
+SPDX-License-Identifier = "FSL-1.1-ALv2 AND ISC"
+
+# The Lucide glyphs the icons are drawn from (maintainers' tooling).
+[[annotations]]
+path = "**/mcp-icons/glyphs/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Lucide Icons and Contributors"
+SPDX-License-Identifier = "ISC"
+
+# Silero VAD v5.1.2 (snakers4/silero-vad), the phone's voice activity model.
+[[annotations]]
+path = "audio/models/silero_vad.onnx"
+precedence = "override"
+SPDX-FileCopyrightText = "Silero Team"
+SPDX-License-Identifier = "MIT"
+
+# Smart Turn v3.2 (pipecat-ai/smart-turn), the end-of-turn model.
+[[annotations]]
+path = "audio/models/smart-turn-v3.2-cpu.onnx"
+precedence = "override"
+SPDX-FileCopyrightText = "Daily (pipecat-ai)"
+SPDX-License-Identifier = "BSD-2-Clause"
+
+# The openai/whisper-small preprocessor configuration Smart Turn reads.
+[[annotations]]
+path = "audio/models/whisper_feature_extractor/**"
+precedence = "override"
+SPDX-FileCopyrightText = "OpenAI"
+SPDX-License-Identifier = "MIT"
+
+# The wake-word engine: sherpa-onnx's WebAssembly build and its keyword
+# model, with the Emscripten runtime inside the build.
+[[annotations]]
+path = "proxy/assets/kws/**"
+precedence = "override"
+SPDX-FileCopyrightText = ["Xiaomi Corporation (k2-fsa sherpa-onnx)", "Emscripten authors"]
+SPDX-License-Identifier = "Apache-2.0 AND MIT"
+
+# A patch to sherpa-onnx's source, applied when the wake-word build is made.
+[[annotations]]
+path = "scripts/kws-no-encoder-reset.patch"
+precedence = "override"
+SPDX-FileCopyrightText = "Xiaomi Corporation (k2-fsa sherpa-onnx) and OtoDock"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Codex's base instructions, a verbatim copy (codex_base_instructions.NOTICE).
+[[annotations]]
+path = "proxy/core/layers/codex/codex_base_instructions.*"
+precedence = "override"
+SPDX-FileCopyrightText = "OpenAI"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Anthropic's skill-creator skill, bundled with the MCP-authoring MCP.
+[[annotations]]
+path = "mcps/custom/mcps-mcp/skills/skill-creator/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Anthropic, PBC"
+SPDX-License-Identifier = "Apache-2.0"
+
+# The phone's ambience and breath recordings, from freesound.org
+# (their SOURCES.md names each one).
+[[annotations]]
+path = ["phone/assets/ambience/*.wav", "phone/assets/breath/*.wav"]
+precedence = "override"
+SPDX-FileCopyrightText = "freesound.org contributors (see SOURCES.md beside each file)"
+SPDX-License-Identifier = "CC0-1.0"
+

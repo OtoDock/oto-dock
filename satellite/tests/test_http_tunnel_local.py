@@ -76,6 +76,15 @@ def test_audio_transcribe_is_allowlisted():
     assert not _is_allowed_path("/v1/audio/tts/synthesize")
 
 
+def test_cli_credential_hook_is_allowlisted():
+    """git's credential helper and the gh wrapper fetch the session's token
+    per command through the tunnel (0.5.139): the exact path, nothing beside."""
+    from satellite.transport.http_tunnel import _is_allowed_path
+    assert _is_allowed_path("/v1/hooks/cli-credential")
+    assert not _is_allowed_path("/v1/hooks/cli-credential/x")
+    assert not _is_allowed_path("/v1/hooks/cli-credentials")
+
+
 def test_audio_tts_generate_is_allowlisted():
     """tts-mcp reaches the voice-over endpoints through the tunnel — the four
     exact paths only, never the policy-gated chat synthesize or admin CRUD."""

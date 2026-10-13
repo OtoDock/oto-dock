@@ -70,7 +70,7 @@ def _resolve_target_fields(resolved: tuple[str, str | None]) -> dict:
     }
 
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 async def build_agent_config(
@@ -95,8 +95,14 @@ async def build_agent_config(
     trigger_payload: dict | None = None,
     subscription_pool_fallback: bool = False,
     external_claim: str = "",
+    extra_mcps: list[str] | None = None,
+    call_ask_back: bool = False,
 ) -> AgentConfig:
     """Build an AgentConfig from agent DB + user context.
+
+    ``extra_mcps`` and ``call_ask_back`` are the phone builder's: the
+    call-control MCP rides a user route's call regardless of assignment, and
+    an outbound call another agent placed offers the ask tool.
 
     The phone ``user`` identity mode (a route tied to a platform user —
     ``services/phone/phone_identity.py``) reuses this builder so the call is
@@ -280,6 +286,14 @@ async def build_agent_config(
     # For TOML (Codex), credential env is injected into the TOML env sections
     # (Codex doesn't inherit parent env for MCP servers). We must rewrite
     # sandbox paths FIRST so the TOML gets the correct sandbox-internal paths.
+    # A dashboard session of an agent with phone-mcp carries the call-control
+    # MCP too: a call it places may run inside this very chat
+    # (ws/phone_attach.py), and the tools end or transfer that call.
+    if client_type == session_kind.DASHBOARD.name and not phone_mode:
+        from services.phone.call_control import CALL_CONTROL_MCP, PHONE_MCP
+        _names = {m.name for m in (mcp_registry.get_agent_mcps(agent_name, placement=target) or [])}
+        if PHONE_MCP in _names and CALL_CONTROL_MCP not in (extra_mcps or []):
+            extra_mcps = [*(extra_mcps or []), CALL_CONTROL_MCP]
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
             mcp_registry.build_session_mcp_config, agent_name, creds_sub,
@@ -300,6 +314,8 @@ async def build_agent_config(
             phone_mode=phone_mode,
             placement=target,
             target_browser=target_browser,
+            extra_mcps=extra_mcps,
+            call_ask_back=call_ask_back,
         )
     )
 
@@ -375,16 +391,13 @@ async def build_agent_config(
     )
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
 
-    # For TOML format: regenerate with rewritten credential env injected.
-    # bash-only env_injection (GH_TOKEN/GIT_CONFIG_*) is EXCLUDED from the file —
-    # it stays in `credential_env` (→ the Codex daemon env, below) for bash, but
-    # is never written to the config.toml on disk.
-    if mcp_format == "toml" and mcp_config and credential_env:
-        mcp_config = await asyncio.to_thread(
-            mcp_registry.inject_credential_env_into_toml,
-            mcp_config, credential_env,
-            exclude_keys=bash_env_keys,
-        )
+    # A Codex config gets the credential environment written in; the
+    # bash-only git entries stay out of the file (they belong to the shell,
+    # through the daemon env below).
+    mcp_config = await asyncio.to_thread(
+        mcp_registry.inject_toml_credentials, mcp_config, credential_env,
+        mcp_format=mcp_format, exclude_keys=bash_env_keys,
+    )
 
     # Resolve dynamic MCP context (e.g., delegation targets with descriptions).
     # Async — builder blocks invoke remote MCP tools.

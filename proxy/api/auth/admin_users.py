@@ -24,7 +24,7 @@ from api.auth._router import router
 from auth import roles as _roles
 from services.agents import offboarding, offboarding_sessions
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 async def _hash_or_503(plain: str) -> str:
@@ -96,7 +96,7 @@ async def admin_list_users(user: UserContext | None = Depends(get_current_user))
         u["invite_pending"] = (
             (u.get("auth_provider") or "").startswith("local") and not _ph
         )
-        for k in ("totp_secret_enc", "totp_recovery_enc"):
+        for k in ("totp_secret_enc", "totp_recovery_enc", "totp_last_step"):
             u.pop(k, None)
     return {"users": users}
 
@@ -627,6 +627,9 @@ async def admin_reset_password(
     pw_hash = await _hash_or_503(temp)
     await asyncio.to_thread(task_store.set_user_password, sub, pw_hash)
     await asyncio.to_thread(task_store.update_user_auth_fields, sub, must_change_password=True)
+    # The write moved the token epoch: no cached pass may outlive it.
+    from auth import token_holder
+    token_holder.forget(sub)
     logger.info(f"Admin {mask_email(u.email)} reset password for {mask_email(target['email'])}")
     # The person's warm chats hold session tokens the reset just invalidated.
     await offboarding_sessions.close_person_sessions(

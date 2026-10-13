@@ -1,6 +1,7 @@
 """Unit tests for core/sandbox/sandbox.py — SandboxBuilder and helpers."""
 
 import os
+import time
 
 import pytest
 
@@ -592,9 +593,19 @@ class TestEnsurePersistentClaudeDir:
         # the same in satellite/tests/test_cli_session.py).
         assert data["syncClaudeAiSkills"] is False
         assert data["syncClaudeAiPlugins"] is False
+        # The account's claude.ai connectors (Claude Docs, Google Drive) would
+        # load as MCP servers and act on the pool owner's account.
+        assert data["disableClaudeAiConnectors"] is True
         # Hooks must remain alongside sandbox config
         assert "PreToolUse" in data["hooks"]
         assert "PostToolUse" in data["hooks"]
+        # A gate that cannot start, times out or exits non-zero blocks the call
+        # (Claude Code 2.1.295+). Only the gate: on the other events exit 2
+        # means "keep going", so a tracker failure must not block.
+        hook_of = lambda event: data["hooks"][event][0]["hooks"][0]  # noqa: E731
+        assert hook_of("PreToolUse")["onFailure"] == "block"
+        for event in ("PostToolUse", "SubagentStop", "Stop"):
+            assert "onFailure" not in hook_of(event), event
         # Permission deny list — covers all three settings.json build paths
         # via the canonical constant in core/sandbox/sandbox.py.
         denied = set(data["permissions"]["deny"])
@@ -1124,8 +1135,7 @@ class TestNetnsPreflight:
         class _Probe:
             returncode = 1
             stderr = b"unshare: unshare failed: Operation not permitted"
-        monkeypatch.setattr(_sandbox_mod.subprocess, "run",
-                            lambda *a, **k: _Probe())
+        monkeypatch.setattr(_sandbox_mod, "_run_probe", lambda *a, **k: _Probe())
 
     def _happy_gates(self, monkeypatch, tmp_path):
         # Tools present + one-level probe passes; keep the resolv side effects
@@ -1194,10 +1204,21 @@ class TestNetnsPreflight:
                 raise FileNotFoundError("unshare")
             return _OK()
 
-        monkeypatch.setattr(_sandbox_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_sandbox_mod, "_run_probe", fake_run)
         monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
         _sandbox_mod.netns_preflight()  # must not raise
         assert calls[0] == "unshare" and "bwrap" in calls
+
+    def test_run_probe_reports_the_exit_and_bounds_the_wait(self):
+        done = _sandbox_mod._run_probe(["sh", "-c", "echo denied >&2; exit 3"], timeout=5)
+        assert done.returncode == 3 and done.stderr == b"denied\n"
+        # A probe that never answers ends at the timeout, its whole process
+        # group with it (the grandchild here would outlive a plain kill), and
+        # the boot never waits past the reap bound.
+        started = time.monotonic()
+        with pytest.raises(_sandbox_mod.subprocess.TimeoutExpired):
+            _sandbox_mod._run_probe(["sh", "-c", "sleep 30 & wait"], timeout=0.5)
+        assert time.monotonic() - started < _sandbox_mod._PROBE_REAP_S + 1
 
     def test_nested_probe_failure_warns_never_fatal(self, monkeypatch, tmp_path, caplog):
         # A host can pass the one-level gate yet deny the NESTED level (what
@@ -1209,7 +1230,7 @@ class TestNetnsPreflight:
         class _OK:
             returncode = 0
             stderr = b""
-        monkeypatch.setattr(_sandbox_mod.subprocess, "run", lambda *a, **k: _OK())
+        monkeypatch.setattr(_sandbox_mod, "_run_probe", lambda *a, **k: _OK())
         monkeypatch.setattr(
             _sandbox_mod, "_nested_sandbox_probe",
             lambda: "bwrap: setting up uid map: Permission denied",

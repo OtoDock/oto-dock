@@ -45,7 +45,7 @@ from typing import Iterable, Optional
 
 from core.sandbox.pty_relay import DEFAULT_SCROLLBACK_BYTES, ExitCb, OutputCb
 
-logger = logging.getLogger("claude-proxy.remote_pty")
+logger = logging.getLogger("otodock.remote_pty")
 
 # The dashboard xterm is a MIRROR, not the controlling terminal — the satellite
 # PTY is. Terminal-QUERY sequences in the output (DA/DSR, DECRQM, kitty probe,
@@ -59,6 +59,8 @@ logger = logging.getLogger("claude-proxy.remote_pty")
 # is still served by the satellite PTY. Vocabulary + rationale live in
 # ``core.terminal_queries`` (shared with the input-side strip and mirrored to
 # the satellite's replay sanitizer).
+from core.background import spawn
+from core.terminal_queries import PasteModeTracker
 from core.terminal_queries import strip_queries as _strip_terminal_queries
 
 # (machine_id, session_id) -> RemotePtyProcess. The single routing table for
@@ -176,6 +178,7 @@ class RemotePtyProcess:
         self._scrollback_limit = scrollback_limit
         self._scrollback: "deque[bytes]" = deque()
         self._scrollback_len = 0
+        self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
         self._closed = False
         self._exit_fired = False
@@ -195,7 +198,7 @@ class RemotePtyProcess:
         try:
             out = self._on_output(data)
             if asyncio.iscoroutine(out):
-                self._loop.create_task(out)
+                spawn(out, name="output", owner="remote_pty")
         except Exception:
             logger.exception("remote pty %s: on_output failed", self.session_id[:8])
 
@@ -204,14 +207,19 @@ class RemotePtyProcess:
         self._fire_exit(code)
 
     def _remember(self, data: bytes) -> None:
+        self._paste_mode.feed(data)
         self._scrollback.append(data)
         self._scrollback_len += len(data)
         while self._scrollback_len > self._scrollback_limit and self._scrollback:
             self._scrollback_len -= len(self._scrollback.popleft())
+            self._paste_mode.trimmed = True
 
     def scrollback(self) -> bytes:
-        """Recent rendered output, for replay to a (re)attaching viewer."""
-        return b"".join(self._scrollback)
+        """Recent rendered output, for replay to a (re)attaching viewer. Once the ring has dropped
+        the program's bracketed-paste toggle, the mode it holds comes first
+        (``terminal_queries.PasteModeTracker``): a fresh mirror would
+        otherwise paste unbracketed and the TUI submit the first line."""
+        return self._paste_mode.replay_prefix() + b"".join(self._scrollback)
 
     # -- input: proxy -> satellite --------------------------------------------
     def write(self, data: bytes) -> None:
@@ -270,7 +278,7 @@ class RemotePtyProcess:
             try:
                 res = self._on_exit(code)
                 if asyncio.iscoroutine(res):
-                    self._loop.create_task(res)
+                    spawn(res, name="exit", owner="remote_pty")
             except Exception:
                 logger.exception("remote pty %s: on_exit failed", self.session_id[:8])
 
@@ -284,7 +292,8 @@ class RemotePtyProcess:
         """
         from core.remote.satellite_connection import get_connection_manager
         mgr = get_connection_manager()
-        self._loop.create_task(mgr.send_fire_and_forget(self.machine_id, msg))
+        spawn(mgr.send_fire_and_forget(self.machine_id, msg),
+              name="send_fire_and_forget", owner="remote_pty")
 
 
 async def spawn_remote_pty(

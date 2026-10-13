@@ -13,7 +13,9 @@ recovery scope so a restore can be authorization-gated:
   ``users/<slug>/`` file whose slug no longer maps to a user); only a manager of
   the agent (or an admin) may list / restore it.
 
-Entries expire after 7 days (reaped by ``app.py``). **No version history** — this
+Entries expire after 7 days (reaped by ``startup.py``'s sweep loop); the
+retention sweep also drops rows whose bytes are gone and bytes no row names
+(``prune_missing_blobs``, ``prune_orphan_blobs``). **No version history** — this
 is a deletion/overwrite safety net, not a backup system.
 
 Bytes live on disk rather than in a BYTEA column because a recover-bin entry can
@@ -25,8 +27,12 @@ no explicit ``conn.commit()`` is needed.
 """
 
 import contextlib
+import errno
 import hashlib
 import logging
+import os
+import stat
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,10 +42,15 @@ from storage.pg import get_conn
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.recover-bin")
+logger = logging.getLogger("otodock.recover-bin")
 
 # How long a captured entry stays recoverable before the reaper drops it.
 RECOVER_BIN_TTL_DAYS = 7
+# Rows checked per query by the missing-blob prune.
+_PRUNE_PAGE = 500
+# A blob no row names is left this long before the orphan pass deletes it:
+# capture() writes the bytes before it inserts the row.
+_ORPHAN_GRACE_S = 86400
 
 # The reason a file landed in the bin. Mirrored by the table's inline CHECK.
 #   ``deleted``  — pre-delete bytes of a removed file (dashboard delete, a
@@ -347,15 +358,23 @@ def get(entry_id: str) -> dict | None:
 
 
 def read_bytes(entry: dict) -> bytes | None:
-    """Read an entry's captured bytes, or ``None`` if the file is gone.
+    """Read an entry's captured bytes, or ``None`` if the file is gone or
+    shorter or longer than the row says (a copy cut short must never be
+    restored as the file).
 
-    The metadata row can outlive its bytes (manual cleanup, partial disk loss);
-    callers treat ``None`` as "unrecoverable" and skip the restore.
+    The metadata row can outlive its bytes (a container recreated without the
+    bin's volume, manual cleanup, partial disk loss); callers treat ``None``
+    as "unrecoverable" and skip the restore. ``prune_missing_blobs`` removes
+    such rows.
     """
     try:
-        return _entry_path(entry["agent_slug"], entry["entry_id"]).read_bytes()
+        data = _entry_path(entry["agent_slug"], entry["entry_id"]).read_bytes()
     except OSError:
         return None
+    size = entry.get("size")
+    if size is not None and len(data) != int(size):
+        return None
+    return data
 
 
 def delete(entry_id: str) -> None:
@@ -366,6 +385,114 @@ def delete(entry_id: str) -> None:
     if entry is not None:
         with contextlib.suppress(OSError):
             _entry_path(entry["agent_slug"], entry_id).unlink()
+
+
+def _blob_state(path: Path, size: int) -> str:
+    """``ok``, ``gone`` (missing, not a regular file, or not ``size`` bytes)
+    or ``unknown`` (any other stat error: never a reason to drop a row)."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return "gone" if exc.errno in (errno.ENOENT, errno.ENOTDIR) else "unknown"
+    if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+        return "gone"
+    return "ok"
+
+
+def prune_missing_blobs(dry_run: bool = False) -> int:
+    """Delete the rows whose bytes are gone or cut short, so the bin never
+    lists an entry it cannot restore. Returns the rows removed (in a dry run,
+    the rows that would be).
+
+    Nothing is pruned unless ``RECOVER_BIN_DIR`` is an existing directory: a
+    moved data dir must never empty the bin. Order makes this safe against
+    the live flows: ``capture()`` writes the bytes before the row,
+    ``delete()`` removes the row before the bytes, and a restore reads the
+    bytes before it deletes the row. The count is what the DELETE removed, so
+    a row a restore or a discard took meanwhile is not reported as lost.
+    """
+    root = config.RECOVER_BIN_DIR
+    if not root.is_dir():
+        return 0
+    removed = 0
+    unknown = 0
+    after = ""
+    while True:
+        with get_conn() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT entry_id, agent_slug, size FROM recover_bin "
+                "WHERE entry_id > %s ORDER BY entry_id LIMIT %s",
+                (after, _PRUNE_PAGE),
+            ).fetchall()]
+        if not rows:
+            break
+        after = rows[-1]["entry_id"]
+        gone = []
+        for r in rows:
+            state = _blob_state(_entry_path(r["agent_slug"], r["entry_id"]), int(r["size"] or 0))
+            if state == "gone":
+                gone.append(r["entry_id"])
+            elif state == "unknown":
+                unknown += 1
+        if gone:
+            if dry_run:
+                removed += len(gone)
+            else:
+                with get_conn() as conn:
+                    cur = conn.execute("DELETE FROM recover_bin WHERE entry_id = ANY(%s)", (gone,))
+                    removed += cur.rowcount or 0
+        if len(rows) < _PRUNE_PAGE:
+            break
+    if unknown:
+        logger.warning("recover-bin: %d entries could not be checked (left as they are)", unknown)
+    if removed and not dry_run:
+        logger.warning("recover-bin: removed %d entries whose bytes were gone or incomplete", removed)
+    return removed
+
+
+def prune_orphan_blobs(dry_run: bool = False) -> int:
+    """Delete blob files no row names, older than a day (a capture that died
+    between its write and its insert, a database restored to an earlier
+    point), and remove an emptied agent directory. A row's blob is never
+    touched. Returns the files removed (in a dry run, that would be)."""
+    root = config.RECOVER_BIN_DIR
+    if not root.is_dir():
+        return 0
+    now = time.time()
+    removed = 0
+    for agent_dir in sorted(root.iterdir()):
+        try:
+            if agent_dir.is_symlink() or not agent_dir.is_dir():
+                continue
+            names = os.listdir(agent_dir)
+        except OSError:
+            continue
+        if not names:
+            continue
+        with get_conn() as conn:
+            known = {r["entry_id"] for r in conn.execute(
+                "SELECT entry_id FROM recover_bin WHERE agent_slug=%s", (agent_dir.name,),
+            ).fetchall()}
+        for name in names:
+            if name in known:
+                continue
+            path = agent_dir / name
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or now - st.st_mtime < _ORPHAN_GRACE_S:
+                continue
+            if not dry_run:
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+            removed += 1
+        if not dry_run:
+            with contextlib.suppress(OSError):
+                agent_dir.rmdir()
+    return removed
 
 
 def delete_expired() -> int:

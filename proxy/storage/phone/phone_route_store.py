@@ -109,9 +109,11 @@ def create_route(data: dict) -> dict:
                 audiosocket_uuid, did, ami_caller_id, ami_outbound_context,
                 dial_prefix, adapter_data, trigger_slug,
                 identity_mode, identity_user_sub, role, remember_callers,
+                transfer_targets, language_detect, voice_id,
                 created_at, updated_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       %s, %s, %s)""",
             (
                 route_id,
                 data.get("direction", "inbound"),
@@ -139,6 +141,9 @@ def create_route(data: dict) -> dict:
                 data.get("identity_user_sub") or None,
                 data.get("role") or roles.VIEWER,
                 bool(data.get("remember_callers", True)),
+                json.dumps(data.get("transfer_targets") or []),
+                bool(data.get("language_detect", False)),
+                data.get("voice_id") or "",
                 now,
                 now,
             ),
@@ -161,6 +166,7 @@ def update_route(route_id: str, data: dict) -> dict | None:
         "audiosocket_uuid", "did", "ami_caller_id",
         "ami_outbound_context", "dial_prefix", "trigger_slug",
         "identity_mode", "identity_user_sub", "role", "remember_callers",
+        "transfer_targets", "language_detect", "voice_id",
     }
     # ``trigger_slug`` / ``identity_user_sub`` may be cleared by passing empty
     # string — keep them in the update dict so the explicit clear lands in DB.
@@ -181,6 +187,8 @@ def update_route(route_id: str, data: dict) -> dict | None:
     for _nullable in ("trigger_slug", "identity_user_sub"):
         if _nullable in updates and updates[_nullable] == "":
             updates[_nullable] = None
+    if "transfer_targets" in updates:
+        updates["transfer_targets"] = json.dumps(updates["transfer_targets"] or [])
 
     updates["updated_at"] = _now()
     set_clause = ", ".join(f"{k} = %s" for k in updates)

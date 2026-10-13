@@ -31,6 +31,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -40,7 +41,15 @@ from aiohttp import web
 
 from calls.call_manager import CallStatus
 from config_manager import normalize_did
-from proxy.client import report_call
+from proxy.client import report_call, report_transfer_outcome
+from telephony.transfer import (
+    CALLER_GONE,
+    TwilioTransfer,
+    dial_action_twiml,
+    e164,
+    loggable_label,
+    pending_dials,
+)
 from telephony.twilio_media import (
     TwilioMediaError,
     TwilioMediaStreamConnection,
@@ -70,6 +79,8 @@ _TWIML_REJECT = (
     '<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>'
 )
 _TWIML_EMPTY = '<?xml version="1.0" encoding="UTF-8"?><Response/>'
+_TWIML_HANGUP = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+_E164_RE = re.compile(r"\+[0-9]{2,20}")
 
 
 def normalize_public_base_url(raw: str) -> str:
@@ -214,6 +225,7 @@ class TwilioCallAPI:
         app.router.add_post("/v1/twilio/inbound/{server_id}", self.inbound)
         app.router.add_get("/v1/twilio/media/{server_id}", self.media)
         app.router.add_post("/v1/twilio/status/{server_id}", self.status)
+        app.router.add_post("/v1/twilio/transfer/{server_id}", self.transfer_action)
 
     # -- inbound webhook ------------------------------------------------------
 
@@ -355,9 +367,19 @@ class TwilioCallAPI:
         conn = TwilioMediaStreamConnection(
             ws, stream_sid=stream_sid, call_sid=call_sid,
         )
+        transfer = TwilioTransfer(
+            server_cfg, call_sid, conn,
+            caller_id=_transfer_caller_id(route, caller_info, is_outbound),
+            action_url=(f"{normalize_public_base_url(server_cfg.get('public_base_url', ''))}"
+                        f"/v1/twilio/transfer/{server_id}"),
+            # The call log row's call_uuid: the CallSid on an inbound call,
+            # the audio uuid on an outbound one (its record never learns the
+            # CallSid), so the Dial's end can correct the row.
+            report_uuid=token if is_outbound else call_sid,
+        )
         # The handler must not return until the call ends — aiohttp tears the
         # websocket down when the handler returns.
-        await self._run_call(conn, token, route, is_outbound, caller_info)
+        await self._run_call(conn, token, route, is_outbound, caller_info, transfer=transfer)
         return ws
 
     # -- status callbacks (outbound) ------------------------------------------
@@ -400,6 +422,67 @@ class TwilioCallAPI:
                 )
                 await self._release_warmup(call)
         return _twiml(_TWIML_EMPTY)
+
+    # -- a transfer's Dial ended (its action callback) -------------------------
+
+    async def transfer_action(self, request: web.Request) -> web.Response:
+        """How the ``<Dial>`` of a transfer ended, and what the caller hears
+        next: nothing when the colleague had the call or the caller is gone
+        (the parent ``CallStatus`` reads ``completed`` then, whatever the
+        Dial's own word), a goodbye when nobody answered or the carrier
+        refused. The log row's outcome follows through the proxy."""
+        server_id = request.match_info["server_id"]
+        server_cfg = self.cfg.twilio_server(server_id)
+        if not server_cfg:
+            return web.json_response({"error": "unknown server"}, status=403)
+        form = {k: v for k, v in (await request.post()).items()
+                if isinstance(v, str)}
+        if not validate_webhook_signature(request, form, server_cfg):
+            logger.warning(f"twilio transfer: bad signature (server {server_id})")
+            return web.json_response({"error": "bad signature"}, status=403)
+        # Limiter AFTER the signature check — see inbound() for the rationale.
+        if not self._limiter.allow():
+            return web.json_response({"error": "rate limit exceeded"}, status=429)
+
+        call_sid = form.get("CallSid", "")
+        dial_status = form.get("DialCallStatus", "")
+        caller_gone = form.get("CallStatus", "") == "completed"
+        entry = pending_dials.by_call_sid(call_sid)
+        if entry is None:
+            logger.warning(
+                f"twilio transfer: the Dial of an unknown call {call_sid[-8:]} ended "
+                f"({dial_status or 'no status'})")
+            return _twiml(_TWIML_HANGUP)
+        entry.outcome = CALLER_GONE if caller_gone else (dial_status or "failed")
+        logger.info(
+            f"twilio transfer {call_sid[-8:]} to {loggable_label(entry.label)}: "
+            f"{dial_status or 'no status'}, call {form.get('CallStatus', '') or 'unknown'} "
+            f"(dial {form.get('DialCallSid', '')[-8:]})")
+        if entry.failed:
+            asyncio.get_running_loop().create_task(
+                report_transfer_outcome(entry.report_uuid, "transfer_failed"))
+        return _twiml(dial_action_twiml(entry, entry.outcome, caller_gone))
+
+
+def _transfer_caller_id(route, caller_info: dict, is_outbound: bool) -> str:
+    """The number a transfer's ``<Dial>`` presents: the route's own Twilio
+    number (an outbound call's From, an inbound call's To as Twilio sent it,
+    E.164). A route's typed ``did`` counts only when it already reads
+    ``+digits``: Twilio refuses any other callerId (13214), the failure a
+    missing attribute produced with the caller's own number."""
+    if is_outbound:
+        return e164(str(getattr(route, "ami_caller_id", "") or ""))
+    did = str((caller_info or {}).get("did") or "")
+    if did:
+        return did
+    typed = e164(str(getattr(route, "did", "") or ""))
+    if _E164_RE.fullmatch(typed):
+        return typed
+    if typed:
+        logger.warning(
+            f"twilio transfer: the route's number {typed!r} is not E.164; the Dial "
+            f"presents no callerId")
+    return ""
 
 
 async def originate_twilio_call(cfg, route, call, server_cfg) -> None:

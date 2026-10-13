@@ -5,7 +5,8 @@ restricted to providers the platform pool can serve.
 Direct LLM declares ``claude-sonnet-5-5`` (tier 3 — the first usable tier for
 real work; the operator's call, phone conversations included). Before the
 engine-contract lane the no-pin default was whatever came first in
-``MODEL_REGISTRY`` insertion order — Haiku 4.5 here.
+``MODEL_REGISTRY`` insertion order — Haiku 4.5 at the time (the rows below
+keep that id as a fixture; the registry retired it onto Haiku 5.5).
 """
 
 import sys
@@ -144,13 +145,13 @@ def test_openai_only_pool_falls_to_the_best_served_tier(monkeypatch):
 # --- the pin -----------------------------------------------------------------
 
 def test_explicit_default_model_wins(monkeypatch):
-    _wire(monkeypatch, ["openai_compatible"], default_model="gpt-5.6-luna")
-    assert config.resolve_agent_model("caller") == "gpt-5.6-luna"
+    _wire(monkeypatch, ["openai_compatible"], default_model="gpt-6-luna")
+    assert config.resolve_agent_model("caller") == "gpt-6-luna"
 
 
 def test_pinned_model_is_honoured_even_when_disabled(monkeypatch):
     # The documented asymmetry: `enabled` moves the DEFAULT, never a pin (an
     # explicit human choice, honoured as before).
-    _wire(monkeypatch, ["anthropic"], default_model="claude-haiku-4-5",
-          models=_disabled("claude-haiku-4-5"))
-    assert config.resolve_agent_model("caller", layer="direct-llm") == "claude-haiku-4-5"
+    _wire(monkeypatch, ["anthropic"], default_model="claude-sonnet-5-5",
+          models=_disabled("claude-sonnet-5-5"))
+    assert config.resolve_agent_model("caller", layer="direct-llm") == "claude-sonnet-5-5"

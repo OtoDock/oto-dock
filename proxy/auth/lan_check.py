@@ -29,7 +29,7 @@ from starlette.requests import HTTPConnection
 
 import config
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # The request headers an edge adds. Only X-Forwarded-For ever resolves a
 # client; the others only tell the detector that an edge is in front.

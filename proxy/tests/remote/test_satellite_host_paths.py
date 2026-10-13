@@ -202,10 +202,16 @@ class TestPullThroughHostPath:
 
 
 class TestPushBackHostPath:
+    @pytest.fixture(autouse=True)
+    def _session(self, monkeypatch, tmp_path):
+        import config
+        monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+        monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: _FakeInfo())
+
     @pytest.mark.asyncio
     async def test_pushes_using_sidecar_metadata(self, monkeypatch, tmp_path):
         # Build a cache file + sidecar as if pull_through wrote them.
-        cache_path = tmp_path / "sess1" / "abc" / "foo.png"
+        cache_path = rff.host_cache_session_root("sess1") / "abc" / "foo.png"
         cache_path.parent.mkdir(parents=True)
         cache_path.write_bytes(b"new-bytes")
         sidecar = cache_path.parent / "_meta.json"
@@ -239,12 +245,38 @@ class TestPushBackHostPath:
 
     @pytest.mark.asyncio
     async def test_missing_machine_id_in_sidecar(self, tmp_path):
-        cp = tmp_path / "cache" / "f.png"
+        cp = rff.host_cache_session_root("sess1") / "cache" / "f.png"
         cp.parent.mkdir(parents=True)
         cp.write_bytes(b"x")
         (cp.parent / "_meta.json").write_text(json.dumps({"abs_path": "/x"}))
         ok = await rff.push_back_host_path("sess1", str(cp))
         assert ok is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("where,machine", [
+        # Climbs out of the cache to a sidecar the caller synced itself.
+        (".remote-host-cache/sess1/../../my-agent/users/alice/workspace/p", "m1"),
+        # Another session's cache.
+        (".remote-host-cache/sess2/abc", "m1"),
+        # This session's cache, a sidecar naming another machine.
+        (".remote-host-cache/sess1/abc", "m2"),
+    ])
+    async def test_only_the_sessions_own_cache_reaches_only_its_machine(
+            self, tmp_path, where, machine):
+        cp = tmp_path / where / "f.png"
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_bytes(b"attacker bytes")
+        (cp.parent / "_meta.json").write_text(json.dumps({
+            "machine_id": machine, "abs_path": "/home/victim/notes.txt"}))
+        fake_cm = AsyncMock()
+        fake_cm.push_file.return_value = True
+        with patch(
+            "core.remote.satellite_connection.get_connection_manager",
+            return_value=fake_cm,
+        ):
+            ok = await rff.push_back_host_path("sess1", str(cp))
+        assert ok is False
+        fake_cm.push_file.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +374,7 @@ class TestResolvePathHookSatelliteHost:
         cache_file.write_bytes(b"x")
         captured: dict = {}
 
-        async def fake_pull_through(session_id, rel):
+        async def fake_pull_through(session_id, rel, held=None):
             captured["rel"] = rel
             return cache_file
 
@@ -380,7 +412,7 @@ class TestResolvePathHookSatelliteHost:
         cache_file.write_bytes(b"x")
         captured: dict = {}
 
-        async def fake_pull_through(session_id, rel):
+        async def fake_pull_through(session_id, rel, held=None):
             captured["rel"] = rel
             return cache_file
 
@@ -413,7 +445,7 @@ class TestResolvePathHookSatelliteHost:
         cache_file.write_bytes(b"x")
         captured: dict = {}
 
-        async def fake_pull_through(session_id, rel):
+        async def fake_pull_through(session_id, rel, held=None):
             captured["rel"] = rel
             return cache_file
 
@@ -445,7 +477,7 @@ class TestResolvePathHookSatelliteHost:
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
 
-        async def fake_pull_through(session_id, rel):
+        async def fake_pull_through(session_id, rel, held=None):
             return None  # not on the satellite — it's a new file
 
         monkeypatch.setattr(
@@ -485,7 +517,7 @@ class TestResolvePathHookSatelliteHost:
         cache_file.parent.mkdir(parents=True)
         cache_file.write_bytes(b"current")
 
-        async def fake_pull_through(session_id, rel):
+        async def fake_pull_through(session_id, rel, held=None):
             return cache_file
 
         monkeypatch.setattr(
@@ -498,6 +530,61 @@ class TestResolvePathHookSatelliteHost:
         }, headers={"Authorization": "Bearer test"})
         assert r.status_code == 200
         assert r.json()["host_path"] == str(cache_file)
+
+    def test_a_held_write_target_is_refused(self, client, monkeypatch, tmp_path):
+        """A write target the session may not write back would have the tool
+        edit the platform copy and the push after it overwrite the machine's
+        copy: refused, even though the platform holds the file."""
+        monkeypatch.setattr(
+            "api.hooks.paths.get_session_security",
+            lambda sid: _make_remote_ctx(allow_full_fs=False),
+        )
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
+        )
+        platform_copy = tmp_path / "shared.md"
+        platform_copy.write_bytes(b"platform")
+
+        async def fake_pull_through(session_id, rel, held=None):
+            held.append(rel)
+            return platform_copy
+
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.pull_through", fake_pull_through,
+        )
+        r = client.post("/v1/hooks/resolve-path", json={
+            "session_id": "s1", "path": "/workspace/shared.md", "writing": True,
+        }, headers={"Authorization": "Bearer test"})
+        assert r.status_code == 403
+        assert "cannot be written from this session" in r.json()["detail"]
+
+    def test_a_held_read_the_platform_lacks_says_why(self, client, monkeypatch):
+        """A path the session may not write back is never read from its
+        machine; with no platform copy the read answers 404 with the reason,
+        never a lexical translation of the same missing file."""
+        monkeypatch.setattr(
+            "api.hooks.paths.get_session_security",
+            lambda sid: _make_remote_ctx(allow_full_fs=False),
+        )
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
+        )
+
+        async def fake_pull_through(session_id, rel, held=None):
+            held.append(rel)
+            return None
+
+        monkeypatch.setattr(
+            "core.remote.remote_file_flow.pull_through", fake_pull_through,
+        )
+        r = client.post("/v1/hooks/resolve-path", json={
+            "session_id": "s1", "path": "/workspace/planted.md",
+        }, headers={"Authorization": "Bearer test"})
+        assert r.status_code == 404
+        assert r.json()["detail"] == (
+            "/workspace/planted.md is not on the platform, and this session may not "
+            "copy files from its machine into that folder (its role cannot write there)"
+        )
 
     def test_write_target_out_of_tree_gets_clear_policy_error(
         self, client, monkeypatch, tmp_path,
@@ -568,6 +655,9 @@ class TestFileWrittenHookDispatch:
         assert called["count"] == 1
 
     def test_agent_tree_path_routes_to_push_back(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "api.hooks.lifecycle.get_session_security", lambda sid: _make_remote_ctx(),
+        )
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: True,
         )
@@ -720,7 +810,8 @@ class TestFileWrittenHookDispatch:
 
     def test_foreign_slug_is_never_stripped(self, client, monkeypatch):
         """Only the session's OWN agent slug folds off — a foreign slug is
-        passed through untouched (and fails push_back's canonical gate)."""
+        passed through untouched and refused (it is no canonical path of the
+        session's agent), and nothing is pushed."""
         monkeypatch.setattr(
             "api.hooks.lifecycle.get_session_security",
             lambda sid: _make_remote_ctx(),
@@ -744,9 +835,37 @@ class TestFileWrittenHookDispatch:
             "session_id": "s1",
             "path": "other-agent/users/alice/workspace/foo.png",
         }, headers={"Authorization": "Bearer test"})
-        assert r.status_code == 200
-        assert r.json() == {"ok": False}
-        assert captured["rel"] == "other-agent/users/alice/workspace/foo.png"
+        assert r.status_code == 200 and r.json()["ok"] is False
+        assert captured == {}
+
+    @pytest.mark.parametrize("role,path", [
+        ("manager", "users/bob/workspace/secret.md"),
+        ("manager", "my-agent/users/bob/workspace/secret.md"),
+        ("admin", "users/alice/.codex/auth.json"),
+        ("admin", "users/alice/.credentials/github.json"),
+        ("viewer", "workspace/shared.md"),
+        ("editor", "config/agent.md"),
+        ("editor", "knowledge/notes.md"),
+    ])
+    def test_a_push_names_only_what_the_session_may_write(self, client, monkeypatch, role, path):
+        """The push hands the platform's bytes to the caller's machine: a
+        token alone must not fetch another user's file, an engine credential
+        or a folder the session may not write."""
+        from unittest.mock import AsyncMock
+        ctx = SecurityContext(role=role, username="alice", agent="my-agent",
+                              is_admin_agent=False,
+                              placement=_make_remote_ctx().placement)
+        monkeypatch.setattr("api.hooks.lifecycle.get_session_security", lambda sid: ctx)
+        monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: True)
+        monkeypatch.setattr("core.remote.remote_file_flow.is_host_cache_path", lambda p: False)
+        push = AsyncMock(return_value=True)
+        monkeypatch.setattr("core.remote.remote_file_flow.push_back", push)
+        r = client.post("/v1/hooks/file-written", json={
+            "session_id": "s1", "path": path,
+        }, headers={"Authorization": "Bearer test"})
+        # A calm answer (file-tools posts this on every preview), nothing pushed.
+        assert r.status_code == 200 and r.json()["ok"] is False
+        push.assert_not_awaited()
 
     def test_slug_prefixed_write_back_reaches_satellite(
         self, client, monkeypatch, tmp_path,
@@ -759,6 +878,7 @@ class TestFileWrittenHookDispatch:
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+        monkeypatch.setattr("auth.path_policy._AGENTS_DIR", tmp_path.resolve())
         monkeypatch.setattr(
             "api.hooks.lifecycle.get_session_security",
             lambda sid: _make_remote_ctx(),
@@ -785,9 +905,11 @@ class TestFileWrittenHookDispatch:
         pushed: dict = {}
 
         async def fake_push_file(machine_id, ref, content, *, agent_slug=""):
+            from pathlib import Path
             pushed["machine_id"] = machine_id
             pushed["rel"] = ref.value
-            pushed["content"] = content
+            # A path push_file streams from (push_back's open descriptor).
+            pushed["content"] = Path(content).read_bytes()
             return True
 
         mock_cm = MagicMock()
@@ -811,9 +933,7 @@ class TestFileWrittenHookDispatch:
         assert r.json() == {"ok": True}
         assert pushed["machine_id"] == "m1"
         assert pushed["rel"] == "users/alice/workspace/foo.png"
-        # Streaming refactor (1.4.0): fan-out receives the platform PATH.
-        from pathlib import Path as _P
-        assert _P(pushed["content"]).read_bytes() == b"edited-bytes"
+        assert pushed["content"] == b"edited-bytes"
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +1054,60 @@ class TestClassifyGateHostCache:
         )
 
 
+class TestClassifyHeldPath:
+    """The display, preview, media and temp-image routes share
+    ``_classify_and_pull``: a path the session may read but not write back is
+    never read from its machine, the platform copy is served, and with none
+    the resolution carries the reason the routes show."""
+
+    def _setup(self, tmp_path, monkeypatch, role="viewer", sid="sess-held"):
+        import config
+        from types import SimpleNamespace
+        monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+        from core.session import session_state
+        monkeypatch.setitem(session_state._session_security, sid, SecurityContext(
+            role=role, username="alice", agent="pa", is_admin_agent=False))
+        monkeypatch.setattr(rff, "is_remote_session", lambda s: True)
+        monkeypatch.setattr(rff, "_get_remote_session_info",
+                            lambda s: SimpleNamespace(machine_id="mach-1", agent_name="pa"))
+
+        class _CM:
+            async def pull_file_to_path(self, *a, **kw):
+                raise AssertionError("a held path never reaches the machine")
+
+        from core.remote import satellite_connection
+        monkeypatch.setattr(satellite_connection, "get_connection_manager", _CM)
+        return sid
+
+    def test_the_platform_copy_is_served(self, tmp_path, monkeypatch):
+        import asyncio
+        from api.hooks import paths
+        sid = self._setup(tmp_path, monkeypatch)
+        f = tmp_path / "pa" / "knowledge" / "notes.md"
+        f.parent.mkdir(parents=True)
+        f.write_bytes(b"platform")
+        host, res = asyncio.run(paths._classify_and_pull(sid, "/knowledge/notes.md"))
+        assert host is not None and host.resolve() == f.resolve()
+        assert f.read_bytes() == b"platform"
+
+    def test_none_with_the_reason_when_the_platform_lacks_it(self, tmp_path, monkeypatch):
+        import asyncio
+        from api.hooks import paths
+        sid = self._setup(tmp_path, monkeypatch)
+        (tmp_path / "pa").mkdir()
+        host, res = asyncio.run(paths._classify_and_pull(sid, "/knowledge/planted.md"))
+        assert host is None and res is not None and not res.allowed
+        assert res.error == rff.held_reason("/knowledge/planted.md")
+        assert not (tmp_path / "pa" / "knowledge").exists()
+
+
 class TestPullThroughMirrorFallback:
+    @pytest.fixture(autouse=True)
+    def _may_write_back(self, monkeypatch):
+        async def allowed(session_id, agent, rel_path):
+            return True
+        monkeypatch.setattr(rff, "write_back_allowed", allowed)
+
     def test_failed_satellite_pull_serves_platform_mirror(self, tmp_path, monkeypatch):
         import asyncio
         from types import SimpleNamespace
@@ -1009,10 +1182,11 @@ class TestPullThroughMirrorFallback:
 
 
 class TestHostCachePreviewEditMint:
-    """Entry-10 write-back (2026-07-19): a host-cache doc (Desktop/Downloads
-    pulled through THIS session's cache) mints an EDIT token for write-capable
-    roles — PutFile then pushes back to the real file. Session-scoped: another
-    session's cache stays view-only; viewer role stays view-only."""
+    """A host-cache doc (Desktop/Downloads pulled through THIS session's
+    cache) mints an EDIT token for the turn's person when they are the
+    session's own person with a write-capable role — PutFile then pushes back
+    to the real file. Anyone else views: a teammate's turn, a run with no
+    person, another session's cache, a viewer."""
 
     @pytest.fixture
     def client(self, monkeypatch):
@@ -1028,12 +1202,13 @@ class TestHostCachePreviewEditMint:
         return TestClient(app)
 
     def _mint(self, client, monkeypatch, tmp_path, *, role,
-              cache_session="sess-1", req_session="sess-1"):
+              cache_session="sess-1", req_session="sess-1", person=None):
         from types import SimpleNamespace
         from unittest.mock import AsyncMock
 
         import config
         from api.hooks import paths, preview, routing
+        from core.events import stream_pump
 
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
         monkeypatch.setattr(config, "COLLABORA_URL", "https://c.example", raising=False)
@@ -1054,15 +1229,35 @@ class TestHostCachePreviewEditMint:
                 role=role, username="u", mount_username="", agent="test-agent",
             ),
         )
-        monkeypatch.setattr(
-            routing, "resolve_hook_chat_id", AsyncMock(return_value=None),
-        )
+        if person is None:
+            monkeypatch.setattr(
+                routing, "resolve_hook_chat_id", AsyncMock(return_value=None),
+            )
+        else:
+            # The chat's turn runs as ``person`` (a sub; "sub-<username>").
+            from storage import database as task_store
+            if task_store.get_chat("chat-1") is None:
+                task_store.create_chat("chat-1", "sub-u", "test-agent")
+            monkeypatch.setattr(
+                routing, "resolve_hook_chat_id", AsyncMock(return_value="chat-1"),
+            )
+            monkeypatch.setattr(
+                routing, "resolve_hook_route",
+                lambda sid: SimpleNamespace(queue_session_id=req_session),
+            )
+            monkeypatch.setitem(stream_pump._active_pumps, "chat-1", SimpleNamespace(
+                is_done=False, session_id=req_session, wake_person=person,
+            ))
+            monkeypatch.setattr("storage.database.get_user", lambda sub: {"name": sub})
+            monkeypatch.setattr("storage.database.get_username_by_sub",
+                                lambda sub: sub.removeprefix("sub-"))
+            monkeypatch.setattr("auth.providers.acting_role_of", lambda sub, agent: role)
         preview._wopi_token_cache.clear()
         from collections import OrderedDict
         monkeypatch.setattr(preview, "_pushed_generations", OrderedDict())
         minted = {}
 
-        def _fake_mint(rel, sub, name, permissions, agent, chat_id=""):
+        def _fake_mint(rel, sub, name, permissions, agent, chat_id="", generation=0):
             minted["permissions"] = permissions
             return "tok", 3600
 
@@ -1093,7 +1288,17 @@ class TestHostCachePreviewEditMint:
     def test_editor_gets_edit_on_own_session_cache(
         self, client, monkeypatch, tmp_path, temp_db,
     ):
-        assert self._mint(client, monkeypatch, tmp_path, role="editor") == "edit"
+        assert self._mint(client, monkeypatch, tmp_path, role="editor", person="sub-u") == "edit"
+
+    def test_a_teammates_turn_views_a_file_on_another_persons_machine(
+        self, client, monkeypatch, tmp_path, temp_db,
+    ):
+        assert self._mint(client, monkeypatch, tmp_path, role="manager", person="sub-v") == "view"
+
+    def test_a_run_with_no_person_views(self, client, monkeypatch, tmp_path, temp_db):
+        # The token reaches whoever opens the chat (an agent-scope run's
+        # chat opens to every user of the agent).
+        assert self._mint(client, monkeypatch, tmp_path, role="manager") == "view"
 
     def test_viewer_stays_view(self, client, monkeypatch, tmp_path, temp_db):
         assert self._mint(client, monkeypatch, tmp_path, role="viewer") == "view"
@@ -1124,7 +1329,7 @@ class TestHostCachePreviewEditMint:
             raise AssertionError("create_media_token ran on the event loop")
 
         monkeypatch.setattr(task_store, "create_media_token", _guarded)
-        assert self._mint(client, monkeypatch, tmp_path, role="editor") == "edit"
+        assert self._mint(client, monkeypatch, tmp_path, role="editor", person="sub-u") == "edit"
 
 
 # ---------------------------------------------------------------------------

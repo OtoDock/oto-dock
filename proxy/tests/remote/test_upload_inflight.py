@@ -20,8 +20,10 @@ from core.remote import upload_inflight
 @pytest.fixture(autouse=True)
 def reset_registry():
     upload_inflight._inflight.clear()
+    upload_inflight._bound_for.clear()
     yield
     upload_inflight._inflight.clear()
+    upload_inflight._bound_for.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -190,3 +192,29 @@ async def test_send_message_dispatches_only_after_push_lands(monkeypatch):
 
     assert order == ["push_landed", "send_command"]
     assert events == []  # empty stream — no error events
+
+
+@pytest.mark.asyncio
+async def test_a_push_bound_for_other_machines_does_not_hold_a_turn():
+    """A Collabora save's fan-out names the machines it marked (the set grows
+    while later saves fold into it): a turn on another machine of the agent
+    does not wait for it, one on a named machine does, and a push with no
+    set (an upload) holds every machine as before."""
+    gate = asyncio.Event()
+
+    async def push():
+        await gate.wait()
+
+    bound = {"m-stalled"}
+    upload_inflight.track("agent-x", push(), machines=bound)
+    assert await upload_inflight.wait_settled("agent-x", machine_id="m-healthy", timeout=0.05) is True
+    assert await upload_inflight.wait_settled("agent-x", machine_id="m-stalled", timeout=0.05) is False
+    bound.add("m-healthy")
+    assert await upload_inflight.wait_settled("agent-x", machine_id="m-healthy", timeout=0.05) is False
+    upload_inflight.track("agent-y", push())
+    assert await upload_inflight.wait_settled("agent-y", machine_id="m-any", timeout=0.05) is False
+    gate.set()
+    assert await upload_inflight.wait_settled("agent-x", machine_id="m-stalled", timeout=1) is True
+    assert await upload_inflight.wait_settled("agent-y", timeout=1) is True
+    await asyncio.sleep(0)
+    assert not upload_inflight._bound_for

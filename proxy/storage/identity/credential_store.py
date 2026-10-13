@@ -383,12 +383,48 @@ def list_agent_account_bindings(user_sub: str, mcp_name: str) -> list[dict]:
 #: The platform setting that remembers the fingerprint of every value the
 #: secret floor accepted, per secret (never listed by any route).
 FLOOR_SETTING = "secret_floor_fingerprints"
+#: The platform setting that names every key this install can decrypt with,
+#: by fingerprint, written at every boot: a backup's manifest copies the
+#: source's, and restore.sh compares it with the target's before it restores
+#: (features/BACKUP-RESTORE.md "Restore", item 3, "Keys this install cannot
+#: read").
+KEY_FINGERPRINTS_SETTING = "credential_key_fingerprints"
 _FLOOR_LABEL = b"otodock secret floor"
 _FLOOR_KEEP = 16
 
 
 def _fingerprint(value: str) -> str:
     return hmac.new(value.encode(), _FLOOR_LABEL, hashlib.sha256).hexdigest()[:32]
+
+
+def key_fingerprints() -> dict[str, str]:
+    """``{fingerprint: label}`` of the decrypting set ``_get_fernet`` builds:
+    the comma entries of CREDENTIAL_ENCRYPTION_KEY in order, the whole value
+    when it differs, then JWT_SECRET. Labels name a line of config.env, never
+    a value."""
+    keys = _configured_keys()
+    out: dict[str, str] = {}
+    for n, raw in enumerate(keys, 1):
+        out.setdefault(_fingerprint(raw), f"CREDENTIAL_ENCRYPTION_KEY entry {n}")
+    whole = config.credential_key_setting()
+    if whole and whole not in keys:
+        out.setdefault(_fingerprint(whole), "CREDENTIAL_ENCRYPTION_KEY as one value")
+    out.setdefault(_fingerprint(config.JWT_SECRET), "JWT_SECRET")
+    return out
+
+
+def record_key_fingerprints() -> None:
+    """Write ``KEY_FINGERPRINTS_SETTING`` for this boot's decrypting set. A
+    database error skips it: the boot must not fail on it."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO platform_settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+                (KEY_FINGERPRINTS_SETTING, json.dumps(key_fingerprints(), sort_keys=True)))
+            conn.commit()
+    except Exception as e:
+        logger.debug("credential key fingerprints not written: %s", e)
 
 
 def _install_has_users() -> bool:
@@ -471,9 +507,11 @@ def startup_key_canary() -> None:
     read back empty. Sampling a few rows per store at boot turns that
     multi-hour mystery into one log line. The probe itself is diagnosis
     only and never raises; the secret floor it runs first refuses a new
-    short secret (``judge_secret_floor``).
+    short secret (``judge_secret_floor``), and the decrypting set is then
+    recorded by fingerprint for restore.sh (``record_key_fingerprints``).
     """
     judge_secret_floor()
+    record_key_fingerprints()
     probes = [
         ("user MCP credentials",
          "SELECT credential_value_enc AS v FROM user_credentials "

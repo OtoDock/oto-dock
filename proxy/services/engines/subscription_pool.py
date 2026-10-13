@@ -460,7 +460,7 @@ def throttle_from_cli_error(session_id: str, error_text: str) -> None:
 # the full cooldown so the next turn fails over to a fresh account.
 _LIMIT_ERROR_MARKERS = (
     "rate_limit", "rate limit", "ratelimit", "429", "too many requests",
-    "usage limit", "usage credits", "quota", "insufficient_quota",
+    "usage limit", "usage credits", "out of usage", "quota", "insufficient_quota",
 )
 # Transient, server-side overload (Anthropic 529 "Overloaded") — NOT the account's
 # fault. Kept separate so it gets the short nudge, not the 15-minute lockout.

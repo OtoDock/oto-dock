@@ -126,4 +126,13 @@ describe('the chat-routed queue frames', () => {
       { type: 'cancel_queued', index: 2, queue_id: 'q', chat_id: 'chat-1' })
     expect(mintQueueId()).not.toBe(mintQueueId())
   })
+
+  it('a send typed while the chat gets ready is queue-only and keeps its chip id', () => {
+    const { hook, ws } = openSocket('chat-1')
+    act(() => { hook.result.current.queueMessage('later', 'chat-1', undefined, undefined, 'q-held') })
+    expect(JSON.parse(ws.sent[ws.sent.length - 1])).toEqual(
+      { type: 'chat', text: 'later', chat_id: 'chat-1', queue_id: 'q-held', queue_only: true })
+    act(() => { hook.result.current.sendMessage('now', 'chat-1') })
+    expect(JSON.parse(ws.sent[ws.sent.length - 1]).queue_only).toBeUndefined()
+  })
 })

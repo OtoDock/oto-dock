@@ -39,6 +39,7 @@ from audio.capabilities import TTSCapabilities
 from audio.constants import SAMPLE_RATE
 from audio.log_policy import log_transcript
 from audio.providers.credential_resolver import CredentialResolver
+from audio.providers.model_succession import DEFAULT_MODELS
 from audio.providers.tts.base import TTSProvider, UnsupportedProviderOperation, VoiceInfo
 
 logger = logging.getLogger(__name__)
@@ -46,11 +47,13 @@ logger = logging.getLogger(__name__)
 _API_BASE = "https://api.elevenlabs.io"
 _WS_BASE = "wss://api.elevenlabs.io"
 
-# Default model. eleven_flash_v2_5 is the realtime tier (~75 ms model TTFB,
-# 32 languages, accepts language_code). Admin-overridable per provider via
-# ``advanced.model_id`` (e.g. eleven_multilingual_v2 / eleven_v3 for maximum
-# voice-over quality — v3 falls back to HTTP streaming, see module docstring).
-_MODEL_ID = "eleven_flash_v2_5"
+# Default model (``audio.providers.model_succession``). eleven_flash_v2_5 is
+# the realtime tier (~75 ms model TTFB, 32 languages, accepts language_code).
+# Admin-overridable per provider via ``advanced.model_id`` (e.g.
+# eleven_multilingual_v2 / eleven_v3 for maximum voice-over quality — the v3
+# and v4 families fall back to HTTP streaming, see module docstring; the
+# vendor's text-to-speech sockets refuse both v4 models with unsupported_model).
+_MODEL_ID = DEFAULT_MODELS[("tts", "elevenlabs")]["model_id"]
 
 # Flash/Turbo bill 0.5 credits/char ≈ $0.05/1k chars at the API rate card
 # (2026-07). Multilingual v2 / v3 are 2× — the class rate reflects the default
@@ -102,8 +105,9 @@ def _to_elevenlabs_lang(tag: str | None) -> str | None:
 
 
 def _is_ws_model(model_id: str) -> bool:
-    """eleven_v3-family models have no WebSocket endpoint (HTTP only)."""
-    return not model_id.startswith("eleven_v3")
+    """The v3 and v4 families have no text-to-speech WebSocket endpoint (HTTP
+    only; v4 streams on the vendor's text-to-dialogue socket alone)."""
+    return not (model_id.startswith("eleven_v3") or model_id.startswith("eleven_v4"))
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -120,8 +124,11 @@ def _as_bool(value, default: bool) -> bool:
 
 
 def _accepts_language_code(model_id: str) -> bool:
-    """Only the Flash/Turbo families enforce ``language_code``; multilingual_v2
-    and v3 reject/ignore it — omit it there and let the text decide."""
+    """Only the Flash/Turbo families enforce ``language_code``; multilingual_v2,
+    v3 and the v4 family (``eleven_v4_turbo`` included, never probed with the
+    parameter) reject/ignore it — omit it there and let the text decide."""
+    if model_id.startswith("eleven_v4"):
+        return False
     return "flash" in model_id or "turbo" in model_id
 
 
@@ -169,11 +176,23 @@ class ElevenLabsTTS(TTSProvider):
 
     capabilities = TTSCapabilities(supports_streaming=True, supports_endpointing=False, is_local=False)
 
-    # PREMADE voice (account-independent — workspace/library-added ids would
-    # 404 on other accounts): Matilda, production-verified through this
-    # platform. All ElevenLabs models are multilingual, so the ``en`` entry
-    # covers every language. Admin-configured voices always win.
-    default_voices = {"en": "XrExE9yKIg1WjnnlVkGX"}
+    # PREMADE voices (account-independent — workspace/library-added ids would
+    # 404 on other accounts), each checked by a live synthesis in its language:
+    # Matilda, Sarah, Laura, Charlotte, Alice, Lily. The vendor ships no
+    # native non-English premade voice: these speak the language with an
+    # English accent, and the entries exist so the language lock can move a
+    # call on this provider; a native accent is a library voice an admin adds
+    # to the workspace and sets on the row. An admin's voice for a language
+    # wins over the shipped one.
+    shipped_voices_native = False
+    default_voices = {
+        "en": "XrExE9yKIg1WjnnlVkGX",
+        "el": "EXAVITQu4vr4xnSDxMaL",
+        "de": "FGY2WhTYpPnrIDTdsKH5",
+        "es": "XB0fDUnXU5powFXDhCwa",
+        "fr": "Xb7hH8MSUJpSbSDYk0k2",
+        "it": "pFZP5JQG7iQjIQuC4Bku",
+    }
 
     def __init__(
         self,
@@ -187,7 +206,7 @@ class ElevenLabsTTS(TTSProvider):
         self.voices: dict[str, str] = voices or {}
         self.voice_id: str = voice_id or ""
         self._advanced = advanced or {}
-        self._model_id = self._advanced.get("model_id") or _MODEL_ID
+        self._model_id = self.live_model_id(self._advanced.get("model_id")) or _MODEL_ID
         self._voice_settings = {
             k: self._advanced[k] for k in _VOICE_SETTING_KEYS if k in self._advanced
         }
@@ -221,8 +240,8 @@ class ElevenLabsTTS(TTSProvider):
         return _COST_PER_CHAR
 
     @classmethod
-    def default_advanced_settings(cls) -> dict:
-        return {"model_id": _MODEL_ID}
+    def default_model_ids(cls) -> dict[str, str]:
+        return dict(DEFAULT_MODELS[("tts", "elevenlabs")])
 
     @classmethod
     def validate_advanced(cls, settings: dict) -> dict[str, str]:

@@ -14,11 +14,13 @@ _CLAUDE = ".claude"
 _CODEX = ".codex"
 
 
-def _hooks_in(d):
-    from core.sandbox.session_config_dir import HOOK_SCRIPTS
+def _hooks_in(d, wrappers=True):
+    from core.sandbox.session_config_dir import HOOK_SCRIPTS, write_command_wrappers
     d.mkdir(parents=True, exist_ok=True)
     for name in (*HOOK_SCRIPTS, "stdio_path_interceptor.py"):
         (d / name).write_text("# hook\n")
+    if wrappers:
+        write_command_wrappers(d)
 
 
 def _ro_binds(cmd):
@@ -32,10 +34,62 @@ def test_a_users_hook_files_are_bound_read_only_over_its_rw_dir(tmp_agents):  # 
     _hooks_in(state)
     cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
     ro = _ro_binds(cmd)
-    for name in ("permission_gate.py", "stop_tracker.py", "stdio_path_interceptor.py"):
+    for name in ("permission_gate.py", "stop_tracker.py", "credential_helper.py",
+                 "stdio_path_interceptor.py"):
         assert ro[str(state / name)] == f"/users/alice/{_CLAUDE}/{name}"
     # The file binds come after the RW dir bind (a later bind wins).
     assert cmd.index(str(state / "permission_gate.py")) > cmd.index(str(state))
+    # The command wrappers' directory, first on the session's PATH, is bound
+    # read-only as a whole: nothing can be planted beside the wrappers.
+    assert ro[str(state / "bin")] == f"/users/alice/{_CLAUDE}/bin"
+    assert cmd.index(str(state / "bin")) > cmd.index(str(state))
+    env = SandboxBuilder(cfg).get_env_overrides()
+    assert env["PATH"].startswith(f"/users/alice/{_CLAUDE}/bin:/usr/local/sbin:")
+    assert env["OTO_HOOKS_DIR"] == f"/users/alice/{_CLAUDE}"
+    assert env["OTO_HOOK_PY"].startswith("/")
+
+
+def test_the_file_that_names_the_hooks_is_bound_read_only_by_its_dir(tmp_agents):  # noqa: F811
+    """``settings.json`` in a ``.claude`` dir and ``hooks.json`` in a
+    ``.codex`` dir name the hooks: rewriting either would drop the gate. Each
+    dir binds only its own engine's file; one planted under the other
+    engine's name is left alone (no CLI reads it)."""
+    agents_dir, mcps_dir = tmp_agents
+    cfg = _make_config(agents_dir, mcps_dir, role="editor")
+    user = agents_dir / "personal-assistant" / "users" / "alice"
+    for sub, own, other in ((_CLAUDE, "settings.json", "hooks.json"),
+                            (_CODEX, "hooks.json", "settings.json")):
+        _hooks_in(user / sub)
+        (user / sub / own).write_text("{}\n")
+        (user / sub / other).write_text("{}\n")
+    ro = _ro_binds(SandboxBuilder(cfg).build_command_prefix(["claude"]))
+    assert ro[str(user / _CLAUDE / "settings.json")] == f"/users/alice/{_CLAUDE}/settings.json"
+    assert ro[str(user / _CODEX / "hooks.json")] == f"/users/alice/{_CODEX}/hooks.json"
+    assert str(user / _CLAUDE / "hooks.json") not in ro
+    assert str(user / _CODEX / "settings.json") not in ro
+
+
+def test_a_linked_settings_file_takes_no_bind(tmp_agents, tmp_path):  # noqa: F811
+    agents_dir, mcps_dir = tmp_agents
+    cfg = _make_config(agents_dir, mcps_dir, role="editor")
+    state = agents_dir / "personal-assistant" / "users" / "alice" / _CLAUDE
+    _hooks_in(state)
+    outside = tmp_path / "settings.json"
+    outside.write_text("{}\n")
+    (state / "settings.json").symlink_to(outside)
+    ro = _ro_binds(SandboxBuilder(cfg).build_command_prefix(["claude"]))
+    assert str(state / "settings.json") not in ro
+    assert str(outside) not in ro
+
+
+def test_a_planted_link_at_the_wrapper_directory_takes_no_bind(tmp_agents, tmp_path):  # noqa: F811
+    agents_dir, mcps_dir = tmp_agents
+    cfg = _make_config(agents_dir, mcps_dir, role="editor")
+    state = agents_dir / "personal-assistant" / "users" / "alice" / _CLAUDE
+    _hooks_in(state, wrappers=False)
+    (state / "bin").symlink_to(tmp_path)
+    cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+    assert str(state / "bin") not in _ro_binds(cmd)
 
 
 def test_the_agent_scopes_hooks_inside_workspace(tmp_agents):  # noqa: F811
@@ -106,6 +160,34 @@ def test_the_hook_reaches_the_session_read_only_through_its_held_handle(tmp_agen
     cmd = SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe])
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     assert out.stdout.split() == ["#", "hook", "read-only"], (out.stdout, out.stderr)
+
+
+@_needs_netns
+def test_the_settings_file_is_read_only_inside_and_its_dir_stays_writable(tmp_agents):  # noqa: F811
+    """End to end: a write to ``settings.json`` fails in the session (a
+    rename onto it too, the CLI's own way of writing it), while the CLI
+    keeps writing its other state beside it."""
+    agents_dir, mcps_dir = tmp_agents
+    cfg = _make_config(agents_dir, mcps_dir, role="editor")
+    state = agents_dir / "personal-assistant" / "users" / "alice" / _CLAUDE
+    _hooks_in(state)
+    (state / "settings.json").write_text('{"hooks": {}}\n')
+    d = f"/users/alice/{_CLAUDE}"
+    probe = ("import os\n"
+             "def attempt(f):\n"
+             "    try:\n"
+             "        f()\n"
+             "        print('written')\n"
+             "    except OSError:\n"
+             "        print('refused')\n"
+             f"attempt(lambda: open({d + '/settings.json'!r}, 'a').write('x'))\n"
+             f"open({d + '/new.tmp'!r}, 'w').write('{{}}')\n"
+             f"attempt(lambda: os.replace({d + '/new.tmp'!r}, {d + '/settings.json'!r}))\n"
+             f"attempt(lambda: open({d + '/state.json'!r}, 'w').write('{{}}'))\n")
+    cmd = SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe])
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert out.stdout.split() == ["refused", "refused", "written"], (out.stdout, out.stderr)
+    assert (state / "settings.json").read_text() == '{"hooks": {}}\n'
 
 
 def test_the_table_the_direct_resolver_reads_has_the_hook_read_only(tmp_agents):  # noqa: F811

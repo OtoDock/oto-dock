@@ -103,6 +103,7 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
             available_mcps=set(env_by_mcp),
             secret_keys=_secret,
             bash_env_keys=_bash,
+            cli_credentials={},
         ),
     )
     entries = server_entries or {}
@@ -335,10 +336,33 @@ def test_no_bundle_for_credless_mcp(monkeypatch, tmp_path):
     assert bundles == {}
 
 
+def test_inject_toml_credentials_is_the_builders_one_step(tmp_path, monkeypatch):
+    """The step every session builder runs: a JSON config, no config or no
+    environment comes back as given; a TOML config goes through the writer
+    (reached as the module attribute, so a test's patch of it holds)."""
+    from services.mcp import mcp_registry
+    toml = tmp_path / "a.toml"
+    toml.write_text("")
+    seen: list = []
+
+    def _fake(path, env, *, exclude_keys=None):
+        seen.append((path, dict(env), set(exclude_keys or ())))
+        return tmp_path / "b.toml"
+    monkeypatch.setattr(mcp_registry, "inject_credential_env_into_toml", _fake)
+    assert mcp_registry.inject_toml_credentials(toml, {"K": "v"}, mcp_format="json") is toml
+    assert mcp_registry.inject_toml_credentials(None, {"K": "v"}, mcp_format="toml") is None
+    assert mcp_registry.inject_toml_credentials(toml, {}, mcp_format="toml") is toml
+    assert mcp_registry.inject_toml_credentials(toml, None, mcp_format="toml") is toml
+    out = mcp_registry.inject_toml_credentials(
+        toml, {"K": "v"}, mcp_format="toml", exclude_keys={"GIT_CONFIG_COUNT"},
+    )
+    assert out == tmp_path / "b.toml" and seen == [(toml, {"K": "v"}, {"GIT_CONFIG_COUNT"})]
+
+
 def test_inject_toml_excludes_bash_env_keys(tmp_path):
     """inject_credential_env_into_toml drops exclude_keys
-    (env_injection) from the FILE — GH_TOKEN never lands on disk, while the
-    non-secret OTO_* still ships into the Codex MCP env block."""
+    (the git entries) from the FILE — nothing bash-only lands on disk, while
+    the non-secret OTO_* still ships into the Codex MCP env block."""
     import json as _json
     from services.mcp import mcp_registry
     toml_path = tmp_path / "agent-x.toml"

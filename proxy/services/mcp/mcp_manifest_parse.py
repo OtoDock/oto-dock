@@ -43,6 +43,7 @@ from services.mcp.mcp_manifest_types import (
     PermissionsBlock,
     REPLACES_KEY_RE,
     ReplacesDecl,
+    ResultFilesDecl,
     SKILL_AUDIENCES,
     SKILL_ID_MAX_LEN,
     SKILL_ID_RE,
@@ -473,6 +474,9 @@ def _parse_tool_filter(raw: Any, mcp_name: str) -> ToolFilterConfig | None:
     Optional:
       * ``env_var_name``: name of the Docker env var to write the flag
         into (default ``ENABLED_TOOLS_FLAG``). Ignored for stdio MCPs.
+      * ``regex_env_var_name``: name of the Docker env var to write the bare
+        regex into (default ``ENABLED_TOOLS_REGEX``); must differ from
+        ``env_var_name``. Ignored for stdio MCPs.
     """
     if raw is None:
         return None
@@ -498,7 +502,96 @@ def _parse_tool_filter(raw: Any, mcp_name: str) -> ToolFilterConfig | None:
             f"tool_filter.env_var_name {env_var_name!r} must match "
             f"POSIX env var name pattern {_ENV_VAR_NAME_RE.pattern}",
         )
-    return ToolFilterConfig(arg_name=arg_name, env_var_name=env_var_name)
+    regex_env_var_name = raw.get("regex_env_var_name", "ENABLED_TOOLS_REGEX")
+    if not isinstance(regex_env_var_name, str) or not _ENV_VAR_NAME_RE.match(regex_env_var_name):
+        raise ValueError(
+            f"tool_filter.regex_env_var_name {regex_env_var_name!r} must match "
+            f"POSIX env var name pattern {_ENV_VAR_NAME_RE.pattern}",
+        )
+    if regex_env_var_name == env_var_name:
+        raise ValueError("tool_filter.regex_env_var_name must differ from env_var_name")
+    return ToolFilterConfig(
+        arg_name=arg_name, env_var_name=env_var_name, regex_env_var_name=regex_env_var_name,
+    )
+
+
+def _declared_env_names(data: dict, config_fields, credentials, instances, path_env) -> set[str]:
+    """Every key the MCP's env may carry besides the tool filter's two: the
+    ``env`` and ``agent_env`` declarations, the config keys, the credential
+    fields (an infra MCP's secrets and its server config), the instance
+    fields and the ``path_env`` names."""
+    names: set[str] = set()
+    for block in ("env", "agent_env"):
+        raw = data.get(block)
+        if isinstance(raw, dict):
+            names.update(str(k) for k in raw)
+    names.update(cf.key for cf in config_fields)
+    for fields in (credentials.fields, credentials.server_config_fields):
+        names.update(str(f["key"]) for f in (fields or []) if isinstance(f, dict) and f.get("key"))
+    if instances is not None:
+        names.update(f.key for f in instances.fields)
+    names.update(path_env)
+    return names
+
+
+# ``result_files``: a tool is named exactly (an MCP tool name's characters);
+# the folder is ONE plain name under the workspace: no dot anywhere (no
+# ``..``, no hidden folder the file sync skips), no separator, no drive.
+_RESULT_FILES_TOOL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+RESULT_FILES_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+RESULT_FILES_DEFAULT_SUBDIR = "mcp-files"
+_RESULT_FILES_MAX_TOOLS = 64
+# Names a folder may not take: Windows device names (a paired Windows
+# machine could not hold the folder) and the folders the platform itself
+# writes in a workspace (``services/agents/repository_instructions.py``).
+_RESULT_FILES_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul", "inbox", "apps", "uploads"}
+    | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def result_files_subdir_ok(subdir) -> bool:
+    """Whether ``subdir`` is a folder name ``result_files`` may use."""
+    return (isinstance(subdir, str) and bool(RESULT_FILES_SUBDIR_RE.match(subdir))
+            and subdir.lower() not in _RESULT_FILES_RESERVED)
+
+
+def _parse_result_files(raw: Any, mcp_name: str) -> ResultFilesDecl | None:
+    """Parse + validate the optional ``result_files`` block:
+    ``{"tools": ["<tool>", …], "subdir": "<folder>"}``.
+
+    ``tools`` names the tools whose results the platform keeps (1 to 64
+    exact names, no glob). ``subdir`` is the folder under the session's
+    workspace; absent, the MCP's own name when that is a plain folder name,
+    else ``mcp-files``. Raises ``ValueError`` on any defect, so a manifest
+    naming ``..``, a path or a hidden folder never installs."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"result_files must be an object, got {type(raw).__name__}")
+    tools = raw.get("tools")
+    if not isinstance(tools, list) or not tools:
+        raise ValueError("result_files.tools must be a non-empty list of tool names")
+    if len(tools) > _RESULT_FILES_MAX_TOOLS:
+        raise ValueError(f"result_files.tools lists more than {_RESULT_FILES_MAX_TOOLS} tools")
+    for tool in tools:
+        if not isinstance(tool, str) or not _RESULT_FILES_TOOL_RE.match(tool):
+            raise ValueError(
+                f"result_files.tools entry {tool!r} is not a tool name "
+                f"(letters, digits, '_', '-', '.'; no glob)",
+            )
+    if len(set(tools)) != len(tools):
+        raise ValueError("result_files.tools names a tool twice")
+    if "subdir" in raw:
+        subdir = raw["subdir"]
+        if not result_files_subdir_ok(subdir):
+            raise ValueError(
+                f"result_files.subdir {subdir!r} must be one plain folder name "
+                f"matching {RESULT_FILES_SUBDIR_RE.pattern}, not a device or platform folder",
+            )
+    else:
+        subdir = mcp_name if result_files_subdir_ok(mcp_name) else RESULT_FILES_DEFAULT_SUBDIR
+    return ResultFilesDecl(tools=list(tools), subdir=subdir)
 
 
 def _parse_path_env(raw: dict, mcp_name: str) -> dict[str, PathEnvDecl]:
@@ -1152,11 +1245,32 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     except ValueError as e:
         raise ValueError(f"{name}: invalid agent_context block — {e}") from e
 
-    # Runtime tool filter declaration (optional).
+    # Runtime tool filter declaration (optional). Its two variables are
+    # written into the MCP's env beside every declared key, so a name that is
+    # also one of them would replace that value silently: refused here.
+    path_env = _parse_path_env(data.get("path_env") or {}, name)
     try:
         tool_filter = _parse_tool_filter(data.get("tool_filter"), name)
+        if tool_filter is not None:
+            taken = _declared_env_names(data, config_fields, credentials, instances, path_env)
+            for var in (tool_filter.env_var_name, tool_filter.regex_env_var_name):
+                if var in taken:
+                    raise ValueError(
+                        f"{var} is also a declared env, config, credential, "
+                        "instance or path_env key")
     except ValueError as e:
         raise ValueError(f"{name}: invalid tool_filter block — {e}") from e
+
+    # The tools whose pictures and file blobs the platform keeps (optional).
+    # A tool output relocation already moves would be saved twice.
+    try:
+        result_files = _parse_result_files(data.get("result_files"), name)
+        relocated = {t for o in (data.get("outputs") or []) if isinstance(o, dict)
+                     for t in (o.get("after_tools") or ["*"])}
+        if result_files and relocated & ({"*"} | set(result_files.tools)):
+            raise ValueError("a tool both outputs and result_files keep")
+    except ValueError as e:
+        raise ValueError(f"{name}: invalid result_files block — {e}") from e
 
     # Direct-LLM deferred tool loading opt-out (optional, strict bool).
     always_load = data.get("always_load", False)
@@ -1261,7 +1375,8 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
             for o in (data.get("outputs") or [])
             if o.get("source") and o.get("destination_template")
         ],
-        path_env=_parse_path_env(data.get("path_env") or {}, name),
+        result_files=result_files,
+        path_env=path_env,
         tool_arg_paths=tool_arg_paths,
         costs=costs,
         permissions=permissions,

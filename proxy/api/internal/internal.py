@@ -16,7 +16,7 @@ from auth.providers import (
     require_auth,
 )
 
-logger = logging.getLogger("claude-proxy.internal-api")
+logger = logging.getLogger("otodock.internal-api")
 router = APIRouter()
 
 

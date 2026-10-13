@@ -53,13 +53,15 @@ DEFAULT_INSTALL_TIMEOUT = 300  # seconds
 _VENV_BIN_DIR = "Scripts" if sys.platform == "win32" else "bin"
 _EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 
-# uv resolver naming a Python floor the current venv can't satisfy — both
-# phrasings: pypi installs report "Requires Python>=3.13", requirements.txt
-# resolves report "the current Python version (3.10.12) does not satisfy
-# Python>=3.11". Captured spec feeds `uv venv --python <spec>`, which
-# downloads a matching standalone CPython when the host lacks one.
+# uv resolver naming a Python floor the current venv can't satisfy, in every
+# phrasing seen: uv 0.12 reports "dummy==1.0 requires Python >=3.14" (a
+# space), older ones "Requires Python>=3.13" and "the current Python version
+# (3.10.12) does not satisfy Python>=3.11". The captured spec, spaces removed,
+# feeds `uv venv --python <spec>`, which downloads a matching standalone
+# CPython when the host lacks one. uv ignores an upper bound, so only a floor
+# ever fails a resolve.
 _PY_FLOOR_RE = re.compile(
-    r"Python(>=\s*\d+(?:\.\d+)?(?:\s*,\s*<\s*\d+(?:\.\d+)?)?)"
+    r"Python\s*(>=\s*\d+(?:\.\d+)*(?:\s*,\s*<=?\s*\d+(?:\.\d+)*)?)"
 )
 
 # A distro package name (dpkg, rpm, pacman and brew all fit).
@@ -276,6 +278,18 @@ class ParsedSource:
     registry: str   # "npm" | "pypi" | "docker" | ""
     package: str
     version: str
+    # The extras of a ``pypi:`` source (``pypi:name[a,b]``), as written.
+    extras: tuple[str, ...] = ()
+
+    @property
+    def requirement(self) -> str:
+        """The package with its extras, as pip and uv name it: ``name[a,b]``."""
+        return f"{self.package}[{','.join(self.extras)}]" if self.extras else self.package
+
+    def pinned(self, version: str) -> str:
+        """This source pinned to ``version``, the extras kept:
+        ``pypi:name[a]@1.2.3``."""
+        return f"{self.registry}:{self.requirement}@{version}"
 
 
 @dataclass
@@ -316,6 +330,10 @@ class InstallResult:
     # stay deterministic. See pin_local_manifest in services/mcp/mcp_updater.py.
     resolved_version: str = ""
     missing_deps: list[MissingDep] = field(default_factory=list)
+    # The ``--python`` spec of the venv this install created: the caller's
+    # ``python_spec`` or a floor uv asked for; "" for uv's default (a pin
+    # that failed, none asked) or when no venv was created.
+    venv_python: str = ""
 
 
 # Progress callback signature. Matches the shape `mcp_install_progress` WS
@@ -339,6 +357,39 @@ def _spec_is_safe(s: str) -> bool:
     return all(c.isalnum() or c in "@/._+-~^<>=!,*" for c in s)
 
 
+# One extra of a PyPI requirement: PEP 508's identifier (letters and digits at
+# both ends, ``-``, ``_`` and ``.`` between), bounded in length and number.
+_EXTRA_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_EXTRA_MAX_LEN = 64
+_EXTRAS_MAX = 16
+
+
+def _split_extras(spec: str) -> tuple[str, tuple[str, ...]] | None:
+    """``name[a,b]`` → ``("name", ("a", "b"))``; ``name`` → ``("name", ())``.
+    One bracket group right after the name and closing the spec, extras
+    comma-separated and nothing else inside; ``None`` for any other shape
+    (an empty group, a second group, a space, an empty or flag-like extra)."""
+    if "[" not in spec and "]" not in spec:
+        return spec, ()
+    start = spec.find("[")
+    if start < 1 or spec.count("[") != 1 or spec.count("]") != 1 or not spec.endswith("]"):
+        return None
+    extras = tuple(spec[start + 1:-1].split(","))
+    if len(extras) > _EXTRAS_MAX:
+        return None
+    if any(len(e) > _EXTRA_MAX_LEN or not _EXTRA_RE.fullmatch(e) for e in extras):
+        return None
+    return spec[:start], extras
+
+
+def normalized_extras(parsed: ParsedSource | None) -> frozenset[str]:
+    """The extras of a parsed source as PEP 685 compares them: lower case,
+    runs of ``-``, ``_`` and ``.`` as one ``-``, order ignored."""
+    if parsed is None:
+        return frozenset()
+    return frozenset(_pep503(e) for e in parsed.extras)
+
+
 def parse_source(source: str) -> ParsedSource | None:
     """Parse `server.source` into (registry, package, version).
 
@@ -348,9 +399,11 @@ def parse_source(source: str) -> ParsedSource | None:
     accepted: the proxy writes one into each install's LOCAL manifest after
     resolving the concrete version, so satellites reinstall deterministically.
 
-    Handles npm scoped packages (`npm:@scope/name`, `npm:@scope/name@ver`).
-    Returns ``version=""`` for an unpinned source. Returns ``None`` for Docker,
-    empty, or empty-package sources.
+    Handles npm scoped packages (`npm:@scope/name`, `npm:@scope/name@ver`) and
+    PyPI extras (`pypi:name[a,b]`, `pypi:name[a,b]@ver`: ``package`` is the
+    bare name, ``extras`` the group). Returns ``version=""`` for an unpinned
+    source. Returns ``None`` for empty or empty-package sources and for a
+    spec that fails the charset or the extras rule.
     """
     if not source:
         return None
@@ -371,14 +424,19 @@ def parse_source(source: str) -> ParsedSource | None:
     if source.startswith("pypi:"):
         pkg_ver = source[5:]
         at_idx = pkg_ver.find("@")
-        package = pkg_ver if at_idx == -1 else pkg_ver[:at_idx]
+        spec = pkg_ver if at_idx == -1 else pkg_ver[:at_idx]
         version = "" if at_idx == -1 else pkg_ver[at_idx + 1:]
+        split = _split_extras(spec)
+        if split is None:
+            logger.warning("Rejecting malformed pypi extras: %r", source)
+            return None
+        package, extras = split
         if not package:
             return None
         if not _spec_is_safe(package) or (version and not _spec_is_safe(version)):
             logger.warning("Rejecting unsafe pypi source spec: %r", source)
             return None
-        return ParsedSource(registry="pypi", package=package, version=version)
+        return ParsedSource(registry="pypi", package=package, version=version, extras=extras)
     if source.startswith("git+"):
         # pip VCS source: git+https://host/repo.git@<ref>#subdirectory=<dir>
         # (the official Blender MCP, and any GitHub/Gitea-only MCP). install_mcp
@@ -600,7 +658,7 @@ def install_system_requirements(
 
 
 # ---------------------------------------------------------------------------
-# Install (npm / pypi)
+# Installing an npm or PyPI package
 # ---------------------------------------------------------------------------
 
 
@@ -678,6 +736,192 @@ def _python_installed_version(venv_dir: Path, dist: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Venv interpreters — where they live, how a venv is created, the prune
+# ---------------------------------------------------------------------------
+
+# A uv-managed download that failed is not tried again for this long: offline,
+# every MCP would otherwise wait out its own failed download.
+_MANAGED_RETRY_AFTER_S = 3600.0
+_MANAGED_TIMEOUT_S = 120
+_managed_failed_at: float | None = None
+
+
+def _pyvenv_home(venv_dir: Path) -> str:
+    """The ``home`` a venv's ``pyvenv.cfg`` names ("" when it names none).
+    Raises ``OSError`` when the file cannot be read."""
+    for line in (venv_dir / "pyvenv.cfg").read_text(errors="replace").splitlines():
+        key, _, val = line.partition("=")
+        if key.strip().lower() == "home":
+            return val.strip()
+    return ""
+
+
+def venv_interpreter_paths(venv_dir: Path) -> list[Path]:
+    """Where a venv's interpreter really lives: its ``bin/python`` resolved
+    and the ``home`` of its ``pyvenv.cfg`` resolved (on Windows the first is
+    a copy inside the venv, the second the real one). Empty when neither can
+    be read."""
+    venv_dir = Path(venv_dir)
+    out: list[Path] = []
+    python = venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"
+    with contextlib.suppress(OSError, RuntimeError):
+        if os.path.lexists(python):
+            out.append(python.resolve())
+    with contextlib.suppress(OSError, RuntimeError):
+        home = _pyvenv_home(venv_dir)
+        if home:
+            out.append(Path(home).resolve())
+    return out
+
+
+def venv_outside(venv_dir: Path, roots: list[Path]) -> bool:
+    """Whether an interpreter path of the venv lies under none of ``roots``
+    (resolved paths both sides). A venv with no readable interpreter path is
+    not judged (``False``)."""
+    paths = venv_interpreter_paths(venv_dir)
+    return any(not any(p == r or p.is_relative_to(r) for r in roots) for p in paths)
+
+
+async def _create_venv(
+    venv_dir: Path,
+    *,
+    uv_bin: str | None,
+    python_bin: str,
+    floor: str | None,
+    pin: str | None,
+    roots: list[Path] | None,
+    env: dict[str, str],
+    cwd: str,
+    timeout: int,
+) -> tuple[bool, str, str]:
+    """Create ``venv_dir``; returns ``(ok, log, spec)`` with ``spec`` the
+    ``--python`` the venv was made with ("" for uv's default).
+
+    ``floor`` is a Python floor uv asked for: it must hold. ``pin`` is the
+    caller's preferred interpreter: a pin uv cannot satisfy falls back to
+    uv's default, never failing the install. With ``roots``, a venv whose
+    interpreter lies outside them (an interpreter the session sandbox does
+    not bind) is made again with ``--managed-python``, which fetches one into
+    ``UV_PYTHON_INSTALL_DIR``; when that fails too the first venv is made
+    again and the log says so."""
+    global _managed_failed_at
+    uv = uv_bin if uv_bin and os.path.isfile(uv_bin) else None
+    if uv is None:
+        if floor:
+            return False, f"python {floor} required but uv not available", ""
+        rc, out = await _run_bounded(
+            [python_bin, "-m", "venv", str(venv_dir)], cwd=cwd, env=env, timeout=timeout,
+        )
+        return rc == 0, out, ""
+
+    async def _uv_venv(spec: str, managed: bool, bound: int) -> tuple[int, str]:
+        cmd = [uv, "venv"]
+        if spec:
+            cmd.extend(["--python", spec])
+        if managed:
+            cmd.append("--managed-python")
+        cmd.append(str(venv_dir))
+        return await _run_bounded(cmd, cwd=cwd, env=env, timeout=bound)
+
+    spec = floor or pin or ""
+    rc, log = await _uv_venv(spec, False, timeout)
+    if rc != 0 and spec and not floor:
+        await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
+        log += f"\nuv venv --python {spec} failed; created on uv's default interpreter"
+        spec = ""
+        rc, out = await _uv_venv("", False, timeout)
+        log += "\n" + out
+    if rc != 0:
+        return False, log, spec
+    if roots and venv_outside(venv_dir, roots):
+        now = asyncio.get_running_loop().time()
+        if _managed_failed_at is not None and now - _managed_failed_at < _MANAGED_RETRY_AFTER_S:
+            logger.warning("venv %s: its interpreter lies outside the platform tree "
+                           "(a managed download failed recently)", venv_dir)
+            return True, log, spec
+        await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
+        rc, out = await _uv_venv(spec, True, min(timeout, _MANAGED_TIMEOUT_S))
+        log += "\n" + out
+        if rc == 0:
+            return True, log, spec
+        _managed_failed_at = now
+        await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
+        rc, out = await _uv_venv(spec, False, timeout)
+        log += "\n" + out
+        logger.warning("venv %s: uv venv --managed-python failed; its interpreter "
+                       "stays outside the platform tree", venv_dir)
+        return rc == 0, log, spec
+    return True, log, spec
+
+
+def _pyvenv_cfgs(mcps_root: Path, max_depth: int = 4) -> list[Path]:
+    """Every ``pyvenv.cfg`` under ``mcps_root`` (install backups and swap
+    folders included), not descending into a venv, ``node_modules`` or
+    ``.uv-python``. A walk error raises."""
+    def _raise(exc: OSError) -> None:
+        raise exc
+
+    found: list[Path] = []
+    base = len(Path(mcps_root).parts)
+    for root, dirs, files in os.walk(mcps_root, onerror=_raise):
+        if "pyvenv.cfg" in files:
+            found.append(Path(root) / "pyvenv.cfg")
+            dirs[:] = []
+            continue
+        depth = len(Path(root).parts) - base
+        dirs[:] = [
+            d for d in dirs
+            if depth < max_depth and d not in (".uv-python", "node_modules", "__pycache__", ".git")
+        ]
+    return found
+
+
+def prune_uv_pythons(mcps_root: Path) -> list[str]:
+    """Remove the interpreters under ``<mcps_root>/.uv-python`` that no MCP
+    venv uses (about 50 MB each, left by an uninstall or a platform that
+    moved to a newer Python). Returns the names removed.
+
+    A venv uses the ``cpython-*`` entry its interpreter resolves into
+    (``bin/python`` and the ``home`` of its ``pyvenv.cfg``); a minor-version
+    link is kept with its target and unlinked, never walked, when not. Any
+    unreadable ``pyvenv.cfg`` or walk error removes nothing. Run only while
+    nothing installs (before the platform serves, before a satellite
+    connects). POSIX only: on Windows a venv's ``home`` names a junction this
+    prune does not follow, so it removes nothing there."""
+    if sys.platform == "win32":
+        return []
+    uv_dir = Path(mcps_root) / ".uv-python"
+    if not uv_dir.is_dir():
+        return []
+    try:
+        uv_real = uv_dir.resolve()
+        used: set[str] = set()
+        for cfg in _pyvenv_cfgs(Path(mcps_root)):
+            _pyvenv_home(cfg.parent)
+            for path in venv_interpreter_paths(cfg.parent):
+                if path.is_relative_to(uv_real) and path != uv_real:
+                    used.add(path.relative_to(uv_real).parts[0])
+        removed: list[str] = []
+        for entry in sorted(uv_dir.iterdir()):
+            if not entry.name.startswith("cpython-"):
+                continue
+            if entry.is_symlink():
+                target = entry.resolve()
+                kept = (target.is_relative_to(uv_real) and target != uv_real
+                        and target.relative_to(uv_real).parts[0] in used)
+                if not kept and entry.name not in used:
+                    entry.unlink()
+                    removed.append(entry.name)
+            elif entry.is_dir() and entry.name not in used:
+                shutil.rmtree(entry)
+                removed.append(entry.name)
+        return removed
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.warning("uv interpreter prune skipped: %s", exc)
+        return []
+
+
 async def install_mcp(
     mcp_dir: Path,
     runtime: str,
@@ -688,6 +932,8 @@ async def install_mcp(
     python_bin: str = "python3",
     timeout: int = DEFAULT_INSTALL_TIMEOUT,
     source_build: list[str] | None = None,
+    python_spec: str | None = None,
+    sandbox_roots: list[Path] | None = None,
 ) -> InstallResult:
     """Install or update an MCP's Node/Python dependencies in-place.
 
@@ -714,6 +960,13 @@ async def install_mcp(
 
     `progress_cb` receives `{phase, pct, message}` dicts (both sync and
     async callables supported) so the satellite can stream them over WS.
+
+    ``python_spec`` is the interpreter a venv this install creates should run
+    on (the platform passes its own minor; a floor uv asks for replaces it,
+    and a pin uv cannot satisfy falls back to uv's default). With
+    ``sandbox_roots``, a created venv whose interpreter lies outside them is
+    made again on a uv-managed interpreter (see ``_create_venv``). A caller
+    passing neither gets uv's default interpreter, as before.
     """
     mcp_dir = Path(mcp_dir)
     name = mcp_dir.name
@@ -801,6 +1054,7 @@ async def install_mcp(
         return InstallResult(ok=True, log=log, version_hash=vh, resolved_version=resolved)
 
     if runtime == "python" and (source.startswith("pypi:") or source.startswith("git+")):
+        parsed_pypi: ParsedSource | None = None
         if source.startswith("git+"):
             # pip VCS source — pip/uv accept "git+https://…@<ref>#subdirectory=<dir>"
             # verbatim. NEVER rewrite the "@<ref>" to "==" (it is the git ref, not
@@ -809,12 +1063,18 @@ async def install_mcp(
             pip_pkg = source
             upgrade = False
         else:
-            pip_pkg = source[5:].replace("@", "==", 1)  # "ha-mcp@6.6.1" -> "ha-mcp==6.6.1"
+            parsed_pypi = parse_source(source)
+            if parsed_pypi is None:
+                return InstallResult(ok=False, log=f"Unparseable pypi source: {source!r}")
+            # "pypi:ha-mcp[x]@6.6.1" -> "ha-mcp[x]==6.6.1": pip and uv resolve
+            # the extras.
+            pip_pkg = parsed_pypi.requirement + (
+                f"=={parsed_pypi.version}" if parsed_pypi.version else "")
             # Unpinned "pypi:pkg" → bare requirement (no "=="); the venv is
             # fresh, so --upgrade only keeps the resolver honest about
             # cached wheels. A pinned "pkg==X.Y.Z" needs no flag (exact
             # forces it) and must NOT float transitive deps on the satellite.
-            upgrade = "==" not in pip_pkg
+            upgrade = not parsed_pypi.version
         venv_dir = mcp_dir / "venv"
         # A catalog package installs from wheels only: no build backend of a
         # source distribution ever runs here, except for a package the
@@ -824,22 +1084,19 @@ async def install_mcp(
         # explicit admin install; never the weekly job).
         wheels_only = source.startswith("pypi:")
 
-        async def _create_venv(python_spec: str | None) -> tuple[bool, str]:
-            """Create venv. ``python_spec`` like ``>=3.13`` or ``None`` for default."""
-            if uv_bin and os.path.isfile(uv_bin):
-                msg = f"uv venv{' --python ' + python_spec if python_spec else ''}"
-                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10, "message": msg})
-                cmd = [uv_bin, "venv"]
-                if python_spec:
-                    cmd.extend(["--python", python_spec])
-                cmd.append(str(venv_dir))
-            else:
-                if python_spec:
-                    return False, f"python {python_spec} required but uv not available"
-                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10, "message": "python -m venv"})
-                cmd = [python_bin, "-m", "venv", str(venv_dir)]
-            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
-            return rc == 0, out
+        async def _make_venv(floor: str | None) -> tuple[bool, str, str]:
+            """Create the venv: on ``floor`` when uv asked for one, else on
+            the caller's pin."""
+            want = floor or python_spec
+            uv_here = bool(uv_bin and os.path.isfile(uv_bin))
+            msg = (f"uv venv{' --python ' + want if want else ''}" if uv_here
+                   else "python -m venv")
+            await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10, "message": msg})
+            return await _create_venv(
+                venv_dir, uv_bin=uv_bin, python_bin=python_bin, floor=floor,
+                pin=python_spec, roots=sandbox_roots, env=env, cwd=str(mcp_dir),
+                timeout=timeout,
+            )
 
         async def _pip_install(no_binary: list[str]) -> tuple[bool, str]:
             # Prefer uv (much faster). UV_PYTHON_INSTALL_DIR ensures any Python
@@ -884,7 +1141,7 @@ async def install_mcp(
         # old venv when the install fails. A venv holds thousands of files,
         # so it is removed off the event loop.
         await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
-        ok, venv_log = await _create_venv(None)
+        ok, venv_log, venv_spec = await _make_venv(None)
         if not ok:
             log = f"venv creation failed:\n{venv_log}"
             await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "venv failed", "error": log})
@@ -894,37 +1151,37 @@ async def install_mcp(
         ok, log = await _install_package()
 
         # If the package requires a Python version this venv doesn't satisfy,
-        # uv reports it as `Python>=3.13,<3.14`. Recreate the venv with that
-        # constraint and retry once. Single retry — if it still fails, surface
-        # the original error.
+        # uv names the floor (`requires Python >=3.14`). Recreate the venv with
+        # that constraint and retry once. Single retry — if it still fails,
+        # surface the original error.
         if not ok and uv_bin:
             m = _PY_FLOOR_RE.search(log)
             if m:
-                python_spec = m.group(1).replace(" ", "")
-                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30, "message": f"retry with Python{python_spec}"})
+                floor = m.group(1).replace(" ", "")
+                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30, "message": f"retry with Python{floor}"})
                 await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
-                ok, venv_log = await _create_venv(python_spec)
+                ok, venv_log, venv_spec = await _make_venv(floor)
                 if ok:
                     ok, log = await _install_package()
                 else:
-                    log = f"venv creation with Python{python_spec} failed:\n{venv_log}"
+                    log = f"venv creation with Python{floor} failed:\n{venv_log}"
         # Read back the concrete version for pypi installs so the caller can pin
-        # the LOCAL manifest. git+ has no PyPI dist name to query — skip it (its
-        # version of record is the pinned git ref in the source). A readback miss
-        # is non-fatal: pip install succeeded; the caller logs + leaves the
-        # manifest unpinned (it self-heals on the next update).
+        # the LOCAL manifest, by the bare name (the extras are not part of it).
+        # git+ has no PyPI dist name to query — skip it (its version of record
+        # is the pinned git ref in the source). A readback miss is non-fatal:
+        # pip install succeeded; the caller logs + leaves the manifest unpinned
+        # (it self-heals on the next update).
         resolved = ""
-        if ok and source.startswith("pypi:"):
-            parsed = parse_source(source)
-            if parsed:
-                resolved = _python_installed_version(venv_dir, parsed.package)
-                if not resolved:
-                    log += f"\nInstalled {parsed.package} but could not read its version back; leaving manifest unpinned."
+        if ok and parsed_pypi is not None:
+            resolved = _python_installed_version(venv_dir, parsed_pypi.package)
+            if not resolved:
+                log += f"\nInstalled {parsed_pypi.package} but could not read its version back; leaving manifest unpinned."
 
         phase = "done" if ok else "failed"
         await _emit(progress_cb, {"mcp": name, "phase": phase, "pct": 100, "message": log[-200:] if not ok else "installed"})
         vh = compute_version_hash(mcp_dir) if ok else ""
-        return InstallResult(ok=ok, log=log, version_hash=vh, resolved_version=resolved)
+        return InstallResult(ok=ok, log=log, version_hash=vh, resolved_version=resolved,
+                             venv_python=venv_spec if ok else "")
 
     if runtime == "docker":
         return InstallResult(ok=True, log="Docker MCP — use Start button to build and run.")
@@ -943,6 +1200,7 @@ async def install_mcp(
                 version_hash=compute_version_hash(mcp_dir),
             )
         venv_dir = mcp_dir / "venv"
+        venv_spec = ""
         if not venv_dir.is_dir():
             # Prefer uv venv when available — the satellite-bundled `python -m
             # venv` triggers an internal `ensurepip --default-pip` step that
@@ -954,16 +1212,17 @@ async def install_mcp(
             # any supported satellite, but defensive). The install env carries
             # UV_LINK_MODE=copy so the python.exe link step also works
             # without Windows Developer Mode / admin.
-            if uv_bin and os.path.isfile(uv_bin):
-                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
-                                           "message": "uv venv"})
-                cmd = [uv_bin, "venv", str(venv_dir)]
-            else:
-                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
-                                           "message": "python -m venv"})
-                cmd = [python_bin, "-m", "venv", str(venv_dir)]
-            rc, out = await _run_bounded(cmd, cwd=str(mcp_dir), env=env, timeout=timeout)
-            if rc != 0:
+            uv_here = bool(uv_bin and os.path.isfile(uv_bin))
+            msg = ((f"uv venv --python {python_spec}" if python_spec else "uv venv")
+                   if uv_here else "python -m venv")
+            await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
+                                       "message": msg})
+            ok, out, venv_spec = await _create_venv(
+                venv_dir, uv_bin=uv_bin, python_bin=python_bin, floor=None,
+                pin=python_spec, roots=sandbox_roots, env=env, cwd=str(mcp_dir),
+                timeout=timeout,
+            )
+            if not ok:
                 log = "venv creation failed:\n" + out
                 await _emit(progress_cb, {"mcp": name, "phase": "failed",
                                            "pct": 100, "message": "venv failed",
@@ -994,18 +1253,19 @@ async def install_mcp(
         if not ok and uv_bin and os.path.isfile(uv_bin):
             m = _PY_FLOOR_RE.search(log)
             if m:
-                python_spec = m.group(1).replace(" ", "")
+                floor = m.group(1).replace(" ", "")
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30,
-                                           "message": f"retry with Python{python_spec}"})
+                                           "message": f"retry with Python{floor}"})
                 await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
-                rc, out = await _run_bounded(
-                    [uv_bin, "venv", "--python", python_spec, str(venv_dir)],
-                    cwd=str(mcp_dir), env=env, timeout=timeout,
+                created, out, venv_spec = await _create_venv(
+                    venv_dir, uv_bin=uv_bin, python_bin=python_bin, floor=floor,
+                    pin=python_spec, roots=sandbox_roots, env=env, cwd=str(mcp_dir),
+                    timeout=timeout,
                 )
-                if rc == 0:
+                if created:
                     ok, log = await _req_install()
                 else:
-                    log = f"venv creation with Python{python_spec} failed:\n" + out
+                    log = f"venv creation with Python{floor} failed:\n" + out
         if not ok:
             await _emit(progress_cb, {"mcp": name, "phase": "failed",
                                        "pct": 100, "message": "pip install failed",
@@ -1014,7 +1274,7 @@ async def install_mcp(
         vh = compute_version_hash(mcp_dir)
         await _emit(progress_cb, {"mcp": name, "phase": "done", "pct": 100,
                                    "message": "installed"})
-        return InstallResult(ok=True, log=log, version_hash=vh)
+        return InstallResult(ok=True, log=log, version_hash=vh, venv_python=venv_spec)
 
     return InstallResult(ok=True, log="No install step required.")
 

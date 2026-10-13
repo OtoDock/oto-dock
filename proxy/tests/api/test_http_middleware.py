@@ -155,6 +155,12 @@ def test_a_wopi_token_lifts_the_tier_on_wopi_only():
     assert status == 401
     status, _, _ = _drive("POST", "/v1/triggers", chunks=4, query=f"access_token={token}")
     assert status == 413
+    # The editor frame posted with ``access_header``: Collabora's WOPI calls
+    # carry the token in the Authorization header alone.
+    status, _, _ = _drive("POST", path, chunks=4, headers=[("authorization", f"Bearer {token}")])
+    assert status not in (401, 413)
+    status, _, _ = _drive("POST", path, declared=4 * CHUNK, headers=[("authorization", "Bearer forged")])
+    assert status == 401
 
 
 def test_the_app_action_routes_take_a_megabyte_without_a_platform_credential():
@@ -175,6 +181,8 @@ def test_the_per_route_caps():
     assert middleware.body_cap("PUT", "/v1/upload/chunked/AbC_-1/3") == (
         config.UPLOAD_CHUNK_BYTES + 64 * 1024, True)
     assert middleware.body_cap("POST", "/v1/hooks/images") == (64 * 1024 * 1024, True)
+    # a kept tool result's pictures ride the tool-result hook
+    assert middleware.body_cap("POST", "/v1/hooks/tool-result") == (64 * 1024 * 1024, True)
     from core.credentials.mcp_gateway import MAX_BODY_BYTES
     assert MAX_BODY_BYTES > config.MAX_JSON_BODY_BYTES
     assert middleware.body_cap("POST", "/v1/mcp-gateway/github/mcp") == (

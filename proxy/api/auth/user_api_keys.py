@@ -27,7 +27,7 @@ from auth.providers import (
     require_user,
 )
 
-logger = logging.getLogger("claude-proxy.user-api-keys")
+logger = logging.getLogger("otodock.user-api-keys")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 

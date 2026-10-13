@@ -44,6 +44,37 @@ def _auth():
     return {"Authorization": f"Bearer {config.API_KEY}"}
 
 
+def test_a_transfers_dial_that_failed_corrects_the_row_once(client):
+    """The daemon's action callback learns the Dial's end after the row was
+    written: the newest ``transferred`` row of the call takes
+    ``transfer_failed``; a repeated callback, another outcome or a row that
+    never read transferred changes nothing. Master key only."""
+    from auth.service_endpoints import is_service_endpoint_allowed
+    assert is_service_endpoint_allowed("POST", "/v1/phone/calls/transfer-outcome")
+    body = {"call_uuid": "CAtransfer01", "outcome": "transfer_failed"}
+    assert client.post("/v1/phone/calls/transfer-outcome", json=body).status_code == 401
+    assert client.post("/v1/phone/calls/transfer-outcome", headers=_auth(),
+                       json=body).json() == {"updated": 0}
+    _report(client, call_uuid="CAtransfer01", outcome="transferred")
+    _report(client, call_uuid="CAtransfer01", outcome="transferred")
+    assert client.post("/v1/phone/calls/transfer-outcome", headers=_auth(),
+                       json=body).json() == {"updated": 1}
+    assert client.post("/v1/phone/calls/transfer-outcome", headers=_auth(),
+                       json=body).json() == {"updated": 1}   # the older row, once
+    assert client.post("/v1/phone/calls/transfer-outcome", headers=_auth(),
+                       json=body).json() == {"updated": 0}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT outcome FROM phone_call_log WHERE call_uuid = %s ORDER BY id",
+            ("CAtransfer01",)).fetchall()
+    assert [r["outcome"] for r in rows] == ["transfer_failed", "transfer_failed"]
+    assert client.post("/v1/phone/calls/transfer-outcome", headers=_auth(),
+                       json={"call_uuid": "CAtransfer01", "outcome": "completed"}).status_code == 400
+    _report(client, call_uuid="CAplain", outcome="completed")
+    assert client.post("/v1/phone/calls/transfer-outcome", headers=_auth(),
+                       json={"call_uuid": "CAplain", "outcome": "transfer_failed"}).json() == {"updated": 0}
+
+
 def _make_server() -> int:
     with get_conn() as conn:
         row = conn.execute(
@@ -106,19 +137,23 @@ class TestPinFailures:
                 started_at=recent, ended_at=recent, from_number="+15550002222")
         _report(client, route_id=route["id"], outcome="completed", pin_attempts=0,
                 started_at=recent, ended_at=recent)
-        _report(client, direction="outbound", outcome="completed", pin_attempts=2,
-                started_at=recent, ended_at=recent)
+        # An outbound call the gate refused (a route tied to a user): the
+        # window is keyed on the number that was dialled, which the ingest
+        # puts in ``to_number`` (``from_number`` holds the route's caller ID).
+        _report(client, direction="outbound", outcome="pin_failed", pin_attempts=2,
+                started_at=recent, ended_at=recent, to_number="+15550003333")
         calls = client.get("/v1/phone/pin-failures", headers=_auth(),
                            params={"window_s": 900}).json()["calls"]
         assert [(c["outcome"], c["pin_attempts"]) for c in calls] == [
-            ("pin_failed", 3), ("pin_timeout", 1)]
+            ("pin_failed", 3), ("pin_failed", 2), ("pin_timeout", 1)]
         assert calls[0]["from_number"] == "+15550002222" and calls[0]["route_id"] == route["id"]
+        assert calls[1]["from_number"] == "+15550003333"
         assert set(calls[0]) == {"from_number", "route_id", "outcome", "pin_attempts",
                                  "started_at", "ended_at"}
         # The window is cut to an hour: the 40-minute-old call is in at most that.
         wide = client.get("/v1/phone/pin-failures", headers=_auth(),
                           params={"window_s": 10 ** 9}).json()["calls"]
-        assert len(wide) == 3
+        assert len(wide) == 4
 
 
 class TestIngest:

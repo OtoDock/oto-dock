@@ -32,3 +32,25 @@ def test_detect_default_when_no_signal():
     assert detect_tts_language("") == "en"
     assert detect_tts_language("xyz 123 qqq") == "en"  # no stopword hits → default
     assert detect_tts_language("zzz", default="de") == "de"
+
+
+def test_auto_pick_and_stt_language_param():
+    from audio.streaming.lang import AUTO, is_auto, stt_language_param
+    assert AUTO == "auto"
+    assert is_auto("auto") and is_auto(" Auto ") and not is_auto("en") and not is_auto(None)
+    # The providers' detection sentinel for the Automatic pick and for no pick.
+    assert stt_language_param("auto") == "multi"
+    assert stt_language_param("") == "multi"
+    assert stt_language_param(None) == "multi"
+    assert stt_language_param("el-GR") == "el-GR"
+
+
+def test_pcm16_to_wav_wraps_the_samples():
+    import io
+    import wave
+    from audio.streaming.lang import pcm16_to_wav
+    pcm = b"\x01\x00" * 800
+    data = pcm16_to_wav(pcm, 8000)
+    with wave.open(io.BytesIO(data), "rb") as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 8000)
+        assert w.readframes(800) == pcm

@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 
 import config
 
-logger = logging.getLogger("claude-proxy.mcp-gateway")
+logger = logging.getLogger("otodock.mcp-gateway")
 
 GATEWAY_PATH_PREFIX = "/v1/mcp-gateway"
 
@@ -130,6 +130,40 @@ class GatewayCredential:
 
 
 @dataclass
+class CliCredential:
+    """The account token a session's command-line tools fetch per command
+    through ``/v1/hooks/cli-credential`` (``proxy/hooks/credential_helper.py``
+    for ``git``, and through it the ``gh`` wrapper): the host the helper
+    serves, the username git presents, the names the wrapper sets on the
+    real command's own process, the manifest it was built for, and the
+    token file by reference, read at the moment of each call."""
+
+    host: str
+    token_ref: TokenRef
+    username: str = "x-access-token"
+    env_names: tuple[str, ...] = ()
+    manifest: str = ""
+
+    def descriptor(self) -> dict:
+        d = asdict(self)
+        d["env_names"] = list(self.env_names)
+        return d
+
+    @classmethod
+    def from_descriptor(cls, d: dict) -> "CliCredential | None":
+        ref = d.get("token_ref")
+        if not isinstance(ref, dict) or not d.get("host"):
+            return None
+        return cls(
+            host=str(d["host"]),
+            token_ref=TokenRef(**ref),
+            username=str(d.get("username") or "x-access-token"),
+            env_names=tuple(str(n) for n in (d.get("env_names") or [])),
+            manifest=str(d.get("manifest") or ""),
+        )
+
+
+@dataclass
 class Resolved:
     header: str
     value: str
@@ -137,6 +171,13 @@ class Resolved:
     path: str
     proxy_local: bool
     expires_in: float | None = None
+
+
+@dataclass
+class ResolvedCli:
+    username: str
+    secret: str
+    env_names: tuple[str, ...]
 
 
 @dataclass
@@ -206,6 +247,17 @@ def credentials_of(session_id: str) -> dict[str, GatewayCredential]:
     out: dict[str, GatewayCredential] = {}
     for key, bundle in (mcp_broker.bundles_of(session_id) or {}).items():
         cred = getattr(bundle, "gateway", None)
+        if cred is not None:
+            out[key] = cred
+    return out
+
+
+def cli_credentials_of(session_id: str) -> dict[str, CliCredential]:
+    """Every command-line credential a session holds, by MCP key."""
+    from core.credentials import mcp_broker
+    out: dict[str, CliCredential] = {}
+    for key, bundle in (mcp_broker.bundles_of(session_id) or {}).items():
+        cred = getattr(bundle, "cli", None)
         if cred is not None:
             out[key] = cred
     return out
@@ -342,24 +394,10 @@ def resolve_credential(cred: GatewayCredential) -> Resolved | Refusal:
             )
     expires_in: float | None = None
     if cred.token_ref is not None:
-        raw = _read_token(cred.token_ref)
-        if not raw:
-            return Refusal("no_value", _REFUSAL_NO_VALUE)
-        from services.mcp import mcp_registry
-        from services.oauth import credential_resolver, oauth_account_store
-        manifest = mcp_registry.get_manifest(cred.manifest) if cred.manifest else None
-        dead = (credential_resolver.account_unusable_reason(raw, manifest) if manifest
-                else oauth_account_store.token_dead_reason(raw))
-        if dead:
-            return Refusal("needs_reconnect", credential_resolver.reconnect_wording(dead))
-        extra = raw.get("extra") or {}
-        preferred = cred.token_ref.preferred_bearer or (
-            extra.get("preferred_bearer", "") if isinstance(extra, dict) else "")
-        if preferred and isinstance(extra, dict) and extra.get(preferred):
-            secret = str(extra.get(preferred) or "")
-        else:
-            secret = oauth_account_store.get_canonical_access_token(raw)
-        expires_in = _expires_in(raw)
+        got = _token_secret(cred.token_ref, cred.manifest)
+        if isinstance(got, Refusal):
+            return got
+        secret, expires_in = got
     else:
         secret = cred.value
     if not secret:
@@ -368,6 +406,40 @@ def resolve_credential(cred: GatewayCredential) -> Resolved | Refusal:
         header=cred.header, value=f"{cred.prefix}{secret}", upstream=cred.upstream,
         path=cred.path, proxy_local=cred.proxy_local, expires_in=expires_in,
     )
+
+
+def _token_secret(ref: TokenRef, manifest_name: str) -> tuple[str, float | None] | Refusal:
+    """The token file's current secret and its remaining life, or why it
+    cannot be used: no file, an account that needs a reconnect, no value."""
+    raw = _read_token(ref)
+    if not raw:
+        return Refusal("no_value", _REFUSAL_NO_VALUE)
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver, oauth_account_store
+    manifest = mcp_registry.get_manifest(manifest_name) if manifest_name else None
+    dead = (credential_resolver.account_unusable_reason(raw, manifest) if manifest
+            else oauth_account_store.token_dead_reason(raw))
+    if dead:
+        return Refusal("needs_reconnect", credential_resolver.reconnect_wording(dead))
+    extra = raw.get("extra") or {}
+    preferred = ref.preferred_bearer or (
+        extra.get("preferred_bearer", "") if isinstance(extra, dict) else "")
+    if preferred and isinstance(extra, dict) and extra.get(preferred):
+        secret = str(extra.get(preferred) or "")
+    else:
+        secret = oauth_account_store.get_canonical_access_token(raw)
+    if not secret:
+        return Refusal("no_value", _REFUSAL_NO_VALUE)
+    return secret, _expires_in(raw)
+
+
+def resolve_cli_credential(cred: CliCredential) -> ResolvedCli | Refusal:
+    """The token a command-line tool gets for ``cred`` right now, or why not
+    (the same reader and the same reconnect rule as the gateway's)."""
+    got = _token_secret(cred.token_ref, cred.manifest)
+    if isinstance(got, Refusal):
+        return got
+    return ResolvedCli(username=cred.username, secret=got[0], env_names=cred.env_names)
 
 
 def resolve(session_id: str, mcp: str) -> Resolved | Refusal:
@@ -404,16 +476,18 @@ def _descriptor_path(session_id: str) -> Path | None:
 
 def write_descriptor(
     session_id: str, credentials: dict[str, GatewayCredential], *,
+    cli: dict[str, CliCredential] | None = None,
     machine_id: str = "", token_hash: str = "", agent: str = "", user_sub: str = "",
     task_scope: str = "",
 ) -> None:
-    """Record what a session was provisioned with, by reference, plus the
-    identity its static values resolve under (the agent, the person, the
-    scope). Nothing to record removes an earlier descriptor."""
+    """Record what a session was provisioned with, by reference (the gateway
+    credentials and the command-line ones), plus the identity its static
+    values resolve under (the agent, the person, the scope). Nothing to
+    record removes an earlier descriptor."""
     path = _descriptor_path(session_id)
     if path is None:
         return
-    if not credentials:
+    if not credentials and not cli:
         remove_descriptor(session_id)
         return
     doc = {
@@ -423,6 +497,7 @@ def write_descriptor(
         "user_sub": user_sub,
         "task_scope": task_scope,
         "credentials": {k: c.descriptor() for k, c in credentials.items()},
+        "cli": {k: c.descriptor() for k, c in (cli or {}).items()},
     }
     tmp = path.with_suffix(".json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -446,6 +521,11 @@ def read_descriptor(session_id: str) -> dict | None:
     for key, d in (creds or {}).items():
         if isinstance(d, dict):
             out[str(key)] = GatewayCredential.from_descriptor(d)
+    cli: dict[str, CliCredential] = {}
+    for key, d in (doc.get("cli") or {}).items():
+        c = CliCredential.from_descriptor(d) if isinstance(d, dict) else None
+        if c is not None:
+            cli[str(key)] = c
     return {
         "machine_id": str(doc.get("machine_id") or ""),
         "token_hash": str(doc.get("token_hash") or ""),
@@ -453,6 +533,7 @@ def read_descriptor(session_id: str) -> dict | None:
         "user_sub": str(doc.get("user_sub") or ""),
         "task_scope": str(doc.get("task_scope") or ""),
         "credentials": out,
+        "cli": cli,
     }
 
 

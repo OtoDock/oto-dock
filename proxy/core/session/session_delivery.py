@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-logger = logging.getLogger("claude-proxy.session-delivery")
+logger = logging.getLogger("otodock.session-delivery")
 
 # Injected delivery callables:
 # (session_id, agent, text, *, user_sub, role, chat_id) -> response|None.

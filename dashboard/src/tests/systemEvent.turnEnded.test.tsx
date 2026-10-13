@@ -1,7 +1,8 @@
 /**
  * The turn-ended card (`system` row, subtype `turn_ended`): the ending's
  * line, and Send again for the endings a verbatim re-send can answer (an
- * error, an exit, a silence, a lost machine), never for a decline or a limit.
+ * error, an exit, a silence, a lost machine, a message that met a stopped
+ * engine), never for a decline or a limit.
  */
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
@@ -18,6 +19,15 @@ describe('the turn-ended card', () => {
                         onSendAgain={onSendAgain} />)
     expect(screen.getByText('This turn ended early')).toBeTruthy()
     expect(screen.getByText(/exit code 137/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Send again' }))
+    expect(onSendAgain).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers Send again for a message that met a stopped engine', () => {
+    const onSendAgain = vi.fn()
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.TURN_ENDED} reason="stopped"
+                        message="⚠ The engine was stopped before this message ran. Send it again."
+                        onSendAgain={onSendAgain} />)
     fireEvent.click(screen.getByRole('button', { name: 'Send again' }))
     expect(onSendAgain).toHaveBeenCalledTimes(1)
   })
@@ -77,5 +87,24 @@ describe("Send again's prompt", () => {
       { id: 'again-img-0', base64: 'data:image/png;base64,AAAA', name: 'photo-1' },
       { id: 'again-img-users/me/workspace/saved.png', path: 'users/me/workspace/saved.png', name: 'saved.png' },
     ])
+  })
+
+  it('re-sends a file by its saved path, and one with no path is left out', () => {
+    const withFiles = {
+      id: 'u1', role: 'user', blocks: [
+        { type: 'file_attachments', files: [
+          { name: 'report.pdf', path: 'users/me/workspace/uploads/report.pdf' },
+          { name: 'still-uploading.zip' },
+        ] },
+        { type: 'text', content: 'summarise this' },
+      ],
+    } as unknown as DisplayMessage
+    const again = lastTurnPrompt([user('u0', 'hi'), answer('a0', 'hello'), withFiles, ended('a1')])
+    expect(again?.text).toBe('summarise this')
+    expect(again?.files).toEqual([{
+      id: 'again-file-users/me/workspace/uploads/report.pdf', name: 'report.pdf', size: 0,
+      uploadedPath: 'users/me/workspace/uploads/report.pdf',
+    }])
+    expect(again?.images).toEqual([])
   })
 })

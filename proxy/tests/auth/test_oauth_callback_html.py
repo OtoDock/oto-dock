@@ -75,9 +75,11 @@ class TestAdminConsentTenantValidation:
         state = oauth_engine.create_admin_consent_state(
             user_sub="u", mcp_name="m365-mcp", provider_id="microsoft",
         )
+        from api.auth.oauth import _state_hash
         return asyncio.run(admin_consent_callback(
             state=state, admin_consent="True", tenant=tenant,
             error=None, error_description=None,
+            connect_ring=_state_hash(state),   # the browser that started it
         ))
 
     def test_guid_tenant_renders(self):

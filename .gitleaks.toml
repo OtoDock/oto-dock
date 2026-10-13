@@ -1,0 +1,32 @@
+# Gitleaks config for this repository's CI (the `lint` job of ci.yml):
+# default rules + the platform's own key format + a tight allowlist for
+# known-benign fixtures. Keep this list SHORT and exact: every entry here is
+# something a human verified is not a secret. The maintainers' release gate
+# scans with the same rules.
+[extend]
+useDefault = true
+
+# The platform's own agent/user API keys (the gate webhook key travels in
+# an environment variable on the dev box, never in a file).
+[[rules]]
+id = "otodock-api-key"
+description = "OtoDock agent or user API key"
+regex = '''otok_[A-Za-z0-9_-]{32,}'''
+
+[allowlist]
+description = "Verified-benign placeholders and test fixtures"
+regexTarget = "match"
+regexes = [
+    # phone_adapters/base.py — a curl TEMPLATE with a literal placeholder
+    # token (__REGISTER_SECRET__ is substituted at provisioning time).
+    '''__REGISTER_SECRET__''',
+    # tests/auth/test_webhook_providers.py — MS Graph validation-handshake
+    # fixture value.
+    '''validationToken": "abc-123-opaque"''',
+    # tests/tasks/test_task_identity_authority.py — TaskIdentity fixture
+    # exercising the is_api_key flag with the literal string "api-key".
+    '''api-key", is_api_key=True''',
+    # dashboard/src/tests/browserModeControls.test.tsx — the own-browser
+    # extension-token field exercised with an obviously synthetic value.
+    '''tok-123456789012345''',
+]

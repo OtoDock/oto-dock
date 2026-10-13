@@ -129,7 +129,7 @@ describe('wake diagnostics store', () => {
     const ch = installFakeNativeChannel()
     try {
       const status = saveWakeDiag()
-      expect(status).toMatch(/saved wake-diag-.*\.json to Downloads/)
+      expect(status).toMatch(/^handed wake-diag-.*\.json to Downloads$/)
       expect(ch.posted).toHaveLength(1)
       const { m, a: [filename, mime], body } = ch.posted[0]
       expect(m).toBe('saveImageFromBase64')

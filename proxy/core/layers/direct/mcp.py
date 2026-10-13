@@ -106,6 +106,10 @@ def stop_mcp_thread(join_timeout: float = 2.0) -> None:
         logger.warning("MCP I/O thread did not stop in %.1fs", join_timeout)
 
 
+# The MCP content block kinds that carry bytes (the MCP schema's words).
+_MCP_FILE_BLOCKS = ("image", "resource")
+
+
 class MCPServerConnection:
     """Wraps a single MCP server connection (stdio or SSE)."""
 
@@ -349,9 +353,15 @@ class MCPServerConnection:
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Call a tool on this server. Returns the result as a string. A
         server that forgot the session is marked dead (``session_gone``)."""
+        return (await self.call_tool_blocks(tool_name, arguments))[0]
+
+    async def call_tool_blocks(self, tool_name: str, arguments: dict) -> tuple[str, list[dict]]:
+        """``call_tool`` with the result's image blocks and embedded
+        resources beside the text (MCP JSON shape), for the platform to keep
+        when the MCP opts the tool in (``services/mcp/result_files.py``)."""
         if not self.session:
             self.dead = True
-            return f"Error: MCP server '{self.name}' is not connected"
+            return f"Error: MCP server '{self.name}' is not connected", []
 
         try:
             result = await asyncio.wait_for(
@@ -360,15 +370,18 @@ class MCPServerConnection:
             )
             # Concatenate all text content from the result
             parts = []
+            blocks: list[dict] = []
             for content in result.content:
                 if hasattr(content, "text"):
                     parts.append(content.text)
                 elif hasattr(content, "data"):
                     parts.append(f"[binary data: {content.mimeType}]")
-            return "\n".join(parts) if parts else "(empty result)"
+                if getattr(content, "type", "") in _MCP_FILE_BLOCKS:
+                    blocks.append(content.model_dump(mode="json", by_alias=True, exclude_none=True))
+            return ("\n".join(parts) if parts else "(empty result)"), blocks
         except asyncio.TimeoutError:
             # A slow tool is NOT a dead server — timeouts never mark dead.
-            return f"Error: Tool '{tool_name}' timed out after {self.tool_timeout}s"
+            return f"Error: Tool '{tool_name}' timed out after {self.tool_timeout}s", []
         except McpError as e:
             # A JSON-RPC error answered by a LIVE server: some servers (the
             # github sidecar) report a tool's own failure this way instead of
@@ -384,7 +397,7 @@ class MCPServerConnection:
                 logger.warning(
                     f"MCP server '{self.name}' marked dead: the server forgot the session ({e})"
                 )
-            return f"Error calling tool '{tool_name}': {e}"
+            return f"Error calling tool '{tool_name}': {e}", []
         except Exception as e:
             # Tool-level failures come back as result.isError above; an
             # EXCEPTION here is transport/protocol trouble (closed stream,
@@ -395,7 +408,7 @@ class MCPServerConnection:
             logger.warning(
                 f"MCP server '{self.name}' marked dead after call failure: {e!r}"
             )
-            return f"Error calling tool '{tool_name}': {e}"
+            return f"Error calling tool '{tool_name}': {e}", []
 
     async def close(self) -> None:
         """Signal the owner task to tear down its contexts, and wait for it.
@@ -586,11 +599,16 @@ class AgentMCPManager:
 
     async def execute_tool(self, namespaced_name: str, arguments: dict) -> str:
         """Execute a single tool call by its namespaced name."""
+        return (await self.execute_tool_blocks(namespaced_name, arguments))[0]
+
+    async def execute_tool_blocks(self, namespaced_name: str, arguments: dict) -> tuple[str, list[dict]]:
+        """``execute_tool`` with the result's image blocks and embedded
+        resources (``MCPServerConnection.call_tool_blocks``)."""
         self.last_activity = time.monotonic()
 
         conn = self._tool_index.get(namespaced_name)
         if not conn:
-            return f"Error: Unknown tool '{namespaced_name}'"
+            return f"Error: Unknown tool '{namespaced_name}'", []
 
         # Find the original tool name (strip mcp__servername__ prefix)
         original_name = None
@@ -600,9 +618,9 @@ class AgentMCPManager:
                 break
 
         if not original_name:
-            return f"Error: Tool '{namespaced_name}' not found in server '{conn.name}'"
+            return f"Error: Tool '{namespaced_name}' not found in server '{conn.name}'", []
 
-        return await conn.call_tool(original_name, arguments)
+        return await conn.call_tool_blocks(original_name, arguments)
 
     async def execute_tools(self, tool_calls: list[dict]) -> list[dict]:
         """Execute multiple tool calls in parallel (dispatched to MCP I/O thread).
@@ -611,7 +629,9 @@ class AgentMCPManager:
             tool_calls: list of {"id": str, "name": str, "input": dict}
 
         Returns:
-            list of {"tool_use_id": str, "content": str}
+            list of {"tool_use_id": str, "content": str}, with
+            ``"file_blocks"`` (the result's image blocks and embedded
+            resources, MCP JSON) when it carried any
         """
         self.last_activity = time.monotonic()
         return await _run_on_mcp_loop(self._execute_tools_impl(tool_calls))
@@ -619,11 +639,14 @@ class AgentMCPManager:
     async def _execute_tools_impl(self, tool_calls: list[dict]) -> list[dict]:
         """Internal: runs on the dedicated MCP I/O event loop."""
         async def _run_one(call: dict) -> dict:
-            result = await self.execute_tool(call["name"], call["input"])
-            return {
+            result, blocks = await self.execute_tool_blocks(call["name"], call["input"])
+            out = {
                 "tool_use_id": call["id"],
                 "content": result,
             }
+            if blocks:
+                out["file_blocks"] = blocks
+            return out
 
         results = await asyncio.gather(
             *[_run_one(tc) for tc in tool_calls],

@@ -468,16 +468,16 @@ class TestSpawnOverrides:
     def test_overrides_ride_the_task_and_chat_pins(self, client, monkeypatch):
         from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
-                            lambda p: [{"model_id": "claude-opus-5", "enabled": True}])
-        r = _spawn(client, surface="chat", model="claude-opus-5",
+                            lambda p: [{"model_id": "claude-opus-5-5", "enabled": True}])
+        r = _spawn(client, surface="chat", model="claude-opus-5-5",
                    layer="claude-code-cli", mode="interactive")
         assert r.status_code == 200
         task = client.fired[0]["task"]
-        assert task.override_model == "claude-opus-5"
+        assert task.override_model == "claude-opus-5-5"
         assert task.override_execution_path == "claude-code-cli"
         assert task.override_execution_mode == "interactive"
         chat = task_store.get_chat(r.json()["chat_id"])
-        assert chat["model"] == "claude-opus-5"
+        assert chat["model"] == "claude-opus-5-5"
         assert chat["execution_path"] == "claude-code-cli"
         assert chat["execution_mode"] == "interactive"
 

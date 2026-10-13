@@ -28,7 +28,7 @@ import posixpath
 from core import layout
 from core.credentials.mcp_broker import SecretBundle
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 CREDENTIAL_FILES_ENV = "OTO_CREDENTIAL_FILES"
 

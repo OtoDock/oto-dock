@@ -21,6 +21,7 @@ from core.events import turn_ending
 from core.events.common_events import CommonEvent, DONE, ERROR
 from core.remote import upload_inflight
 from core.remote.remote_session_info import RemoteSessionInfo
+from core.session import engine_prompts
 from core.session.session_state import (
     get_session_user_tz,
     resolve_bg_command_frame,
@@ -80,7 +81,7 @@ class RemoteTurnMixin:
         # a wedged push logs and the turn proceeds (the pre-existing
         # best-effort failure mode). Returns immediately (no wait) when
         # nothing is in flight, i.e. the vast majority of turns.
-        await upload_inflight.wait_settled(info.agent_name)
+        await upload_inflight.wait_settled(info.agent_name, machine_id=info.machine_id)
 
         inject_time = kwargs.get("inject_time", False)
         settle_after_result = kwargs.get("settle_after_result", 0)
@@ -116,7 +117,10 @@ class RemoteTurnMixin:
 
         # Fresh per-turn state — the engine's (a per-turn translator and settle
         # controller, the registry prunes, a fresh main-turn consumer), and
-        # the turn's own silence clock.
+        # the turn's own silence clock. Whether the proxy's own abort ended
+        # the process since the last turn is read first: a send that meets
+        # that dead process below is a stop, not a lost machine.
+        killed_before = info.proxy_killed
         info.proxy_killed = False
         info.last_event_at = time.monotonic()
         info.task_turn = bool(settle_after_result and settle_after_result > 0)
@@ -159,11 +163,22 @@ class RemoteTurnMixin:
             # found", never triggering auto-resume. can_resume_session still
             # verifies the transcript before issuing --resume, so a truly
             # unresumable chat reseeds from history rather than resuming blind.
+            # The dead subprocess is the ``stopped`` ending when the proxy's
+            # own abort ended it (a Stop, its watchdog) on an engine whose
+            # hard abort kills the process, and nothing started it since;
+            # the machine was never lost. (After a typed ending's kill the
+            # pump has already stopped reading, so no second ending is seen.)
+            # A missing session object is never our kill: the satellite's
+            # abort keeps it, a reconnect drops it.
             err_text = str(e)
             data: dict = {"message": err_text}
             if "CLI process not running" in err_text or "Session not found" in err_text:
                 info.cli_dead = True
-                ending = turn_ending.TurnEnding(reason=turn_ending.LOST, detail=err_text)
+                reason = turn_ending.LOST
+                if ("CLI process not running" in err_text and killed_before
+                        and self.capabilities_for(session_id).runtime.hard_abort_kills_process):
+                    reason = turn_ending.STOPPED
+                ending = turn_ending.TurnEnding(reason=reason, detail=err_text)
                 data = {"message": ending.line(), "ending": ending.as_dict()}
             yield CommonEvent(type=ERROR, data=data)
             yield CommonEvent(type=DONE)
@@ -225,6 +240,7 @@ class RemoteTurnMixin:
             if isinstance(ev, dict):
                 resolve_bg_command_frame(info.session_id, ev)
                 _reconcile_snapshot(info.session_id, ev)
+                engine_prompts.note_frame(info.session_id, ev)
             drained[(ev or {}).get("type", "?") if isinstance(ev, dict) else "?"] += 1
         if drained:
             logger.warning(

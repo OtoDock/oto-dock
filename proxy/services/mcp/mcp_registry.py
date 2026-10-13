@@ -323,6 +323,38 @@ def get_mcps_by_provider(provider_id: str) -> list[McpManifest]:
     return out
 
 
+def _default_text(value: Any) -> str:
+    """A manifest config default as the text an environment carries: a
+    string as written, a number as its text, a bool as ``true``/``false``;
+    anything else is no default."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value if isinstance(value, str) else ""
+
+
+def effective_config(manifest: McpManifest | None, saved: dict[str, str] | None = None) -> dict[str, str]:
+    """The config values an MCP runs with: each declared ``config`` row's
+    non-empty ``default`` (in effect before an admin saves the row, as the
+    admin page shows it), the stored values over them (a saved ``""`` wins),
+    and no ``_``-prefixed key (internal control state). An empty default is
+    left unset: an absent variable and an empty one can differ to a server.
+    ``saved`` is the store's read when the caller already holds it."""
+    if manifest is None:
+        return {}
+    out: dict[str, str] = {}
+    for field_def in manifest.config or []:
+        key = getattr(field_def, "key", "")
+        default = _default_text(getattr(field_def, "default", ""))
+        if key and not key.startswith("_") and default:
+            out[key] = default
+    if saved is None:
+        saved = mcp_store.get_mcp_config_values(manifest.name)
+    out.update({k: v for k, v in saved.items() if not k.startswith("_")})
+    return out
+
+
 def get_tool_filter(mcp_name: str) -> tuple[str, str] | None:
     """Resolve the runtime tool filter for an MCP.
 
@@ -2005,12 +2037,11 @@ def resolve_server_config(
         for k, v in manifest.agent_env.items():
             env[k] = _resolve_template(v, manifest, agent_name, session_ctx)
 
-        # Config values from DB (admin-configured operational settings).
-        # `_`-prefixed keys are internal control state (e.g.
-        # `_hosted_service_mode`, `_managed_instance_deleted`) and MUST NOT
-        # leak into the MCP subprocess env.
-        config_vals = mcp_store.get_mcp_config_values(manifest.name)
-        env.update({k: v for k, v in config_vals.items() if not k.startswith("_")})
+        # Config values (admin-configured operational settings, the manifest's
+        # default for a row nobody saved). `_`-prefixed keys are internal
+        # control state (e.g. `_hosted_service_mode`,
+        # `_managed_instance_deleted`) and never reach the MCP subprocess env.
+        env.update(effective_config(manifest))
 
         if env:
             entry["env"] = env
@@ -2327,8 +2358,13 @@ def build_session_mcp_config(
     external: bool = False,
     only_mcps: list[str] | None = None,
     session_id: str = "",
+    call_ask_back: bool = False,
 ) -> tuple[Path | None, dict[str, str], dict[str, str], dict, set]:
     """Main entry point: build a complete MCP config for a session.
+
+    ``call_ask_back`` is a phone session's fact (a daemon-driven outbound
+    call: an agent waits for questions) exposed to stdio MCPs as
+    ``${session.call_ask_back}``.
 
     ``session_id`` writes the build into the session's own directory (the
     file keeps the identity's name), so a concurrent build of the same
@@ -2370,8 +2406,8 @@ def build_session_mcp_config(
     Returns: (config_path, credential_env_vars, exclusion_reasons, secret_bundles,
         bash_env_keys) — a 5-tuple. ``credential_env_vars`` is the NON-secret flat
         env (secrets are stripped to the per-MCP ``secret_bundles``);
-        ``bash_env_keys`` are the OAuth ``env_injection`` names (GH_TOKEN/
-        GIT_CONFIG_*) that stay in the CLI parent env but are listed in
+        ``bash_env_keys`` are the git helper entries (GIT_CONFIG_*, no
+        secret) that stay in the CLI parent env but are listed in
         ``OTO_STRIP_KEYS`` so the interceptor drops them from MCP children.
 
     ``secret_bundles`` maps each included MCP's mcpServers key (server_name or
@@ -2457,8 +2493,8 @@ def build_session_mcp_config(
 
     # The flat env that reaches the CLI/daemon process + the codex TOML is
     # stripped of PURE MCP secrets — each MCP gets those via its broker bundle
-    # instead. env_injection (GH_TOKEN) + paths + OTO_* STAY (bash + the MCP need
-    # them in-process).
+    # instead. The git helper entries + paths + OTO_* STAY (bash + the MCP need
+    # them in-process); no token value is among them.
     flat_env = {
         k: v for k, v in cred_result.env_vars.items()
         if k not in cred_result.secret_keys
@@ -2529,6 +2565,7 @@ def build_session_mcp_config(
             "task_owner": task_owner,
             "task_username": task_username,
             "task_scope": task_scope if (task_owner or task_mode) else "",
+            "call_ask_back": "1" if call_ask_back else "",
         }
         server_entry = resolve_server_config(
             manifest, agent_name,
@@ -2692,12 +2729,17 @@ def build_session_mcp_config(
             )
 
         servers[srv_key] = server_entry
-        if bundle_env or gateway_cred is not None:
-            secret_bundles[srv_key] = SecretBundle(env=bundle_env, gateway=gateway_cred)
-            # A credentialed (wrapped) stdio MCP drops the bash-only
-            # env_injection creds (GH_TOKEN/GIT_CONFIG_*) it would inherit from
-            # the CLI env — the interceptor strips OTO_STRIP_KEYS-named vars at
-            # spawn. (No-op on HTTP MCPs — they aren't stdio-wrapped.)
+        # The command-line credential (a ``git_credential_helper`` manifest):
+        # by reference on the bundle, fetched per command through the broker.
+        cli_cred = cred_result.cli_credentials.get(mcp_name)
+        if bundle_env or gateway_cred is not None or cli_cred is not None:
+            secret_bundles[srv_key] = SecretBundle(
+                env=bundle_env, gateway=gateway_cred, cli=cli_cred,
+            )
+            # A credentialed (wrapped) stdio MCP drops the bash-only git
+            # entries (GIT_CONFIG_*) it would inherit from the CLI env — the
+            # interceptor strips OTO_STRIP_KEYS-named vars at spawn. (No-op
+            # on HTTP MCPs — they aren't stdio-wrapped.)
             if cred_result.bash_env_keys and "command" in server_entry:
                 server_entry.setdefault("env", {})["OTO_STRIP_KEYS"] = ",".join(
                     sorted(cred_result.bash_env_keys)
@@ -2792,6 +2834,23 @@ def _sweep_session_builds(root: Path) -> None:
                 shutil.rmtree(entry, ignore_errors=True)
 
 
+def inject_toml_credentials(
+    mcp_config: Path | None, credential_env: dict[str, str] | None,
+    *, mcp_format: str | None, exclude_keys: set[str] | None = None,
+) -> Path | None:
+    """The one credential-injection step every session builder runs after
+    its credential environment is complete: a Codex (TOML) config gets the
+    environment written into each stdio MCP's env table (Codex spawns MCPs
+    from the file alone), the bash-only keys left out; a JSON config, no
+    config or no environment comes back unchanged. Synchronous: the async
+    builders call it off the loop."""
+    if mcp_format != "toml" or not mcp_config or not credential_env:
+        return mcp_config
+    return inject_credential_env_into_toml(
+        mcp_config, credential_env, exclude_keys=exclude_keys,
+    )
+
+
 def inject_credential_env_into_toml(
     toml_path: Path, credential_env: dict[str, str],
     *, exclude_keys: set[str] | None = None,
@@ -2804,10 +2863,10 @@ def inject_credential_env_into_toml(
     regenerates the TOML file.
 
     ``exclude_keys`` are dropped from what lands in the TOML — used for the
-    bash-only ``env_injection`` creds (GH_TOKEN/GIT_CONFIG_*): Codex MCPs don't
-    need them, and writing them to the config FILE would put the user's token on
-    disk. They stay in the Codex DAEMON env (the parent process) so
-    bash ``git``/``gh`` still authenticate.
+    bash-only git helper entries (GIT_CONFIG_*): Codex MCPs don't need
+    them, and a session's shell configuration has no place in an MCP's
+    file. They stay in the Codex DAEMON env (the parent process) so bash
+    ``git`` finds the session's credential helper.
 
     Returns the same path (modified in-place).
     """

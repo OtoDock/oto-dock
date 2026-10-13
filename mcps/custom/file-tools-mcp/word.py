@@ -11,6 +11,7 @@ from pathlib import Path
 from equations import OMML_NS, latex_to_omml_element, omml_to_latex
 from isolation import run_parse
 from shared import (
+    HELP_POINTER,
     _checked_resolved,
     _dropped_note,
     _normalize_operations,
@@ -20,9 +21,83 @@ from shared import (
     _resolve_path,
     _to_agents_relative,
     _WRITE_OP_ADVICE,
+    help_text,
     logger,
     cleanup_partials,
     safe_open_write,
+    split_help_ops,
+)
+
+_RUN_KEYS = ("bold?, italic?, underline?, strikethrough?, color? (hex), font_size? (pt), "
+             "font_name?")
+_SPACING_KEYS = ("space_before? / space_after? (points), line_spacing? (a multiple: 1.0, "
+                 "1.5, 2.0), first_line_indent? / left_indent? (inches), keep_together?, "
+                 "keep_with_next?, widow_control?")
+_ALIGN = "alignment? (left | center | right | justify)"
+
+# What {"op": "help"} answers; one entry per operation the dispatcher in
+# _write_docx_core knows (a test holds the two together).
+_HELP_GROUPS = (
+    ("PARAGRAPHS", (
+        ("add_heading", "text, level? (1-9, default 1)"),
+        ("add_paragraph", f"text with {_RUN_KEYS}, or runs: [{{text, {_RUN_KEYS}}} "
+                          f"or {{equation: '<latex>'}} for inline math]; {_ALIGN}; {_SPACING_KEYS}"),
+        ("insert_paragraph", f"index (insert before this paragraph, 0-based), text, {_RUN_KEYS}, "
+                             f"{_ALIGN}"),
+        ("delete_paragraph", "index"),
+        ("set_paragraph_format", f"index, {_ALIGN}, {_SPACING_KEYS}"),
+    )),
+    ("EQUATIONS", (
+        ("add_equation", "latex, alignment? (default center): display math as a native, "
+                         "Word-editable equation; amsmath subset (sums, fractions, scripts, "
+                         "Greek, matrices, cases, align*)"),
+    )),
+    ("LISTS", (
+        ("add_list", "items: [text or {text, level?}], ordered? (false), level? (1-5, "
+                     "default 1)"),
+    )),
+    ("TABLES", (
+        ("add_table", "headers, rows (lists of cells), style? (default 'Table Grid')"),
+        ("merge_table_cells", "table_index? (0), start_row, start_col, end_row, end_col"),
+        ("add_table_row", "table_index? (-1 = last), values"),
+        ("delete_table_row", "table_index? (-1 = last), row_index? (-1 = last)"),
+        ("set_table_column_widths", "table_index? (-1 = last), widths (inches per column)"),
+        ("style_table", "table_index? (-1 = last), header? {fill?, font_color?, bold?}, "
+                        "alternating_colors? [hex, hex], row_fill? {row: hex}, border? (true "
+                        "or {color?, size?})"),
+    )),
+    ("IMAGES", (
+        ("add_image", f"image_path, width_inches? (4.0), height_inches?, {_ALIGN}"),
+    )),
+    ("PAGE STRUCTURE", (
+        ("add_page_break", "(no keys): starts a new page after the cursor; never the last op"),
+        ("add_section_break", "orientation? (portrait | landscape), margin_top? / "
+                              "margin_bottom? / margin_left? / margin_right? (inches)"),
+        ("set_page_setup", "orientation? (landscape), margin_top? / margin_bottom? / "
+                           "margin_left? / margin_right? (inches); the last section"),
+    )),
+    ("HEADERS / FOOTERS", (
+        ("add_header", f"text or runs [{{text, {_RUN_KEYS}}}], {_ALIGN}, section_index? (-1)"),
+        ("add_footer", f"text or runs [{{text, {_RUN_KEYS}}}], {_ALIGN}, section_index? (-1)"),
+        ("add_page_number", "position? (left | center | right), format? ('{page}' or "
+                            "'{page} of {total}'), font_size? (10), section_index? (-1)"),
+    )),
+    ("LINKS / REFERENCES", (
+        ("add_hyperlink", "url, text?, color? (hex, 0563C1), underline? (true), "
+                          "paragraph_index? (else a new paragraph)"),
+        ("add_table_of_contents", "title? ('Table of Contents'), levels? (3); renders in "
+                                  "Word and Collabora"),
+    )),
+    ("EDITING", (
+        ("search_and_replace", "find, replace, match_case? (true); body, tables, headers "
+                               "and footers"),
+    )),
+)
+_HELP_NOTES = (
+    "UNITS: space_before / space_after are POINTS (6-18 is typical body spacing; "
+    "they are not twips, 180 means 2.5 inches); line_spacing is a MULTIPLE of the "
+    "line height; indents and widths are INCHES. Implausible spacing and a trailing "
+    "page break are flagged in the result's warnings."
 )
 
 
@@ -396,8 +471,13 @@ async def handle_write_docx(args: dict) -> str:
     """Thin parent wrapper: path resolution and the preview push are
     session-bound and stay here; the op loop (which DOM-loads an existing
     document) runs in a bounded worker child."""
-    path = await _resolve_path(args["path"], writing=True)
     ops, dropped = _normalize_operations(args.get("operations"))
+    help_ops, ops = split_help_ops(ops)
+    answer = help_text("write_docx", _HELP_GROUPS, _HELP_NOTES, help_ops)
+    if help_ops and not ops:
+        # A question never creates or previews a document.
+        return answer + _dropped_note(dropped)
+    path = await _resolve_path(args["path"], writing=True)
     await _preresolve_image_ops(ops)
     try:
         msg = await run_parse(
@@ -409,7 +489,7 @@ async def handle_write_docx(args: dict) -> str:
         cleanup_partials(path)
         raise
     await _push_preview(path)
-    return msg
+    return msg + ("\n\n" + answer if answer else "")
 
 
 def _write_docx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
@@ -939,7 +1019,7 @@ def _write_docx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
 
             else:
                 logger.warning(f"write_docx: unknown operation '{ot}', skipping")
-                errors.append(f"Op #{idx}: unknown operation '{ot}'")
+                errors.append(f"Op #{idx}: unknown operation '{ot}'" + HELP_POINTER)
 
         except Exception as exc:
             errors.append(f"Op #{idx} {ot}: {exc}")

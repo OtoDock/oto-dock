@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from auth.oauth_providers.base import OAuthProvider
 
-logger = logging.getLogger("claude-proxy.oauth-providers")
+logger = logging.getLogger("otodock.oauth-providers")
 
 
 # Hardcoded provider singletons. Populated at import time below.

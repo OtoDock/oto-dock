@@ -34,7 +34,7 @@ from auth.webhook_providers.base import NormalizedEvent, VerifyResult
 from auth.webhook_providers.generic import GenericWebhookProvider
 from services.webhooks.event_normalizer import normalize_event
 
-logger = logging.getLogger("claude-proxy.webhook-providers.microsoft")
+logger = logging.getLogger("otodock.webhook-providers.microsoft")
 
 
 class MicrosoftWebhookProvider(GenericWebhookProvider):
@@ -137,11 +137,15 @@ class MicrosoftWebhookProvider(GenericWebhookProvider):
                 or (f"{rid}:{change}" if rid else "")
                 or f"{item.get('subscriptionId', '')}:{idx}"
             )
+            # Only an item's own id names the event itself: the two derived
+            # keys repeat for every later change of the same item, so they
+            # serve the ten-minute ring and never the durable handler dedupe.
             ev = normalize_event(
                 body=item,
                 headers=headers,
                 manifest_block=norm_block,
                 vendor_event_id=event_id,
+                global_event_id=str(item.get("id") or ""),
             )
             # Canonicalize the per-item type to its catalog key. Graph items
             # carry changeType ("created"/"updated") as the raw type, while

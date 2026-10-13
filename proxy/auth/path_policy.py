@@ -378,7 +378,7 @@ def _patch_files(tool_input: dict | str) -> list[tuple[str, str, tuple[bool, ...
         )
     if not isinstance(text, str) or not text:
         return []
-    files = []
+    files: list[tuple[str, str, tuple[bool, ...]]] = []
     for kind, raw in _PATCH_FILE_RE.findall(text):
         raw = raw.strip()
         if raw:
@@ -821,19 +821,21 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
                     return True
             return False
 
-        # Agent-scoped context (no username): workspace/ is writable, and —
-        # ONLY for manager-provenance task fires (ctx.knowledge_rw) — the
-        # knowledge tree, under the same per-attachment mirror rule as the
-        # owner tier (attachment writable AND provenance, both required).
-        # /config stays denied (human-manager-only), memory/ was denied
-        # earlier (_is_memory_file precedes this branch).
+        # Agent-scoped context (no username): workspace/ for the workspace
+        # tier, and — ONLY for manager-provenance task fires
+        # (ctx.knowledge_rw) — the knowledge tree, under the same
+        # per-attachment mirror rule as the owner tier (attachment writable
+        # AND provenance, both required). /config stays denied
+        # (human-manager-only), memory/ was denied earlier (_is_memory_file
+        # precedes this branch).
         if not ctx.username:
             if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
-                # An external caller never writes the shared workspace: the
-                # builder always makes it a viewer (phone_identity.
-                # EXTERNAL_ROUTE_ROLE); the role check stays as defence in
-                # depth should another producer ever hand out a wider role.
-                return not (is_external_ctx(ctx) and ctx.role == roles.VIEWER)
+                # The sandbox's own rule for this mount (read-only below the
+                # workspace tier): service sessions run as a manager, while
+                # a viewer's own task on a Shared-only agent and an external
+                # caller (always a viewer, phone_identity.
+                # EXTERNAL_ROUTE_ROLE) keep their role here.
+                return roles.can_write_workspace(ctx.role)
             if ctx.knowledge_rw:
                 mirror = _mirror_verdict()
                 if mirror is not None:

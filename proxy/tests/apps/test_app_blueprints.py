@@ -190,6 +190,33 @@ def test_export_and_import_round_trip_lands_pending_with_tasks_by_slug(agent_tre
     assert not task_store.app_actions_approved(task_store.get_app(row["id"]))
 
 
+def test_an_import_never_pulls_a_bundle_the_session_may_not_write_back(agent_tree, monkeypatch):
+    """A viewer reads the shared workspace but may not write it back: the
+    bundle on its machine is never pulled into the platform tree, and with
+    no platform copy the import says why."""
+    from core.remote import remote_file_flow as rff
+    from core.remote import satellite_connection
+    sid = "sess-bp-viewer"
+    session_state.set_session_security(sid, SecurityContext(
+        role="viewer", username="alice", agent=AGENT, is_admin_agent=False))
+    monkeypatch.setattr(rff, "is_remote_session", lambda s: True)
+    monkeypatch.setattr(rff, "_get_remote_session_info",
+                        lambda s: SimpleNamespace(machine_id="m-1", agent_name=AGENT))
+
+    class _CM:
+        async def pull_file_to_path(self, *a, **kw):
+            raise AssertionError("a held path never reaches the machine")
+
+    monkeypatch.setattr(satellite_connection, "get_connection_manager", _CM)
+    try:
+        r = _hook("import", {"path": "workspace/apps/board.otoapp", "visibility": "user"}, sid=sid)
+    finally:
+        session_state._session_security.pop(sid, None)
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == rff.held_reason("workspace/apps/board.otoapp")
+    assert not (agent_tree / "workspace" / "apps").exists()
+
+
 def test_export_and_import_never_follow_a_link(agent_tree, tmp_path):
     """The apps TOCTOU sites: the export reads the working folder and writes
     the bundle beneath the agent's tree without following a link (a linked

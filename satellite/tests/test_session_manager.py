@@ -1241,6 +1241,26 @@ class TestManifestPaging:
         assert threads == [False]
         assert [len(m["files"]) for m in ws.sent] == [3]
 
+    @pytest.mark.asyncio
+    async def test_skips_are_listed_only_for_a_proxy_that_asks(self, sat_config, monkeypatch):
+        from satellite.transport import file_sync
+        self._tree(sat_config, 2)
+        real = file_sync._hash_file
+
+        def hash_file(path):
+            if path.name == "f0.txt":
+                raise PermissionError(13, "locked")
+            return real(path)
+        monkeypatch.setattr(file_sync, "_hash_file", hash_file)
+        sm = SessionManager(sat_config)
+        plain, asked = _CapturingWS(), _CapturingWS()
+        await sm.request_manifest({"agent_slug": "test-agent", "command_id": "c1"}, plain)
+        await sm.request_manifest(
+            {"agent_slug": "test-agent", "command_id": "c2", "report_skipped": True}, asked)
+        assert [e["path"] for e in plain.sent[0]["files"]] == ["workspace/f1.txt"]
+        assert {e["path"]: e.get("skipped") for e in asked.sent[0]["files"]} == {
+            "workspace/f0.txt": "unreadable", "workspace/f1.txt": None}
+
     def test_pages_are_bounded_by_entries_and_by_bytes(self):
         from satellite.sessions.session_manager import _manifest_pages
         assert _manifest_pages([], 4096) == [[]]

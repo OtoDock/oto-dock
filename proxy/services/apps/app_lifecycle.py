@@ -26,7 +26,7 @@ from storage.pg import run_db
 if TYPE_CHECKING:
     from services.agents.offboarding import OffboardEvent
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 
 async def stop_rows(rows: list[dict]) -> int:

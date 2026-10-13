@@ -166,6 +166,61 @@ async def test_the_same_source_identity_updates(mcps_dir, tmp_path, fake_package
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ref", ["v1.2.0", "main", ""])
+async def test_a_catalog_install_refuses_a_git_source_that_pins_no_commit(
+        mcps_dir, tmp_path, fake_package_install, ref):
+    source = "git+https://host/r.git" + (f"@{ref}" if ref else "") + "#subdirectory=mcp"
+    manifest = {**_packaged(source, runtime="python"), "version": "1.2.0"}
+    src = tmp_path / "upload" / "pkg-mcp"
+    src.mkdir(parents=True)
+    (src / "README.md").write_text("Pkg.\n")
+    (src / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(HTTPException) as ei:
+        await ci.install_from_extracted_folder(src, from_catalog=True)
+    assert ei.value.status_code == 400 and "full 40-character commit" in ei.value.detail
+    assert fake_package_install == [] and not (mcps_dir / "community" / "pkg-mcp").exists()
+    # The same folder from an admin's ZIP installs: the rule is the catalog's.
+    assert (await ci.install_from_extracted_folder(src))["status"] == "installed"
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_install_takes_a_commit_pinned_git_source(mcps_dir, tmp_path, fake_package_install):
+    source = "git+https://host/r.git@2cea8d566dde07fbac28a61d698909d69724e853#subdirectory=mcp"
+    src = tmp_path / "upload" / "pkg-mcp"
+    src.mkdir(parents=True)
+    (src / "README.md").write_text("Pkg.\n")
+    (src / "manifest.json").write_text(json.dumps({**_packaged(source, runtime="python"), "version": "1.2.0"}))
+    assert (await ci.install_from_extracted_folder(src, from_catalog=True))["status"] == "installed"
+    assert fake_package_install == [("python", source)]
+
+
+@pytest.mark.asyncio
+async def test_install_from_catalog_applies_the_catalog_rule(monkeypatch, tmp_path):
+    seen = {}
+
+    async def _registry():
+        return {"mcps": []}
+    from services.community import community_catalog
+    monkeypatch.setattr(community_catalog, "fetch_registry", _registry)
+
+    async def _tarball(url=ci.CATALOG_TARBALL_URL):
+        return b""
+    monkeypatch.setattr(ci, "_fetch_catalog_tarball", _tarball)
+
+    def _extract(tarball, name, dest):
+        (dest / name).mkdir()
+        return dest / name
+    monkeypatch.setattr(ci, "_extract_mcp_subfolder", _extract)
+
+    async def _install(root, **kw):
+        seen.update(kw)
+        return {"status": "installed"}
+    monkeypatch.setattr(ci, "install_from_extracted_folder", _install)
+    await ci.install_from_catalog("pkg-mcp")
+    assert seen["from_catalog"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("runtime, first, second", [
     ("node", "npm:pkg", "npm:other"),
     ("node", "npm:pkg", "pypi:pkg"),
@@ -257,9 +312,18 @@ def test_container_identity_comes_from_the_image_not_the_label():
 def test_identity_never_raises_on_odd_values():
     ident = ci.source_identity
     assert ident(runtime="node", source=42, image="", url_template="")[0] == "unknown"
-    assert ident(runtime="python", source="pypi:pkg[extra]", image="", url_template="")[0] == "unknown"
+    assert ident(runtime="python", source="pypi:pkg[-extra]", image="", url_template="")[0] == "unknown"
     assert ident(runtime="none", source="", image="", url_template="") == ("none", "")
     assert ident(runtime=None, source=None, image=None, url_template=None)[0] in ("unknown", "none")
+
+
+def test_extras_are_not_part_of_the_identity():
+    ident = ci.source_identity
+    bare = ident(runtime="python", source="pypi:Nextcloud_MCP-Server@0.39.0", image="", url_template="")
+    assert bare == ("pypi", "nextcloud-mcp-server")
+    for source in ("pypi:nextcloud-mcp-server[documents]",
+                   "pypi:nextcloud-mcp-server[documents,ocr]@0.40.0"):
+        assert ident(runtime="python", source=source, image="", url_template="") == bare
 
 
 @pytest.mark.asyncio

@@ -34,8 +34,9 @@ from storage import database as task_store
 from storage.automation import run_status
 from core import placement
 from core.session import session_kind
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.recovery")
+logger = logging.getLogger("otodock.recovery")
 
 # How long a parked run waits for its satellite to reconnect before it is
 # failed. Generous: a restart + fleet reconnect (jittered backoff, cap 30s)
@@ -337,11 +338,11 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
             await _decline(sid, "no security context for its run",
                            incarnation=info.get("incarnation") or "")
             continue
-        asyncio.create_task(_recover_session(
+        spawn(_recover_session(
             machine_id, sid, info,
             run_id=rec.get("run_id"), chat_id=rec["chat_id"],
             agent=rec["agent"], state=state,
-        ))
+        ), name="recover_session", owner="run_recovery")
 
     # Adopt plain chats whose turn was live at the shutdown (no parked run)
     # so their output lands and the turn closes: a turn the satellite still
@@ -381,11 +382,11 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
             await _decline(sid, "closed on purpose, or placed on another machine",
                            incarnation=incarnation)
             continue
-        asyncio.create_task(_recover_session(
+        spawn(_recover_session(
             machine_id, sid, info,
             run_id=None, chat_id=chat["id"], agent=chat.get("agent") or "",
             state=state,
-        ))
+        ), name="recover_session", owner="run_recovery")
 
     # Idle sessions the satellite kept alive across the restart get
     # re-REGISTERED (registry only — nothing streams). Without this they
@@ -461,8 +462,9 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
             logger.exception(
                 "Wake redelivery failed for machine %s", machine_id[:8],
             )
-    asyncio.create_task(_machine_wake_pass())
-    asyncio.create_task(_machine_resume_pass(machine_id, set(reported) | set(others)))
+    spawn(_machine_wake_pass(), name="machine_wake_pass", owner="run_recovery")
+    spawn(_machine_resume_pass(machine_id, set(reported) | set(others)),
+          name="machine_resume_pass", owner="run_recovery")
 
 
 def _held_or_spawning(remote, session_id: str) -> bool:
@@ -701,10 +703,12 @@ async def _recover_session(
         "Recovery: adopting turn for chat=%s session=%s run=%s",
         chat_id[:16], session_id[:8], run_id or "(none)",
     )
-    try:
-        await pump._task
-    except Exception:
-        logger.exception("Recovery pump error for chat %s", chat_id[:16])
+    # asyncio.wait, not the task: cancelling this coroutine at shutdown must
+    # never cancel the adopted pump (its chat stays recoverable).
+    await asyncio.wait({pump._task})
+    if not pump._task.cancelled() and pump._task.exception() is not None:
+        logger.error("Recovery pump error for chat %s", chat_id[:16],
+                     exc_info=pump._task.exception())
 
     if run_id:
         await _finalize_run(run_id, chat_id)

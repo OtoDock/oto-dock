@@ -193,7 +193,8 @@ def get_usage_aggregated(
     own subscription only, ``'self_api_key'`` = the user's own API keys only,
     ``None`` = grand total (unchanged behaviour, no join).
     """
-    use_join = basis in _BASIS_PREDS
+    basis_pred = _BASIS_PREDS.get(basis) if basis else None
+    use_join = basis_pred is not None
     col = "ur." if use_join else ""
     conditions: list[str] = []
     params: list[Any] = []
@@ -212,8 +213,8 @@ def get_usage_aggregated(
     if end:
         conditions.append(f"{col}created_at<%s")
         params.append(end)
-    if use_join:
-        conditions.append(_BASIS_PREDS[basis])
+    if basis_pred is not None:
+        conditions.append(basis_pred)
         from_clause = (
             "usage_records ur"
             " LEFT JOIN execution_layer_subscriptions els ON ur.source_key = els.id"
@@ -301,20 +302,29 @@ def get_all_users_usage(start: str, end: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_agent_activity_counts(start: str, end: str) -> dict[str, dict]:
-    """Per-agent activity volume across ALL scopes for the agents-map heat:
-    {agent: {messages, records}}. usage_records is the deliberate heat
-    source — it is small (rollup rows) and indexed by (agent, scope,
-    created_at); chat_messages is the highest-cardinality table in the
-    schema and has no timestamp index, so it must NOT back this."""
+def get_agent_activity_counts(start: str, end: str, viewer_sub: str,
+                              shared_agents: list[str]) -> dict[str, dict]:
+    """Per-agent activity volume for the agents-map heat, as ``viewer_sub``
+    may see it: {agent: {messages, records}}. A row counts when it is the
+    agent's own work (``scope='agent'``), the viewer's own, or a chat turn
+    of an agent in ``shared_agents`` (the viewer's Shared-only agents, whose
+    one history every member reads although a person's turn there is
+    written ``scope='user'`` under whoever paid); another person's personal
+    work, a user-scope task on a Shared-only agent included, never warms
+    the map. usage_records is the deliberate heat source: it is
+    small (rollup rows) and indexed by (agent, scope, created_at);
+    chat_messages is the highest-cardinality table in the schema and has
+    no timestamp index, so it must NOT back this."""
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT agent, COALESCE(SUM(message_count),0) AS messages,"
             " COUNT(*) AS records"
             " FROM usage_records WHERE created_at>=%s AND created_at<%s"
             " AND agent IS NOT NULL AND agent<>''"
+            " AND (scope = 'agent' OR user_sub = %s"
+            "      OR (agent = ANY(%s) AND source_type = 'chat'))"
             " GROUP BY agent",
-            (start, end),
+            (start, end, viewer_sub, list(shared_agents)),
         ).fetchall()
         return {r["agent"]: {"messages": r["messages"], "records": r["records"]}
                 for r in rows}

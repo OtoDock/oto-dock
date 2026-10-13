@@ -122,7 +122,7 @@ async def test_lazy_discovery_recovered_once(caplog):
 async def test_failure_rate_limited_then_retries(caplog):
     mc = _mock_get_failing()
     with patch("auth.providers.oidc_provider.httpx.AsyncClient", return_value=mc):
-        with caplog.at_level("WARNING", logger="claude-proxy"):
+        with caplog.at_level("WARNING", logger="otodock"):
             await ensure_oidc_discovery()
             await ensure_oidc_discovery()  # inside the retry window — skipped
         assert mc.get.await_count == 1

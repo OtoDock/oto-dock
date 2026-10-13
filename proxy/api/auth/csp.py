@@ -21,7 +21,7 @@ from fastapi import Request, Response
 
 from api.auth._router import router
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _WINDOW_S = 3600.0
 _DISTINCT_PER_HOUR = 200

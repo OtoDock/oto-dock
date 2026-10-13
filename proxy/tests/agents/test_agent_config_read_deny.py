@@ -74,6 +74,12 @@ NOT_PROTECTED = [
     # not under a config dir at all
     "/users/alice/workspace/notes.json",
     "/users/alice/workspace/.env",
+    # Codex's managed worktrees: the hidden sibling of .codex at the scope
+    # root, where the platform points git-worktree-root (a checkout the
+    # session edits, not a config dir)
+    "/workspace/.codex-worktrees/myrepo-1/src/app.py",
+    "/users/alice/.codex-worktrees/x/config.toml",
+    "/home/frank/.oto-dock/agents/pa/users/alice/.codex-worktrees/x/auth.json",
     # the dir itself (no filename)
     "/users/alice/.claude",
     "",
@@ -95,6 +101,15 @@ def test_handles_path_objects_and_none():
         Path("/users/alice/.claude/x.json")
     ) is True
     assert path_roles.is_protected_agent_config_path(None) is False
+
+
+def test_codex_worktree_root_is_writable():
+    # The write rule widens to the .codex dir and its direct children; the
+    # worktree root beside it is an ordinary workspace write at every depth.
+    for p in ("/workspace/.codex-worktrees", "/workspace/.codex-worktrees/myrepo-1",
+              "/users/alice/.codex-worktrees/myrepo-1/src/app.py"):
+        assert path_roles.is_protected_agent_config_path(p, writing=True) is False, p
+    assert path_roles.is_protected_agent_config_path("/workspace/.codex/worktrees", writing=True) is True
 
 
 # ---------------------------------------------------------------------------

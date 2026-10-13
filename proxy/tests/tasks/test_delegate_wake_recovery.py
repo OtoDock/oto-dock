@@ -1029,7 +1029,7 @@ class TestRedeliverPendingWakes:
         task_store.append_pending_delegate_wake("chat-fs", "W", by="user-vi")
         delivered: list = []
         self._fake_ladder(monkeypatch, delivered, path="none")
-        with caplog.at_level("INFO", logger="claude-proxy.scheduler"):
+        with caplog.at_level("INFO", logger="otodock.scheduler"):
             assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
         assert delivered == [("chat-fs", "W", None, "viewer", False)]
         assert task_store.claim_pending_delegate_wake("chat-fs") == []
@@ -1040,7 +1040,7 @@ class TestRedeliverPendingWakes:
         task_store.append_pending_delegate_wake("chat-ph", "W")
         delivered: list = []
         self._fake_ladder(monkeypatch, delivered, path="none")
-        with caplog.at_level("INFO", logger="claude-proxy.scheduler"):
+        with caplog.at_level("INFO", logger="otodock.scheduler"):
             assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
         assert delivered == [("chat-ph", "W", None, "viewer", False)]
         assert task_store.claim_pending_delegate_wake("chat-ph") == []
@@ -1834,3 +1834,156 @@ def test_the_wake_context_bound_covers_its_roster_read(monkeypatch):
 
     out, took = asyncio.run(_go())
     assert out is None and took < 1.0
+
+
+class _NoConversationLayer(_SpawnLayer):
+    """A local layer whose session left no conversation file."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed: list[str] = []
+
+    async def can_resume_session(self, sid, agent_name="", username=""):
+        return False
+
+    async def close_session(self, sid):
+        self.closed.append(sid)
+
+
+class TestFreshSpawnRung:
+    """A wake for a dead LOCAL chat whose session left no conversation
+    starts a fresh session with the chat's history, instead of waiting
+    stored until a person opens the chat."""
+
+    def _echo(self, monkeypatch, out=""):
+        from services.scheduler import lanes
+        ran: list[dict] = []
+
+        async def _fake(layer, session_id, chat_id, agent, prompt, *, person="", claim=None,
+                        **kw):
+            from core.events import input_queue
+            ran.append({"sid": session_id, "prompt": prompt,
+                        "held": input_queue.get(chat_id).holds(claim)})
+            input_queue.get(chat_id).release(claim)
+            return out
+        monkeypatch.setattr(lanes, "_run_echo_turn_pumped", _fake)
+        return ran
+
+    def test_the_wake_continues_on_a_fresh_session_with_the_history(self, temp_db, ledger,
+                                                                   monkeypatch):
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        ran = self._echo(monkeypatch)
+        task_store.create_chat("chat-f1", "user-1", "pa")
+        task_store.update_chat("chat-f1", session_id=_SID, codex_thread_id="old-thread")
+        task_store.add_chat_message("chat-f1", "user", "plan the launch")
+        task_store.add_chat_message("chat-f1", "assistant", "here is the plan")
+        out = asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "THE WAKE", user_sub=None, role="manager", chat_id="chat-f1"))
+        assert out == ""
+        [cfg] = layer.cfgs
+        assert cfg.resume is False and cfg.resume_handle == ""
+        [turn] = ran
+        new_sid = turn["sid"]
+        assert new_sid != _SID and turn["held"]
+        assert "plan the launch" in turn["prompt"] and turn["prompt"].endswith("THE WAKE")
+        chat = task_store.get_chat("chat-f1")
+        assert chat["session_id"] == new_sid
+        assert not chat["codex_thread_id"] and not chat["pending_history_seed"]
+        # The reseeded card says the conversation continued on a fresh session.
+        cards = [r for r in task_store.get_chat_messages("chat-f1")
+                 if r.get("event_type") == "system" and "session_reseeded" in (r["event_data"] or "")]
+        assert cards
+        # The admission slot is the new session's (its lifecycle owns it).
+        assert ledger["C"]._sessions.get(new_sid) == "chat"
+        assert ledger["C"]._sessions.get(_SID) is None
+
+    def test_a_busy_chat_keeps_its_session_and_the_wake_is_stored(self, temp_db, ledger,
+                                                               monkeypatch):
+        from core.events import input_queue
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        ran = self._echo(monkeypatch)
+        task_store.create_chat("chat-f2", "user-1", "pa")
+        task_store.update_chat("chat-f2", session_id=_SID)
+        q = input_queue.get("chat-f2")
+
+        async def _run():
+            held = q.try_claim()
+            try:
+                # The superseded check sees the claim: nothing spawns.
+                return await scheduler._deliver_via_oneshot(
+                    _SID, "pa", "THE WAKE", user_sub=None, role="manager",
+                    chat_id="chat-f2")
+            finally:
+                q.release(held)
+        assert asyncio.run(_run()) is None
+        assert layer.cfgs == [] and ran == []
+        assert task_store.get_chat("chat-f2")["session_id"] == _SID
+        input_queue._registry.pop("chat-f2", None)
+
+    def test_a_chat_taken_between_the_start_and_the_turn_closes_the_new_session(
+            self, temp_db, ledger, monkeypatch):
+        from core.events import input_queue
+        from services.scheduler import wake_fresh
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        ran = self._echo(monkeypatch)
+        task_store.create_chat("chat-f3", "user-1", "pa")
+        task_store.update_chat("chat-f3", session_id=_SID)
+        q = input_queue.get("chat-f3")
+        held = q.try_claim()
+
+        async def _run():
+            return await wake_fresh.run_echo(layer, "new-sid", _SID, "chat-f3", "pa", "W",
+                                             person="")
+        try:
+            assert asyncio.run(_run()) is None
+        finally:
+            q.release(held)
+        assert layer.closed == ["new-sid"] and ran == []
+        assert task_store.get_chat("chat-f3")["session_id"] == _SID
+        input_queue._registry.pop("chat-f3", None)
+
+    def test_a_fresh_echo_refused_after_the_repoint_puts_the_chat_back(self, temp_db, ledger,
+                                                                       monkeypatch):
+        from core.events import input_queue
+        from services.scheduler import wake_fresh
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        self._echo(monkeypatch, out=None)
+        task_store.create_chat("chat-f6", "user-1", "pa")
+        task_store.update_chat("chat-f6", session_id=_SID)
+        out = asyncio.run(wake_fresh.run_echo(layer, "new-sid-6", _SID, "chat-f6", "pa", "W",
+                                              person=""))
+        assert out is None and layer.closed == ["new-sid-6"]
+        chat = task_store.get_chat("chat-f6")
+        assert chat["session_id"] == _SID and chat["pending_history_seed"] == "resume_failed"
+        assert not input_queue.is_claimed("chat-f6")
+        input_queue._registry.pop("chat-f6", None)
+
+    def test_a_remote_chat_keeps_the_skip(self, temp_db, ledger, monkeypatch):
+        from storage import remote_store
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        monkeypatch.setattr(remote_store, "resolve_execution_target",
+                            lambda agent, user_sub, role: ("machine-1", ""))
+        task_store.create_chat("chat-f4", "user-1", "pa")
+        task_store.update_chat("chat-f4", session_id=_SID)
+        assert asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "W", user_sub=None, role="manager", chat_id="chat-f4")) is None
+        assert layer.cfgs == []
+        assert task_store.get_chat("chat-f4")["session_id"] == _SID
+
+    def test_a_direct_chat_starts_under_its_own_id_from_its_rows(self, temp_db, ledger,
+                                                              monkeypatch):
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        task_store.create_chat("chat-f5", "user-1", "pa")
+        task_store.update_chat("chat-f5", session_id=_SID, execution_path="direct-llm")
+        out = asyncio.run(scheduler._deliver_via_oneshot(
+            _SID, "pa", "W", user_sub=None, role="manager", chat_id="chat-f5"))
+        assert out == ""
+        [cfg] = layer.cfgs
+        assert cfg.resume is True
+        assert task_store.get_chat("chat-f5")["session_id"] == _SID

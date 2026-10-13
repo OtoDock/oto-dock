@@ -570,7 +570,7 @@ def judge_envelope_problem(agent: str, judge: dict) -> str | None:
     worker's override meets), or None. A retired model is judged as its
     successor, the model the run would use."""
     engine = (judge or {}).get("engine") or None
-    model = config.successor_model((judge or {}).get("model") or "") or None
+    model = config.live_model_id((judge or {}).get("model") or "") or None
     if not (engine or model):
         return None
     from fastapi import HTTPException

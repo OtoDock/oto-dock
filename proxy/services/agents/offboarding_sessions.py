@@ -37,7 +37,7 @@ from auth import roles
 from services.agents import offboarding
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.offboarding")
+logger = logging.getLogger("otodock.offboarding")
 
 SUBSCRIBER = "sessions"
 REASON = "access_revoked"

@@ -29,6 +29,7 @@ import re
 import shutil
 import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -37,7 +38,7 @@ from pydantic import BaseModel
 from auth.providers import UserContext, get_current_user, require_user
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.local-templates")
+logger = logging.getLogger("otodock.local-templates")
 router = APIRouter(dependencies=[Depends(require_user)])
 
 # The parser reads every context file into memory with no cap of its own,
@@ -66,7 +67,20 @@ def _require_creator_or_admin(user: UserContext | None) -> UserContext:
     return user
 
 
-def _resolve_template_dir(user: UserContext, raw_path: str) -> Path:
+@dataclass(frozen=True)
+class _Folder:
+    """A caller's template or package folder, authorized: ``rel`` is its
+    agent-tree path (what a remote machine lists), ``platform`` the
+    platform's copy, which need not exist (a remote session's folder may
+    reach the platform only at the end of the turn)."""
+
+    raw: str
+    rel: str
+    platform: Path
+    agent: str
+
+
+def _resolve_template_dir(user: UserContext, raw_path: str) -> _Folder:
     """Resolve a caller-supplied template path against the session's policy.
 
     Requires a real session principal: the path policy is built from the
@@ -120,9 +134,300 @@ def _resolve_template_dir(user: UserContext, raw_path: str) -> Path:
     # check above must not lead into another person's tree.
     if not resolved.is_relative_to(agent_root) or not check_host_path_access(resolved, ctx).allowed:
         raise HTTPException(403, "access denied")
-    if not resolved.is_dir():
-        raise HTTPException(400, f"Not a directory: {raw_path}")
-    return resolved
+    return _Folder(
+        raw=raw_path.strip(), rel=ref.value.strip("/"), platform=resolved, agent=ctx.agent,
+    )
+
+
+# A remote session's folder is read from its machine, four pulls at a time.
+# One 60 s deadline covers the listing and the pulls: the MCP clients wait
+# 120 s for a call, so a read that ends in time leaves the install or the
+# package check the other half.
+_REMOTE_PULLS = 4
+_REMOTE_READ_BUDGET_S = 60.0
+# The longest name this platform's filesystems hold, in UTF-8 bytes.
+_MAX_NAME_BYTES = 255
+
+
+class _MachineRefused(Exception):
+    """A path the machine listed that the snapshot may not hold."""
+
+
+def _clip(text: str, limit: int = 120) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _skipped_name(parts: list[str], skip_dirs: frozenset[str]) -> str | None:
+    """The local snapshot's skip rules on one listed path (``parts`` relative
+    to the folder, the file name last): the name of what is left out, a
+    folder or the file itself, or None to keep the file."""
+    for i, name in enumerate(parts[:-1]):
+        if name.startswith(".") or name == "node_modules" or name in skip_dirs or (
+                name == "data" and _is_app_dir(Path(*parts[:i]))):
+            return "/".join(parts[:i + 1])
+    if parts[-1].startswith("."):
+        return "/".join(parts)
+    return None
+
+
+def _plan_remote_snapshot(
+    folder: _Folder, entries: list[dict], *, skip_dirs: frozenset[str],
+    skipped: list[str] | None, what: str,
+) -> list[tuple[str, str]]:
+    """``(agent-tree path, path inside the folder)`` for every listed file
+    the snapshot takes, the listing judged before a byte moves: the caps on
+    the listed sizes (and again on what lands), and by name every file the
+    snapshot could not hold as listed (listed twice, also the folder of
+    another listed file, a name too long for this platform)."""
+    from core.remote.file_sync import is_canonical_rel_path
+    prefix = folder.rel + "/"
+    out: list[tuple[str, str]] = []
+    total = 0
+    left_out_seen = set(skipped or ())
+    kept: set[str] = set()
+    kept_dirs: set[str] = set()
+    for entry in entries:
+        path = entry["path"]
+        # Canonical first: a ``..`` is refused, never skipped as a dot-name.
+        if not is_canonical_rel_path(path) or not path.startswith(prefix):
+            raise _MachineRefused(path)
+        inner = path[len(prefix):]
+        parts = inner.split("/")
+        left_out = _skipped_name(parts, skip_dirs)
+        if left_out is not None:
+            if skipped is not None and left_out not in left_out_seen:
+                left_out_seen.add(left_out)
+                skipped.append(left_out)
+            continue
+        try:
+            name_bytes = [len(part.encode()) for part in parts]
+        except UnicodeEncodeError:
+            raise _MachineRefused(path)
+        if max(name_bytes) > _MAX_NAME_BYTES:
+            raise HTTPException(
+                400,
+                f"A name in {_clip(inner)} is longer than {_MAX_NAME_BYTES} bytes, "
+                "more than this platform holds: shorten it",
+            )
+        if inner in kept:
+            raise HTTPException(
+                400, f"The machine listed {_clip(inner)} twice in the {what} folder",
+            )
+        dirs = ["/".join(parts[:i]) for i in range(1, len(parts))]
+        clash = inner if inner in kept_dirs else next((d for d in dirs if d in kept), None)
+        if clash is not None:
+            raise HTTPException(
+                400,
+                f"The machine listed {_clip(clash)} as both a file and a folder "
+                f"in the {what} folder",
+            )
+        kept.add(inner)
+        kept_dirs.update(dirs)
+        if len(out) >= _MAX_FILES:
+            raise HTTPException(
+                400, f"The {what} folder has too many files (max {_MAX_FILES})",
+            )
+        _check_file_size(inner, entry["size"])
+        total += entry["size"]
+        _check_total_size(total, what)
+        out.append((path, inner))
+    return out
+
+
+def _file_too_large(rel: str) -> HTTPException:
+    return HTTPException(
+        400, f"{rel} is too large (max {_MAX_FILE_BYTES // 1024} KB per file)",
+    )
+
+
+def _folder_too_large(what: str) -> HTTPException:
+    return HTTPException(
+        400,
+        f"The {what} folder is too large "
+        f"(max {_MAX_TOTAL_BYTES // (1024 * 1024)} MB total)",
+    )
+
+
+def _check_file_size(rel: str, size: int) -> None:
+    if size > _MAX_FILE_BYTES:
+        raise _file_too_large(rel)
+
+
+def _check_total_size(total: int, what: str) -> None:
+    if total > _MAX_TOTAL_BYTES:
+        raise _folder_too_large(what)
+
+
+def _held_elsewhere(session_id: str, folder: _Folder, machine: str) -> HTTPException | None:
+    """The 409 when the session's machine runs it for another agent than
+    the folder's: no retry changes that answer, unlike a 503."""
+    from core.remote import remote_file_flow
+    held = remote_file_flow.remote_session_agent(session_id)
+    if held and held != folder.agent:
+        return HTTPException(409, f"This session runs {held} on {machine}, not {folder.agent}")
+    return None
+
+
+async def _failed_pull(
+    session_id: str, folder: _Folder, path: str, inner: str, cap: int, what: str,
+) -> HTTPException:
+    """Why a pull under ``cap`` failed: a file the machine holds past the
+    cap is too large (a retry would fail the same way), anything else a
+    503 the agent retries."""
+    from core.remote import remote_file_flow
+    from services.delegation.file_transfer import remote_source_label
+    machine = await remote_source_label(session_id)
+    held = _held_elsewhere(session_id, folder, machine)
+    if held is not None:
+        return held
+    probe = await remote_file_flow.stat_probe(session_id, path)
+    size = probe.get("size") if probe and probe.get("exists") else None
+    if isinstance(size, int) and size > cap:
+        return _file_too_large(inner) if size > _MAX_FILE_BYTES else _folder_too_large(what)
+    return HTTPException(503, f"{inner} could not be read from {machine}, retry in a moment")
+
+
+async def _pull_remote_snapshot(
+    session_id: str, folder: _Folder, files: list[tuple[str, str]], what: str,
+) -> Path:
+    """Pull ``files`` from the session's machine into a private temp dir.
+    The bytes land nowhere else: the platform copy arrives through the
+    end-of-turn sync, gated as always. Each pull is capped by what may still
+    land (a file at most 1 MiB, the folder 20 MiB counted from what landed,
+    whatever the listing said); a file past its cap fails the read with a
+    400, any other failed pull with a 503 (the agent retries) rather than
+    serving older bytes. The first failure ends the read: the workers still
+    running are cancelled and awaited before the temp dir goes, so none
+    writes into it afterwards."""
+    from core.remote import remote_file_flow
+
+    dest = Path(tempfile.mkdtemp(prefix="oto-local-template-"))
+    queue = list(files)
+    landed = 0
+
+    async def _worker() -> None:
+        nonlocal landed
+        while queue:
+            path, inner = queue.pop(0)
+            cap = min(_MAX_FILE_BYTES, _MAX_TOTAL_BYTES - landed)
+            if cap <= 0:
+                # Never passed on: a cap of 0 is no cap to the pull.
+                raise _folder_too_large(what)
+            target = dest / inner
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise HTTPException(
+                    400, f"{_clip(inner)} cannot be stored here: {exc.strerror or exc}",
+                )
+            if not await remote_file_flow.pull_into(
+                    session_id, path, target, agent=folder.agent, max_bytes=cap):
+                raise await _failed_pull(session_id, folder, path, inner, cap, what)
+            st = target.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                raise HTTPException(400, f"Only regular files are allowed: {inner}")
+            _check_file_size(inner, st.st_size)
+            landed += st.st_size
+            _check_total_size(landed, what)
+
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        tasks = [
+            asyncio.create_task(_worker()) for _ in range(min(_REMOTE_PULLS, len(files)))
+        ]
+        if tasks:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for task in tasks:
+            if task.done():
+                task.result()
+        return dest
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        # Every worker ends before the rmtree, even when the caller is
+        # cancelled again meanwhile; that cancel is raised after it.
+        interrupted = False
+        while not all(task.done() for task in tasks):
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                interrupted = True
+        for task in tasks:
+            if not task.cancelled():
+                task.exception()
+        shutil.rmtree(dest, ignore_errors=True)
+        if interrupted:
+            raise asyncio.CancelledError
+        raise
+
+
+async def _snapshot_folder(
+    user: UserContext, folder: _Folder, *, skip_dirs: frozenset[str] = frozenset(),
+    skipped: list[str] | None = None, what: str = "template",
+) -> Path:
+    """The private copy the checks read. For a session on a remote machine
+    the machine's folder: what the agent wrote this turn reaches the
+    platform only at the turn's end, so the platform copy may be missing or
+    old. The platform copy only when the machine holds nothing there (a
+    folder only the platform has); a machine that does not answer, or not
+    in time, is a 503, never a silent read of older bytes."""
+    from core.remote import remote_file_flow
+    from services.delegation.file_transfer import remote_source_label
+
+    machine = ""
+    if user.session_id and remote_file_flow.is_remote_session(user.session_id):
+        session_id = user.session_id
+        try:
+            async with asyncio.timeout(_REMOTE_READ_BUDGET_S):
+                entries = await remote_file_flow.list_remote_entries(
+                    session_id, folder.rel, agent=folder.agent,
+                )
+                if entries:
+                    try:
+                        files = _plan_remote_snapshot(
+                            folder, entries, skip_dirs=skip_dirs, skipped=skipped, what=what,
+                        )
+                    except _MachineRefused as exc:
+                        path = str(exc)
+                        logger.warning("local %s read: the machine listed %r", what, path)
+                        inner = path.removeprefix(folder.rel + "/")
+                        raise HTTPException(
+                            400,
+                            f"The machine listed an invalid path in the {what} folder: "
+                            f"{_clip(repr(inner))}",
+                        )
+                    return await _pull_remote_snapshot(session_id, folder, files, what)
+        except TimeoutError:
+            machine = await remote_source_label(session_id)
+            raise HTTPException(
+                503,
+                f"Reading the {what} folder from {machine} took too long, "
+                "retry in a moment",
+            )
+        machine = await remote_source_label(session_id)
+        if entries is None:
+            raise _held_elsewhere(session_id, folder, machine) or HTTPException(
+                503, f"{machine} did not list the {what} folder, retry in a moment",
+            )
+        if not folder.platform.is_dir() and any(
+                part.startswith(".") for part in folder.rel.split("/")):
+            # The machine never lists a folder under a dot-folder, and the
+            # sync never carries one: the author has to move it.
+            raise HTTPException(
+                400,
+                f"Not a directory: {folder.raw} (a folder inside a folder whose "
+                f"name starts with '.' is not read from {machine}; move it)",
+            )
+    if not folder.platform.is_dir():
+        where = (
+            f" (not on the platform, and {machine} holds no file there that it "
+            "reads: generated, dependency and dot folders are not read)"
+        ) if machine else ""
+        raise HTTPException(400, f"Not a directory: {folder.raw}{where}")
+    return await asyncio.to_thread(
+        _snapshot_template_dir, folder.platform, skip_dirs=skip_dirs, skipped=skipped,
+        what=what,
+    )
 
 
 def _snapshot_template_dir(
@@ -260,11 +565,10 @@ async def validate_local_package(
     from services.community import community_installer
 
     u = _require_package_author(user)
-    src = _resolve_template_dir(u, body.path)
+    folder = _resolve_template_dir(u, body.path)
     skipped: list[str] = []
-    snapshot = await asyncio.to_thread(
-        _snapshot_template_dir, src, skip_dirs=_PACKAGE_SKIP_DIRS, skipped=skipped,
-        what="package",
+    snapshot = await _snapshot_folder(
+        u, folder, skip_dirs=_PACKAGE_SKIP_DIRS, skipped=skipped, what="package",
     )
     try:
         return await asyncio.to_thread(
@@ -324,13 +628,16 @@ async def _load_snapshot(user: UserContext, raw_path: str):
         load_template_from_dir,
     )
 
-    src = _resolve_template_dir(user, raw_path)
-    snapshot = await asyncio.to_thread(_snapshot_template_dir, src)
+    folder = _resolve_template_dir(user, raw_path)
+    snapshot = await _snapshot_folder(user, folder)
     try:
         template = await asyncio.to_thread(load_template_from_dir, snapshot)
     except TemplateValidationError as exc:
         shutil.rmtree(snapshot, ignore_errors=True)
-        raise HTTPException(400, detail={"error": "invalid_template", "message": str(exc)})
+        # The parser names files by their snapshot path; the author knows
+        # them by their place in the folder.
+        message = str(exc).replace(f"{snapshot}{os.sep}", "")
+        raise HTTPException(400, detail={"error": "invalid_template", "message": message})
     except Exception:
         shutil.rmtree(snapshot, ignore_errors=True)
         raise

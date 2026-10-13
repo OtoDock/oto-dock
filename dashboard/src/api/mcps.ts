@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { raiseApiError } from '../lib/http/apiJson'
 import type { McpRuntime } from '../lib/kinds/mcpRuntime'
 import type { DockerStatus, EnableDockerResult } from '../lib/status/docker'
 
@@ -90,6 +91,9 @@ export interface McpServer {
   // (allowed since 2026-08-27; always surfaced as a provenance badge).
   has_scripts?: boolean
   docker_status?: DockerStatus
+  // The running container serves another image than the manifest names (an
+  // update whose recreate did not happen): a Restart switches it.
+  docker_image_stale?: boolean
   // false = operator-owned compose sibling (core file-tools on containerized
   // installs) — no status pill, no start/stop/restart controls.
   docker_managed?: boolean
@@ -263,7 +267,8 @@ export function useDockerAction() {
   return useMutation({
     mutationFn: async ({ name, action }: { name: string; action: 'start' | 'stop' | 'restart' }) => {
       const res = await apiFetch(`/v1/admin/mcps/${name}/docker/${action}`, { method: 'POST' })
-      if (!res.ok) throw new Error(`Failed to ${action} container`)
+      // The server's sentence (a missing image says to run Update again).
+      if (!res.ok) await raiseApiError(res, `Failed to ${action} container`)
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -350,6 +355,20 @@ export interface McpUpdateInfo {
   // ('switched'); the install is ahead of the catalog ('ahead', no update).
   reason?: 'package' | 'manifest' | 'both' | 'source' | 'switched' | 'ahead'
   source_change?: McpSourceChange
+  // npm/pypi offers: the version the weekly job applies now ("" none) and,
+  // while the newest release waits out its first seven days, when it may
+  // ("" when its release time is unknown: an admin applies it).
+  settled?: string
+  auto_after?: string
+  // The install dir carries .hold: the weekly job skips it.
+  held?: boolean
+  // The venv runs on an interpreter the sandbox cannot use: Update rebuilds it.
+  rebuild?: boolean
+  // git+ offers: whether the catalog's source pins a full commit (the weekly
+  // job builds only that; the catalog install refuses a tag or a branch), and
+  // the ref it names.
+  pinned_commit?: boolean
+  catalog_ref?: string
 }
 
 export interface McpUpdateState {
@@ -357,6 +376,31 @@ export interface McpUpdateState {
   checked: number
   // Empty until the first check.
   checked_at: string
+  auto_update_enabled?: boolean
+}
+
+// What the weekly job will do with an offer, in one line (null: nothing to
+// add). An admin's Update applies the newest release at once either way.
+export function automaticUpdateNote(info: McpUpdateInfo, autoUpdateEnabled: boolean): string | null {
+  if (info.registry === 'git') {
+    if (info.pinned_commit === false) {
+      return 'Its catalog source names a tag or a branch, not a commit: it can be installed once the catalog pins a commit.'
+    }
+    if (info.held) return 'Held: automatic updates skip it.'
+    if (!autoUpdateEnabled) return 'Automatic updates are off.'
+    return 'The next automatic run builds the commit the catalog pins on this server, and paired machines rebuild it at their next sync.'
+  }
+  if (info.settled === undefined || info.reason === 'manifest') return null
+  if (info.held) return 'Held: automatic updates skip it.'
+  if (!autoUpdateEnabled) return 'Automatic updates are off.'
+  if (info.auto_after === undefined) return null
+  if (!info.auto_after) return 'Its release date is unknown: it applies when an admin updates it.'
+  const when = new Date(info.auto_after).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+  // A catalog edit beside the waiting release waits with it ('both'): only a
+  // package offer applies its settled release first.
+  return info.settled && info.reason === 'package'
+    ? `Automatic updates apply ${info.settled} now and ${info.latest} at the first run after ${when}.`
+    : `Applies at the first automatic run after ${when}, seven days after its release.`
 }
 
 // An update offer the page counts and badges: never a finished switch nor an

@@ -14,7 +14,7 @@
 # Telephony takes calls only once a PBX / SIP trunk or Twilio is configured
 # in the dashboard (Setup → Phone) — until then the service idles fail-closed.
 
-ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm
+ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
 FROM ${PYTHON_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -69,5 +69,18 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=4 \
   CMD ["sh", "-c", "curl -fsS http://localhost:9093/health || exit 1"]
 
 USER 1000:1000
+
+# OCI image metadata. The version is a build arg the release workflow and
+# the build overlay pass from VERSIONS.md, declared after every RUN so a new
+# version never invalidates a cached layer.
+ARG OTODOCK_VERSION=dev
+LABEL org.opencontainers.image.title="OtoDock phone" \
+      org.opencontainers.image.description="The OtoDock phone service: calls through a PBX or SIP trunk to the agents." \
+      org.opencontainers.image.source="https://github.com/OtoDock/oto-dock" \
+      org.opencontainers.image.url="https://otodock.io" \
+      org.opencontainers.image.documentation="https://docs.otodock.io" \
+      org.opencontainers.image.vendor="OtoDock" \
+      org.opencontainers.image.licenses="FSL-1.1-ALv2" \
+      org.opencontainers.image.version="${OTODOCK_VERSION}"
 
 CMD ["/opt/otodock/phone/venv/bin/python", "main.py"]

@@ -615,3 +615,82 @@ async def test_a_cancelled_first_caller_cancels_nobody_elses_rows():
     assert await second == ["rows"]       # the joiner still gets the rows
     assert await memo.get(("k",), job) == ["rows"]   # and the memo holds them
     assert ("k",) not in memo._flights
+
+
+# ---------------------------------------------------------------------------
+# The agents map reads the same rows (GET /v1/agents/activity)
+# ---------------------------------------------------------------------------
+
+def _map(agent: str = AGENT) -> dict:
+    rows = client.get("/v1/agents/activity").json()["agents"]
+    return next(r for r in rows if r["name"] == agent)
+
+
+@pytest.fixture
+def _agents_exist():
+    from storage.agents import agent_store
+    for slug in (AGENT, OTHER_AGENT):
+        if not agent_store.get_agent(slug):
+            agent_store.create_agent(slug, slug.title(), created_by="user-admin")
+
+
+def test_the_map_never_lights_another_person_s_personal_chat(temp_db, _as, _agents_exist):
+    foreign = _mk_chat("user-bob")
+    _as(_user(sub="user-alice"), pump=[foreign])
+    assert _map()["streaming"] is False and _map()["live"] is False
+    # An admin is no exception: the map advertises, the audit pages show.
+    _as(_user(sub="user-admin", role="admin"), pump=[foreign])
+    assert _map()["streaming"] is False
+    # The owner's own map lights.
+    _as(_user(sub="user-bob"), pump=[foreign])
+    assert _map()["streaming"] is True and _map()["live"] is True
+
+
+def test_the_map_lights_a_shared_only_chat_and_an_agent_run_for_the_agent_s_people(
+        temp_db, _as, _agents_exist):
+    shared = _mk_chat(f"agent::{AGENT}")
+    _as(_user(sub="user-alice"), pump=[], interactive=[shared])
+    assert _map()["streaming"] is True
+    # Not on the viewer's list: nothing (the agent is not even on their map).
+    _as(_user(sub="user-carol", agents=(OTHER_AGENT,)), pump=[shared])
+    assert [r["name"] for r in client.get("/v1/agents/activity").json()["agents"]] == [OTHER_AGENT]
+    run_chat = _mk_task_run_chat(f"task::{AGENT}", scope="agent", created_by="user-bob")
+    _as(_user(sub="user-alice"), pump=[run_chat])
+    assert _map()["streaming"] is True
+
+
+def test_the_map_shows_a_user_scope_run_to_its_creator_only(temp_db, _as, _agents_exist):
+    run_chat = _mk_task_run_chat("user-bob", scope="user", created_by="user-bob")
+    _as(_user(sub="user-alice"), pump=[run_chat])
+    assert _map()["streaming"] is False
+    _as(_user(sub="user-bob"), pump=[run_chat])
+    assert _map()["streaming"] is True
+
+
+def test_a_warming_chat_glows_without_the_pulse(temp_db, _as, _agents_exist):
+    cid = _mk_chat("user-alice")
+    _warming(cid)
+    _as(_user(sub="user-alice"), pump=[])
+    assert _map()["live"] is True and _map()["streaming"] is False
+    _as(_user(sub="user-bob"), pump=[])
+    assert _map()["live"] is False
+
+
+def test_the_heat_counts_the_agent_s_work_the_viewer_s_own_and_shared_only_rows(
+        temp_db, _as, _agents_exist):
+    from storage.agents import agent_store
+    agent_store.create_agent("agent-pool", "Pool", created_by="user-admin",
+                             collaborative=False, default_scope="agent")
+    for sub, scope, agent in (("user-bob", "user", AGENT),      # bob's personal chat
+                              ("user-alice", "user", AGENT),    # alice's own
+                              (None, "agent", AGENT),           # an agent-scope task
+                              ("user-bob", "user", "agent-pool")):  # bob in the shared history
+        task_store.insert_usage_record(sub, agent, scope, "chat", None, 0.01, message_count=1)
+    # Bob's own user-scope task on the pool stays his.
+    task_store.insert_usage_record("user-bob", "agent-pool", "user", "task", None, 0.01, message_count=1)
+    _as(_user(sub="user-alice", agents=(AGENT, "agent-pool")), pump=[])
+    assert _map()["messages_7d"] == 2
+    assert _map("agent-pool")["messages_7d"] == 1
+    _as(_user(sub="user-bob", agents=(AGENT, "agent-pool")), pump=[])
+    assert _map()["messages_7d"] == 2
+    assert _map("agent-pool")["messages_7d"] == 2

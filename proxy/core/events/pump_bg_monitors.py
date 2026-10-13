@@ -27,8 +27,9 @@ from core.events import chat_writer
 from core.events.bg_command_state import get_bg_command_registry
 from ws import wire_events as wire
 from core.events.common_events import TEXT
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 def _persist_row(chat_id: str, role: str, content: str, *, label: str,
@@ -325,11 +326,12 @@ def arm_bg_monitors(layer, session_id: str, chat_id: str) -> None:
         return
     reg = get_subagent_registry(session_id)
     if reg.has_pending and not bg_monitor_running(session_id):
-        asyncio.create_task(_bg_agent_monitor(layer, session_id, chat_id, reg.pending_count))
+        spawn(_bg_agent_monitor(layer, session_id, chat_id, reg.pending_count),
+              name="bg_agent_monitor", owner="pump_bg_monitors")
     bgreg = get_bg_command_registry(session_id)
     if bgreg.has_pending and not bg_command_monitor_running(session_id):
-        asyncio.create_task(
-            _bg_command_monitor(layer, session_id, chat_id, bgreg.pending_count))
+        spawn(_bg_command_monitor(layer, session_id, chat_id, bgreg.pending_count),
+              name="bg_command_monitor", owner="pump_bg_monitors")
 
 
 @contextmanager

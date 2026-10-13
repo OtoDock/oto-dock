@@ -677,6 +677,67 @@ class TestInteractiveSession:
         await asyncio.sleep(0.05)
         assert len(pings) == 2
 
+    async def test_a_batch_journaled_before_the_park_does_not_reopen_it(self, monkeypatch):
+        # A tail batch read before the hook parked the turn (an earlier
+        # call's tool_use line, journaled within the same poll) and folded
+        # after it must not reopen the parked turn: the composer hold would
+        # drop and a send would paste into the dialog. A line from after the
+        # park (the answer) reopens as always; a batch or a park with no
+        # time folds as before.
+        from services.notifications import notification_manager as nm
+        monkeypatch.setattr(nm, "broadcast_chat_status", lambda *a, **k: None)
+        monkeypatch.setattr(nm, "agent_label", lambda a: a)
+
+        async def _ping(user_sub, **kw):
+            return None
+        monkeypatch.setattr(nm, "fire_ephemeral", _ping)
+        s = isess.InteractiveSession(session_id="park-stale", chat_id="c", agent_name="agent",
+                                     user_sub="u1")
+        s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)
+        s._title_armed = False
+        s._turn_open = True
+        s.park_on_native_dialog("AskUserQuestion", sent_at=1000.0)
+        s._apply_turn_signal("tool_use", signal_at=999.2)
+        assert s.question_parked is True and s.turn_open is False
+        s._apply_turn_signal("user", signal_at=999.9)
+        assert s.question_parked is True and s.turn_open is False
+        s._apply_turn_signal("tool_use", signal_at=1003.5)
+        assert s.question_parked is False and s.turn_open is True
+        # No time on either side: the fold of before.
+        s.park_on_native_dialog("AskUserQuestion")
+        s._apply_turn_signal("tool_use", signal_at=1.0)
+        assert s.question_parked is False
+        s.park_on_native_dialog("AskUserQuestion", sent_at=2000.0)
+        s._apply_turn_signal("tool_use")
+        assert s.question_parked is False
+
+    async def test_the_receiver_hands_the_gates_stamp_to_the_park(self, monkeypatch):
+        from api.hooks import permission as hp
+        got = []
+
+        class _Sess:
+            def park_on_native_dialog(self, tool, *, sent_at=None):
+                got.append((tool, sent_at))
+        monkeypatch.setattr(isess, "get", lambda sid: _Sess())
+        assert hp.HookPermissionRequest(session_id="s", tool_name="t", hook_sent_at=5.5).hook_sent_at == 5.5
+        token = hp._hook_sent_at.set(77.0)
+        try:
+            hp._park_interactive_on_dialog("sid", "AskUserQuestion")
+        finally:
+            hp._hook_sent_at.reset(token)
+        hp._park_interactive_on_dialog("sid", "ExitPlanMode")
+        assert got == [("AskUserQuestion", 77.0), ("ExitPlanMode", None)]
+
+    async def test_every_fold_site_passes_the_signal_time(self, monkeypatch):
+        s = isess.InteractiveSession(session_id="park-sites", chat_id="c", agent_name="agent",
+                                     user_sub="u1")
+        seen = []
+        monkeypatch.setattr(s, "_apply_turn_signal",
+                            lambda sig, question_pending=False, signal_at=None: seen.append(signal_at))
+        monkeypatch.setattr(s, "_post_batch_effects", lambda r: None)
+        s._fold_tail_result({"last_signal": "tool_use", "last_signal_at": 12.5})
+        assert seen == [12.5]
+
     async def test_park_writes_no_chat_row(self, monkeypatch):
         # The chat rows stay the tailers' job (a hook-written card was tried
         # and dropped: it could not be answered from the history and the
@@ -1150,7 +1211,7 @@ class TestSpawnCollisionGuard:
             conn = WarmupController()
             conn.user_sub = "user-guard"
             conn.user = {"username": "guard", "role": "manager"}
-            with caplog.at_level("WARNING", logger="claude-proxy"):
+            with caplog.at_level("WARNING", logger="otodock"):
                 res = await conn._create_or_resume_session(
                     "sid-collide", "agent", "default", resume=True,
                     adopt=False,
@@ -1191,7 +1252,7 @@ class TestSpawnCollisionGuard:
             conn._send = _send
             handled = await conn._deliver_chat_to_live_interactive(
                 {"text": "hello twin"})
-            assert handled is True
+            assert handled == "typed"
             # The client is told the session is interactive (it sent `chat`
             # believing it dead) — the re-attach frame shape.
             ready = [f for f in sent if f.get("type") == "warmup_ready"]
@@ -1241,7 +1302,7 @@ class TestSpawnCollisionGuard:
             conn._process_attachments = _refuse
             handled = await conn._deliver_chat_to_live_interactive(
                 {"text": "look", "images": [{"data": "x", "name": "a.png"}]})
-            assert handled is True
+            assert handled == "typed"
             assert [f["type"] for f in sent] == ["error"]
             assert "shared workspace" in sent[0]["message"]
             assert b"".join(live._input_buffer) == b""

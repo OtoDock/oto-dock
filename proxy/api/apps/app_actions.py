@@ -34,7 +34,7 @@ from api.apps.apps import (
 from auth.providers import UserContext, get_current_user, require_auth, require_human
 from storage import database as task_store
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 

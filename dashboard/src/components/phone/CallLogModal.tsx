@@ -22,10 +22,14 @@ const OUTCOME_TONE: Record<string, 'default' | 'green' | 'amber' | 'blue' | 'red
   busy: 'default',
   failed: 'red',
   error: 'red',
+  transferred: 'blue',
+  transfer_failed: 'red',
 }
 
 const OUTCOME_LABEL: Record<string, string> = {
   completed: 'Completed',
+  transferred: 'Transferred',
+  transfer_failed: 'Transfer failed',
   hangup: 'Hung up',
   pin_failed: 'Wrong PIN',
   pin_cooldown: 'PIN locked out',

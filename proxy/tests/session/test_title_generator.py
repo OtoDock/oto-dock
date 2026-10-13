@@ -64,22 +64,22 @@ def test_select_auto_ladder_prefers_groq(temp_db, monkeypatch):
 def test_select_auto_ladder_falls_to_anthropic(temp_db, monkeypatch):
     from services import title_generator as tg
     _configure(monkeypatch, {"anthropic"})
-    assert tg._select_provider() == ("anthropic", "claude-sonnet-5-5")
+    assert tg._select_provider() == ("anthropic", "claude-haiku-5-5")
 
 
 def test_select_admin_pin_overrides_ladder(temp_db, monkeypatch):
     from storage import database as db
     from services import title_generator as tg
     _configure(monkeypatch, {"groq", "openai"})
-    db.set_platform_setting("title_generation_model", "gpt-5.4-mini")
-    assert tg._select_provider() == ("openai", "gpt-5.4-mini")
+    db.set_platform_setting("title_generation_model", "gpt-6-luna")
+    assert tg._select_provider() == ("openai", "gpt-6-luna")
 
 
 def test_select_pin_unconfigured_falls_back_to_ladder(temp_db, monkeypatch):
     from storage import database as db
     from services import title_generator as tg
     _configure(monkeypatch, {"groq"})  # openai NOT configured
-    db.set_platform_setting("title_generation_model", "gpt-5.4-mini")
+    db.set_platform_setting("title_generation_model", "gpt-6-luna")
     assert tg._select_provider() == ("groq", "openai/gpt-oss-120b")
 
 
@@ -94,16 +94,29 @@ def test_status_shape(temp_db, monkeypatch):
 
 
 def test_status_lists_a_pinned_model_the_ladder_no_longer_offers(temp_db, monkeypatch):
-    # An admin's pin of Haiku 4.5 (the Anthropic title row before 1.7.1)
-    # still runs, so the dropdown must offer it or it shows Auto instead.
+    # An admin's pin of Sonnet 5.5 (the Anthropic title row from 1.7.1 to
+    # 1.8.0) still runs, so the dropdown must offer it or it shows Auto instead.
+    from storage import database as db
+    from services import title_generator as tg
+    _configure(monkeypatch, {"anthropic"})
+    db.set_platform_setting("title_generation_model", "claude-sonnet-5-5")
+    st = tg.title_generation_status()
+    assert st["selected_model"] == "claude-sonnet-5-5"
+    assert st["active_model"] == "claude-sonnet-5-5"
+    assert [o["model"] for o in st["options"]] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
+
+
+def test_a_haiku_4_5_pin_titles_on_haiku_5_5(temp_db, monkeypatch):
+    # The retired Anthropic row's pin (the title model before 1.7.1) lands on
+    # its successor, which is the Anthropic title row again: one option.
     from storage import database as db
     from services import title_generator as tg
     _configure(monkeypatch, {"anthropic"})
     db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
+    assert tg._select_provider() == ("anthropic", "claude-haiku-5-5")
     st = tg.title_generation_status()
-    assert st["selected_model"] == "claude-haiku-4-5"
-    assert st["active_model"] == "claude-haiku-4-5"
-    assert [o["model"] for o in st["options"]] == ["claude-sonnet-5-5", "claude-haiku-4-5"]
+    assert st["selected_model"] == st["active_model"] == "claude-haiku-5-5"
+    assert [o["model"] for o in st["options"]] == ["claude-haiku-5-5"]
 
 
 def test_status_reports_a_retired_pin_by_the_successor_that_runs(temp_db, monkeypatch):
@@ -122,19 +135,45 @@ def test_status_reports_a_retired_pin_by_the_successor_that_runs(temp_db, monkey
     assert [o["model"] for o in st["options"]] == ["openai/gpt-oss-120b", "gpt-6-luna"]
 
 
+def test_a_pin_no_model_row_lists_titles_on_auto(temp_db, monkeypatch):
+    # A retired id with no successor (Haiku 4.5 once its row is dropped):
+    # left as it was, every title failed at the provider while the card
+    # said Active. It is skipped for Auto, and the status names it.
+    from storage import database as db
+    from services import title_generator as tg
+    _configure(monkeypatch, {"groq", "openai"})
+    db.set_platform_setting("title_generation_model", "gpt-5.4-mini")
+    assert tg._select_provider() == ("groq", "openai/gpt-oss-120b")
+    st = tg.title_generation_status()
+    assert st["unlisted_pin"] == "gpt-5.4-mini"
+    assert st["selected_model"] == ""
+    assert st["active_model"] == "openai/gpt-oss-120b"
+    assert "gpt-5.4-mini" not in [o["model"] for o in st["options"]]
+
+
+def test_a_listed_pin_names_no_unlisted_model(temp_db, monkeypatch):
+    from storage import database as db
+    from services import title_generator as tg
+    _configure(monkeypatch, {"anthropic"})
+    db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
+    assert tg.title_generation_status()["unlisted_pin"] == ""
+    db.set_platform_setting("title_generation_model", "")
+    assert tg.title_generation_status()["unlisted_pin"] == ""
+
+
 def test_status_lists_a_pin_the_ladder_dropped_while_titles_are_off(temp_db, monkeypatch):
     # The disabled <select> still shows the pin; with no option for it, it
     # would show Auto, and switching titles back on titles with the pin.
     from storage import database as db
     from services import title_generator as tg
     _configure(monkeypatch, {"anthropic"})
-    db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
+    db.set_platform_setting("title_generation_model", "claude-sonnet-5-5")
     db.set_platform_setting("title_generation_enabled", "0")
     st = tg.title_generation_status()
     assert st["enabled"] is False
     assert st["active"] is False
-    assert st["selected_model"] == "claude-haiku-4-5"
-    assert [o["model"] for o in st["options"]] == ["claude-sonnet-5-5", "claude-haiku-4-5"]
+    assert st["selected_model"] == "claude-sonnet-5-5"
+    assert [o["model"] for o in st["options"]] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +461,109 @@ def test_task_chat_first_message_stamps_deterministic_title(temp_db):
     db.create_chat("c-plain", "user-1", "agent-x")
     db.add_chat_message("c-plain", "user", "hello")
     assert (db.get_chat("c-plain")["title"] or "") == ""
+
+
+# ---------------------------------------------------------------------------
+# The status tells "configured" from "working"
+# ---------------------------------------------------------------------------
+
+def test_a_provider_whose_credentials_do_not_resolve_is_reported_not_working(temp_db, monkeypatch):
+    """A hosted-relay Groq row with no account behind it is configured, so
+    the status said Active while every chat kept its first words (T1,
+    2026-10-09): the attempt is noted and the status carries it."""
+    from services import title_generator as tg
+    monkeypatch.setattr(tg, "_last_attempt", None)
+    monkeypatch.setattr(tg, "_fail_warned_at", 0.0)
+    _configure(monkeypatch, {"groq"})
+    monkeypatch.setattr(tg, "_provider_credentials", lambda p: None)
+    assert tg.title_generation_status()["last_attempt"] is None
+    assert tg.resolve_title_provider() is None
+    st = tg.title_generation_status()
+    assert st["active"] is True
+    attempt = st["last_attempt"]
+    assert attempt["ok"] is False and attempt["provider"] == "groq"
+    assert "credential did not resolve" in attempt["reason"] and attempt["at"]
+    assert attempt["kind"] == "credential"
+    # A Check once the credentials resolve clears it, as a credential check.
+    monkeypatch.setattr(tg, "_provider_credentials", lambda p: ("key", ""))
+    checked = tg.check_title_generation()["last_attempt"]
+    assert checked["ok"] is True and checked["kind"] == "credential"
+    # A lookup that raises is noted, and the Check still answers.
+    def _boom(p):
+        raise RuntimeError("relay unreachable")
+    monkeypatch.setattr(tg, "_provider_credentials", _boom)
+    failed = tg.check_title_generation()["last_attempt"]
+    assert failed["ok"] is False and "relay unreachable" in failed["reason"]
+
+
+def test_a_check_never_clears_the_provider_s_refusal_of_a_title(temp_db, monkeypatch):
+    """A revoked key still resolves: Check calls no model, so the last
+    title's refusal stands until a title is made."""
+    from storage import database as db
+    from services import title_generator as tg
+    monkeypatch.setattr(tg, "_last_attempt", None)
+    db.create_chat("c1", "user-1", "agent-x")
+    db.add_chat_message("c1", "user", "plan the release")
+    _patch_provider(monkeypatch, "x")
+
+    async def _refused(*a, **k):
+        raise RuntimeError("401 invalid api key")
+    monkeypatch.setattr(tg, "generate_title", _refused)
+    asyncio.run(tg.request_chat_title("c1"))
+    _configure(monkeypatch, {"groq"})
+    monkeypatch.setattr(tg, "resolve_title_provider",
+                        lambda: ("groq", "openai/gpt-oss-120b", "key", ""))
+    after = tg.check_title_generation()["last_attempt"]
+    assert after["ok"] is False and after["kind"] == "title" and "401" in after["reason"]
+
+
+def test_a_provider_error_and_an_empty_title_are_noted_a_title_clears_them(temp_db, monkeypatch):
+    from storage import database as db
+    from services import title_generator as tg
+    monkeypatch.setattr(tg, "_last_attempt", None)
+    db.create_chat("c1", "user-1", "agent-x")
+    db.add_chat_message("c1", "user", "plan the release")
+    _patch_provider(monkeypatch, "")
+    asyncio.run(tg.request_chat_title("c1"))
+    assert tg.title_generation_status()["last_attempt"]["reason"] == "the model answered an empty title"
+
+    db.create_chat("c2", "user-1", "agent-x")
+    db.add_chat_message("c2", "user", "plan the release")
+
+    async def _refused(*a, **k):
+        raise RuntimeError("401 invalid api key")
+    monkeypatch.setattr(tg, "generate_title", _refused)
+    asyncio.run(tg.request_chat_title("c2"))
+    attempt = tg.title_generation_status()["last_attempt"]
+    assert attempt["ok"] is False and "401 invalid api key" in attempt["reason"]
+
+    db.create_chat("c3", "user-1", "agent-x")
+    db.add_chat_message("c3", "user", "plan the release")
+    _patch_provider(monkeypatch, "🗓 Release plan")
+    asyncio.run(tg.request_chat_title("c3"))
+    assert tg.title_generation_status()["last_attempt"]["ok"] is True
+
+
+def test_the_check_route_is_an_admin_s(temp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import app
+    from auth.providers import UserContext, get_current_user
+    from services import title_generator as tg
+    monkeypatch.setattr(tg, "_last_attempt", None)
+    _configure(monkeypatch, {"groq"})
+    monkeypatch.setattr(tg, "_provider_credentials", lambda p: None)
+    client = TestClient(app)
+
+    def member():
+        return UserContext(sub="user-m", email="m@test.com", name="m", role="member")
+
+    def admin():
+        return UserContext(sub="user-a", email="a@test.com", name="a", role="admin")
+    try:
+        app.dependency_overrides[get_current_user] = member
+        assert client.post("/v1/admin/title-generation/check").status_code == 403
+        app.dependency_overrides[get_current_user] = admin
+        r = client.post("/v1/admin/title-generation/check")
+        assert r.status_code == 200 and r.json()["last_attempt"]["ok"] is False
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

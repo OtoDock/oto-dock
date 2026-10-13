@@ -705,6 +705,159 @@ def test_a_person_accepts_an_app_into_an_agent_of_theirs_and_leaving_it_unplaces
     assert share_store.placements_for_agent(RECEIVING, NEWCOMER) == []
 
 
+POOL = "share-pool"
+
+
+def _pool() -> None:
+    """A Shared-only agent: the member edits it, the newcomer holds a row
+    below the editor tier there (one an older install keeps)."""
+    from storage.agents import agent_store
+    _agents()
+    if not agent_store.get_agent(POOL):
+        agent_store.create_agent(POOL, "Ops Pool", created_by=OWNER,
+                                 collaborative=False, default_scope="agent")
+    task_store.add_user_agent(OWNER, POOL, "manager", "test")
+    task_store.add_user_agent(MEMBER, POOL, "editor", "test")
+    task_store.add_user_agent(NEWCOMER, POOL, "viewer", "test")
+
+
+def _member_with_pool() -> UserContext:
+    return _user(MEMBER, agents=(AGENT, RECEIVING, THIRD, POOL),
+                 agent_roles={AGENT: "editor", RECEIVING: "editor", THIRD: "viewer", POOL: "editor"})
+
+
+def _newcomer_with_pool() -> UserContext:
+    return _user(NEWCOMER, agents=(RECEIVING, POOL), agent_roles={RECEIVING: "viewer", POOL: "viewer"})
+
+
+def _owner_with_pool() -> UserContext:
+    return _user(OWNER, agents=(AGENT, RECEIVING, THIRD, POOL),
+                 agent_roles={AGENT: "manager", RECEIVING: "manager", THIRD: "manager", POOL: "manager"})
+
+
+def test_an_editor_accepting_into_a_shared_only_agent_places_it_for_the_agent():
+    """Every session of a Shared-only agent runs as the agent, so a person's
+    own listing there would reach no chat: the accept places the app for the
+    agent instead, the same row turned (sharer, cap and expiry kept), and
+    the sharer is told."""
+    _pool()
+    row = _shared()
+    _as(_owner_with_pool())
+    with _notify_patch():
+        share = _share_to(row["id"], "person", MEMBER, cap="editor")["share"]
+    expires = share_store.get_share(share["id"])["expires_at"]
+    _as(_member_with_pool())
+    with _notify_patch() as fired:
+        r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 200, r.text
+    turned = share_store.get_share(share["id"])
+    assert (turned["grantee_kind"], turned["grantee_agent"], turned["grantee_sub"]) == ("agent", POOL, None)
+    assert turned["decision"] == "accepted" and turned["decided_by"] == MEMBER
+    assert turned["created_by"] == OWNER and turned["role_cap"] == "editor"
+    assert turned["expires_at"] == expires and turned["placed_agent"] is None
+    assert r.json()["share"]["to_agent"]["slug"] == POOL
+    # The sharer hears where it went.
+    kwargs = fired.await_args.kwargs
+    assert kwargs["target"] == OWNER and "Ops Pool" in kwargs["title"]
+    assert "for everyone on it" in kwargs["body"]
+    # It is the agent's now: the pool's sessions reach it with no person,
+    # and the member's section holds nothing.
+    assert share_store.placement_for(row["id"], POOL)["source"] == "agent"
+    assert client.get("/v1/shares/inbox").json()["items"] == []
+    _as(_newcomer_with_pool())
+    assert [a["id"] for a in _panel(POOL) if a.get("placement")] == [row["id"]]
+    # Accepting it again finds no person share any more.
+    _as(_member_with_pool())
+    assert client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL}).status_code == 404
+
+
+def test_below_the_editor_tier_a_shared_only_agent_refuses_the_accept():
+    _pool()
+    row = _shared()
+    _as(_owner_with_pool())
+    with _notify_patch():
+        share = _share_to(row["id"], "person", NEWCOMER)["share"]
+    _as(_newcomer_with_pool())
+    r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 403
+    assert "Ops Pool is set to Shared only" in r.json()["detail"] and "editor role" in r.json()["detail"]
+    fresh = share_store.get_share(share["id"])
+    assert fresh["grantee_kind"] == "person" and fresh["decision"] == "pending"
+    # Another agent of theirs still takes it as their own.
+    assert client.post(f"/v1/shares/{share['id']}/accept", json={"agent": RECEIVING}).status_code == 200
+
+
+def test_a_shared_only_accept_keeps_the_agent_share_rules():
+    """A personal app is never placed for an agent; the switch off, a sharer
+    who may no longer share it, or the app already there for everyone each
+    refuse, and the person share waits on."""
+    _pool()
+    _as(_owner_with_pool())
+    personal = _personal()
+    with _notify_patch():
+        mine = _share_to(personal["id"], "person", MEMBER)["share"]
+    _as(_member_with_pool())
+    r = client.post(f"/v1/shares/{mine['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 400 and "personal app" in r.json()["detail"]
+
+    row = _shared()
+    _as(_owner_with_pool())
+    with _notify_patch():
+        share = _share_to(row["id"], "person", MEMBER)["share"]
+    _as(_member_with_pool())
+    task_store.set_platform_setting(share_store.SETTING_TO_AGENTS, "0")
+    r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 403 and "turned off" in r.json()["detail"]
+    task_store.set_platform_setting(share_store.SETTING_TO_AGENTS, "1")
+
+    # The sharer lost the editor tier on the app's agent.
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE user_agents SET agent_role='viewer' WHERE sub=%s AND agent=%s", (OWNER, AGENT))
+        conn.commit()
+    r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 403 and "can no longer share it" in r.json()["detail"]
+    with get_conn() as conn:
+        conn.execute("UPDATE user_agents SET agent_role='manager' WHERE sub=%s AND agent=%s", (OWNER, AGENT))
+        conn.commit()
+
+    # A sharer with no editor standing on the receiving agent: the person
+    # they chose cannot widen the share to it; they are asked instead.
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE user_agents SET agent_role='viewer' WHERE sub=%s AND agent=%s", (OWNER, POOL))
+        conn.commit()
+    r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 403 and "Ask Owner to share it with Ops Pool" in r.json()["detail"]
+    assert share_store.get_share(share["id"])["grantee_kind"] == "person"
+    with get_conn() as conn:
+        conn.execute("UPDATE user_agents SET agent_role='manager' WHERE sub=%s AND agent=%s", (OWNER, POOL))
+        conn.commit()
+
+    # Already there for everyone: 409, and the person share is untouched.
+    _as(_owner_with_pool())
+    _share_to(row["id"], "agent", POOL)
+    _as(_member_with_pool())
+    r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 409 and "already in Ops Pool's apps" in r.json()["detail"]
+    assert share_store.get_share(share["id"])["grantee_kind"] == "person"
+    assert share_store.get_share(mine["id"])["decision"] == "pending"
+
+
+def test_an_expired_agent_share_holding_the_slot_answers_409():
+    _pool()
+    row = _shared()
+    _as(_owner_with_pool())
+    old = _share_to(row["id"], "agent", POOL)["share"]
+    share_store.set_share_expiry(old["id"], (datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
+    with _notify_patch():
+        share = _share_to(row["id"], "person", MEMBER)["share"]
+    _as(_member_with_pool())
+    r = client.post(f"/v1/shares/{share['id']}/accept", json={"agent": POOL})
+    assert r.status_code == 409 and "holds its place" in r.json()["detail"]
+    assert share_store.get_share(share["id"])["grantee_kind"] == "person"
+
+
 def test_a_decline_reads_declined_and_a_new_share_replaces_it():
     _agents()
     row = _shared()

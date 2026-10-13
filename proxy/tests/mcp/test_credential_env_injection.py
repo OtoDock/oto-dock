@@ -194,9 +194,14 @@ def patch_resolver(monkeypatch, tmp_path):
     )
 
 
+_GH_HELPER = {"host": "github.com", "helper": "!gh auth git-credential"}
+
+
 class TestResolverEmitsEnvVars:
-    def test_user_scope_bearer_required(self, patch_resolver):
-        """User-scope session: GH_TOKEN + GITHUB_TOKEN both filled."""
+    def test_env_injection_alone_places_no_token_in_the_env(self, patch_resolver):
+        """The names a manifest lists are what the command wrapper sets on
+        the real command's own process; the session's environment never
+        receives the token (the second private report's finding)."""
         patch_resolver.set_manifest(_build_manifest(["GH_TOKEN", "GITHUB_TOKEN"]))
         _write_token_file(patch_resolver.token_dir, "primary", "ghp_user_token_xyz")
 
@@ -208,15 +213,15 @@ class TestResolverEmitsEnvVars:
             agent_name="dev-agent",
         )
 
-        assert result == {
-            "GH_TOKEN": "ghp_user_token_xyz",
-            "GITHUB_TOKEN": "ghp_user_token_xyz",
-        }
+        assert result == {}
 
-    def test_service_scope_bearer_required(self, patch_resolver):
-        """Agent-scope (no user_sub) reads service-account token."""
-        patch_resolver.set_manifest(_build_manifest(["GH_TOKEN"]))
+    def test_service_scope_records_the_bound_accounts_credential_by_reference(self, patch_resolver):
+        """Agent scope (no user_sub) resolves the service account: the git
+        entries name the platform's helper and the broker half carries the
+        token file by reference, never the value."""
+        patch_resolver.set_manifest(_build_manifest(["GH_TOKEN"], git_credential_helper=_GH_HELPER))
         _write_token_file(patch_resolver.token_dir, "primary", "ghp_service_token")
+        cli: dict = {}
 
         result = credential_resolver._resolve_oauth_mcp(
             mcp_name="github-mcp",
@@ -224,9 +229,16 @@ class TestResolverEmitsEnvVars:
             user_sub=None,
             task_scope="agent",
             agent_name="dev-agent",
+            cli_credentials=cli,
         )
 
-        assert result == {"GH_TOKEN": "ghp_service_token"}
+        assert "ghp_service_token" not in json.dumps(result)
+        assert result["GIT_CONFIG_VALUE_1"] == credential_resolver.PLATFORM_GIT_HELPER
+        cred = cli["github-mcp"]
+        assert cred.host == "github.com" and cred.env_names == ("GH_TOKEN",)
+        assert cred.manifest == "github-mcp" and cred.username == "x-access-token"
+        assert cred.token_ref.token_dir == str(patch_resolver.token_dir)
+        assert cred.token_ref.account_label == "primary"
 
     def test_no_env_injection_returns_empty_for_bearer(self, patch_resolver):
         """Bearer-required MCP without env_injection still resolves but
@@ -259,13 +271,14 @@ class TestResolverEmitsEnvVars:
 
         assert result is None
 
-    def test_empty_access_token_skips_injection(self, patch_resolver):
-        """Token file with no access_token = no env vars emitted (rare —
-        only if writeback corrupted the file)."""
-        patch_resolver.set_manifest(_build_manifest(["GH_TOKEN"]))
+    def test_empty_access_token_delivers_nothing(self, patch_resolver):
+        """Token file with no access_token = no git entries and no broker
+        half (rare — only if writeback corrupted the file)."""
+        patch_resolver.set_manifest(_build_manifest(["GH_TOKEN"], git_credential_helper=_GH_HELPER))
         # Token file present but access_token missing.
         f = patch_resolver.token_dir / "primary.json"
         f.write_text(json.dumps({"provider": "github", "account_id": "primary"}))
+        cli: dict = {}
 
         result = credential_resolver._resolve_oauth_mcp(
             mcp_name="github-mcp",
@@ -273,22 +286,20 @@ class TestResolverEmitsEnvVars:
             user_sub="user-sub-1",
             task_scope="user",
             agent_name="dev-agent",
+            cli_credentials=cli,
         )
 
-        assert result == {}
+        assert result == {} and cli == {}
 
 
 class TestResolverEmitsGitCredentialHelper:
     def test_git_credential_helper_wires_git_config(self, patch_resolver):
-        """git_credential_helper → GIT_CONFIG_* pointing git's credential
-        helper at the provider CLI bridge (no token in config)."""
-        patch_resolver.set_manifest(_build_manifest(
-            ["GH_TOKEN"],
-            git_credential_helper={
-                "host": "github.com", "helper": "!gh auth git-credential",
-            },
-        ))
+        """git_credential_helper → GIT_CONFIG_* pointing git at the
+        platform's credential helper (the manifest's own helper string is
+        accepted and not read); no token anywhere in the answer."""
+        patch_resolver.set_manifest(_build_manifest(["GH_TOKEN"], git_credential_helper=_GH_HELPER))
         _write_token_file(patch_resolver.token_dir, "primary", "ghp_tok")
+        cli: dict = {}
 
         result = credential_resolver._resolve_oauth_mcp(
             mcp_name="github-mcp",
@@ -296,18 +307,59 @@ class TestResolverEmitsGitCredentialHelper:
             user_sub="user-sub-1",
             task_scope="user",
             agent_name="dev-agent",
+            cli_credentials=cli,
         )
 
-        assert result["GH_TOKEN"] == "ghp_tok"
+        assert "GH_TOKEN" not in result and "ghp_tok" not in json.dumps(result)
         # Two entries: an empty RESET then our helper — so an interactive system
         # helper (Windows Git Credential Manager) can't win over the token one.
         assert result["GIT_CONFIG_COUNT"] == "2"
         assert result["GIT_CONFIG_KEY_0"] == "credential.https://github.com.helper"
         assert result["GIT_CONFIG_VALUE_0"] == ""
         assert result["GIT_CONFIG_KEY_1"] == "credential.https://github.com.helper"
-        assert result["GIT_CONFIG_VALUE_1"] == "!gh auth git-credential"
-        # The token itself never lands in the git config value.
-        assert "ghp_tok" not in result["GIT_CONFIG_VALUE_1"]
+        assert result["GIT_CONFIG_VALUE_1"] == credential_resolver.PLATFORM_GIT_HELPER
+        assert "gh auth git-credential" not in result["GIT_CONFIG_VALUE_1"]
+        # The helper the entries name is the script every config dir carries,
+        # run by the interpreter and from the dir each spawn path names.
+        from core.sandbox.session_config_dir import HOOK_SCRIPTS
+        assert "credential_helper.py" in HOOK_SCRIPTS
+        assert result["GIT_CONFIG_VALUE_1"].startswith('!"$OTO_HOOK_PY" -I "$OTO_HOOKS_DIR/credential_helper.py"')
+        assert cli["github-mcp"].host == "github.com"
+
+    def test_cli_token_env_gives_a_step_the_token_and_the_manifests_helper(
+        self, patch_resolver, monkeypatch,
+    ):
+        """An app step's script has no helper beside it: it receives the
+        names with the token and the manifest's own git helper entries, for
+        the MCPs enabled on the local placement, where a step runs; one
+        enabled on a paired machine alone gives it nothing."""
+        from core import placement
+        manifest = _build_manifest(["GH_TOKEN", "GITHUB_TOKEN"], git_credential_helper=_GH_HELPER)
+        manifest.name = "github-mcp"
+        patch_resolver.set_manifest(manifest)
+        _write_token_file(patch_resolver.token_dir, "primary", "ghp_step")
+        asked: list = []
+
+        def _local_mcps(agent, *, placement=None):
+            asked.append(placement)
+            return [manifest] if placement == self_placement.LOCAL_PLACEMENT else []
+        self_placement = placement
+        monkeypatch.setattr("services.mcp.mcp_registry.get_agent_mcps", _local_mcps)
+        monkeypatch.setattr(
+            "services.mcp.mcp_registry.get_agent_mcps_all_placements",
+            lambda agent: pytest.fail("a step never walks the other placements"),
+        )
+
+        env = credential_resolver.cli_token_env(
+            "dev-agent", "user-sub-1", task_scope="user", providers=["github"],
+        )
+
+        assert env["GH_TOKEN"] == env["GITHUB_TOKEN"] == "ghp_step"
+        assert env["GIT_CONFIG_VALUE_1"] == "!gh auth git-credential"
+        assert asked == [placement.LOCAL_PLACEMENT]
+        assert credential_resolver.cli_token_env(
+            "dev-agent", "user-sub-1", task_scope="user", providers=["slack"],
+        ) == {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -392,7 +444,8 @@ class TestResolverMcpEnvInjection:
             mcp_name="some-mcp", cred_type_info={"oauth": {}},
             user_sub="user-sub-1", task_scope="user", agent_name="dev-agent",
         )
-        assert result == {"CLI_TOKEN": "tok_xyz", "VENDOR_TOKEN": "tok_xyz"}
+        # The MCP's own token env is delivered; the shell's names are not.
+        assert result == {"VENDOR_TOKEN": "tok_xyz"}
 
 
 class TestCallerSecretClassification:
@@ -401,7 +454,7 @@ class TestCallerSecretClassification:
     ):
         """resolve_credentials puts mcp_env_injection names into secret_keys
         (broker-bundle-only, stripped from config files) and keeps them OUT
-        of bash_env_keys — while env_injection still reaches the bash env."""
+        of bash_env_keys; an env_injection name reaches no environment."""
         manifest = _build_mcp_env_manifest(
             ["NOTION_TOKEN"], env_injection=["CLI_TOKEN"],
         )
@@ -428,6 +481,6 @@ class TestCallerSecretClassification:
         assert res.env_by_mcp["notion-mcp"]["NOTION_TOKEN"] == "ntn_secret_2"
         assert "NOTION_TOKEN" in res.secret_keys          # broker-only
         assert "NOTION_TOKEN" not in res.bash_env_keys    # never in bash env
-        assert "CLI_TOKEN" in res.bash_env_keys           # bash injection intact
-        assert "CLI_TOKEN" not in res.secret_keys
+        assert "CLI_TOKEN" not in res.env_vars and res.bash_env_keys == set()
         assert "notion-mcp" in res.available_mcps
+        assert res.cli_credentials == {}                  # no git host named

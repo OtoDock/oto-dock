@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FileNode } from '../../api/agents'
 import { apiFetch } from '../../api/auth'
 import { getFileKind } from '../../lib/fileTypes'
 import { encodePathSegments } from '../../lib/paths'
 import { useCollaboraLiveReload } from '../../hooks/useCollaboraLiveReload'
+import { postSaveAndWait, useCollaboraIdle } from '../../hooks/useCollaboraIdle'
 import FileEditor from '../FileEditor'
 import FilePreviewPortal from './FilePreviewPortal'
 import VideoPlayer from '../chat/media/VideoPlayer'
@@ -23,8 +24,9 @@ interface Props {
  *
  * - text  → embedded `FileEditor` (writable if `canWrite`)
  * - image → centered `<img>` with object-contain
- * - document → Collabora iframe (WOPI flow). The wopi_url is cached in
- *   component state at mount; React Query invalidation on the file tree
+ * - document → Collabora iframe (WOPI flow). Each load mints (the first,
+ *   Reload, a `file_updated` reload, the idle recovery), so a reload opens
+ *   the file's newest document; React Query invalidation on the file tree
  *   does NOT re-derive the iframe key.
  * - other → a download-only fallback
  */
@@ -205,15 +207,19 @@ function DocumentPreview({
   canWrite: boolean
   onClose: () => void
 }) {
-  // Cache the frame at mount; never re-derive from React Query state.
+  // The frame each load minted, kept in component state; never re-derived
+  // from React Query state. The frame key moves only when a mint lands: a
+  // key alone would post the previous load's token into a new iframe.
   const [frame, setFrame] = useState<CollaboraFrameData | null>(null)
+  const [frameKey, setFrameKey] = useState(0)
   const [error, setError] = useState<string | null>(null)
-  const [reloadTs, setReloadTs] = useState(0)
-  const reload = useCallback(() => setReloadTs(Date.now()), [])
+  const [loadKey, setLoadKey] = useState(0)
+  const reload = useCallback(() => setLoadKey((k) => k + 1), [])
+  const hostRef = useRef<HTMLDivElement | null>(null)
 
   // Live-reload when another user changes this same file,
   // dirty-guarded so unsaved edits are never silently discarded.
-  const { iframeRef, reloadAvailable, doReload } = useCollaboraLiveReload({
+  const { iframeRef, reloadAvailable, doReload, modifiedRef } = useCollaboraLiveReload({
     agentSlug: agent,
     relPath: node.path,
     reload,
@@ -221,6 +227,7 @@ function DocumentPreview({
 
   useEffect(() => {
     let cancelled = false
+    setError(null)
     apiFetch('/v1/documents/wopi-url', {
       method: 'POST',
       body: JSON.stringify({ file_path: node.path, agent, edit: canWrite }),
@@ -229,14 +236,34 @@ function DocumentPreview({
         if (!res.ok) throw new Error(await res.text())
         return res.json()
       })
-      .then((data) => !cancelled && setFrame({
-        url: data.wopi_url, token: data.access_token, ttl: data.access_token_ttl,
-      }))
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
+      .then((data) => {
+        if (cancelled) return
+        setFrame({ url: data.wopi_url, token: data.access_token, ttl: data.access_token_ttl })
+        setFrameKey(loadKey)
+      })
+      .catch((e) => {
+        if (cancelled) return
+        // A token from an earlier mint may be past its end: no frame then.
+        setFrame(null)
+        setError(e instanceof Error ? e.message : String(e))
+      })
     return () => {
       cancelled = true
     }
-  }, [agent, node.path, canWrite])
+  }, [agent, node.path, canWrite, loadKey])
+
+  // Collabora's idle end: a resume in place when it can, else a fresh mint.
+  // Not while the Reload banner is up (the person decides); unsaved edits
+  // are saved first (bounded).
+  const recoverIdle = useCallback(() => {
+    if (reloadAvailable) return
+    void (async () => {
+      const win = iframeRef.current?.contentWindow
+      if (modifiedRef.current && win) await postSaveAndWait(win, 5000)
+      doReload()
+    })()
+  }, [reloadAvailable, iframeRef, modifiedRef, doReload])
+  useCollaboraIdle({ iframeRef, hostRef, loadKey, token: frame?.token, recover: recoverIdle })
 
   return (
     <FilePreviewPortal
@@ -245,7 +272,7 @@ function DocumentPreview({
       downloadUrl={downloadUrl}
       onReload={reload}
     >
-      <div className="relative h-full w-full bg-black">
+      <div ref={hostRef} className="relative h-full w-full bg-black">
         {reloadAvailable && (
           <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between gap-2 px-3 py-1.5 bg-amber-500/95 text-white text-xs">
             <span>This document changed. Reload to see the latest — your unsaved edits will be discarded.</span>
@@ -258,8 +285,14 @@ function DocumentPreview({
           </div>
         )}
         {error && (
-          <div className="h-full flex items-center justify-center text-red-300 text-sm px-4 text-center">
-            {error}
+          <div className="h-full flex flex-col items-center justify-center gap-2 text-red-300 text-sm px-4 text-center">
+            <span>{error}</span>
+            <button
+              onClick={reload}
+              className="px-2 py-1 rounded-md border border-white/30 hover:bg-white/10 text-xs text-white/80"
+            >
+              Retry
+            </button>
           </div>
         )}
         {!error && !frame && (
@@ -267,13 +300,13 @@ function DocumentPreview({
             Loading preview…
           </div>
         )}
-        {frame && (
+        {!error && frame && (
           <CollaboraFrame
             iframeRef={iframeRef}
             url={frame.url}
             accessToken={frame.token}
             accessTokenTtl={frame.ttl}
-            frameKey={reloadTs}
+            frameKey={frameKey}
             className="w-full h-full border-0"
           />
         )}

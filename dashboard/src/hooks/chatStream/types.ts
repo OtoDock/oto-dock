@@ -62,6 +62,9 @@ export interface UseChatStreamOptions {
    * the page re-resumes it so the fresh warmup runs on the new target and
    * the "moved" history card arrives. */
   onChatMoved?: (data: { chat_id: string; new_target: string; resolved_label?: string }) => void
+  /** chat_view_only for the VIEWED chat: a phone call drives it (read-only
+   * history until the call ends); null when the chat is its own again. */
+  onChatViewOnly?: (data: { chat_id: string; kind: string } | null) => void
   /** switch_engine ack for the VIEWED chat (stale-guarded like onChatMoved).
    * Arrives on the acting socket AND via per-user broadcast — idempotent. */
   onEngineSwitched?: (data: { chat_id: string; execution_path: string; model: string }) => void

@@ -221,7 +221,7 @@ def test_run_compose_streaming_buffers_and_throttles(
         docker_manager.subprocess, "Popen",
         lambda *a, **k: _FakePopen(text, returncode=1),
     )
-    caplog.set_level(logging.INFO, logger="claude-proxy.docker-manager")
+    caplog.set_level(logging.INFO, logger="otodock.docker-manager")
 
     rc, stderr = docker_manager._run_compose_streaming(
         file_tools_manifest, ["docker", "compose", "up"], timeout=30,
@@ -279,7 +279,7 @@ def test_compose_up_perm_denied_logs_hint_once(
     monkeypatch.setattr(
         docker_manager, "_run_compose_streaming", lambda *a, **k: (1, perm_err),
     )
-    caplog.set_level(logging.ERROR, logger="claude-proxy.docker-manager")
+    caplog.set_level(logging.ERROR, logger="otodock.docker-manager")
 
     assert docker_manager._compose_up(file_tools_manifest, ["up"], timeout=10) is False
     assert docker_manager._compose_up(file_tools_manifest, ["up"], timeout=10) is False
@@ -302,7 +302,7 @@ def test_container_status_perm_denied_logs_hint(
                   "daemon socket at unix:///var/run/docker.sock")
 
     monkeypatch.setattr(docker_manager.subprocess, "run", lambda *a, **k: _R())
-    caplog.set_level(logging.ERROR, logger="claude-proxy.docker-manager")
+    caplog.set_level(logging.ERROR, logger="otodock.docker-manager")
 
     assert docker_manager.get_container_status(file_tools_manifest) == "not_found"
     assert any("docker' group" in r.message for r in caplog.records)
@@ -532,3 +532,97 @@ def test_record_failure_never_breaks_a_successful_start(
         lambda m: (_ for _ in ()).throw(OSError("disk on fire")),
     )
     assert docker_manager._compose_up(fake_docker_manifest, ["up", "-d"], timeout=10) is True
+
+
+# ---------------------------------------------------------------------------
+# The running image against the manifest's, and Restart as a recreate
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace as _NS
+
+
+def _ps_lines(*containers: dict) -> str:
+    import json as _json
+    return "\n".join(_json.dumps(c) for c in containers)
+
+
+def _image_manifest(tmp_path, image="ghcr.io/otodock/video-tools:0.2.1"):
+    return _NS(name="video-tools", mcp_dir=tmp_path,
+               server=_NS(runtime="docker", docker_compose="docker-compose.yml",
+                          image=image, service_name="video-tools", port=9000))
+
+
+@pytest.mark.parametrize("a, b", [
+    ("busybox", "docker.io/library/busybox:latest"),
+    ("library/busybox:1", "busybox:1"),
+    ("index.docker.io/softeria/x:0.1", "softeria/x:0.1"),
+    ("ghcr.io/otodock/camoufox:0.0.76", "ghcr.io/otodock/camoufox:0.0.76"),
+])
+def test_image_references_compare_as_docker_resolves_them(a, b):
+    assert docker_manager.normalize_image(a) == docker_manager.normalize_image(b)
+
+
+def test_container_state_reads_the_running_images(tmp_path, monkeypatch):
+    out = _ps_lines({"State": "running", "Health": "", "Image": "ghcr.io/otodock/video-tools:0.2.0"})
+    monkeypatch.setattr(docker_manager.subprocess, "run",
+                        lambda *a, **k: _NS(returncode=0, stdout=out, stderr=""))
+    m = _image_manifest(tmp_path)
+    status, images = docker_manager.container_state(m)
+    assert status == "running" and images == ["ghcr.io/otodock/video-tools:0.2.0"]
+    assert docker_manager.get_container_status(m) == "running"
+    assert docker_manager.image_stale(m, images) is True
+    assert docker_manager.image_stale(m, ["ghcr.io/otodock/video-tools:0.2.1"]) is False
+    assert docker_manager.image_stale(_image_manifest(tmp_path, image=""), images) is False
+    assert docker_manager.image_stale(m, []) is False
+
+
+@pytest.fixture
+def recreate_rig(tmp_path, monkeypatch):
+    from core.config import deployment
+    from services.mcp import compose_rewrite
+    from storage.mcp import mcp_store
+    m = _image_manifest(tmp_path)
+    state = {"status": "running", "up": [], "env": 0, "enabled": True}
+    monkeypatch.setattr(mcp_store, "get_mcp_state", lambda n: {"enabled": state["enabled"]})
+    monkeypatch.setattr(deployment, "in_docker_compose", lambda: False)
+    monkeypatch.setattr(compose_rewrite, "ensure_t1_override", lambda m, **kw: None)
+    monkeypatch.setattr(docker_manager, "_inject_mcp_env",
+                        lambda m: state.__setitem__("env", state["env"] + 1))
+    monkeypatch.setattr(docker_manager, "get_container_status", lambda m: state["status"])
+    monkeypatch.setattr(docker_manager, "_compose_up",
+                        lambda m, args, **kw: state["up"].append(args) or True)
+    return m, state
+
+
+@pytest.mark.parametrize("status", ["running", "unhealthy", "starting"])
+def test_restart_recreates_an_existing_container_from_the_current_env(recreate_rig, status):
+    m, state = recreate_rig
+    state["status"] = status
+    assert docker_manager.restart_container(m) is True
+    assert state["env"] == 1
+    assert state["up"] == [["up", "-d", "--force-recreate", "--no-build", "--pull", "never"]]
+
+
+def test_an_exited_container_is_started_by_the_restart_button_only(recreate_rig):
+    m, state = recreate_rig
+    state["status"] = "stopped"
+    assert docker_manager.restart_container(m) is False          # a saved tool filter
+    assert docker_manager.restart_container(m, start_exited=True) is True
+    assert len(state["up"]) == 1
+
+
+@pytest.mark.parametrize("status", ["not_found", "error"])
+def test_restart_never_starts_a_stopped_mcp(recreate_rig, status):
+    m, state = recreate_rig
+    state["status"] = status
+    assert docker_manager.restart_container(m, start_exited=True) is False
+    assert state["env"] == 1          # the new .env applies at its next start
+    assert state["up"] == []
+
+
+def test_restart_never_starts_a_disabled_mcp(recreate_rig):
+    """A disable whose compose down failed can leave a container behind."""
+    m, state = recreate_rig
+    state["enabled"] = False
+    assert docker_manager.restart_container(m, start_exited=True) is False
+    assert state["up"] == []

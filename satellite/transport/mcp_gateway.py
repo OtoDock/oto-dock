@@ -68,6 +68,21 @@ _REFUSAL_VENDOR_401 = (
     "in Settings > Integrations."
 )
 _REFUSAL_NO_ANSWER = "The MCP server did not answer."
+# After a revoke (0.5.140: the proxy's revoke frame carries the refusal's
+# kind and reason). The account kinds read as a disconnect; another kind
+# (an allowlist row removed, the platform unable to reach the host) is the
+# proxy's own reason.
+_REFUSAL_DISCONNECTED = (
+    "This MCP's account was disconnected on the platform: reconnect it in Settings > "
+    "Integrations (a reconnected account reaches this machine within a minute)."
+)
+_REFUSAL_WITHDRAWN = (
+    "The platform withdrew this MCP's credential (its account was disconnected or its "
+    "host is no longer allowed): reconnect it in Settings > Integrations."
+)
+_ACCOUNT_KINDS = frozenset({"needs_reconnect", "no_value", "no_credential"})
+_TOMBSTONES_MAX = 1024
+_REASON_MAX = 500
 
 
 @dataclass
@@ -78,6 +93,22 @@ class _Token:
     upstream: str
     path: str
     lease_until: float
+
+
+@dataclass
+class _Revoked:
+    """A token the platform revoked, kept so the session's next request is
+    refused at once with why (no wait for a push that is not coming)."""
+    session_id: str
+    message: str
+
+
+def _revoked_message(kind: str, reason: str) -> str:
+    if kind in _ACCOUNT_KINDS:
+        return _REFUSAL_DISCONNECTED
+    if kind and reason:
+        return reason[:_REASON_MAX]
+    return _REFUSAL_WITHDRAWN
 
 
 def token_hash_of(bearer: str) -> str:
@@ -117,6 +148,9 @@ class GatewayTable:
 
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str], _Token] = {}
+        # Revoked keys, oldest first (bounded): a push of the key clears its
+        # entry, a wipe of the session clears all of the session's.
+        self._revoked: dict[tuple[str, str], _Revoked] = {}
         self._changed = asyncio.Event()
 
     def push(self, msg: dict) -> bool:
@@ -133,6 +167,22 @@ class GatewayTable:
         except (TypeError, ValueError):
             lease = LEASE_MAX_S
         lease = max(0.0, min(lease, LEASE_MAX_S))
+        if lease <= 0:
+            # A revoke: the proxy refuses the credential now (a disconnected
+            # account, a removed allowlist row), so the entry goes, whatever
+            # value the frame carries, and the next request learns why.
+            self._entries.pop((token_hash, mcp), None)
+            self._revoked.pop((token_hash, mcp), None)
+            self._revoked[(token_hash, mcp)] = _Revoked(
+                session_id=str(msg.get("session_id") or ""),
+                message=_revoked_message(str(msg.get("kind") or ""), str(msg.get("reason") or "")),
+            )
+            while len(self._revoked) > _TOMBSTONES_MAX:
+                self._revoked.pop(next(iter(self._revoked)))
+            self._changed.set()
+            self._changed = asyncio.Event()
+            return True
+        self._revoked.pop((token_hash, mcp), None)
         parts = urlsplit(upstream)
         self._entries[(token_hash, mcp)] = _Token(
             session_id=str(msg.get("session_id") or ""), header=header, value=value,
@@ -154,7 +204,17 @@ class GatewayTable:
         ]
         for k in keys:
             self._entries.pop(k, None)
+        for k in [k for k, r in self._revoked.items()
+                  if (token_hash and k[0] == token_hash)
+                  or (not token_hash and session_id and r.session_id == session_id)]:
+            self._revoked.pop(k, None)
         return len(keys)
+
+    def revoked(self, token_hash: str, mcp: str) -> str | None:
+        """Why the platform revoked this session's token for ``mcp``, while
+        no newer push replaced it; None otherwise."""
+        r = self._revoked.get((token_hash, mcp))
+        return r.message if r is not None else None
 
     def sweep(self, now: float | None = None) -> int:
         now = time.monotonic() if now is None else now
@@ -263,7 +323,14 @@ class LocalMcpGateway:
         body = await self._read_body(request)
         if body is None:
             return web.json_response({"error": "request-body-too-large"}, status=413)
-        token = await self.table.wait_for(token_hash_of(bearer), mcp, _PUSH_WAIT_S)
+        bearer_hash = token_hash_of(bearer)
+        token = self.table.get(bearer_hash, mcp)
+        if token is None:
+            revoked = self.table.revoked(bearer_hash, mcp)
+            if revoked is not None:
+                logger.info("mcp-gateway: mcp %s was revoked by the platform", mcp)
+                return self._refuse(method, body, revoked)
+            token = await self.table.wait_for(bearer_hash, mcp, _PUSH_WAIT_S)
         if token is None:
             logger.info("mcp-gateway: no token for mcp %s (session unknown or lease ended)", mcp)
             return self._refuse(method, body, _REFUSAL_NO_TOKEN)

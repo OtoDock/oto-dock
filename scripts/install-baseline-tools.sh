@@ -462,8 +462,8 @@ install_sympy() {
 # proxy/tests/execution/test_engine_descriptor.py holds them equal to the rows.
 # _install_pinned_cli upgrades an existing install to the exact pin rather than
 # skipping it.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.289}"
-CODEX_VERSION="${CODEX_VERSION:-0.160.0}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.296}"
+CODEX_VERSION="${CODEX_VERSION:-0.162.1}"
 
 # Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
 # "codex-cli 0.139.0").

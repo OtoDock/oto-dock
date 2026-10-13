@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import logging
 import os
+import secrets
 import stat
 import time
 import uuid
@@ -23,11 +24,12 @@ from typing import TYPE_CHECKING
 import contextlib
 
 from services.infra import path_confinement, safe_fs
+from core.background import spawn
 
 if TYPE_CHECKING:
     from services.path_policy_v2 import PathRef
 
-logger = logging.getLogger("claude-proxy.satellite")
+logger = logging.getLogger("otodock.satellite")
 
 
 # A push's chunk on a connection measured slow (512 KiB, MAX_CHUNK_SIZE,
@@ -40,6 +42,33 @@ def push_ceiling_s(size: int) -> float:
     """The longest a push of ``size`` bytes may run however it moves: 16 KiB/s
     at the least, 10 minutes for anything smaller."""
     return max(600.0, size / (16 * 1024))
+
+
+def _staging_name(name: str) -> str:
+    """A pull's own staging name beside ``name``: hidden, random, and
+    ending in ``.partial`` (both manifests skip it, retention reaps an
+    orphan). The name part is cut to 200 bytes so the whole fits in 255."""
+    base = os.fsdecode(os.fsencode(name)[:200])
+    return f".{base}.{secrets.token_hex(8)}.partial"
+
+
+def _in_agents_tree(dest: Path) -> bool:
+    """An agent's own tree (an agent folder never starts with a dot; the
+    host cache does)."""
+    import config
+    try:
+        rel = safe_fs.rel_under(dest, config.AGENTS_DIR)
+    except safe_fs.EscapeRefused:
+        return False
+    return bool(rel) and not rel.startswith(".")
+
+
+def _close_opened_root(job: "asyncio.Future[tuple[int, str]]") -> None:
+    """Close the handle a pull's root-open produced after its caller left."""
+    if job.cancelled() or job.exception() is not None:
+        return
+    with contextlib.suppress(OSError):
+        os.close(job.result()[0])
 
 
 # --- Multi-user shared-workspace conflict detection (versioned-sync) ---
@@ -76,6 +105,9 @@ class _PullStream:
     partial_rel: str = ""
     handle: object = None  # opened lazily on the first chunk
     received_bytes: int = 0
+    # The caller's own cap on the bytes, judged chunk by chunk (0 = the
+    # sync's MAX_FILE_SIZE).
+    max_bytes: int = 0
     # The final chunk's sha256; the commit (off the loop) compares against it.
     expected_hash: str = ""
     # The connection the pull went out on (a replacement rejects it by
@@ -92,6 +124,10 @@ class _PullStream:
     # The caller left before the commit ran (its path lock went with it):
     # the job cleans up instead of renaming over a write made since.
     abandoned: bool = False
+    # The destination is a platform copy the sync hashes (not a private
+    # snapshot, nor the host cache under the agents root): only then is its
+    # verified hash worth keeping.
+    in_agents_tree: bool = False
 
 
 @dataclass
@@ -603,13 +639,14 @@ class SatelliteFileTransferMixin:
         *,
         agent_slug: str = "",
         stall_s: float | None = None,
+        max_bytes: int | None = None,
     ) -> bool:
         """Stream a file from the satellite to ``dest_path`` (bounded memory).
 
         The satellite chunks the file into ``file_content`` messages; each
-        decoded chunk is written straight to ``dest_path + '.partial'`` and
-        the file is atomically renamed into place on the final chunk
-        (sha256-verified). Returns True on success; False on a stall,
+        decoded chunk is written straight to a staging file of the pull's own
+        beside the destination (``_staging_name``) and the file is atomically
+        renamed into place on the final chunk (sha256-verified). Returns True on success; False on a stall,
         read-denied / not-found / hash-mismatch / size-cap / disconnect.
 
         The pull fails only when the transfer stops moving: no chunk for
@@ -618,6 +655,10 @@ class SatelliteFileTransferMixin:
         before the next one's first chunk), or past ``max(10 min, the file's
         size at 16 KiB/s)`` from its first chunk, or 10 minutes from its
         start while no chunk came from a paced (0.5.137) satellite.
+
+        ``max_bytes`` fails the pull at the chunk that would pass it, before
+        those bytes are written (a caller that read a size from a manifest
+        bounds what may land even when the file grew since).
 
         Same ``ref.kind`` semantics as ``push_file``. A destination in the
         agents tree is reached beneath the agents root with no component
@@ -634,9 +675,19 @@ class SatelliteFileTransferMixin:
             raise ValueError("pull_file_to_path(agent_tree) requires agent_slug")
 
         dest = Path(dest_path)
-        partial = Path(str(dest) + ".partial")
+        staging = _staging_name(dest.name)
+        partial = dest.parent / staging
+        open_job = asyncio.ensure_future(asyncio.to_thread(self._open_pull_root, dest))
         try:
-            rootfd, dest_rel = await asyncio.to_thread(self._open_pull_root, dest)
+            rootfd, dest_rel = await asyncio.shield(open_job)
+        except asyncio.CancelledError:
+            # The thread runs on whatever the caller does: wait for its mkdir
+            # (a caller that removes its folder after the cancel must not see
+            # it come back) and close the handle it opens.
+            open_job.add_done_callback(_close_opened_root)
+            with contextlib.suppress(BaseException):
+                await asyncio.wait({open_job})
+            raise
         except OSError as e:
             logger.warning(
                 "Satellite %s file pull refused (%s): %s", machine_id[:8], dest, e,
@@ -659,9 +710,11 @@ class SatelliteFileTransferMixin:
             hasher=hashlib.sha256(),
             rootfd=rootfd,
             dest_rel=dest_rel,
-            partial_rel=dest_rel + ".partial",
+            partial_rel=f"{dest_rel.rpartition('/')[0]}/{staging}".lstrip("/"),
             conn=conn,
             started=started,
+            max_bytes=max(0, max_bytes or 0),
+            in_agents_tree=_in_agents_tree(dest),
         )
         stall = float(stall_s if stall_s is not None else getattr(config, "PULL_STALL_S", 90.0))
         try:
@@ -790,6 +843,9 @@ class SatelliteFileTransferMixin:
         if st.received_bytes + len(block) > MAX_FILE_SIZE:
             self._fail_pull(st, "pulled file exceeds MAX_FILE_SIZE")
             return
+        if st.max_bytes and st.received_bytes + len(block) > st.max_bytes:
+            self._fail_pull(st, f"pulled file exceeds the caller's {st.max_bytes} bytes")
+            return
         if st.handle is None:
             try:
                 st.handle = os.fdopen(self._open_partial(st), "wb")
@@ -846,8 +902,9 @@ class SatelliteFileTransferMixin:
         self._close_pull_root(st)
         # The sha256 of these bytes was just verified — prime the manifest
         # hash cache so the next sync cycle never re-hashes a big pull.
-        from core.remote.file_sync import prime_hash_cache
-        prime_hash_cache(st.dest_path, actual)
+        if st.in_agents_tree:
+            from core.remote.file_sync import prime_hash_cache
+            prime_hash_cache(st.dest_path, actual)
         return True
 
     def _fail_pull(self, st: "_PullStream", reason: str) -> None:
@@ -901,15 +958,12 @@ class SatelliteFileTransferMixin:
 
     @staticmethod
     def _open_partial(st: "_PullStream") -> int:
-        """The partial's write descriptor beneath the root. A link planted
-        at the staging name goes (its target stays) and the bytes land in a
-        fresh file."""
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        try:
-            return safe_fs.open_beneath(st.rootfd, st.partial_rel, flags, 0o644)
-        except safe_fs.SymlinkRefused:
-            safe_fs.unlink_beneath(st.rootfd, st.partial_rel, missing_ok=True)
-            return safe_fs.open_beneath(st.rootfd, st.partial_rel, flags | os.O_EXCL, 0o644)
+        """The partial's write descriptor beneath the root: a new file at
+        the pull's own random staging name, so nothing planted there (a
+        link, a hard link to another file) is ever written into, and two
+        pulls into one destination never share one."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        return safe_fs.open_beneath(st.rootfd, st.partial_rel, flags, 0o644)
 
     @staticmethod
     def _close_pull_root(st: "_PullStream") -> None:
@@ -966,7 +1020,8 @@ class SatelliteFileTransferMixin:
                 lane.shed_since_warning = 0
             return False
         lane.inflight += 1
-        asyncio.create_task(self._run_applier(machine_id, lane, frame))
+        spawn(self._run_applier(machine_id, lane, frame),
+              name="run_applier", owner="satellite_file_transfer")
         return True
 
     async def _run_applier(self, machine_id: str, lane: _FileChangedLane,
@@ -1120,10 +1175,11 @@ class SatelliteFileTransferMixin:
                 _crossed = sync_delta_alerts.record_turn_write(
                     machine_id, agent_slug, rel_path, int(_sz or 0))
                 if _crossed is not None:
-                    asyncio.ensure_future(sync_delta_alerts.maybe_alert(
+                    spawn(sync_delta_alerts.maybe_alert(
                         machine_id, agent_slug, source="per-turn",
                         new_files=_crossed[0], new_bytes=_crossed[1],
-                        subtree_counts=_crossed[2]))
+                        subtree_counts=_crossed[2]),
+                          name="maybe_alert", owner="satellite_file_transfer")
             except Exception:
                 logger.debug("sync-delta turn counter failed", exc_info=True)
 
@@ -1136,6 +1192,7 @@ class SatelliteFileTransferMixin:
         conflict_notify: tuple[str, str] | None = None  # (loser_slug, filename)
         fanout_source: bytes | Path | None = None
         fanout_lock = None
+        fanout_marked: dict[str, tuple[int, int]] | None = None
         lock = await remote_file_flow._acquire_global_path_lock(agent_slug, rel_path)
         try:
             async with lock:
@@ -1225,6 +1282,11 @@ class SatelliteFileTransferMixin:
                     else:
                         fanout_source = await self._workspace_path_checked(agent_dir, rel_path)
                     if fanout_source is not None:
+                        # The targets are marked in flight before the path
+                        # lock is released: a read there with no pull record
+                        # would otherwise pull the older bytes back first.
+                        fanout_marked = await workspace_fanout.mark_fan_out_targets(
+                            agent_slug, rel_path, exclude_machine_id=machine_id)
                         fanout_lock = await remote_file_flow.acquire_fanout_lock(
                             agent_slug, rel_path)
                         await fanout_lock.acquire()
@@ -1240,6 +1302,7 @@ class SatelliteFileTransferMixin:
             try:
                 await workspace_fanout.fan_out_write(
                     agent_slug, rel_path, fanout_source, exclude_machine_id=machine_id,
+                    marked=fanout_marked,
                 )
             except Exception:
                 logger.exception(
@@ -1271,14 +1334,14 @@ class SatelliteFileTransferMixin:
         if _lib_src is not None:
             _parts = rel_path.split("/")
             if len(_parts) >= 4:
-                asyncio.create_task(library_projector.propagate_mirror_write(
+                spawn(library_projector.propagate_mirror_write(
                     agent_slug, _lib_src, "/".join(_parts[3:]),
-                ))
+                ), name="propagate_mirror_write", owner="satellite_file_transfer")
         elif rel_path.startswith("knowledge/"):
-            asyncio.create_task(library_projector.propagate_source_write(
+            spawn(library_projector.propagate_source_write(
                 agent_slug, rel_path[len("knowledge/"):],
                 deleted=(action == "delete"),
-            ))
+            ), name="propagate_source_write", owner="satellite_file_transfer")
 
     async def _capture_pre_overwrite(
         self, agent_dir, rel_path: str,

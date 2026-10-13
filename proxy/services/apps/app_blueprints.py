@@ -33,7 +33,7 @@ from services.infra import path_confinement, safe_fs
 from storage import database as task_store
 from core import layout
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 FORMAT = 1
 BUNDLE_NAME = "blueprint.json"

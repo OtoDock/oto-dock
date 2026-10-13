@@ -44,7 +44,7 @@ def test_move_by_filename_is_precise(tmp_path: Path, temp_db, monkeypatch):
 
     agents_dir = tmp_path / "agents"
     monkeypatch.setattr(app_config, "AGENTS_DIR", agents_dir)
-    fake_ctx = MagicMock(agent="agent-x", username="alice")
+    fake_ctx = MagicMock(agent="agent-x", username="alice", mount_username="alice")
 
     with patch("services.mcp.mcp_registry.get_manifest", return_value=_fake_manifest(mcp_dir, source)), \
          patch("core.session.session_state.get_session_security", return_value=fake_ctx):
@@ -72,7 +72,7 @@ def test_mtime_fallback_when_no_result_text(tmp_path: Path, temp_db, monkeypatch
 
     agents_dir = tmp_path / "agents"
     monkeypatch.setattr(app_config, "AGENTS_DIR", agents_dir)
-    fake_ctx = MagicMock(agent="agent-x", username="alice")
+    fake_ctx = MagicMock(agent="agent-x", username="alice", mount_username="alice")
 
     with patch("services.mcp.mcp_registry.get_manifest", return_value=_fake_manifest(mcp_dir, source)), \
          patch("core.session.session_state.get_session_security", return_value=fake_ctx):
@@ -96,7 +96,7 @@ def test_parse_rejects_path_traversal(tmp_path: Path, temp_db, monkeypatch):
 
     agents_dir = tmp_path / "agents"
     monkeypatch.setattr(app_config, "AGENTS_DIR", agents_dir)
-    fake_ctx = MagicMock(agent="agent-x", username="alice")
+    fake_ctx = MagicMock(agent="agent-x", username="alice", mount_username="alice")
 
     with patch("services.mcp.mcp_registry.get_manifest", return_value=_fake_manifest(mcp_dir, source)), \
          patch("core.session.session_state.get_session_security", return_value=fake_ctx):
@@ -118,7 +118,7 @@ def test_keep_recent_caps_dest(tmp_path: Path, temp_db, monkeypatch):
     source = mcp_dir / "screenshots"; source.mkdir()
     agents_dir = tmp_path / "agents"
     monkeypatch.setattr(app_config, "AGENTS_DIR", agents_dir)
-    fake_ctx = MagicMock(agent="agent-x", username="alice")
+    fake_ctx = MagicMock(agent="agent-x", username="alice", mount_username="alice")
     manifest = _fake_manifest(mcp_dir, source, keep_recent=3)
 
     with patch("services.mcp.mcp_registry.get_manifest", return_value=manifest), \
@@ -143,7 +143,7 @@ def test_cleanup_session_noop_without_gc_after(tmp_path: Path, temp_db, monkeypa
     source = mcp_dir / "screenshots"; source.mkdir()
     agents_dir = tmp_path / "agents"
     monkeypatch.setattr(app_config, "AGENTS_DIR", agents_dir)
-    fake_ctx = MagicMock(agent="agent-x", username="alice")
+    fake_ctx = MagicMock(agent="agent-x", username="alice", mount_username="alice")
     manifest = _fake_manifest(mcp_dir, source, keep_recent=15)
 
     with patch("services.mcp.mcp_registry.get_manifest", return_value=manifest), \
@@ -173,7 +173,7 @@ def test_t2_uses_docker_cp(tmp_path: Path, temp_db, monkeypatch):
     monkeypatch.setattr(app_config, "INSTALL_ID", "testinst")
     monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_SOCKPROX)
     monkeypatch.setattr(deployment, "docker_subprocess_env", lambda: {})
-    fake_ctx = MagicMock(agent="agent-x", username="alice")
+    fake_ctx = MagicMock(agent="agent-x", username="alice", mount_username="alice")
 
     calls = []
 
@@ -204,3 +204,28 @@ def test_no_outputs_is_noop(tmp_path: Path, temp_db, monkeypatch):
     with patch("services.mcp.mcp_registry.get_manifest", return_value=m):
         mcp_output_relocation.record_tool_start("sess-1", "plain-mcp")
         assert mcp_output_relocation.relocate_for_tool("sess-1", "plain-mcp", "x") == []
+
+
+def test_a_shared_only_chat_relocates_into_the_shared_workspace(tmp_path: Path, monkeypatch):
+    """The MOUNT decides the workspace: a Shared-only human chat (a username,
+    an agent-scope mount) works in the agent's ``workspace`` and its
+    screenshots land there, never in a user folder it does not mount."""
+    import config as app_config
+    from auth.path_policy import SecurityContext
+    from services.mcp import mcp_output_relocation
+
+    mcp_dir = tmp_path / "mcp"; mcp_dir.mkdir()
+    source = mcp_dir / "screenshots"; source.mkdir()
+    (source / "page-1.png").write_bytes(b"PNG")
+    agents_dir = tmp_path / "agents"
+    monkeypatch.setattr(app_config, "AGENTS_DIR", agents_dir)
+    ctx = SecurityContext(role="editor", username="alice", agent="agent-x",
+                          is_admin_agent=False, session_scope="agent")
+
+    with patch("services.mcp.mcp_registry.get_manifest", return_value=_fake_manifest(mcp_dir, source)), \
+         patch("core.session.session_state.get_session_security", return_value=ctx):
+        moved = mcp_output_relocation.relocate_for_tool(
+            "sess-so", "fake-mcp", "browser_take_screenshot", result_text="page-1.png")
+    assert moved == [agents_dir / "agent-x" / "workspace" / ".screenshots" / "page-1.png"]
+    assert not (agents_dir / "agent-x" / "users").exists()
+    assert mcp_output_relocation.session_workspace_shown(ctx) == "/workspace"

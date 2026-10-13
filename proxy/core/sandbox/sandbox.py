@@ -9,10 +9,12 @@ The engines' config-dir builders (core/layers/<x>/config_dir.py) create and popu
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +23,7 @@ import config as app_config
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.sandbox")
+logger = logging.getLogger("otodock.sandbox")
 
 
 #: Where an external caller's own tree appears inside the session
@@ -102,11 +104,11 @@ _SYSTEM_RO_FILES = [
     "/etc/passwd",
     "/etc/group",
     "/etc/nsswitch.conf",
-    # System git config — set by `scripts/install-baseline-tools.sh` to
-    # wire `/usr/local/bin/oto-git-credential-helper` as github.com's
-    # credential helper so `git push` consults `GH_TOKEN` (injected via
-    # manifest `env_injection`) without manual `gh auth setup-git`.
-    # Mounted only when the host has it (existing existence check below).
+    # System git config — `scripts/install-baseline-tools.sh` wires the
+    # host's `oto-git-credential-helper` there; a platform session's own git
+    # configuration resets it and names the session's credential helper, so
+    # it is mounted for the rest of what the host's config says. Mounted only
+    # when the host has it (existing existence check below).
     "/etc/gitconfig",
 ]
 
@@ -304,6 +306,38 @@ def tmpfs_cap_preflight() -> None:
     )
 
 
+# How long a killed probe child gets to be reaped before the boot goes on
+# without it (a child uninterruptible inside the kernel never is).
+_PROBE_REAP_S = 5
+
+
+def _run_probe(argv: list[str], timeout: float) -> subprocess.CompletedProcess[bytes]:
+    """Run a boot probe within a wall-clock bound the boot can rely on.
+
+    ``subprocess.run(timeout=...)`` kills the child when the time is up and
+    then waits for it with no bound, so a child the kernel will not let die
+    (uninterruptible inside a namespace or mount call) hangs the boot for
+    good, with nothing in the log. Here the child owns a process group that
+    the timeout kills whole (pasta and bwrap included), the wait after the
+    kill is bounded, and a child still alive after it is left behind: the
+    caller sees ``TimeoutExpired`` either way.
+    """
+    proc = subprocess.Popen(
+        argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        _, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_PROBE_REAP_S)
+        if proc.stderr is not None:
+            proc.stderr.close()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stderr=err or b"")
+
+
 def _nested_sandbox_probe() -> str | None:
     """Probe that a SECOND bwrap can start inside the full sandbox stack.
 
@@ -327,9 +361,7 @@ def _nested_sandbox_probe() -> str | None:
     argv += ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--",
              bwrap, "--ro-bind", "/", "/", "--", "/bin/true"]
     try:
-        probe = subprocess.run(
-            argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20,
-        )
+        probe = _run_probe(argv, timeout=20)
     except subprocess.TimeoutExpired:
         return "nested probe timed out after 20s"
     except Exception as e:  # noqa: BLE001 — diagnostic-only path
@@ -369,10 +401,7 @@ def netns_preflight() -> None:
     # sandbox needs; a present-but-blocked kernel/profile fails here at boot
     # instead of at every session spawn.
     try:
-        probe = subprocess.run(
-            ["unshare", "-Urn", "true"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
-        )
+        probe = _run_probe(["unshare", "-Urn", "true"], timeout=10)
     except FileNotFoundError:
         # `unshare` (util-linux) absent. This used to skip the probe entirely —
         # letting a namespace-denying host boot and then fail every session
@@ -384,10 +413,9 @@ def netns_preflight() -> None:
             "the canonical probe."
         )
         try:
-            probe = subprocess.run(
-                ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--",
-                 "/bin/true"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
+            probe = _run_probe(
+                ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--", "/bin/true"],
+                timeout=10,
             )
         except Exception as e:
             raise RuntimeError(
@@ -515,13 +543,38 @@ def cli_version_preflight() -> None:
             continue
         m = re.search(r"(\d+\.\d+\.\d+)", out or "")
         have = m.group(1) if m else ""
-        if have and have != want:
+        pkg = _npm_package_of(exe) or "<package>"
+        hint = (f"run scripts/install-baseline-tools.sh (or `npm i -g "
+                f"--allow-scripts={pkg} {pkg}@{want}`) to reconcile the proxy host")
+        if not have:
+            # npm 12 installs a CLI whose own install step it skipped as a stub
+            # that prints no version.
             logger.warning(
-                "CLI pin DRIFT: %s is %s but VERSIONS.md pins %s — run "
-                "scripts/install-baseline-tools.sh (or `npm i -g <pkg>@%s`) to "
-                "reconcile the proxy host.",
-                label, have, want, want,
+                "CLI pin: %s (%s) printed no version — its install step may not "
+                "have run (npm 12 skips install scripts by default); %s.",
+                label, exe, hint,
             )
+        elif have != want:
+            logger.warning(
+                "CLI pin DRIFT: %s is %s but VERSIONS.md pins %s — %s.",
+                label, have, want, hint,
+            )
+
+
+def _npm_package_of(exe: str) -> str:
+    """The npm package a globally installed CLI comes from, read from where
+    its binary resolves (``…/node_modules/<pkg>/…`` or
+    ``…/node_modules/@scope/<pkg>/…``); "" for a binary npm did not install."""
+    parts = Path(os.path.realpath(exe)).parts
+    if "node_modules" not in parts:
+        return ""
+    i = len(parts) - 1 - parts[::-1].index("node_modules")
+    rest = parts[i + 1:]
+    if not rest:
+        return ""
+    if rest[0].startswith("@") and len(rest) > 1:
+        return f"{rest[0]}/{rest[1]}"
+    return rest[0]
 
 
 def cli_install_ro_binds(bin_path: str) -> list[str]:
@@ -824,11 +877,20 @@ class SandboxBuilder:
         else:
             cfg_dir = f"{layout.V_WORKSPACE}/{config_dir_name}"
 
+        from core.sandbox import session_config_dir as scd
         env = {
             config_env_var: cfg_dir,
-            # Restrict PATH to system dirs only (user home isn't mounted)
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            # The command wrappers (bound read-only, so nothing a session
+            # writes can precede the system dirs), then the system dirs only
+            # (a user home isn't mounted).
+            "PATH": f"{cfg_dir}/{scd.WRAPPER_DIR}:{scd.SANDBOX_PATH}",
             "HOME": "/tmp",  # CLI needs a writable HOME for temp files
+            # Where git's credential helper and the wrappers live, and the
+            # interpreter that runs them (the same resolved path the hook
+            # commands name): the git entries the resolver writes expand
+            # these through the shell.
+            "OTO_HOOKS_DIR": cfg_dir,
+            "OTO_HOOK_PY": scd.sandbox_python(),
         }
         # The Claude CLI refuses `--dangerously-skip-permissions` when it runs as
         # root. No default topology runs the proxy as root — bare-metal T1 is the
@@ -982,19 +1044,28 @@ class SandboxBuilder:
 
     def _hook_file_binds(self, mounts: list[Mount]) -> list[Mount]:
         """A read-only bind of each hook script and the stdio interceptor
-        (``session_config_dir.HOOK_SCRIPTS``) over its copy in every CLI
-        state dir the table leaves read-write: the session's own
-        ``.claude``/``.codex`` (a user's, an external caller's, or the agent
-        scope's inside ``/workspace``). The copies sit in a writable tree, so
-        without this a session could rewrite the hook that judges its own
-        tools (the path policy refused it, the kernel did not). A dir the
-        table masks or binds read-only takes none; a file that is missing, a
-        link, or under a linked path is skipped. A state dir that is not a
-        mount of its own (the agent scope's, inside ``/workspace``) is first
-        bound onto itself read-write: a mountpoint cannot be renamed away, so
-        the session cannot swap in a dir of its own around the binds.
-        Satellites run no bwrap."""
-        from core.sandbox.session_config_dir import _INTERCEPTOR_SRC, HOOK_SCRIPTS
+        (``session_config_dir.HOOK_SCRIPTS``), and of the file that names the
+        hooks (``settings.json`` in a ``.claude`` dir, ``hooks.json`` in a
+        ``.codex`` dir), over its copy in every CLI state dir the table
+        leaves read-write: the session's own ``.claude``/``.codex`` (a
+        user's, an external caller's, or the agent scope's inside
+        ``/workspace``). The copies sit in a writable tree, so without this a
+        session could rewrite the hook that judges its own tools, or the file
+        that names it (the path policy refused it, the kernel did not). The
+        CLI's own settings writes then fail and last for the session only. A
+        dir the table masks or binds read-only takes none; a file that is
+        missing, a link, or under a linked path is skipped. A state dir that
+        is not a mount of its own (the agent scope's, inside ``/workspace``)
+        is first bound onto itself read-write: a mountpoint cannot be renamed
+        away, so the session cannot swap in a dir of its own around the
+        binds. A bind holds only while the host file is not replaced (a
+        rename over a mountpoint detaches it in every other namespace), so
+        these files' content stays a function of the scope's paths and the
+        build (``session_config_dir.write_if_changed``). Satellites run no
+        bwrap."""
+        from core.sandbox.session_config_dir import (
+            _INTERCEPTOR_SRC, HOOK_FILE_OF_STATE_DIR, HOOK_SCRIPTS, WRAPPER_DIR,
+        )
 
         def cover(path: str) -> Mount | None:
             best = None
@@ -1024,7 +1095,8 @@ class SandboxBuilder:
             host_dir = root.joinpath(*rel.split("/")) if rel else root
             if os.path.realpath(host_dir) != str(host_dir):
                 continue
-            files = [host_dir / name for name in names]
+            files = [host_dir / name
+                     for name in (*names, HOOK_FILE_OF_STATE_DIR[d.rsplit("/", 1)[-1]])]
             files = [f for f in files
                      if f.is_file() and not f.is_symlink() and os.path.realpath(f) == str(f)]
             if not files:
@@ -1032,6 +1104,14 @@ class SandboxBuilder:
             if c.sandbox != d:
                 binds.append(Mount(str(host_dir), d, True))
             binds.extend(Mount(str(f), f"{d}/{f.name}", False) for f in files)
+            # The command wrappers' directory sits first on the session's
+            # PATH: read-only as a whole, so nothing can be added beside
+            # them (a planted interpreter there would run in place of the
+            # hooks'), and a mountpoint cannot be renamed away.
+            wrappers = host_dir / WRAPPER_DIR
+            if (wrappers.is_dir() and not wrappers.is_symlink()
+                    and os.path.realpath(wrappers) == str(wrappers)):
+                binds.append(Mount(str(wrappers), f"{d}/{WRAPPER_DIR}", False))
         return binds
 
     def _role_mount_table(self) -> list[Mount]:

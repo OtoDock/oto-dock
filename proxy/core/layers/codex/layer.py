@@ -164,6 +164,9 @@ _CODEX_CAPABILITIES = LayerCapabilities(
             "escalation": ("CodexEscalation", "CodexTerminalInput"),
         },
         question_tool_holds_turn=True,        # request_user_input holds the turn on item/tool/requestUserInput; ask_user_question answers it
+        # Codex reads AGENTS.md only from the root down to its working folder,
+        # so a repository cloned into the workspace is never on that path.
+        repository_instruction_files=("AGENTS.md", "CLAUDE.md"),
     ),
     model_policy=ModelPolicy(
         default_model="gpt-6.1-sol",          # tier 2; Astra (tier 1) is offered, never defaulted
@@ -610,8 +613,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                     mcp_toml_content, bundle_keys, session_id,
                 )
             from core.sandbox.interceptor_wrap import wrap_toml_text
+            from core.sandbox.session_config_dir import sandbox_python
             mcp_toml_content = wrap_toml_text(
-                mcp_toml_content, interpreter="python3", interpreter_args=("-I",),
+                mcp_toml_content, interpreter=sandbox_python(), interpreter_args=("-I",),
                 interceptor_path=f"{sandbox_codex_dir}/stdio_path_interceptor.py",
             )
 
@@ -627,9 +631,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             )
 
         # Write combined config.toml (instructions + MCP servers). The hook
-        # floor (`[features] hooks = true`) is written for the bare TUI and
-        # for unattended sessions; an external caller also loses the shell
-        # tool (see _write_config_toml).
+        # floor (`[features] hooks = true`) is written for every session; an
+        # external caller also loses the shell tool (see _write_config_toml).
         config_dir = Path(config.sandbox_host_claude_dir)
         # ONE rule with the remote start payload (helpers.codex_hooks_floor).
         hooks_floor = codex_hooks_floor(config.client_type, config.interactive)
@@ -812,9 +815,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             mcp_server_names=mcp_server_names_from_toml(mcp_toml_content),
             local_model=bool(local_endpoint),
             hooks_floor=hooks_floor,
-            # The plan collaboration mode follows the platform mode, not the
-            # sandbox: a judge (CHECKS.md) is read-only without planning.
-            plan_mode=(config.permission_mode == "plan"),
+            # The approval policy and the plan collaboration mode follow the
+            # platform mode, not the sandbox: a judge (CHECKS.md) is
+            # read-only without planning.
+            permission_mode=config.permission_mode,
         )
 
         # Session metadata (permission mode + security context were
@@ -1137,7 +1141,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         set_session_mode(session_id, mode)
         session = await get_codex_session(session_id)
         if session:
-            session.set_sandbox_mode(_permission_to_sandbox(mode), plan_mode=(mode == "plan"))
+            session.set_mode(mode, _permission_to_sandbox(mode))
 
     async def send_control_request(
         self, session_id: str, subtype: str, **kwargs,
@@ -1338,19 +1342,18 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # when a Codex bump graduates it to default-on (see CODEX.md).
         if interactive or client_type == session_kind.DASHBOARD.name:
             parts.append("default_mode_request_user_input = true")
-        if interactive or not session_kind.attended(client_type):
-            # Enable Codex's hook system so our PreToolUse permission_gate.py runs
-            # as the command-level FLOOR (baseline restricted-tools + dangerous +
-            # RBAC + path) — the SAME decide_tool_permission authority every other
-            # surface uses. Interactive TUI: trusted via
-            # --dangerously-bypass-hook-trust. Unattended app-server sessions
-            # (task / phone / meeting / trigger): trusted via thread/start.config
-            # (session.py::_thread_overrides) — with `never` + full access the
-            # JSON-RPC bridge never fires, so the hook is the only gate there.
-            # Dashboard app-server chats keep the bridge alone (both would
-            # double-gate). The key is default-on upstream; explicit on purpose.
-            # Canonical key is `hooks` (the older `codex_hooks` is deprecated).
-            parts.append("hooks = true")
+        # Enable Codex's hook system so our PreToolUse permission_gate.py runs
+        # as the command-level FLOOR (baseline restricted-tools + dangerous +
+        # RBAC + path) — the SAME decide_tool_permission authority every other
+        # surface uses. Interactive TUI: trusted via
+        # --dangerously-bypass-hook-trust. App-server sessions: trusted per
+        # thread via thread/start.config (session.py::_thread_overrides) —
+        # under `never` the JSON-RPC bridge never fires, so the hook is the
+        # gate there; an attended chat's gate stands aside while the bridge
+        # asks (OTO_HOOK_BRIDGED). Every session of the scope writes the same
+        # line. The key is default-on upstream; explicit on purpose.
+        # Canonical key is `hooks` (the older `codex_hooks` is deprecated).
+        parts.append("hooks = true")
         if no_shell:
             # External callers (a phone caller who is not a platform user) get
             # no exec_command / write_stdin at all: the shell is what could read
@@ -1377,6 +1380,18 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             _esc_cwd = trusted_cwd.replace('\\', '\\\\').replace('"', '\\"')
             parts.append(f'[projects."{_esc_cwd}"]')
             parts.append('trust_level = "trusted"')
+
+        if interactive and sandbox_codex_dir:
+            # Codex 0.162's managed worktrees (the TUI's create_worktree and
+            # list_worktrees tools, a trusted project) check out under
+            # $CODEX_HOME/worktrees by default: the .codex dir the path policy
+            # protects and whose children the sync manifest does not prune. A
+            # hidden sibling at the scope root is neither protected nor synced.
+            # Absolute, as Codex requires; the satellite twin writes its own
+            # host path (codex_pty_session._build_codex_config_toml).
+            _scope_root = sandbox_codex_dir.rstrip("/").rsplit("/", 1)[0]
+            parts.append("[desktop]")
+            parts.append(f'git-worktree-root = "{_scope_root}/.codex-worktrees"')
 
         # Custom model provider for a local OpenAI-compatible endpoint
         # (Ollama, LM Studio, LiteLLM, vLLM, …). wire_api MUST be "responses":

@@ -50,7 +50,7 @@ import contextlib
 
 from core.execution_layer import CredentialFileSpec
 
-logger = logging.getLogger("claude-proxy.token-fanout")
+logger = logging.getLogger("otodock.token-fanout")
 
 _FRESHNESS_INTERVAL_S = 300
 

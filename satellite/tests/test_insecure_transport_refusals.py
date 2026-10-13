@@ -220,3 +220,32 @@ async def test_the_4006_close_uninstalls_on_a_secure_link(actions, monkeypatch):
     calls = _closing_connect(monkeypatch, c)
     await c.connect_forever()
     assert actions["uninstall"] == [True] and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_push_is_acknowledged_before_it_is_applied(monkeypatch):
+    """On a secure link the loop answers ``update_received`` on the socket
+    before the update task starts (it takes the loop while it unpacks, then
+    exits): the proxy counts a rollback only for a push that arrived. A
+    plaintext link acknowledges nothing (it applies nothing)."""
+    order: list = []
+
+    async def _update(msg):
+        order.append(("applied", msg["target_version"]))
+
+    monkeypatch.setattr(ws_client, "_self_update_and_restart", _update)
+
+    class _AckWS(_LoopWS):
+        async def send(self, raw: str) -> None:
+            order.append(("sent", json.loads(raw)))
+
+    for insecure, expect in ((False, [("sent", {"type": "update_received", "target_version": "9.9.9"}),
+                                      ("applied", "9.9.9")]),
+                             (True, [])):
+        order.clear()
+        c = _client(insecure=insecure)
+        c._ws = _AckWS([_UPDATE])
+        await c._message_loop()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert order == expect, insecure

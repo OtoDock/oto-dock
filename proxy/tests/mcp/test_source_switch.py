@@ -586,7 +586,7 @@ async def test_an_applied_update_retires_the_persisted_offer(rig, monkeypatch):
                                                       "registry": "npm", "package": "pkg",
                                                       "reason": "package"}})
 
-    async def _updated(name, manifest):
+    async def _updated(name, manifest, **kw):
         return {"status": "updated"}
     monkeypatch.setattr(mcp_updater, "_update_node_python_mcp", _updated)
     await mcp_updater.update_one("pkg-mcp")
@@ -695,7 +695,8 @@ def test_update_state_reads_the_persisted_check(temp_db, monkeypatch):
     monkeypatch.setattr(mcp_registry, "_manifests", {})
     r = _client(_principal("admin")).get("/v1/admin/mcps/update-state")
     assert r.status_code == 200
-    assert r.json() == {"updates": {}, "checked": 0, "checked_at": ""}
+    assert r.json() == {"updates": {}, "checked": 0, "checked_at": "",
+                        "auto_update_enabled": True}
     store.replace_check_results({"x-mcp": {"current": "1", "latest": "2", "registry": "npm",
                                            "package": "x", "reason": "package"}})
     body = _client(_principal("admin")).get("/v1/admin/mcps/update-state").json()

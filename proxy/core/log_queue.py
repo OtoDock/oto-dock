@@ -60,10 +60,14 @@ _ACCESS_LOGGER = "uvicorn.access"
 # the usual names of keys, signatures, codes and passwords. The value goes,
 # the name stays, so a line still says what was asked for.
 _URL_SECRET = re.compile(
-    r"((?:[?&]|%3F|%26)(?:access_token|token|key|t|api_?key|sig|signature|"
+    r"((?:[?&]|%3F|%26)(?:access_token|access_header|token|key|t|api_?key|sig|signature|"
     r"x-amz-signature|x-goog-signature|code|password|secret)(?:=|%3D))(?:(?!%26)[^&\s\"'#])+",
     re.IGNORECASE,
 )
+# A bearer credential in a logged text (an editor frame posted with
+# Collabora's ``access_header`` carries ``Authorization: Bearer <token>`` in
+# its socket path, once or twice encoded, or decoded with its spaces).
+_BEARER = re.compile(r"((?:Bearer|bearer)(?:\s|\+|%20|%2520)+)[A-Za-z0-9._~/+=-]{8,}")
 # A share link's token is a path segment (``/s/<token>``, its socket too).
 _SHARE_PATH = re.compile(r"(/s/)[A-Za-z0-9_-]{8,}")
 # The HTTP clients log every request's full URL at INFO.
@@ -114,6 +118,8 @@ def redact(text: str) -> str:
     ``[redacted]``."""
     if "/s/" in text:
         text = _SHARE_PATH.sub(r"\1[redacted]", text)
+    if "earer" in text:
+        text = _BEARER.sub(r"\1[redacted]", text)
     if "=" not in text and "%3D" not in text and "%3d" not in text:
         return text
     return _URL_SECRET.sub(r"\1[redacted]", text)
@@ -158,7 +164,7 @@ class _Listener(logging.handlers.QueueListener):
     @staticmethod
     def _overflow_record(n: int) -> logging.LogRecord:
         return logging.LogRecord(
-            "claude-proxy.log-queue", logging.WARNING, __file__, 0,
+            "otodock.log-queue", logging.WARNING, __file__, 0,
             "log queue overflow: dropped %d records while the log writer "
             "was blocked", (n,), None,
         )

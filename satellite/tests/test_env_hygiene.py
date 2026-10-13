@@ -135,6 +135,14 @@ class TestNestedClaudeSessionVars:
         out = curate_satellite_env({"claude_code_child_session": "1", "PATH": "/bin"})
         assert out == {"PATH": "/bin"}
 
+    def test_inherited_hook_flags_stripped(self):
+        # A satellite started from an agent's shell in a Codex chat inherits
+        # that daemon's hook flags; every spawn sets its own.
+        flags = {"OTO_HOOK_DENY_ONLY": "1", "OTO_HOOK_NO_FORWARD": "1",
+                 "OTO_HOOK_BRIDGED": "1", "OTO_INTERACTIVE": "1"}
+        out = curate_satellite_env({**flags, "PATH": "/bin"})
+        assert out == {"PATH": "/bin"}
+
     def test_keep_set_cannot_bring_them_back(self, monkeypatch):
         # Identity, not a secret false positive — OTO_ENV_KEEP does not apply.
         monkeypatch.setenv("OTO_ENV_KEEP", "CLAUDE_CODE_CHILD_SESSION")

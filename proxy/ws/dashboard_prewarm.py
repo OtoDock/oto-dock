@@ -30,7 +30,7 @@ from ws.dashboard import _resolve_session_interactive
 from core.session import session_kind
 from auth.providers import acting_role_of
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 _ROLLBACK_TASKS: set[asyncio.Task] = set()

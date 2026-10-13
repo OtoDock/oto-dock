@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from mcp.server import Server
@@ -69,10 +69,25 @@ ENABLED_TOOLS = _resolve_tool_set()
 # ---------------------------------------------------------------------------
 
 class _ApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status: int = 0):
+        super().__init__(message)
+        self.status = status
 
 
-async def _request(method: str, path: str, **kwargs) -> Any:
+# The request never left: retrying it cannot run anything twice.
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout)
+# The request may have reached the platform and be running there still: any
+# transport failure once the connection opened (a timeout, a dropped or reset
+# connection while the platform worked).
+_NO_ANSWER = httpx.TransportError
+
+
+async def _request(
+    method: str, path: str, *, retry: Literal["all", "connect"] = "all", **kwargs,
+) -> Any:
+    """``retry="all"`` sends a call once more after a 5xx or any transport
+    error; ``"connect"`` only after a connection that never opened, for a
+    call a second run must not repeat or that a retry cannot fix."""
     headers = kwargs.pop("headers", {}) or {}
     if API_KEY and "Authorization" not in headers:
         headers["Authorization"] = f"Bearer {API_KEY}"
@@ -81,12 +96,13 @@ async def _request(method: str, path: str, **kwargs) -> Any:
     url = f"{PROXY_URL}{path}"
     # Installs cascade MCP + skill-package downloads — give them room.
     timeout = kwargs.pop("timeout", 120.0)
+    attempts = 2
     last_exc: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(attempts):
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.request(method, url, headers=headers, **kwargs)
-            if resp.status_code >= 500 and attempt == 0:
+            if resp.status_code >= 500 and retry == "all" and attempt < attempts - 1:
                 await asyncio.sleep(1.0)
                 continue
             if resp.status_code >= 400:
@@ -96,7 +112,9 @@ async def _request(method: str, path: str, **kwargs) -> Any:
                     detail = js.get("detail") or js
                 except Exception:
                     pass
-                raise _ApiError(f"{method} {path} → {resp.status_code}: {detail}")
+                raise _ApiError(
+                    f"{method} {path} → {resp.status_code}: {detail}", status=resp.status_code,
+                )
             if resp.status_code == 204 or not resp.content:
                 return None
             return resp.json()
@@ -104,7 +122,7 @@ async def _request(method: str, path: str, **kwargs) -> Any:
             raise
         except Exception as exc:
             last_exc = exc
-            if attempt == 0:
+            if attempt < attempts - 1 and (retry == "all" or isinstance(exc, _NOT_SENT)):
                 await asyncio.sleep(1.0)
                 continue
             raise _ApiError(f"{method} {path}: {exc}") from exc
@@ -242,8 +260,12 @@ def _format_plan(result: dict) -> list[str]:
 async def _tool_validate_agent_template(path: str) -> str:
     if not path.strip():
         return "❌ Error: path is required"
+    # Only a connection that never opened is retried: a 503 or a timeout is
+    # the folder read failing or running long, and a second attempt would
+    # double the wait before the agent hears it.
     result = await _request(
         "POST", "/v1/agents/local-template/validate", json={"path": path.strip()},
+        retry="connect",
     )
     if not isinstance(result, dict):
         return "❌ Error: unexpected response from validate"
@@ -270,9 +292,30 @@ async def _tool_create_agent(path: str, target_slug: str) -> str:
     body: dict[str, Any] = {"path": path.strip()}
     if target_slug.strip():
         body["target_slug"] = target_slug.strip()
-    result = await _request(
-        "POST", "/v1/agents/install-from-local-template", json=body,
-    )
+    try:
+        result = await _request(
+            "POST", "/v1/agents/install-from-local-template", json=body, retry="connect",
+        )
+    except _ApiError as exc:
+        if isinstance(exc.__cause__, _NO_ANSWER) and not isinstance(exc.__cause__, _NOT_SENT):
+            # Never sent twice: the first install may be running still, and
+            # a second one would find its slug taken and offer another.
+            raise _ApiError(
+                f"the install got no answer ({type(exc.__cause__).__name__}) "
+                "and may still be running on the platform. Before calling "
+                "`create_agent` again, check whether its slug (`target_slug`, else "
+                "the template's) is taken: `list_building_blocks` lists every taken "
+                "slug. If it is, the agent was created; never install it again under "
+                "a suggested slug.",
+            ) from exc
+        if exc.status == 503:
+            # The platform answers 503 only while reading the folder, before
+            # the install starts.
+            raise _ApiError(
+                f"{exc}. Nothing was created; call `create_agent` again in a moment.",
+                status=exc.status,
+            ) from exc
+        raise
     if not isinstance(result, dict):
         return "❌ Error: unexpected response from install"
 

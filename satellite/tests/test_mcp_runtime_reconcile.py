@@ -244,3 +244,20 @@ async def test_a_hung_npm_rebuild_is_killed_and_retried_next_start(tmp_path, mon
             break
         await asyncio.sleep(0.05)
     assert not [p for p in pids.read_text().split() if _alive(int(p))]
+
+
+def test_reconcile_ends_with_the_interpreter_prune(tmp_path):
+    """The unused uv-managed interpreters go once the venvs are settled; a
+    venv's interpreter stays."""
+    if sys.platform == "win32":
+        pytest.skip("the prune is POSIX only")
+    uvp = tmp_path / ".uv-python"
+    for name in ("cpython-3.13.14-linux", "cpython-3.11.9-linux"):
+        (uvp / name / "bin").mkdir(parents=True)
+        (uvp / name / "bin" / "python3").write_text("")
+    d = _make_mcp(tmp_path, "community", "pkg", {"name": "pkg", "server": {"runtime": "python"}})
+    (d / "venv").mkdir()
+    (d / "venv" / "pyvenv.cfg").write_text(f"home = {uvp / 'cpython-3.13.14-linux' / 'bin'}\n")
+    asyncio.run(mis.reconcile_mcp_runtimes(tmp_path, None))
+    assert (uvp / "cpython-3.13.14-linux").is_dir()
+    assert not (uvp / "cpython-3.11.9-linux").exists()

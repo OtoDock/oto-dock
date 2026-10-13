@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("claude-proxy.execution_mode")
+logger = logging.getLogger("otodock.execution_mode")
 
 INTERACTIVE = "interactive"
 HEADLESS = "-p"

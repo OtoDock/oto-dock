@@ -567,7 +567,7 @@ def test_delete_lands_behind_the_chats_queued_writer_job(temp_db, caplog):
         res = await api.delete_chat(cid, user=EDITOR)
         return await fut, res
 
-    with caplog.at_level(logging.WARNING, logger="claude-proxy.chat-writer"):
+    with caplog.at_level(logging.WARNING, logger="otodock.chat-writer"):
         row_id, res = asyncio.run(scenario())
     assert row_id > 0 and res == {"status": "ok"}
     assert task_store.get_chat(cid) is None

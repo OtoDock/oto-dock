@@ -682,3 +682,72 @@ async def test_a_deletion_drops_every_stored_wake_of_the_person(world):
     assert db.delete_user(w.pat)
     await transfer.reconcile_person(w.pat, actor=w.admin, reason=offboarding.DELETED)
     assert db.claim_pending_delegate_wake("w-del") == []
+
+
+def _queued(chat_id: str, queue_id: str, author: str) -> None:
+    db.enqueue_chat_input(chat_id, queue_id, author, text="waiting", cli_text="waiting",
+                          event_data="", images="", origin_conn="")
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_takes_the_persons_waiting_messages(world, monkeypatch):
+    """Nobody could send a deleted person's queued messages: they go with
+    the person, from the table and from memory (``delete_user`` takes the
+    rows before the offboarding runs); a teammate's on the same chat stay."""
+    from core.events import input_queue
+    from core.events.common_events import TurnInput
+    from services.notifications import notification_manager
+    monkeypatch.setattr(notification_manager, "push_live", lambda *a, **k: 1)
+    w = world
+    db.create_chat("q-chat-a", w.pat, A, "default")
+    q = await input_queue.loaded("q-chat-a")
+    await q.add("q-pat", w.pat, TurnInput("waiting"))
+    await q.add("q-admin", w.admin, TurnInput("waiting"))
+    from core.events import chat_writer
+    await chat_writer.drain("q-chat-a", timeout=5)
+    assert db.delete_user(w.pat)
+    assert [r["queue_id"] for r in db.list_chat_input_queue("q-chat-a")] == ["q-admin"]
+    assert await transfer._drop_queued_inputs(w.pat, offboarding.DELETED, {}) == 1
+    assert [qi.queue_id for qi in input_queue.peek("q-chat-a")] == ["q-admin"]
+    input_queue._registry.pop("q-chat-a", None)
+
+
+@pytest.mark.asyncio
+async def test_an_offboarding_drops_what_the_person_may_no_longer_send(world, monkeypatch):
+    """A person who lost agent A: their messages queued on A's chats go (rows,
+    registry, chips); those on B, which they still drive, stay. A demotion
+    below the editor tier drops them only where the chat takes that tier."""
+    from core.events import input_queue
+    from services.notifications import notification_manager
+    monkeypatch.setattr(notification_manager, "push_live", lambda *a, **k: 1)
+    w = world
+    db.create_chat("q-on-a", w.pat, A, "default")
+    db.create_chat("q-on-b", w.pat, B, "default")
+    db.create_chat("q-agent-b", "agent::" + B, B, "default")
+    _queued("q-on-a", "qa", w.pat)
+    _queued("q-on-b", "qb", w.pat)
+    _queued("q-agent-b", "qab", w.pat)
+    user = db.get_user(w.pat)
+    removed = {w.pat: (user, {B: "editor"})}
+    assert await transfer._drop_queued_inputs(w.pat, offboarding.REMOVED, removed) == 1
+    assert db.list_chat_input_queue("q-on-a") == []
+    assert [r["queue_id"] for r in db.list_chat_input_queue("q-on-b")] == ["qb"]
+    demoted = {w.pat: (user, {B: "member"})}
+    assert await transfer._drop_queued_inputs(w.pat, offboarding.DEMOTED, demoted) == 1
+    assert db.list_chat_input_queue("q-agent-b") == []
+    assert [r["queue_id"] for r in db.list_chat_input_queue("q-on-b")] == ["qb"]
+    assert input_queue.peek("q-on-a") == []
+
+
+def test_the_upgrade_sweeps_messages_of_people_deleted_before(world):
+    """Rows a 1.7.x deletion left behind are removed once at the upgrade."""
+    from storage import schema
+    w = world
+    db.create_chat("q-orphan", w.admin, A, "default")
+    _queued("q-orphan", "q-ghost", "local:deleted-long-ago")
+    _queued("q-orphan", "q-live", w.admin)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM platform_settings WHERE key = 'chat_input_queue_orphans_swept'")
+        schema.run_migrations(conn)
+        conn.commit()
+    assert [r["queue_id"] for r in db.list_chat_input_queue("q-orphan")] == ["q-live"]

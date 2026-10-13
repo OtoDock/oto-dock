@@ -278,7 +278,6 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
     }
     // Mount-once by design (see onCloseRef above): one history entry per
     // lightbox lifetime — re-arming on onClose identity is the self-close bug.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Android back-gesture / back-button integration — same pattern as
@@ -299,7 +298,6 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
       w.__otodockLightboxActive = false
       delete w.__otodockLightboxClose
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -310,7 +308,6 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
       pop()
       document.body.style.overflow = prev
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {

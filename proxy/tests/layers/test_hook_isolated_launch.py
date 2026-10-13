@@ -28,8 +28,9 @@ def test_claude_hooks_run_python3_isolated_quoting_the_script():
     hooks = build_settings("/users/alice/.claude")["hooks"]
     cmds = _commands(hooks)
     assert cmds, "no hook commands"
+    from core.sandbox.session_config_dir import sandbox_python
     for c in cmds:
-        assert c.startswith('python3 -I "/users/alice/.claude/')
+        assert c.startswith(f'{sandbox_python()} -I "/users/alice/.claude/')
         assert c.endswith('.py"')
     assert any("permission_gate.py" in c for c in cmds)
 
@@ -38,8 +39,9 @@ def test_codex_hooks_run_python3_isolated():
     hooks = build_hooks("/workspace/.codex")["hooks"]
     cmds = _commands(hooks)
     assert cmds
+    from core.sandbox.session_config_dir import sandbox_python
     for c in cmds:
-        assert c.startswith('python3 -I "/workspace/.codex/') and c.endswith('.py"')
+        assert c.startswith(f'{sandbox_python()} -I "/workspace/.codex/') and c.endswith('.py"')
 
 
 def test_the_interceptor_wrap_passes_the_isolation_flag_locally():

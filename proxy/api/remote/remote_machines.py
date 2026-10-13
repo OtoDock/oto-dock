@@ -11,6 +11,7 @@ These two routes are intentionally unauthenticated — the pairing token in
 the install command is the auth.
 """
 
+import asyncio
 import contextlib
 import hashlib
 import io
@@ -32,6 +33,7 @@ from storage import remote_store
 from storage.agents import agent_store
 from storage.pg import run_db
 from auth import roles
+from core.background import spawn
 
 
 def _merge_live_status(machine: dict) -> dict:
@@ -52,7 +54,7 @@ def _merge_live_status(machine: dict) -> dict:
         machine["last_seen"] = live["last_seen_iso"]
     return machine
 
-logger = logging.getLogger("claude-proxy.remote-machines")
+logger = logging.getLogger("otodock.remote-machines")
 router = APIRouter()
 
 
@@ -74,7 +76,6 @@ def _kick_presync(machine_id: str, agent_slug: str) -> None:
     warm (or in-progress) tree instead of paying the whole initial transfer
     inline. Harmless + idempotent (per-(machine, agent) sync lock inside);
     offline machines no-op (the reconnect catch-up covers them)."""
-    import asyncio
 
     async def _run() -> None:
         try:
@@ -85,7 +86,7 @@ def _kick_presync(machine_id: str, agent_slug: str) -> None:
                 "enable pre-sync failed for %s/%s", machine_id[:8], agent_slug,
             )
 
-    asyncio.create_task(_run())
+    spawn(_run(), name="enable_presync", owner="remote_machines")
 
 
 # --- Satellite installer assets ---
@@ -401,9 +402,10 @@ def _build_bootstrap_script(
 
     # The git credential helper rides as a third payload on Linux/macOS —
     # the baseline script looks for it NEXT TO ITSELF (repo-local layout),
-    # so install.sh materializes both into one temp dir. Without this every
-    # bootstrap install warned "credential helper source not found" and
-    # GH_TOKEN-driven `git push` from sandboxed agents stayed unwired.
+    # so install.sh materializes both into one temp dir; without it every
+    # bootstrap install warned "credential helper source not found". A
+    # platform session's own git configuration resets this host helper and
+    # names the session's credential helper instead.
     helper_path = scripts_dir / "oto-git-credential-helper"
     helper_b64 = (
         _b64.b64encode(helper_path.read_bytes()).decode("ascii")
@@ -1440,6 +1442,34 @@ def _plaintext_link(conn, machine: dict) -> bool:
     return isinstance(caps, dict) and bool(caps.get("insecure_transport"))
 
 
+async def _note_online_push(machine_id: str, machine: dict, conn, ack) -> None:
+    """Count an online push for the rollback check: at once for a satellite
+    that sends no acknowledgement; for one that does, when it comes, or
+    after ``_UPDATE_ACK_WAIT_S`` if the connection it went out on is still
+    the machine's (a push whose connection died first never reached it:
+    offered again, nothing counted)."""
+    from core.remote.satellite_connection import get_connection_manager
+    from ws.satellite import (
+        _UPDATE_ACK_WAIT_S, SATELLITE_VERSION_LATEST, _broadcast_satellite_updating,
+        note_update_pushed,
+    )
+    if ack is not None:
+        try:
+            await asyncio.wait_for(ack, _UPDATE_ACK_WAIT_S)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if get_connection_manager().get_connection(machine_id) is not conn:
+                logger.warning(
+                    "update-now push to %s was not acknowledged before its connection "
+                    "ended; no rollback counted", machine_id[:8],
+                )
+                return
+    note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
+    with contextlib.suppress(Exception):
+        await _broadcast_satellite_updating(
+            machine_id, machine, machine.get("satellite_version") or "", SATELLITE_VERSION_LATEST,
+        )
+
+
 async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
     """Shared logic for the admin and user "Update now" endpoints.
     Pushes the tarball if connected, else sets pending_update for next
@@ -1451,8 +1481,8 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
     from core.remote.satellite_connection import get_connection_manager
     from ws.satellite import (
         SATELLITE_VERSION_LATEST,
-        _broadcast_satellite_updating,
-        note_update_pushed,
+        UPDATE_ACK_SATELLITE_VERSION,
+        _version_at_least,
     )
     import base64 as _b64
 
@@ -1465,7 +1495,10 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
         tarball_bytes, expected_sha256 = get_satellite_tarball_with_hash()
         conn = cm.get_connection(machine_id)
         if conn is not None:
+            acks = _version_at_least(str(getattr(conn, "satellite_version", "") or ""),
+                                     UPDATE_ACK_SATELLITE_VERSION)
             try:
+                ack = cm.expect_update_ack(machine_id) if acks else None
                 await conn.enqueue_send({
                     "type": "update_required",
                     "target_version": SATELLITE_VERSION_LATEST,
@@ -1473,15 +1506,16 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
                     "expected_sha256": expected_sha256,
                     "previous_version": machine.get("satellite_version") or "",
                 })
-                # Same rollback detection + budget as the automatic push:
-                # if the satellite comes back below the target, the next
-                # reconnect records/announces it (ws/satellite.py).
-                note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
-                await _broadcast_satellite_updating(
-                    machine_id, machine,
-                    machine.get("satellite_version") or "",
-                    SATELLITE_VERSION_LATEST,
-                )
+                # Same rollback detection + budget as the automatic push: if
+                # the satellite comes back below the target, the next
+                # reconnect records/announces it (ws/satellite.py). One that
+                # acknowledges is counted once it read the push (in the
+                # background: the request answers now).
+                if ack is None:
+                    await _note_online_push(machine_id, machine, conn, None)
+                else:
+                    spawn(_note_online_push(machine_id, machine, conn, ack),
+                          name="note_online_push", owner="remote_machines")
             except Exception as e:
                 logger.exception("update-now push failed for %s", machine_id[:8])
                 raise HTTPException(status_code=500, detail=str(e))

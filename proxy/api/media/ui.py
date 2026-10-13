@@ -50,7 +50,7 @@ from auth.providers import UserContext, get_current_user
 from services.infra import safe_fs
 from storage import database as task_store
 
-logger = logging.getLogger("claude-proxy.ui")
+logger = logging.getLogger("otodock.ui")
 router = APIRouter()
 
 # The hook caps an artifact at 2 MB when it is minted; the agent may Edit the

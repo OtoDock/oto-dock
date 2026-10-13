@@ -15,6 +15,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TypedDict, cast
 
 import jwt
 from fastapi import Depends, HTTPException, Request
@@ -25,7 +26,7 @@ from storage import database as task_store
 from storage.pg import run_db_fast
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.auth")
+logger = logging.getLogger("otodock.auth")
 
 # In-memory CSRF state store: state -> metadata dict
 # ({"expiry": monotonic timestamp, "redirect_uri": str | None})
@@ -527,7 +528,9 @@ def session_token_holder_ok(payload: dict) -> bool:
     if not sub:
         return True
     user = task_store.get_user(sub)
-    return bool(user) and session_token_is_current(user, payload)
+    if not user:
+        return False
+    return session_token_is_current(user, payload)
 
 
 # --- The forced password change and 2FA enrolment ---
@@ -741,8 +744,9 @@ async def get_current_user(request: Request) -> UserContext | None:
         memo = getattr(state, "otodock_principal", _PRINCIPAL_UNSET)
     else:
         memo = _PRINCIPAL_UNSET
+    principal: UserContext | None
     if memo is not _PRINCIPAL_UNSET:
-        principal = memo
+        principal = cast("UserContext | None", memo)
     else:
         principal = await _resolve_principal(request)
         if state is not None:
@@ -877,7 +881,13 @@ async def _resolve_principal(req: Request) -> UserContext | None:
     return None
 
 
-def _parse_external_claim(claim: str) -> dict[str, str]:
+class _ExternalClaim(TypedDict, total=False):
+    external_claim: str
+    external_channel: str
+    external_id: str
+
+
+def _parse_external_claim(claim: str) -> _ExternalClaim:
     """``UserContext`` kwargs for a session token's ``ext`` claim. A malformed
     claim (the proxy signed it, so that is a bug) is logged and treated as
     absent — the token then has no external standing at all."""

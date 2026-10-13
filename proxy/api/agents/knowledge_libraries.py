@@ -43,8 +43,9 @@ from storage.knowledge import db_knowledge_libraries
 
 from api.agents._router import router
 from core import layout
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.knowledge-libraries")
+logger = logging.getLogger("otodock.knowledge-libraries")
 
 # A session token changes an agent's libraries only for the agent it was
 # started for, the consumer ``{name}``; ``{source}`` is another agent by
@@ -366,11 +367,11 @@ async def set_knowledge_library(
                 # the rename instead of resurrecting the old file.
                 from services.infra import file_bookkeeping
                 old_rel, new_rel = moved
-                asyncio.create_task(
-                    file_bookkeeping.tombstone_path(name, f"{layout.KNOWLEDGE}/{old_rel}"))
-                asyncio.create_task(
-                    file_bookkeeping.record_platform_write(
-                        name, f"{layout.KNOWLEDGE}/{new_rel}", None))
+                spawn(file_bookkeeping.tombstone_path(name, f"{layout.KNOWLEDGE}/{old_rel}"),
+                      name="tombstone_path", owner="knowledge_libraries")
+                spawn(file_bookkeeping.record_platform_write(
+                        name, f"{layout.KNOWLEDGE}/{new_rel}", None),
+                      name="record_platform_write", owner="knowledge_libraries")
         # `name` here is the AGENT slug (the path param); `label` is the
         # library's display name. Spelled out so the two never blur.
         created = await asyncio.to_thread(
@@ -387,8 +388,8 @@ async def set_knowledge_library(
     consumers = await asyncio.to_thread(
         db_knowledge_libraries.unpromote, name, subdir)
     if consumers:
-        asyncio.create_task(
-            library_projector.teardown_library(name, subdir, consumers))
+        spawn(library_projector.teardown_library(name, subdir, consumers),
+              name="teardown_library", owner="knowledge_libraries")
     logger.info("knowledge-library unpromote: %s subdir=%r by=%s detached=%d",
                 name, subdir, u.acting_sub, len(consumers))
     return {"status": "unshared", "subdir": subdir,
@@ -443,7 +444,8 @@ async def attach_knowledge_library(
         await asyncio.to_thread(
             db_knowledge_libraries.set_writable, source, name, req.writable,
             subdir)
-    asyncio.create_task(library_projector.attach_setup(source, name))
+    spawn(library_projector.attach_setup(source, name),
+          name="attach_setup", owner="knowledge_libraries")
     logger.info(
         "knowledge-library attach: %s/%s→%s writable=%s by=%s created=%s",
         source, subdir or "<root>", name, req.writable, u.acting_sub, created)
@@ -470,7 +472,8 @@ async def detach_knowledge_library(
     if not removed:
         raise HTTPException(status_code=404, detail="Not attached")
     from services.knowledge import library_projector
-    asyncio.create_task(library_projector.detach_teardown(source, name, sub))
+    spawn(library_projector.detach_teardown(source, name, sub),
+          name="detach_teardown", owner="knowledge_libraries")
     logger.info("knowledge-library detach: %s/%s→%s by=%s",
                 source, sub or "<root>", name, u.acting_sub)
     return {"status": "detached", "subdir": sub}

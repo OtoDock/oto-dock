@@ -23,7 +23,7 @@ from core.session.session_state import _active_processes, _aborted_sessions
 if TYPE_CHECKING:
     from pathlib import Path
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 # ---------------------------------------------------------------------------

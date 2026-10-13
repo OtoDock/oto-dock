@@ -43,6 +43,10 @@ def _make_cm(push_delays: dict):
     cm.get_sync_lock = _lock
     cm.get_clock_offset = MagicMock(return_value=0.0)
     cm.send_command = AsyncMock(return_value={"files": []})
+    # A bare MagicMock answers truthy: every merge here is a current Linux one.
+    cm.satellite_supports_skipped_manifest = MagicMock(return_value=False)
+    cm.satellite_absence_unreliable = MagicMock(return_value=False)
+    cm.satellite_restores_holds = MagicMock(return_value=False)
 
     async def _push_file(machine_id, ref, content, agent_slug="", **kw):
         state["active"] += 1
@@ -80,6 +84,8 @@ async def _run_sync(tmp_path, monkeypatch, actions, cm, progress_cb=None,
     monkeypatch.setattr(sync_state_store, "load_for_machine_agent",
                         lambda *a: {})
     monkeypatch.setattr(file_tombstones_store, "load_for_agent", lambda *a: {})
+    monkeypatch.setattr(file_tombstones_store, "load_holds_for_agent",
+                        sync_kw.pop("holds_fn", lambda *a: {}))
     monkeypatch.setattr(
         file_sync, "diff_manifests",
         diff_fn or (lambda *a, **kw: SimpleNamespace(actions=actions, to_scrub=[])),
@@ -510,3 +516,61 @@ async def test_an_acked_merge_push_clears_the_platform_ahead_mark_and_moves_the_
         assert ticks == sorted(ticks) and ticks[-1] == 2
     finally:
         remote_file_flow._platform_ahead.clear()
+
+
+@pytest.mark.asyncio
+async def test_the_merge_asks_for_skips_and_judges_by_the_asked_version(tmp_path, monkeypatch):
+    """A 0.5.145 satellite is asked to list what it could not read; an older
+    one never is. What the merge may trust is read before the request: a
+    satellite that restarts on a new version while the reply is merged is
+    another connection, and the reply still belongs to the one asked."""
+    cm, _ = _make_cm({})
+    seen: dict = {}
+    reply = {"files": [{"path": "workspace/locked.pst", "skipped": "unreadable",
+                        "size": 1, "mtime": 0}]}
+
+    async def _send(machine_id, msg, **kw):
+        seen["msg"] = msg
+        # The machine updates and reconnects while the reply is in flight.
+        cm.satellite_absence_unreliable.return_value = False
+        cm.satellite_restores_holds.return_value = True
+        return reply
+
+    cm.send_command = _send
+    cm.satellite_supports_paged_manifest = MagicMock(return_value=True)
+    cm.satellite_absence_unreliable.return_value = True
+
+    def _diff(local, remote, **kw):
+        seen["remote"], seen["kw"] = remote, kw
+        return SimpleNamespace(actions=[], to_scrub=[])
+
+    await _run_sync(tmp_path, monkeypatch, [], cm, diff_fn=_diff,
+                    holds_fn=lambda *a: {"workspace/x.txt": 2.0})
+    assert "report_skipped" not in seen["msg"]
+    assert seen["remote"] == []          # an unasked satellite's skip is dropped
+    assert seen["kw"]["absence_unknown"] is True
+    assert seen["kw"]["restore_holds"] is False
+    assert seen["kw"]["holds"] == {"workspace/x.txt": 2.0}
+
+    cm.satellite_supports_skipped_manifest.return_value = True
+    cm.satellite_absence_unreliable.return_value = False
+    cm.satellite_restores_holds.return_value = True
+    await _run_sync(tmp_path, monkeypatch, [], cm, diff_fn=_diff)
+    assert seen["msg"]["report_skipped"] is True
+    assert seen["remote"] == reply["files"]
+    assert seen["kw"]["restore_holds"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_restore_pull_lands_with_the_machines_time(tmp_path, monkeypatch):
+    from core.remote.file_sync import FileAction
+    cm, _ = _make_cm({})
+    cm.pull_file_to_path = AsyncMock(return_value=True)
+    restore = FileAction("workspace/notes.md", "pull", drop_tombstone=True, keep_mtime=1000.0)
+    plain = FileAction("workspace/other.md", "pull")
+    from storage.files import file_tombstones_store
+    monkeypatch.setattr(file_tombstones_store, "drop", lambda *a: None)
+    await _run_sync(tmp_path, monkeypatch, [restore, plain], cm)
+    agent_dir = tmp_path / "test-agent" / "workspace"
+    assert os.stat(agent_dir / "notes.md").st_mtime == 1000.0
+    assert os.stat(agent_dir / "other.md").st_mtime > 1000.0

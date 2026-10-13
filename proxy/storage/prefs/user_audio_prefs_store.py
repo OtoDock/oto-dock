@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from storage.pg import get_conn
 
 # Defaults returned when a user has no saved row. ``auto`` = prefer native,
 # fall back to platform (final policy is decided by the capability resolver).
-DEFAULT_PREFS = {
+DEFAULT_PREFS: dict[str, Any] = {
     "stt_mode": "auto",
     "tts_mode": "auto",
     "tts_voice_map": {},

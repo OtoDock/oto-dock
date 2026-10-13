@@ -33,7 +33,7 @@ import httpx
 
 from auth.oauth_providers.base import OAuthProvider, TokenSet, UserInfo
 
-logger = logging.getLogger("claude-proxy.oauth-providers.zoom")
+logger = logging.getLogger("otodock.oauth-providers.zoom")
 
 
 class ZoomOAuthProvider(OAuthProvider):

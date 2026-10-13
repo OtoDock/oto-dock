@@ -20,6 +20,11 @@ from core.remote.satellite_connection import SatelliteConnectionManager
 from services.path_policy_v2 import PathRef
 
 
+def _partials(dest: Path) -> list[Path]:
+    """The staging files a pull into ``dest`` left beside it."""
+    return sorted(dest.parent.glob(f".{dest.name}.*.partial"))
+
+
 class _FakeConn:
     """Captures messages the manager enqueues (the file_pull request)."""
 
@@ -85,7 +90,7 @@ async def test_multi_chunk_reassembles(tmp_path):
 
     assert await asyncio.wait_for(task, timeout=5.0) is True
     assert dest.read_bytes() == data
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []
     assert rid not in mgr._pending_pulls
 
 
@@ -132,7 +137,7 @@ async def test_hash_mismatch_fails_and_cleans(tmp_path):
 
     assert await asyncio.wait_for(task, timeout=5.0) is False
     assert not dest.exists()
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []
 
 
 @pytest.mark.asyncio
@@ -147,7 +152,7 @@ async def test_error_response_fails(tmp_path):
 
     assert await asyncio.wait_for(task, timeout=5.0) is False
     assert not dest.exists()
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []
 
 
 @pytest.mark.asyncio
@@ -182,7 +187,61 @@ async def test_size_cap_fails(tmp_path, monkeypatch):
 
     assert await asyncio.wait_for(task, timeout=5.0) is False
     assert not dest.exists()
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []
+
+
+@pytest.mark.asyncio
+async def test_the_callers_cap_fails_before_the_bytes_land(tmp_path):
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "out.bin"
+    task = asyncio.create_task(mgr.pull_file_to_path(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), dest,
+        agent_slug="agent-1", stall_s=2.0, max_bytes=8,
+    ))
+    for _ in range(400):
+        if any(m.get("type") == "file_pull" for m in conn.sent):
+            break
+        await asyncio.sleep(0.005)
+    rid = next(m["request_id"] for m in conn.sent if m.get("type") == "file_pull")
+    st = mgr._pending_pulls[rid]
+    mgr._on_pull_chunk(st, _chunk(rid, 0, 2, b"X" * 6))
+    mgr._on_pull_chunk(st, _chunk(rid, 1, 2, b"X" * 6, last_hash="sha256:whatever"))
+    assert await asyncio.wait_for(task, timeout=5.0) is False
+    assert not dest.exists()
+    assert _partials(dest) == []
+
+
+@pytest.mark.parametrize("cap, chunks, landed", [
+    (8, [b"X" * 9], False),             # past the cap on the first chunk
+    (8, [b"X" * 4, b"X" * 4], True),    # exactly at the cap
+    (0, [b"X" * 40], True),             # 0 and None: only the sync's own cap
+    (None, [b"X" * 40], True),
+])
+@pytest.mark.asyncio
+async def test_the_callers_cap_at_every_edge(tmp_path, cap, chunks, landed):
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "out.bin"
+    task = asyncio.create_task(mgr.pull_file_to_path(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), dest,
+        agent_slug="agent-1", stall_s=2.0, max_bytes=cap,
+    ))
+    for _ in range(400):
+        if any(m.get("type") == "file_pull" for m in conn.sent):
+            break
+        await asyncio.sleep(0.005)
+    rid = next(m["request_id"] for m in conn.sent if m.get("type") == "file_pull")
+    st = mgr._pending_pulls[rid]
+    digest = f"sha256:{hashlib.sha256(b''.join(chunks)).hexdigest()}"
+    for i, data in enumerate(chunks):
+        last = i == len(chunks) - 1
+        mgr._on_pull_chunk(st, _chunk(rid, i, len(chunks), data, last_hash=digest if last else ""))
+    assert await asyncio.wait_for(task, timeout=5.0) is landed
+    assert dest.exists() is landed
+    assert _partials(dest) == []
 
 
 @pytest.mark.asyncio
@@ -195,11 +254,11 @@ async def test_a_stall_cleans_partial(tmp_path):
     task, rid, st = await _start_pull(mgr, conn, dest, stall_s=0.15)
     # Deliver only the first of two chunks → never finalizes → stalls.
     mgr._on_pull_chunk(st, _chunk(rid, 0, 2, b"partial-data"))
-    assert Path(str(dest) + ".partial").exists()  # partial opened mid-stream
+    assert len(_partials(dest)) == 1  # partial opened mid-stream
 
     assert await asyncio.wait_for(task, timeout=5.0) is False
     assert not dest.exists()
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []
     assert rid not in mgr._pending_pulls
 
 
@@ -344,19 +403,26 @@ async def test_a_link_at_a_parent_never_carries_the_pull_outside_the_tree(tmp_pa
     assert ok is False
     assert conn.sent == []
     assert not (outside / "x.bin").exists()
-    assert not (outside / "x.bin.partial").exists()
+    assert not list(outside.glob("*x.bin*"))
     assert mgr._pending_pulls == {}
     assert data
 
 
 @pytest.mark.asyncio
-async def test_a_link_at_the_partial_name_is_replaced_never_written_through(tmp_path, monkeypatch):
+async def test_nothing_planted_beside_the_destination_is_written_into(tmp_path, monkeypatch):
+    """A pull stages under its own random name: a link or a hard link to
+    another file planted at a predictable staging name is never opened."""
+    import os
     agents, outside = _agents_tree(tmp_path, monkeypatch)
-    (agents / "agent-1" / "workspace").mkdir()
+    ws = agents / "agent-1" / "workspace"
+    ws.mkdir()
     target = outside / "t"
     target.write_bytes(b"keep")
-    dest = agents / "agent-1" / "workspace" / "x.bin"
+    other = ws / "other.txt"
+    other.write_bytes(b"theirs")
+    dest = ws / "x.bin"
     Path(str(dest) + ".partial").symlink_to(target)
+    os.link(other, ws / ".x.bin.partial")
     mgr = SatelliteConnectionManager()
     conn = _FakeConn()
     mgr._connections["m1"] = conn
@@ -366,9 +432,84 @@ async def test_a_link_at_the_partial_name_is_replaced_never_written_through(tmp_
     mgr._on_pull_chunk(st, _chunk(rid, 0, 1, data, last_hash=f"sha256:{h.hexdigest()}"))
     assert await asyncio.wait_for(task, timeout=5.0) is True
     assert dest.read_bytes() == data
-    assert target.read_bytes() == b"keep"
-    assert not Path(str(dest) + ".partial").exists()
+    assert target.read_bytes() == b"keep" and other.read_bytes() == b"theirs"
+    assert _partials(dest) == []
     assert rid not in mgr._pending_pulls
+
+
+@pytest.mark.asyncio
+async def test_two_pulls_into_one_destination_never_share_a_staging_file(tmp_path):
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "out.bin"
+    t1, r1, s1 = await _start_pull(mgr, conn, dest)
+    t2, r2, s2 = await _start_pull(mgr, conn, dest)
+    assert s1.partial_rel != s2.partial_rel
+    mgr._on_pull_chunk(s1, _chunk(r1, 0, 2, b"one-"))
+    mgr._on_pull_chunk(s2, _chunk(r2, 0, 2, b"two-"))
+    for st, rid, part in ((s1, r1, b"one-"), (s2, r2, b"two-")):
+        h = hashlib.sha256(part + b"end")
+        mgr._on_pull_chunk(st, _chunk(rid, 1, 2, b"end", last_hash=f"sha256:{h.hexdigest()}"))
+    assert await asyncio.wait_for(t1, timeout=5.0) is True
+    assert await asyncio.wait_for(t2, timeout=5.0) is True
+    # Whichever commit ran last, the file is one whole pull, never a mix.
+    assert dest.read_bytes() in (b"one-end", b"two-end")
+    assert _partials(dest) == []
+
+
+@pytest.mark.asyncio
+async def test_only_a_platform_copy_primes_the_sync_hash_cache(tmp_path, monkeypatch):
+    from core.remote import file_sync
+    agents, _ = _agents_tree(tmp_path, monkeypatch)
+    (agents / "agent-1" / "workspace").mkdir()
+    primed: list = []
+    monkeypatch.setattr(file_sync, "prime_hash_cache", lambda p, h: primed.append(p))
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    data = b"Q" * 10
+    digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
+    for dest in (agents / "agent-1" / "workspace" / "x.bin", tmp_path / "snapshot" / "x.bin"):
+        task, rid, st = await _start_pull(mgr, conn, dest)
+        mgr._on_pull_chunk(st, _chunk(rid, 0, 1, data, last_hash=digest))
+        assert await asyncio.wait_for(task, timeout=5.0) is True
+    assert primed == [agents / "agent-1" / "workspace" / "x.bin"]
+
+
+@pytest.mark.asyncio
+async def test_a_pull_cancelled_while_its_root_opens_closes_it(tmp_path, monkeypatch):
+    """The root opens in a thread that runs on after a cancel: the caller
+    waits for it (its mkdir never lands after the caller cleaned up) and
+    the handle it opened is closed."""
+    import os
+    import threading
+    opened: list[int] = []
+    release = threading.Event()
+    real = SatelliteConnectionManager._open_pull_root
+
+    def slow_open(dest):
+        release.wait(5)
+        out = real(dest)
+        opened.append(out[0])
+        return out
+
+    monkeypatch.setattr(SatelliteConnectionManager, "_open_pull_root", staticmethod(slow_open))
+    mgr = SatelliteConnectionManager()
+    mgr._connections["m1"] = _FakeConn()
+    task = asyncio.create_task(mgr.pull_file_to_path(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), tmp_path / "d" / "x.bin",
+        agent_slug="agent-1"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()            # waiting for the thread, not gone
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+    assert opened and (tmp_path / "d").is_dir()
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +545,7 @@ async def test_commit_runs_off_the_loop_after_the_stream_is_popped(tmp_path, mon
     # A late chunk after the final one is ignored.
     mgr._on_pull_chunk(st, _chunk(rid, 1, 1, b"LATE"))
     assert dest.read_bytes() == data
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []
 
 
 # ---------------------------------------------------------------------------
@@ -553,4 +694,4 @@ async def test_a_caller_that_leaves_during_the_commit_leaves_no_partial(tmp_path
         await asyncio.sleep(0.01)
     assert st.rootfd == -1 and st.abandoned
     assert not dest.exists()
-    assert not Path(str(dest) + ".partial").exists()
+    assert _partials(dest) == []

@@ -26,6 +26,9 @@ interactive session never carries a meeting id.
 import asyncio
 import logging
 import re
+import threading
+import time
+from datetime import datetime, timezone
 
 import config
 from storage import database as task_store
@@ -33,11 +36,14 @@ from storage import database as task_store
 logger = logging.getLogger("title_generator")
 
 # The dashboard injects a "[Current time: …]" prelude (and the viewer focus
-# line) ahead of interactive sends — strip them or they become the title
-# (twin of ws/dashboard_chat.py's send-time recognizer; both must keep
-# matching the injected shapes).
+# line, and a task run the parallel-activity line) ahead of interactive
+# sends — strip them or they become the title (twin of
+# ws/dashboard_chat_text.py's send-time recognizer; both must keep matching
+# the injected shapes).
 _TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
 # Early-fire thresholds — the canonical values shared by BOTH trigger surfaces
@@ -51,19 +57,23 @@ TITLE_CHAR_THRESHOLD = 280
 TITLE_TOOL_THRESHOLD = 5
 
 
+def _without_preludes(text: str) -> str:
+    """``text`` with its leading injected prelude lines dropped."""
+    stripped = text or ""
+    while True:  # stacked preludes (the time stamp plus the focus line)
+        once = _TIME_PRELUDE_RE.sub("", stripped, count=1)
+        if once == stripped:
+            return stripped
+        stripped = once
+
+
 def deterministic_title(text: str) -> str:
     """Stable chat title from a first user message — first ~6 words / 48 chars,
     whitespace-collapsed, ellipsis if truncated. The same rule the chat layer
     applies at send time (``ws/dashboard_chat_support.py::_deterministic_title``);
     exposed here so the storage layer can stamp scheduler-driven task chats
     without importing the WS controller."""
-    stripped = text or ""
-    while True:  # stacked preludes (the time stamp plus the focus line)
-        once = _TIME_PRELUDE_RE.sub("", stripped, count=1)
-        if once == stripped:
-            break
-        stripped = once
-    cleaned = " ".join(stripped.split())
+    cleaned = " ".join(_without_preludes(text).split())
     if not cleaned:
         return "New Chat"
     words = cleaned.split(" ")
@@ -75,22 +85,21 @@ def deterministic_title(text: str) -> str:
     return title + ("…" if cut else "")
 
 # Per-provider title model: the cheapest capable model each provider offers
-# (Anthropic's is Sonnet 5.5, tier 3: Haiku 4.5 has no successor). Ollama /
-# LiteLLM resolve their model dynamically from the configured local Direct-LLM
-# models.
+# (Anthropic's is Haiku 5.5, tier 4, a tenth of Sonnet 5.5's price; it was
+# Sonnet 5.5 while Haiku 4.5 had no successor). Ollama / LiteLLM resolve their
+# model dynamically from the configured local Direct-LLM models.
 _PROVIDER_TITLE_MODEL = {
     # gpt-oss-120b is a reasoning model, which is fine here: on Groq its
     # thinking rides a separate ``message.reasoning`` field (never content, so
     # titles stay clean) and _MAX_TOKENS leaves room for the thinking tokens —
-    # same treatment as OpenAI's gpt-6-luna. generate_title() also requests
+    # same treatment as OpenAI's gpt-6-luna and Anthropic's Haiku 5.5, whose
+    # adaptive thinking is on by default. generate_title() also requests
     # effort "low" so reasoning-capable title models think minimally.
     # A change here needs the hosted relay's row first (relay_vendors.py in
     # otodock-commercial): the relay rejects a model it does not price.
-    # Anthropic has no Haiku newer than 4.5, which is near retirement with no
-    # successor, so its row is Sonnet 5.5 (about twice Haiku's cost per title).
     "groq": "openai/gpt-oss-120b",
     "openai": "gpt-6-luna",
-    "anthropic": "claude-sonnet-5-5",
+    "anthropic": "claude-haiku-5-5",
 }
 # Auto-resolution order when the admin hasn't pinned a model.
 _LADDER = ["groq", "openai", "anthropic", "ollama"]
@@ -116,11 +125,11 @@ _TITLE_SYS = (
     "Start with one relevant emoji. Output only the title — no quotes, no preamble."
 )
 # Generous cap: a title is ~10 tokens, but gpt-6-luna, gpt-oss-120b and
-# claude-sonnet-5-5 are REASONING models whose thinking tokens are billed as
+# claude-haiku-5-5 are REASONING models whose thinking tokens are billed as
 # output and must fit under this cap too — a tiny cap (e.g. 24) lets reasoning
 # exhaust the budget and yields an EMPTY title. A non-reasoning model (an
-# admin's claude-haiku-4-5 pin) emits ~10 tokens and stops, so this is only a
-# ceiling for it, never a cost.
+# admin's pin of a custom row without the flag) emits ~10 tokens and stops, so
+# this is only a ceiling for it, never a cost.
 _MAX_TOKENS = 1024
 _INPUT_CHARS = 4000        # hard cap on the prompt+excerpt fed to the model (cost bound)
 _EXCERPT_CHARS = 1500      # cap on the assistant excerpt specifically
@@ -179,6 +188,19 @@ def _title_model_for(provider: str) -> str:
     return ""
 
 
+def _pinned_model() -> str:
+    """The title-model pin as it runs today (``config.live_model_id``), ''
+    for Auto."""
+    return config.live_model_id(
+        (task_store.get_platform_setting(_SETTING_MODEL) or "").strip())
+
+
+def _pin_unlisted(model: str) -> bool:
+    """No builtin and no model row names ``model`` any more: the registry
+    dropped it and no admin re-added it."""
+    return not config.get_model_layers(model)
+
+
 def _select_provider() -> tuple[str, str] | None:
     """``(provider, model)`` honoring the enable toggle + admin model pin +
     Auto-ladder. Uses ``_provider_configured`` (NO token mint) so it is safe to
@@ -186,10 +208,11 @@ def _select_provider() -> tuple[str, str] | None:
     if task_store.get_platform_setting(_SETTING_ENABLED) == "0":
         return None
     # A persisted pin the boot remap never sees: a retired id follows its
-    # successor at read time (an admin's gpt-5.6-luna titles on GPT-6 Luna).
-    selected = config.successor_model(
-        (task_store.get_platform_setting(_SETTING_MODEL) or "").strip())
-    if selected:
+    # successor at read time (an admin's gpt-5.6-luna titles on GPT-6 Luna),
+    # and a pin no model row lists any more (a retired id with no successor)
+    # is skipped for Auto rather than failing every title at the provider.
+    selected = _pinned_model()
+    if selected and not _pin_unlisted(selected):
         provider = config.get_model_provider(selected)
         if _provider_configured(provider):
             return provider, selected
@@ -232,18 +255,83 @@ def _provider_credentials(provider: str) -> tuple[str, str] | None:
     return None
 
 
+# The last title attempt's outcome, so the admin's Setup card says "Not
+# working" (with why) instead of Active while every chat keeps its first
+# words: a provider can be configured (a relay subscription, a key) and
+# still resolve no credential or answer an error. Process-local: the proxy
+# is one process, and a restart asks again at the next title or Check.
+_last_attempt: dict | None = None
+_attempt_lock = threading.Lock()
+_FAIL_WARN_EVERY_S = 60.0
+_fail_warned_at = 0.0
+
+
+# What an attempt proved: a title made or refused by the provider
+# (``title``), or only whether the credential resolves (``credential``: a
+# title's lookup, or the admin's Check, which calls no model).
+ATTEMPT_TITLE = "title"
+ATTEMPT_CREDENTIAL = "credential"
+
+
+def _note_attempt(ok: bool, provider: str, model: str, reason: str = "",
+                  kind: str = ATTEMPT_TITLE) -> None:
+    global _last_attempt, _fail_warned_at
+    with _attempt_lock:
+        _last_attempt = {
+            "ok": ok, "kind": kind, "provider": provider, "model": model,
+            "reason": reason, "at": datetime.now(timezone.utc).isoformat(),
+        }
+        if ok:
+            return
+        now = time.monotonic()
+        if now - _fail_warned_at < _FAIL_WARN_EVERY_S:
+            return
+        _fail_warned_at = now
+    logger.warning("title-gen: %s (%s): %s", provider, model, reason)
+
+
 def resolve_title_provider() -> tuple[str, str, str, str] | None:
     """``(provider, model, api_key, base_url)`` to use for a title, or None to
-    keep the deterministic title. MAY mint a relay token — never call from a GET."""
+    keep the deterministic title. MAY mint a relay token — never call from a GET.
+    A provider that is selected but resolves no credential is noted."""
     sel = _select_provider()
     if not sel:
         return None
     provider, model = sel
-    creds = _provider_credentials(provider)
+    try:
+        creds = _provider_credentials(provider)
+    except Exception as e:
+        _note_attempt(False, provider, model, f"the credential lookup failed: {str(e)[:200]}",
+                      kind=ATTEMPT_CREDENTIAL)
+        raise
     if not creds:
+        _note_attempt(False, provider, model,
+                      "the provider's credential did not resolve (the hosted relay "
+                      "gave no token, or the subscription holds no key)",
+                      kind=ATTEMPT_CREDENTIAL)
         return None
     api_key, base_url = creds
     return provider, model, api_key, base_url
+
+
+def check_title_generation() -> dict:
+    """The admin's Check: resolve the credentials now (it may mint a relay
+    token, so it is a POST), note the outcome, answer the status. It calls
+    no model, so a credential that resolves never clears the provider's own
+    refusal of the last title (a revoked key still resolves): only a title
+    made clears that."""
+    try:
+        resolved = resolve_title_provider()
+    except Exception:
+        resolved = None   # noted by the lookup
+    if resolved:
+        last = _last_attempt
+        refused = (last is not None and not last["ok"] and last.get("kind") == ATTEMPT_TITLE
+                   and last["provider"] == resolved[0])
+        if not refused:
+            _note_attempt(True, resolved[0], resolved[1], "the credential resolves",
+                          kind=ATTEMPT_CREDENTIAL)
+    return title_generation_status()
 
 
 def title_generation_status() -> dict:
@@ -254,8 +342,12 @@ def title_generation_status() -> dict:
     title model; the frontend prepends an Auto entry)."""
     enabled = task_store.get_platform_setting(_SETTING_ENABLED) != "0"
     selected = (task_store.get_platform_setting(_SETTING_MODEL) or "").strip()
-    # What _select_provider runs for the pin: a retired id's successor.
-    pinned = config.successor_model(selected)
+    # What _select_provider runs for the pin: a retired id's successor, or
+    # nothing (Auto) for a pin no model row lists any more.
+    pinned = _pinned_model()
+    unlisted = pinned if pinned and _pin_unlisted(pinned) else ""
+    if unlisted:
+        pinned = selected = ""
     options = []
     for provider in _LADDER:
         if _provider_configured(provider):
@@ -288,6 +380,11 @@ def title_generation_status() -> dict:
         "active_provider": sel[0] if sel else "",
         "active_model": sel[1] if sel else "",
         "options": options,
+        # The last title or Check since the proxy started (None before one):
+        # a failure here means "configured but not working".
+        "last_attempt": dict(_last_attempt) if _last_attempt else None,
+        # A pin no model row lists any more ('' otherwise): titles run on Auto.
+        "unlisted_pin": unlisted,
     }
 
 
@@ -356,7 +453,10 @@ def _first_turn_texts(chat_id: str) -> tuple[str, str]:
         if not content:
             continue
         if role == "user" and not user_text:
-            user_text = content
+            # A terminal's first row carries the injected preludes (the time,
+            # a task run's parallel activity naming other chats): the title
+            # is about this chat's own words.
+            user_text = _without_preludes(content).strip()
         elif role == "assistant" and not assistant_text:
             assistant_text = content
         if user_text and assistant_text:
@@ -393,11 +493,17 @@ async def request_chat_title(chat_id: str, *, assistant_excerpt: str = "") -> No
         if not claimed:
             return
         assistant_text = (assistant_excerpt or "").strip() or db_assistant
-        title, usage = await generate_title(
-            user_prompt, assistant_text, provider, model, api_key, base_url,
-        )
+        try:
+            title, usage = await generate_title(
+                user_prompt, assistant_text, provider, model, api_key, base_url,
+            )
+        except Exception as e:
+            _note_attempt(False, provider, model, f"the provider answered an error: {str(e)[:200]}")
+            raise
         if not title:
+            _note_attempt(False, provider, model, "the model answered an empty title")
             return  # keep deterministic; flag stays claimed (no retry storm)
+        _note_attempt(True, provider, model)
         # CAS on the claim-time title: a manual rename that landed after the
         # claim wins — never overwrite it, never broadcast the stale title.
         # The generation cost is metered either way (the tokens were spent).

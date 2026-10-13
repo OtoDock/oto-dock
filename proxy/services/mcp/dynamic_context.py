@@ -45,7 +45,7 @@ from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 from core import host_os
 from services.infra import external_data
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _providers: dict[str, Callable[..., str | None]] = {}
 

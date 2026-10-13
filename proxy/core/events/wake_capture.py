@@ -39,7 +39,7 @@ from core.events.common_events import PRODUCER_DONE, SYSTEM, CommonEvent
 from core.session import session_kind
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Hard ceiling for one wake bracket — a wake turn can run tools, so this is
 # a runaway guard, not a latency budget (mirrors the bg monitors' 600s).
@@ -150,7 +150,10 @@ async def capture_wake_turn(
             "source": source,
         }))
 
+    from core.session import engine_prompts
+
     def _feed(data: dict) -> None:
+        engine_prompts.note_frame(session_id, data, in_turn=True)
         for chunk in translator.feed(data):
             for ev in cli_chunk_to_events(chunk):
                 if queue is not None:

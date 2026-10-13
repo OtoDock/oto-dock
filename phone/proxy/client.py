@@ -4,7 +4,10 @@ Uses a persistent WebSocket connection to the proxy's /ws/phone endpoint
 for the entire call duration. Warmup, chat turns, and close all go through
 the same connection — no per-turn HTTP overhead.
 
-Falls back to HTTP SSE if WebSocket connection fails.
+There is no other transport: a call whose socket fails to open or closes
+under it is marked ``proxy_lost`` and the pipeline ends it with the apology
+phrase (nothing else may answer it). The standalone reporters at the end of
+the module post over HTTP on their own short-lived clients.
 """
 
 import asyncio
@@ -31,8 +34,7 @@ class ProxyClient:
     - "proxy" (default): CLI subprocess path
     - "direct": Anthropic API path (lower latency)
 
-    The WebSocket stays open for the entire call. If the WebSocket
-    connection fails, falls back to HTTP SSE for that operation.
+    The WebSocket stays open for the entire call; without it the call ends.
     """
 
     def __init__(self, model: str = "unified", llm_mode: str = "proxy",
@@ -43,7 +45,9 @@ class ProxyClient:
                  caller_phone: str = "",
                  caller_did: str = "",
                  dial_event: dict | None = None,
-                 pin_verified: bool = False):
+                 pin_verified: bool = False,
+                 attach: dict | None = None,
+                 transfer_available: bool = True):
         self.model = model
         self.llm_mode = llm_mode
         self.phone_mode = phone_mode
@@ -67,12 +71,23 @@ class ProxyClient:
         # upgrades the caller's identity label (call log) and marks the
         # caller's private tree as verified.
         self.pin_verified = bool(pin_verified)
+        # A call that runs inside the caller's chat: ``{session_id, grant}``
+        # from the proxy's relay. The warmup attaches to that session.
+        self.attach = dict(attach) if attach else None
+        # The proxy is gone (the socket never opened, or closed): the
+        # pipeline ends the call, since nothing else may answer it. Set by
+        # ``connect`` and the receive loop's end; ``on_proxy_lost`` is the
+        # pipeline's handler, called once from the loop's end.
+        self.proxy_lost: bool = False
+        self.on_proxy_lost = None
+        self._closing: bool = False
+        # Whether this line can hand the caller over (a registered channel, or
+        # Twilio): the warmup says so, and the prompt lists targets only then.
+        self.transfer_available = bool(transfer_available)
         self.session_id: str | None = None
         self.messages: list[dict[str, str]] = []
         self._ws: websockets.ClientConnection | None = None
         self._ws_connected: bool = False
-        # HTTP fallback client
-        self._http: httpx.AsyncClient | None = None
         # Barge-in tracking
         self._last_spoken_chars: int = 0
         self._barge_in_pending: bool = False
@@ -88,11 +103,21 @@ class ProxyClient:
         self._turn_queue: asyncio.Queue | None = None
         self._control_queue: asyncio.Queue = asyncio.Queue()
         self._recv_task: asyncio.Task | None = None
+        # A call tool the agent called (the proxy's ``call_control`` frame):
+        # handed to the pipeline synchronously whatever its turn, never
+        # dropped. Without a handler the frame is refused at once.
+        self.on_call_control = None
+
+    @property
+    def current_turn(self) -> int:
+        """The turn id of the open or last engine turn (the proxy echoes it)."""
+        return self._current_turn
 
     async def connect(self) -> bool:
         """Establish persistent WebSocket to proxy.
 
-        Returns True if connected, False if fell back to HTTP.
+        Returns True if connected; False marks the proxy lost, and the
+        pipeline ends the call.
         """
         # Key travels in the Authorization header, never the URL — the proxy's
         # access log records the full path+query of every WS handshake.
@@ -112,12 +137,9 @@ class ProxyClient:
             logger.info(f"WebSocket connected to proxy at {config.PROXY_WS_HOST_PORT}")
             return True
         except Exception as e:
-            logger.warning(f"WebSocket connection failed, will use HTTP fallback: {e}")
             self._ws_connected = False
-            self._http = httpx.AsyncClient(
-                base_url=config.PROXY_URL,
-                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
-            )
+            self.proxy_lost = True
+            logger.warning(f"WebSocket connection failed, the call cannot be served: {e}")
             return False
 
     async def _recv_loop(self) -> None:
@@ -134,6 +156,9 @@ class ProxyClient:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == "call_control":
+                    self._dispatch_call_control(msg)
                     continue
                 turn = msg.get("turn")
                 if turn is None:
@@ -155,22 +180,53 @@ class ProxyClient:
             self._control_queue.put_nowait(closed)
             if self._turn_queue is not None:
                 self._turn_queue.put_nowait(closed)
+            # The daemon's own close at hangup is not a loss.
+            if not self._closing:
+                self.proxy_lost = True
+                handler = self.on_proxy_lost
+                if handler is not None:
+                    try:
+                        handler()
+                    except Exception as e:
+                        logger.error(f"proxy lost handler error: {e}")
+
+    def _dispatch_call_control(self, msg: dict) -> None:
+        handler = self.on_call_control
+        if handler is None:
+            request_id = str((msg.get("data") or {}).get("request_id") or "")
+            asyncio.get_running_loop().create_task(self.send_call_control_result(
+                request_id, False, "The call is not live yet."))
+            return
+        try:
+            handler(msg)
+        except Exception as e:
+            logger.error(f"call control handler error: {e}")
+
+    async def send_call_control_result(self, request_id: str, ok: bool, message: str) -> None:
+        """Answer one ``call_control`` frame (the tool's result text)."""
+        if not (self._ws_connected and self._ws):
+            return
+        try:
+            await self._ws.send(json.dumps({
+                "type": "call_control_result",
+                "data": {"request_id": request_id, "ok": bool(ok), "message": message},
+            }))
+        except Exception as e:
+            logger.warning(f"WS call control result send failed: {e}")
+
+    def discard_turn(self) -> None:
+        """Stop reading the open turn: the line closes as the farewell drains
+        and whatever the engine still produces is the proxy's transcript. The
+        receiver drops the turn's remaining frames."""
+        self._turn_queue = None
+        self.turn_in_flight = False
 
     async def warmup_session(self) -> str | None:
-        """Pre-create a persistent session on the proxy.
-
-        Uses WebSocket if connected, otherwise HTTP fallback.
-        Returns the session_id, or None on failure.
+        """Pre-create a persistent session on the proxy over the socket.
+        Returns the session_id, or None on failure (no socket included).
         """
-        if self._ws_connected and self._ws:
-            return await self._ws_warmup()
-        # HTTP fallback: if session already pre-warmed, skip creating a new one
-        if self.session_id:
-            return self.session_id
-        return await self._http_warmup()
-
-    async def _ws_warmup(self) -> str | None:
-        """Warmup via WebSocket."""
+        if not (self._ws_connected and self._ws):
+            return None
         try:
             msg = {
                 "type": "warmup",
@@ -190,7 +246,17 @@ class ProxyClient:
                 "caller_did": self.caller_did,
                 "dial_event": self.dial_event,
                 "pin_verified": self.pin_verified,
+                # This daemon acts on ``call_control`` frames: the proxy may
+                # give the session the call tools instead of the markers alone.
+                "call_control": True,
+                # Whether a transfer is possible on this line: the prompt
+                # lists the route's targets only when it is.
+                "transfer": self.transfer_available,
             }
+            if self.attach:
+                # The call runs inside the caller's chat: borrow that session.
+                msg["attach_session_id"] = self.attach.get("session_id", "")
+                msg["attach_grant"] = self.attach.get("grant", "")
             if self.session_id:
                 # Include pre-warmed session_id so proxy can reuse existing session
                 msg["session_id"] = self.session_id
@@ -213,52 +279,6 @@ class ProxyClient:
             logger.warning(f"WS warmup failed: {e}")
             return None
 
-    async def _http_warmup(self) -> str | None:
-        """Warmup via HTTP (fallback)."""
-        if not self._http:
-            return None
-        try:
-            body = {
-                "model": self.model,
-                "permission_mode": "auto",
-                "llm_mode": self.llm_mode,
-                "phone_mode": self.phone_mode,
-                "call_type": self.call_type,
-                "phone_context_override": self.phone_context_override,
-                # Same trigger-enrichment fields as the WS path — HTTP
-                # fallback also enables enrichment when the proxy supports it.
-                "audiosocket_uuid": self.audiosocket_uuid,
-                "phone_route_id": self.phone_route_id,
-                "caller_phone": self.caller_phone,
-                "caller_did": self.caller_did,
-                "dial_event": self.dial_event,
-                "pin_verified": self.pin_verified,
-            }
-            resp = await self._http.post(
-                "/v1/sessions/warmup",
-                headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
-                json=body,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                self.session_id = data.get("session_id")
-                if self.session_id:
-                    self.messages.append({
-                        "role": "assistant",
-                        "content": f"[//]: # (session:{self.session_id})",
-                    })
-                logger.info(
-                    f"HTTP warmup ready: {self.session_id} "
-                    f"(mode={data.get('llm_mode', self.llm_mode)})"
-                )
-                return self.session_id
-            else:
-                logger.warning(f"HTTP warmup failed: {resp.status_code} {resp.text}")
-                return None
-        except Exception as e:
-            logger.warning(f"HTTP warmup error: {e}")
-            return None
-
     def set_session_id(self, session_id: str) -> None:
         """Inject an externally-obtained session_id (e.g. from pre-warmup)."""
         self.session_id = session_id
@@ -277,20 +297,44 @@ class ProxyClient:
         if self._last_spoken_chars > 0:
             self._barge_in_pending = True
 
-    async def send_message(self, text: str):
+    async def send_system_note(self, text: str, *, resume: bool = False) -> bool:
+        """A daemon-composed turn whose reply is not awaited: the resume note
+        at an in-session call's end (``resume`` says the chat is its own
+        again). The frame goes out in order before ``close``; the proxy's
+        producer runs it after the call's last turn."""
+        if not (self._ws_connected and self._ws):
+            return False
+        self._turn_seq += 1
+        self._current_turn = self._turn_seq
+        self._turn_queue = asyncio.Queue()
+        frame = {"type": "chat", "prompt": text, "turn": self._turn_seq,
+                 "barge_in_chars": None, "system": True}
+        if resume:
+            frame["resume"] = True
+        try:
+            await self._ws.send(json.dumps(frame))
+        except Exception as e:
+            logger.warning(f"WS system note failed: {e}")
+            return False
+        return True
+
+    async def send_message(self, text: str, *, system: bool = False):
         """Send a user message and stream back assistant text tokens.
 
-        Yields text chunks as they arrive from the LLM.
-        Uses WebSocket if connected, otherwise HTTP SSE fallback.
+        Yields text chunks as they arrive from the LLM. Without the socket
+        it yields nothing and marks the proxy lost: the pipeline ends the
+        call with the apology phrase instead of speaking an error.
+        ``system`` marks a prompt the daemon composed (an opening, a hold or
+        resume note): a call that runs inside a person's chat writes no user
+        row for it.
         """
-        if self._ws_connected and self._ws:
-            async for chunk in self._ws_send_message(text):
-                yield chunk
-        else:
-            async for chunk in self._http_send_message(text):
-                yield chunk
+        if not (self._ws_connected and self._ws):
+            self.proxy_lost = True
+            return
+        async for chunk in self._ws_send_message(text, system=system):
+            yield chunk
 
-    async def _ws_send_message(self, text: str):
+    async def _ws_send_message(self, text: str, *, system: bool = False):
         """Send message via WebSocket and yield text chunks."""
         barge_in_chars = None
         if self._barge_in_pending and self._last_spoken_chars > 0:
@@ -306,15 +350,20 @@ class ProxyClient:
         self._turn_queue = asyncio.Queue()
 
         try:
-            await self._ws.send(json.dumps({
+            frame = {
                 "type": "chat",
                 "prompt": text,
                 "turn": turn,
                 "barge_in_chars": barge_in_chars,
-            }))
+            }
+            if system:
+                frame["system"] = True
+            await self._ws.send(json.dumps(frame))
         except Exception as e:
+            # The socket is broken: the receive loop ends it for the
+            # pipeline; this turn says nothing.
             logger.error(f"WS send failed: {e}")
-            yield "Sorry, I couldn't reach the AI service."
+            self.proxy_lost = True
             return
 
         full_response = []
@@ -328,10 +377,10 @@ class ProxyClient:
             msg_type = msg.get("type", "")
 
             if msg_type == "_closed":
+                # The receive loop marked the proxy lost: the pipeline ends
+                # the call after this stream, no error speech.
                 logger.error("WS connection closed during chat")
                 self.turn_in_flight = False
-                if not full_response:
-                    yield "Sorry, the connection was lost."
                 break
             elif msg_type == "text":
                 content = msg.get("data", {}).get("content", "")
@@ -372,19 +421,14 @@ class ProxyClient:
 
     @property
     def supports_abort(self) -> bool:
-        """Whether an in-flight turn can be cancelled server-side.
-
-        Direct always aborts cleanly (the API stream unwinds and the session
-        pops the un-answered user message). Proxy mode aborts over the WS
-        channel — the proxy runs the same graceful per-layer interrupt the
-        duplex chat attach uses (CLI stdin control_request, Codex interrupt),
-        keeping the partial turn; the daemon's turn-id filter drops the tail
-        frames. The HTTP-SSE fallback has no signalling channel, so a
-        dead-WS proxy client degrades to run-to-completion (barge-in
-        fidelity still rides the X-Claude-Barge-In-Chars header).
+        """Whether an in-flight turn can be cancelled server-side: over the
+        socket, in both modes. Direct aborts cleanly (the API stream unwinds
+        and the session pops the un-answered user message). Proxy mode runs
+        the same graceful per-layer interrupt the duplex chat attach uses
+        (CLI stdin control_request, Codex interrupt), keeping the partial
+        turn; the daemon's turn-id filter drops the tail frames.
         """
-        return self.llm_mode == "direct" or (
-            self.llm_mode == "proxy" and self._ws_connected)
+        return self._ws_connected
 
     @property
     def abort_erases_turn(self) -> bool:
@@ -398,144 +442,36 @@ class ProxyClient:
         return self.llm_mode == "direct"
 
     async def abort_turn(self) -> None:
-        """Abort the in-flight turn (barge-in / continuation on Direct).
-
-        WS path: the proxy cancels the turn's producer — the API stream and
-        any in-flight tool unwind, and the direct session pops the
-        un-answered user message so the pipeline can resend it batched with
-        the caller's new speech. HTTP path: abandoning the SSE iterator
-        already closed the request; drop the un-answered user message from
-        local history for the same reason. Callers gate on supports_abort.
+        """Abort the in-flight turn (barge-in / continuation on Direct): the
+        proxy cancels the turn's producer — the API stream and any in-flight
+        tool unwind, and the direct session pops the un-answered user message
+        so the pipeline can resend it batched with the caller's new speech.
+        Callers gate on supports_abort.
         """
-        if not self.supports_abort:
+        if not (self._ws_connected and self._ws):
             return
-        if self._ws_connected and self._ws:
-            try:
-                await self._ws.send(json.dumps({
-                    "type": "abort", "turn": self._current_turn,
-                }))
-            except Exception as e:
-                logger.warning(f"WS abort send failed: {e}")
-            return
-        if self.messages and self.messages[-1].get("role") == "user":
-            self.messages.pop()
-
-    async def _http_send_message(self, text: str):
-        """Send message via HTTP SSE (fallback)."""
-        if not self._http:
-            yield "Sorry, no connection available."
-            return
-
-        self.messages.append({"role": "user", "content": text})
-        messages_to_send = [{"role": m["role"], "content": m["content"]} for m in self.messages]
-
-        body = {
-            "model": self.model,
-            "messages": messages_to_send,
-            "stream": True,
-        }
-
-        headers = {
-            "Authorization": f"Bearer {config.PROXY_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Claude-Permission-Mode": "auto",
-        }
-
-        if self.llm_mode == "direct":
-            headers["X-Claude-LLM-Mode"] = "direct"
-
-        if self._barge_in_pending and self._last_spoken_chars > 0:
-            headers["X-Claude-Barge-In-Chars"] = str(self._last_spoken_chars)
-            self._barge_in_pending = False
-            self._last_spoken_chars = 0
-
-        full_response = []
-
         try:
-            async with self._http.stream(
-                "POST", "/v1/chat/completions",
-                json=body, headers=headers,
-            ) as response:
-                if response.status_code != 200:
-                    error = await response.aread()
-                    logger.error(f"HTTP error {response.status_code}: {error.decode()}")
-                    yield "Sorry, I encountered an error."
-                    return
-
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    event_type = data.get("type", "")
-                    event_data = data.get("data", {})
-
-                    if event_type == "text":
-                        content = event_data.get("content", "")
-                        if content:
-                            full_response.append(content)
-                            yield content
-                    elif event_type in ("tool_start", "tool_end"):
-                        # Same both-boundaries rule as the WS path above.
-                        yield TOOL_USE_SIGNAL
-                    elif event_type == "session":
-                        self.session_id = event_data.get("session_id")
-                    elif event_type == "done":
-                        break
-        except httpx.HTTPError as e:
-            logger.error(f"HTTP error: {e}")
-            yield "Sorry, I couldn't reach the AI service."
-            return
-
-        assistant_text = "".join(full_response)
-        if assistant_text:
-            content = assistant_text
-            if self.session_id:
-                content += f"\n\n[//]: # (session:{self.session_id})"
-            self.messages.append({"role": "assistant", "content": content})
-
-        self._last_spoken_chars = 0
-        logger.info(f"HTTP response: {len(assistant_text)} chars, session={self.session_id}")
+            await self._ws.send(json.dumps({
+                "type": "abort", "turn": self._current_turn,
+            }))
+        except Exception as e:
+            logger.warning(f"WS abort send failed: {e}")
 
     async def close_session(self) -> bool:
         """Close the persistent session on the proxy (call on hangup)."""
-        if not self.session_id:
+        if not self.session_id or not (self._ws_connected and self._ws):
             return False
-
-        if self._ws_connected and self._ws:
-            try:
-                await self._ws.send(json.dumps({"type": "close"}))
-                logger.info(f"WS close sent: session={self.session_id}")
-                return True
-            except Exception as e:
-                logger.warning(f"WS close failed: {e}")
-                return False
-
-        # HTTP fallback
-        if self._http:
-            try:
-                resp = await self._http.delete(
-                    f"/v1/sessions/{self.session_id}",
-                    headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
-                )
-                data = resp.json()
-                closed = data.get("status") == "closed"
-                logger.info(f"HTTP close session {self.session_id}: {data.get('status')}")
-                return closed
-            except Exception as e:
-                logger.warning(f"HTTP close failed: {e}")
-                return False
-
-        return False
+        try:
+            await self._ws.send(json.dumps({"type": "close"}))
+            logger.info(f"WS close sent: session={self.session_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"WS close failed: {e}")
+            return False
 
     async def close(self) -> None:
         """Close the persistent session and transport."""
+        self._closing = True
         await self.close_session()
         if self._recv_task and not self._recv_task.done():
             self._recv_task.cancel()
@@ -547,9 +483,6 @@ class ProxyClient:
                 await self._ws.close()
             self._ws = None
             self._ws_connected = False
-        if self._http:
-            await self._http.aclose()
-            self._http = None
 
 
 async def report_call(payload: dict) -> None:
@@ -576,9 +509,29 @@ async def report_call(payload: dict) -> None:
         logger.warning(f"Call report failed: {e}")
 
 
+async def report_transfer_outcome(call_uuid: str, outcome: str) -> None:
+    """A transfer's Dial ended without the colleague after the call's row was
+    reported as ``transferred``: the row takes ``outcome``
+    (``POST /v1/phone/calls/transfer-outcome``). The same contract as
+    ``report_call``: best effort, short timeouts, every error swallowed."""
+    try:
+        async with httpx.AsyncClient(
+            base_url=config.PROXY_URL,
+            timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0),
+        ) as http:
+            await http.post(
+                "/v1/phone/calls/transfer-outcome",
+                headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
+                json={"call_uuid": call_uuid, "outcome": outcome},
+            )
+    except Exception as e:
+        logger.warning(f"Transfer outcome report failed: {e}")
+
+
 async def fetch_pin_failures(window_s: int) -> list[dict] | None:
-    """The inbound calls of the last ``window_s`` seconds that entered the
-    PIN gate (``GET /v1/phone/pin-failures``), for the lockout windows after
+    """The calls of the last ``window_s`` seconds that entered the PIN gate
+    (``GET /v1/phone/pin-failures``: inbound, and outbound on a user route,
+    keyed by the number the gate counted), for the lockout windows after
     a restart; None when the proxy did not answer (the caller tries again
     later). Same short-lived client and auth as ``report_call``."""
     try:
@@ -608,9 +561,9 @@ async def report_turn_classifier_usage(
 
     Best-effort, fire-and-forget: owns a short-lived HTTP client with a tight timeout and
     swallows every error, so it can never disturb call teardown. Uses the same internal
-    Bearer auth as the warmup path (``config.PROXY_API_KEY`` == the proxy master key).
-    Standalone (not a ProxyClient method) because ``ProxyClient._http`` is None on the
-    WebSocket-happy path and the call's client is being torn down at report time.
+    Bearer auth as the socket (``config.PROXY_API_KEY`` == the proxy master key).
+    Standalone (not a ProxyClient method) because the call's client speaks only its
+    socket, and that is being torn down at report time.
 
     The hosted relay bills the classifier independently (non-streaming → buffered usage);
     this records the BASE price locally for display — a separate ledger."""

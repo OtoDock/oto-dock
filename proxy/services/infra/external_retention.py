@@ -45,7 +45,7 @@ from storage.files import file_author_store
 from storage.files import file_tombstones_store
 from storage.phone import phone_call_log_store
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 DEFAULT_DAYS = 90
 MIN_DAYS = 1

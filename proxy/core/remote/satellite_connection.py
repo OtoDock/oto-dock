@@ -17,8 +17,9 @@ from dataclasses import dataclass, field
 
 from fastapi import WebSocket
 from auth import roles
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.satellite")
+logger = logging.getLogger("otodock.satellite")
 
 
 # Send queue capacity per connection. Matches satellite-side queue size so
@@ -331,6 +332,24 @@ _STEER_TURN_MIN_VERSION = (0, 5, 128)
 # Reads Codex's ``willRetry`` at the error notification's top level, so a
 # retried error no longer ends its Codex turn (SATELLITE_VERSION 0.5.131).
 _CODEX_RETRY_READ_MIN_VERSION = (0, 5, 131)
+# The command floor on an ATTENDED remote Codex app-server chat (proxy
+# HOOKS.md "Attended Codex chats"): the ``codex_attended_floor`` start-payload
+# field (the hook trusted per thread, the deny-only / no-forward / bridged
+# hook env) and the live ``permission_mode`` in the start payload and the
+# ``set_permission_mode`` control frame, from which the satellite derives the
+# approval policy by MODE (a full-access machine's default mode asks through
+# the bridge). Additive: an older satellite ignores both and runs the chat as
+# before (no gate in Don't Ask and auto, none outside plan on a full-access
+# machine); the proxy warns once per session start.
+_CODEX_ATTENDED_FLOOR_MIN_VERSION = (0, 5, 143)
+
+# A Windows satellite in this range hashed only the files the platform had
+# pushed to it (``os.set_blocking`` raised on every regular file), so its
+# manifest leaves out files it has; the bug sat under the 0.5.130 label for
+# an hour on master. 0.5.144 fixed the hash; 0.5.145 also lists on request
+# (``report_skipped``) what it could not read.
+_WINDOWS_BLIND_HASH_VERSIONS = ((0, 5, 130), (0, 5, 144))
+_SKIPPED_MANIFEST_MIN_VERSION = (0, 5, 145)
 
 # Heartbeat persistence cadence. The heartbeat handler refreshes the in-memory
 # ``last_heartbeat`` / ``last_seen_iso`` on EVERY heartbeat (20 s) but hands a
@@ -591,6 +610,9 @@ class SatelliteConnectionManager(
         # replacement those of the replaced connection, instead of letting
         # them wait out their timeout.
         self._pending_acks: dict[str, tuple[str, asyncio.Future, SatelliteConnection | None]] = {}
+        # machine_id -> the wait for its ``update_received`` after an online
+        # "Update now" push (api/remote/remote_machines.py).
+        self._update_acks: dict[str, asyncio.Future] = {}
         # The pages of a paged manifest reply, by command id, until the last
         # frame resolves the wait (cleared with the ack on every other end).
         self._manifest_pages: dict[str, _ManifestJoin] = {}
@@ -958,9 +980,8 @@ class SatelliteConnectionManager(
                     # Identity-guarded — a send failure on a connection that
                     # a duplicate reconnect already replaced must not tear
                     # down the fresh one.
-                    asyncio.create_task(
-                        self.deregister(conn.machine_id, expected=conn)
-                    )
+                    spawn(self.deregister(conn.machine_id, expected=conn),
+                          name="deregister", owner="satellite_connection")
                     return
         except asyncio.CancelledError:
             return
@@ -1073,7 +1094,8 @@ class SatelliteConnectionManager(
 
         # Cache the admin max_sessions override + name off-loop (fail-open
         # until it lands — same as an unknown cap today).
-        asyncio.create_task(self._refresh_machine_cache(machine_id, conn))
+        spawn(self._refresh_machine_cache(machine_id, conn),
+              name="refresh_machine_cache", owner="satellite_connection")
 
         # Kick off a background MCP verify pass. If any MCP on the satellite
         # is marked unhealthy (mid-install marker present) or its version_hash
@@ -1089,7 +1111,7 @@ class SatelliteConnectionManager(
                 )
             except Exception as e:
                 logger.debug("reconcile verify on reconnect failed: %s", e)
-        asyncio.create_task(_kick_verify())
+        spawn(_kick_verify(), name="kick_verify", owner="satellite_connection")
 
         # Catch up every agent on this machine to the platform NOW — applying
         # deletes (tombstones) + drift that landed while it was offline, without
@@ -1105,7 +1127,7 @@ class SatelliteConnectionManager(
                 logger.debug(
                     "reconnect workspace sync kick failed for %s", machine_id[:8],
                 )
-        asyncio.create_task(_kick_workspace_sync())
+        spawn(_kick_workspace_sync(), name="kick_workspace_sync", owner="satellite_connection")
 
         return conn
 
@@ -1530,12 +1552,31 @@ class SatelliteConnectionManager(
         instead of letting the turn end silently."""
         return self._satellite_at_least(machine_id, _CODEX_RETRY_READ_MIN_VERSION)
 
+    def satellite_supports_codex_attended_floor(self, machine_id: str) -> bool:
+        """True if the connected satellite runs the command floor on an
+        attended Codex chat and derives the approval policy from a shipped
+        ``permission_mode`` (SATELLITE_VERSION 0.5.143). When False the
+        remote layer ships the mode blank (an older satellite would freeze
+        its plan collaboration mode at it) and logs that the chat runs as
+        before until the satellite updates."""
+        return self._satellite_at_least(machine_id, _CODEX_ATTENDED_FLOOR_MIN_VERSION)
+
     def satellite_supports_long_bg_drain(self, machine_id: str) -> bool:
         """True if the connected satellite forwards post-turn stdout up to
         the background-work ceiling (SATELLITE_VERSION 0.5.120). When False
         the remote reaper keeps today's behaviour for background commands
         (subagents are still spared: their Stop hook is not stdout)."""
         return self._satellite_at_least(machine_id, _LONG_BG_DRAIN_MIN_VERSION)
+
+    def expect_update_ack(self, machine_id: str) -> asyncio.Future:
+        """The future an online update push waits on: resolved with the
+        target version when the satellite says it read the push."""
+        fut = asyncio.get_running_loop().create_future()
+        old = self._update_acks.get(machine_id)
+        if old is not None and not old.done():
+            old.cancel()
+        self._update_acks[machine_id] = fut
+        return fut
 
     def satellite_version(self, machine_id: str) -> str:
         """The connected satellite's reported SATELLITE_VERSION, or ``""`` when
@@ -1590,6 +1631,33 @@ class SatelliteConnectionManager(
         (SATELLITE_VERSION 0.5.130); an older one answers in one frame and
         must not be asked (it would ignore the key anyway)."""
         return self._satellite_at_least(machine_id, _PAGED_MANIFEST_MIN_VERSION)
+
+    def satellite_supports_skipped_manifest(self, machine_id: str) -> bool:
+        """True if the connected satellite lists, when asked with
+        ``report_skipped``, what its manifest walk could not read
+        (SATELLITE_VERSION 0.5.145)."""
+        return self._satellite_at_least(machine_id, _SKIPPED_MANIFEST_MIN_VERSION)
+
+    def satellite_absence_unreliable(self, machine_id: str) -> bool:
+        """True for a Windows satellite whose manifest may leave out files it
+        has (``_WINDOWS_BLIND_HASH_VERSIONS``): the merge must not read an
+        absent file as deleted there, or push over it."""
+        if not self._satellite_is_windows(machine_id):
+            return False
+        low, fixed = _WINDOWS_BLIND_HASH_VERSIONS
+        return (self._satellite_at_least(machine_id, low)
+                and not self._satellite_at_least(machine_id, fixed))
+
+    def satellite_restores_holds(self, machine_id: str) -> bool:
+        """True for the satellite that decides a ``windows-hash-hold``: a
+        Windows one that hashes again and lists what it cannot read."""
+        return (self._satellite_is_windows(machine_id)
+                and self.satellite_supports_skipped_manifest(machine_id))
+
+    def _satellite_is_windows(self, machine_id: str) -> bool:
+        from core import host_os
+        row = host_os.of(self.satellite_os(machine_id))
+        return row is not None and row.name == host_os.WINDOWS
 
     def _on_manifest_frame(self, machine_id: str, msg: dict) -> None:
         """One ``file_manifest`` frame, only from the machine the command
@@ -1842,6 +1910,13 @@ class SatelliteConnectionManager(
                 if not future.done():
                     future.set_result(msg)
 
+        elif msg_type == "update_received":
+            # A satellite read an online "Update now" push (0.5.140; the
+            # auth-time push reads its acknowledgement on its own socket).
+            fut = self._update_acks.pop(machine_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(str(msg.get("target_version") or ""))
+
         elif msg_type == "pause":
             # Deliberate pause (tray Pause). Persist so the sustained-outage
             # evaluator skips this machine (no false admin alert). The
@@ -1998,10 +2073,9 @@ class SatelliteConnectionManager(
             cb = self._sessions_alive_callback
             if cb is not None:
                 others = msg.get("other_sessions")
-                asyncio.create_task(
-                    cb(machine_id, msg.get("sessions") or [],
+                spawn(cb(machine_id, msg.get("sessions") or [],
                        others if isinstance(others, list) else None),
-                )
+                      name="sessions_alive", owner="satellite_connection")
 
         elif msg_type == "transcript_lines":
             # Interactive remote PTY: the satellite
@@ -2220,11 +2294,13 @@ class SatelliteConnectionManager(
             # otodock-CLI: a satellite-initiated request to open an interactive
             # session (the user ran `otodock` on the machine). Identity is
             # re-derived from THIS machine's owner binding — never the frame.
-            asyncio.create_task(self._handle_local_session_open(machine_id, msg))
+            spawn(self._handle_local_session_open(machine_id, msg),
+                  name="handle_local_session_open", owner="satellite_connection")
 
         elif msg_type == "local_session_list":
             # otodock-CLI --resume: list the owner's resumable chats for an agent.
-            asyncio.create_task(self._handle_local_session_list(machine_id, msg))
+            spawn(self._handle_local_session_list(machine_id, msg),
+                  name="handle_local_session_list", owner="satellite_connection")
 
         elif msg_type == "local_session_detached":
             # The local `otodock` terminal disconnected — drop the idle-reaper

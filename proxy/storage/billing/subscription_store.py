@@ -14,6 +14,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from storage.billing import subscription_status
 from storage.identity.credential_store import _encrypt, _decrypt
@@ -919,8 +920,8 @@ def update_model(
     xhigh, tier). A tier describes the model, not one (layer, model) row:
     ``tier`` / ``clear_tier`` / ``good_at`` are applied to every row sharing
     the model_id so the id never carries two tiers."""
-    sets = []
-    vals = []
+    sets: list[str] = []
+    vals: list[Any] = []
     tier_sets: list[str] = []
     tier_vals: list = []
     if clear_tier:
@@ -1016,7 +1017,7 @@ def sync_builtin_models(layer: str, models: list[dict]) -> int:
     Custom→builtin promotion: if a user previously added a model as custom
     (is_builtin=FALSE) and that same model_id now appears in the registry,
     the existing row is flipped to is_builtin=TRUE with the registry's
-    display_name/pricing/etc. This is the expected open-source upgrade path —
+    display_name/pricing/etc. This is the expected self-hosted upgrade path —
     users who added a model ahead of us don't end up with a duplicate or a
     stale custom entry after the platform ships the model as built-in.
     """

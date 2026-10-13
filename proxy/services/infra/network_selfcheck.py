@@ -27,7 +27,7 @@ import urllib.request
 import config
 from core.config import deployment
 
-logger = logging.getLogger("claude-proxy.network-selfcheck")
+logger = logging.getLogger("otodock.network-selfcheck")
 
 # Identify the control-plane containers by their compose service LABEL, never a
 # name substring (a substring like "otodock" would also match otodock-proxy,

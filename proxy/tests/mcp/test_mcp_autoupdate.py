@@ -22,10 +22,11 @@ class _Srv:
 
 
 class _Manifest:
-    def __init__(self, name, runtime="docker", category="community"):
+    def __init__(self, name, runtime="docker", category="community", source=""):
         self.name = name
         self.category = category
         self.server = _Srv(runtime)
+        self.server.source = source
 
 
 # --- fixtures ------------------------------------------------------------
@@ -64,10 +65,11 @@ def _patch_updater(monkeypatch, *, targets, updates, update_result=None,
         return {"updates": updates}
     monkeypatch.setattr(au.mcp_updater, "detect_available_updates", _detect)
 
-    called = {"update": []}
+    called = {"update": [], "kwargs": []}
 
-    async def _update_one(name):
+    async def _update_one(name, **kw):
         called["update"].append(name)
+        called["kwargs"].append(kw)
         if update_exc:
             raise update_exc
         return update_result or {"status": "updated", "old_version": "1.0",
@@ -169,7 +171,7 @@ async def test_mixed_run_one_failure_one_success(monkeypatch, log_rows, notify_c
     stdio = _Manifest("foo", runtime="python")
     docker = _Manifest("bar", runtime="docker")
 
-    async def _update_one(name):
+    async def _update_one(name, **kw):
         if name == "bar":
             raise RuntimeError("kaboom")
         return {"status": "updated", "old_version": "1.0", "version": "2.0"}
@@ -230,7 +232,7 @@ async def test_an_install_ahead_of_the_catalog_is_left_alone(
                            "reason": "ahead"}},
         in_use=lambda n: pytest.fail("an ahead install is never in-use-checked"),
     )
-    with caplog.at_level(logging.INFO, logger="claude-proxy.mcp-autoupdate"):
+    with caplog.at_level(logging.INFO, logger="otodock.mcp-autoupdate"):
         summary = await au.run_auto_update()
     assert called["update"] == []
     assert all(c == 0 for c in summary["counts"].values())

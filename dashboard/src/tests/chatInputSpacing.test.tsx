@@ -36,9 +36,9 @@ describe('ChatInput composer spacing', () => {
     expect(wrapper.className).not.toMatch(/\bpb-\d/)
   })
 
-  // iOS Safari zooms the page into a focused field under 16px; the class is
-  // the contract here for the same reason as above (no stylesheet in jsdom).
-  it('the textarea is 16px on a touch device and keeps its desktop size', () => {
+  // The composer keeps its size on every device: the viewport's zoom cap,
+  // not a 16 px field, stops iOS zooming into it (lib/device/viewport.ts).
+  it('the textarea keeps its size on a touch device', () => {
     const { container } = render(
       <ChatInput
         value=""
@@ -53,7 +53,8 @@ describe('ChatInput composer spacing', () => {
       />,
     )
     const box = container.querySelector('textarea') as HTMLTextAreaElement
-    expect(box.className).toContain('pointer-coarse:text-base')
+    expect(box.className).not.toContain('pointer-coarse')
+    expect(box.className).not.toMatch(/(^|\s)text-base(\s|$)/)
     expect(box.className).toMatch(/(^|\s)text-sm(\s|$)/)
   })
 })

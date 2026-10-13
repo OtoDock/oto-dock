@@ -45,7 +45,7 @@ export type MessageBlock =
   | { type: 'media_processing'; mediaKind: 'video' | 'audio'; caption?: string }
   | { type: 'image_generating'; promptPreview: string; model: string }
   | { type: 'image_attachments'; images: string[]; paths?: (string | null)[] }
-  | { type: 'file_attachments'; files: Array<{ name: string; path?: string }> }
+  | { type: 'file_attachments'; files: Array<{ name: string; path?: string; folder?: boolean }> }
   | { type: 'url'; url: string; title: string; description: string }
   | { type: 'file'; filename: string; downloadUrl: string; description: string }
   | { type: 'ui'; token: string; uiUrl: string; title?: string; height?: number; path?: string }

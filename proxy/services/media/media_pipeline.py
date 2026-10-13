@@ -25,7 +25,7 @@ from pathlib import Path
 
 import config
 
-logger = logging.getLogger("claude-proxy.media")
+logger = logging.getLogger("otodock.media")
 
 # ffmpeg/ffprobe are resolved via config (config.env / os.environ, per the
 # platform's _cfg precedence). Point OTO_FFMPEG_PATH at a non-sandbox-mounted

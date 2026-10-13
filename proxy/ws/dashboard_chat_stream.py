@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 from fastapi import WebSocketDisconnect
 from storage import database as task_store
 from storage.pg import run_db
@@ -34,19 +35,25 @@ from core.events.stream_pump import (
 from core.events.pump_bg_monitors import arm_bg_monitors
 from core.session import session_kind, visibility as _vis
 from ws.dashboard_chat_text import (
-    HEAL_READY, HEAL_RECONNECTING, TurnDeferred, _queued_outgoing, grace_layer,
+    HEAL_READY, HEAL_RECONNECTING, HEAL_REFUSED, TurnDeferred, _queued_outgoing, grace_layer,
 )
 from ws import chat_phase
 from ws import wire_events as wire
 from ws.dashboard_dispatch import StreamCtx
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 # Pump items a viewer sends per wake before it yields to its next wait.
 _VIEWER_DRAIN_MAX = 256
 
 
-class ChatStreamMixin:
+class ChatStreamMixin(_Host):
     """The producer/pump plumbing: starting a stream, streaming through the pump,"""
 
     # The socket dropped while a turn streamed: the loop's way out starts no
@@ -427,6 +434,9 @@ class ChatStreamMixin:
         if is_viewed:
             pump._plan_filename = self.chat_plan_filename  # inherit from previous pump
         _active_pumps[target_chat_id] = pump
+        # A warmup's first turn is running: the messages sent while it got
+        # ready are its producer's to drain.
+        input_queue.first_turn_started(target_chat_id)
         pump.start()
         # Watch this turn for background work it leaves behind — the ONE arming
         # site that covers every turn source (user send, queue drain, server
@@ -438,9 +448,8 @@ class ChatStreamMixin:
         # switched chats mid-turn had no arming site at all → its badges never
         # cleared and the review nudge never fired). Idempotent with the other
         # _ensure_bg_monitor callers via the monitors' per-session guards.
-        asyncio.create_task(
-            self._arm_bg_monitor_after(pump, sid, target_chat_id, target_layer)
-        )
+        spawn(self._arm_bg_monitor_after(pump, sid, target_chat_id, target_layer),
+              name="arm_bg_monitor_after", owner="dashboard_chat_stream")
         if is_viewed:
             self.implementing_plan = ""  # pump owns it now
         return pump
@@ -1069,6 +1078,15 @@ class ChatStreamMixin:
                 await self._defer_drain(cid, q, claim, taken, spoken, with_interactions=bool(arts))
                 released = True
                 return False
+            if heal == HEAL_REFUSED:
+                # A teammate's live terminal refused this person: nothing was
+                # typed, so their messages wait for it to close (marked; the
+                # close arms the queue).
+                handed = True
+                await self._defer_drain(cid, q, claim, taken, spoken, with_interactions=False,
+                                        waiting=input_queue.WAITING_TERMINAL)
+                released = True
+                return False
             if heal != HEAL_READY:
                 from core.session import interactive_session
                 if batch is not None and interactive_session.find_live_for_chat(cid):
@@ -1140,16 +1158,18 @@ class ChatStreamMixin:
                 q.release(claim)
 
     async def _defer_drain(self, cid: str, q, claim, taken: list, spoken: list, *,
-                           with_interactions: bool) -> None:
-        """The drain's turn waits for the chat's machine: the queued messages
-        go back (marked, so their chips say why), the connection's spoken
-        items too; the interactions' rows are written already, so they get
-        the not-sent line instead. The claim goes without re-arming (the
-        reconnect pass arms the queue). No ``done``, as on the drain's other
+                           with_interactions: bool,
+                           waiting: str = input_queue.WAITING_RECONNECT) -> None:
+        """The drain's turn waits (for the chat's machine, or ``waiting``: a
+        teammate's terminal to close): the queued messages go back (marked,
+        so their chips say why), the connection's spoken items too; the
+        interactions' rows are written already, so they get the not-sent line
+        instead. The claim goes without re-arming (the reconnect pass, or the
+        terminal's close, arms the queue). No ``done``, as on the drain's other
         exits without a turn: the page is not streaming here, and a ``done``
         on an empty bubble makes it refetch, which drains again."""
         for qi in taken:
-            qi.waiting = input_queue.WAITING_RECONNECT
+            qi.waiting = waiting
         q.put_back([qi for qi in taken if qi not in q.items])
         self.implement_queue[:0] = spoken
         q.release(claim, rearm=False)
@@ -1250,10 +1270,9 @@ class ChatStreamMixin:
         detached mid-turn. Awaiting the pump task (not the turn's last event)
         matters: it completes only after the producer's finally ran, which is
         where Codex registers bg sub-agents that outlive the turn — checking
-        has_pending any earlier can miss them."""
-        try:
-            if pump._task:
-                await pump._task
-        except (asyncio.CancelledError, Exception):
-            pass
+        has_pending any earlier can miss them. ``asyncio.wait``, not the task
+        itself: cancelling this watcher at shutdown must never cancel the
+        pump it watches."""
+        if pump._task:
+            await asyncio.wait({pump._task})
         self._ensure_bg_monitor(session=sid, chat=cid, layer_=lyr)

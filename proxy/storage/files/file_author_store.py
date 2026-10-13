@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 from storage.pg import get_conn
 
-logger = logging.getLogger("claude-proxy.file-author")
+logger = logging.getLogger("otodock.file-author")
 
 
 def _now_iso() -> str:

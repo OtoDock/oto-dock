@@ -96,8 +96,9 @@ from storage.knowledge.db_knowledge_libraries import subtree_covers
 from services.infra import safe_fs
 from services.infra.path_confinement import join_under, safe_agent_dir
 from core import layout
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.knowledge-libraries")
+logger = logging.getLogger("otodock.knowledge-libraries")
 
 SHARED_SUBDIR = "shared"
 _EXCLUDED_TOP = frozenset({"memory", SHARED_SUBDIR})
@@ -856,10 +857,11 @@ def schedule_reconcile_for_agent(agent_slug: str) -> None:
     if not agent_slug:
         return
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_reconcile_for_agent(agent_slug))
+    spawn(_reconcile_for_agent(agent_slug),
+          name="reconcile_for_agent", owner="library_projector")
 
 
 async def reconcile_loop() -> None:

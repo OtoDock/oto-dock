@@ -70,6 +70,74 @@ class TestParseSource:
         assert mcp_installer.parse_source("npm:") is None
         assert mcp_installer.parse_source("pypi:") is None
 
+    # ---- PyPI extras: one bracket group right after the name.
+
+    def test_pypi_extras(self):
+        p = mcp_installer.parse_source("pypi:nextcloud-mcp-server[documents]")
+        assert (p.registry, p.package, p.version, p.extras) == (
+            "pypi", "nextcloud-mcp-server", "", ("documents",))
+        assert p.requirement == "nextcloud-mcp-server[documents]"
+
+    def test_pypi_extras_pinned(self):
+        p = mcp_installer.parse_source("pypi:x_y.z[a,b-c,d_e.f]@1.2.0")
+        assert (p.package, p.version, p.extras) == ("x_y.z", "1.2.0", ("a", "b-c", "d_e.f"))
+        assert p.pinned("1.3.0") == "pypi:x_y.z[a,b-c,d_e.f]@1.3.0"
+
+    def test_pypi_without_extras_pins_as_before(self):
+        p = mcp_installer.parse_source("pypi:ha-mcp")
+        assert p.extras == () and p.pinned("6.7.0") == "pypi:ha-mcp@6.7.0"
+
+    @pytest.mark.parametrize("source", [
+        "pypi:name[]",              # an empty group
+        "pypi:name[a][b]",          # a second group
+        "pypi:name[a]x",            # text after the group
+        "pypi:[a]",                 # no name
+        "pypi:name[-x]",            # a flag-like extra
+        "pypi:name[a,]",            # an empty extra
+        "pypi:name[a, b]",          # whitespace
+        "pypi:name [a]",            # whitespace before the group
+        "pypi:name[a;b]",           # a separator pip would read
+        "pypi:name[a]@-x",          # a flag-like version
+        "pypi:name[" + "a" * 200 + "]",   # an over-long extra
+        "pypi:name[" + ",".join("e%d" % i for i in range(17)) + "]",  # too many
+        "pypi:name]a[",
+        "pypi:-name[a]",
+    ])
+    def test_malformed_extras_are_refused(self, source):
+        assert mcp_installer.parse_source(source) is None
+
+    def test_npm_keeps_refusing_brackets(self):
+        assert mcp_installer.parse_source("npm:@s/x[a]") is None
+
+    def test_extras_compare_as_normalized_sets(self):
+        a = mcp_installer.parse_source("pypi:x[Doc_s,b]")
+        b = mcp_installer.parse_source("pypi:x[b,doc-s]")
+        assert mcp_installer.normalized_extras(a) == mcp_installer.normalized_extras(b)
+        assert mcp_installer.normalized_extras(None) == frozenset()
+
+
+class TestPythonFloorWording:
+    """uv 0.12.23 names a floor with a space (`requires Python >=3.14`); the
+    older wordings stay matched."""
+
+    @pytest.mark.parametrize("log, spec", [
+        (b"Because dummy-floor==1.0 requires Python >=3.14 and only dummy-floor==1.0 "
+         b"is available, we can conclude that all versions of dummy-floor cannot be used.",
+         ">=3.14"),
+        (b"Because dummy-floor==1.0 requires Python >=3.14 and you require "
+         b"dummy-floor==1.0, we can conclude that your requirements are unsatisfiable.",
+         ">=3.14"),
+        (b"Requires Python>=3.13,<3.14", ">=3.13,<3.14"),
+        (b"the current Python version (3.10.12) does not satisfy Python>=3.11", ">=3.11"),
+        (b"requires Python >=3.10.2, <4", ">=3.10.2,<4"),
+    ])
+    def test_every_wording_names_the_floor(self, log, spec):
+        m = mcp_installer._PY_FLOOR_RE.search(log.decode())
+        assert m is not None and m.group(1).replace(" ", "") == spec
+
+    def test_a_python_version_alone_is_no_floor(self):
+        assert mcp_installer._PY_FLOOR_RE.search("Using Python 3.13.16 environment at: v") is None
+
 
 class TestVersionHash:
     def test_stable(self, tmp_path: Path):
@@ -334,6 +402,16 @@ class TestPinLocalManifest:
         assert data["version"] == "1.21.3"
         assert data["server"]["source"] == "pypi:workspace-mcp@1.21.3"
 
+    def test_pins_pypi_with_its_extras(self, tmp_path: Path):
+        from services.mcp import mcp_updater
+        self._write_unpinned(tmp_path, "pypi:nextcloud-mcp-server[documents]")
+        mcp_updater.pin_local_manifest(
+            tmp_path, "pypi", "nextcloud-mcp-server", "0.40.0", extras=("documents",))
+        data = json.loads((tmp_path / "manifest.json").read_text())
+        assert data["server"]["source"] == "pypi:nextcloud-mcp-server[documents]@0.40.0"
+        p = mcp_installer.parse_source(data["server"]["source"])
+        assert (p.package, p.version, p.extras) == ("nextcloud-mcp-server", "0.40.0", ("documents",))
+
 
 class TestSelfHash:
     def test_returns_hex(self):
@@ -488,6 +566,43 @@ class TestBinaryOnlyPython:
         calls[:] = []
         await mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=_fake_uv(tmp_path))
         assert calls and not any("--only-binary=:all:" in c["argv"] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_extras_reach_the_package_manager_and_the_readback_asks_the_bare_name(
+        self, tmp_path, monkeypatch,
+    ):
+        mcp_dir = _python_dir(tmp_path)
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        asked = []
+        monkeypatch.setattr(mcp_installer, "_python_installed_version",
+                            lambda venv, dist: asked.append(dist) or "0.40.0")
+        r = await mcp_installer.install_mcp(
+            mcp_dir, "python", "pypi:nextcloud-mcp-server[documents]@0.40.0",
+            uv_bin=_fake_uv(tmp_path),
+        )
+        assert r.ok and r.resolved_version == "0.40.0"
+        pip = calls[1]["argv"]
+        assert "--only-binary=:all:" in pip
+        assert pip[-1] == "nextcloud-mcp-server[documents]==0.40.0"
+        assert "--upgrade" not in pip
+        assert asked == ["nextcloud-mcp-server"]
+
+    @pytest.mark.asyncio
+    async def test_an_unpinned_extras_source_upgrades(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x[a,b]", uv_bin=_fake_uv(tmp_path),
+        )
+        assert calls[1]["argv"][-2:] == ["--upgrade", "x[a,b]"]
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_pypi_source_runs_nothing(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x[-e]", uv_bin=_fake_uv(tmp_path),
+        )
+        assert r.ok is False and "Unparseable" in r.log
+        assert calls == []
 
     @pytest.mark.asyncio
     async def test_pypi_install_recreates_the_venv(self, tmp_path, monkeypatch):
@@ -901,3 +1016,212 @@ class TestSourceBuildFallback:
         assert r.ok, r.log
         assert calls[2]["argv"][1:4] == ["venv", "--python", ">=3.13"]
         assert all(_no_binary(c["argv"]) == [] for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# The interpreter a created venv runs on: the caller's pin, a floor uv asks
+# for, a managed interpreter when the first one lies outside the roots.
+# ---------------------------------------------------------------------------
+
+_FLOOR_0_12 = (b"Because x==1.0 requires Python >=3.14 and you require x==1.0, "
+               b"we can conclude that your requirements are unsatisfiable.\n")
+
+
+@pytest.fixture
+def _fresh_managed_state(monkeypatch):
+    monkeypatch.setattr(mcp_installer, "_managed_failed_at", None)
+
+
+def _venv_argv(call: dict) -> list[str]:
+    return call["argv"][1:-1]
+
+
+class TestInterpreterPin:
+    @pytest.mark.asyncio
+    async def test_a_pypi_venv_takes_the_pin(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+            python_spec="3.13",
+        )
+        assert r.ok, r.log
+        assert _venv_argv(calls[0]) == ["venv", "--python", "3.13"]
+        assert r.venv_python == "3.13"
+
+    @pytest.mark.asyncio
+    async def test_a_bundled_venv_takes_the_pin(self, tmp_path, monkeypatch):
+        mcp_dir = tmp_path / "mcps" / "custom" / "bundled"
+        mcp_dir.mkdir(parents=True)
+        (mcp_dir / "requirements.txt").write_text("x\n")
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            mcp_dir, "python", "", uv_bin=_fake_uv(tmp_path), python_spec="3.13",
+        )
+        assert r.ok and r.venv_python == "3.13"
+        assert _venv_argv(calls[0]) == ["venv", "--python", "3.13"]
+
+    @pytest.mark.asyncio
+    async def test_a_pin_uv_cannot_meet_falls_back_to_its_default(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(1, b"No interpreter found"), _Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+            python_spec="3.13",
+        )
+        assert r.ok, r.log
+        assert _venv_argv(calls[0]) == ["venv", "--python", "3.13"]
+        assert _venv_argv(calls[1]) == ["venv"]
+        assert r.venv_python == ""
+
+    @pytest.mark.asyncio
+    async def test_a_floor_replaces_the_pin(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1, _FLOOR_0_12), _Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+            python_spec="3.13",
+        )
+        assert r.ok, r.log
+        assert _venv_argv(calls[2]) == ["venv", "--python", ">=3.14"]
+        assert r.venv_python == ">=3.14"
+
+    @pytest.mark.asyncio
+    async def test_no_pin_keeps_uv_s_default(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+        )
+        assert _venv_argv(calls[0]) == ["venv"] and r.venv_python == ""
+
+    @pytest.mark.asyncio
+    async def test_without_uv_the_pin_is_not_asked(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=None, python_spec="3.13",
+        )
+        assert r.ok and calls[0]["argv"][1:3] == ["-m", "venv"]
+
+    @pytest.mark.asyncio
+    async def test_an_interpreter_outside_the_roots_is_replaced_by_a_managed_one(
+        self, tmp_path, monkeypatch, _fresh_managed_state,
+    ):
+        verdicts = iter([True])
+        monkeypatch.setattr(mcp_installer, "venv_outside", lambda v, r: next(verdicts, False))
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+            python_spec="3.13", sandbox_roots=[tmp_path],
+        )
+        assert r.ok, r.log
+        assert _venv_argv(calls[1]) == ["venv", "--python", "3.13", "--managed-python"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_managed_download_is_not_retried_for_the_next_install(
+        self, tmp_path, monkeypatch, caplog, _fresh_managed_state,
+    ):
+        monkeypatch.setattr(mcp_installer, "venv_outside", lambda v, r: True)
+        calls = _recording_spawn(
+            monkeypatch, [_Proc(0), _Proc(1, b"offline"), _Proc(0), _Proc(0), _Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+            python_spec="3.13", sandbox_roots=[tmp_path],
+        )
+        assert r.ok, r.log
+        assert "--managed-python" in calls[1]["argv"]
+        assert "--managed-python" not in calls[2]["argv"]
+        assert "stays outside the platform tree" in caplog.text
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path / "second"), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+            python_spec="3.13", sandbox_roots=[tmp_path],
+        )
+        assert r.ok and len(calls) == 2
+        assert not any("--managed-python" in c["argv"] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_the_satellite_shape_asks_no_pin_and_no_roots(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_installer, "venv_outside",
+                            lambda v, r: pytest.fail("judged without roots"))
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:x@1.0", uv_bin=_fake_uv(tmp_path),
+        )
+        assert r.ok and len(calls) == 2
+
+
+class TestVenvInterpreterPaths:
+    def _venv(self, tmp_path: Path, home: Path, target: Path) -> Path:
+        venv = tmp_path / "mcps" / "custom" / "a" / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text(f"home = {home}\nversion_info = 3.13.14\n")
+        (venv / "bin" / "python").symlink_to(target)
+        return venv
+
+    def test_inside_and_outside(self, tmp_path):
+        interp = tmp_path / "mcps" / ".uv-python" / "cpython-3.13.14" / "bin"
+        interp.mkdir(parents=True)
+        (interp / "python3.13").write_text("")
+        venv = self._venv(tmp_path, interp, interp / "python3.13")
+        roots = [(tmp_path / "mcps" / ".uv-python").resolve()]
+        assert mcp_installer.venv_outside(venv, roots) is False
+        assert mcp_installer.venv_outside(venv, [(tmp_path / "elsewhere").resolve()]) is True
+
+    def test_the_home_alone_counts_for_a_copied_interpreter(self, tmp_path):
+        venv = tmp_path / "v"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").write_text("a copy")
+        (venv / "pyvenv.cfg").write_text(f"home = {tmp_path / 'outside' / 'bin'}\n")
+        assert mcp_installer.venv_outside(venv, [venv.resolve()]) is True
+
+    def test_a_venv_with_nothing_readable_is_not_judged(self, tmp_path):
+        assert mcp_installer.venv_outside(tmp_path / "missing", [tmp_path]) is False
+
+
+class TestPruneUvPythons:
+    def _tree(self, tmp_path: Path) -> Path:
+        mcps = tmp_path / "mcps"
+        uvp = mcps / ".uv-python"
+        for name in ("cpython-3.13.14-linux", "cpython-3.12.1-linux", "cpython-3.11.9-linux"):
+            (uvp / name / "bin").mkdir(parents=True)
+            (uvp / name / "bin" / "python3").write_text("")
+        (uvp / "cpython-3.13-linux").symlink_to(uvp / "cpython-3.13.14-linux")
+        (uvp / "cpython-3.11-linux").symlink_to(uvp / "cpython-3.11.9-linux")
+        (uvp / ".lock").write_text("")
+        (uvp / ".temp").mkdir()
+        return mcps
+
+    def _venv(self, at: Path, interp_bin: Path) -> None:
+        (at / "bin").mkdir(parents=True)
+        (at / "pyvenv.cfg").write_text(f"home = {interp_bin}\n")
+        (at / "bin" / "python").symlink_to(interp_bin / "python3")
+
+    def test_only_unused_interpreters_go(self, tmp_path):
+        mcps = self._tree(tmp_path)
+        uvp = mcps / ".uv-python"
+        # A venv on the minor link, one in an install backup on 3.12.
+        self._venv(mcps / "custom" / "a" / "venv", uvp / "cpython-3.13-linux" / "bin")
+        self._venv(mcps / "community" / "b.bak" / "venv", uvp / "cpython-3.12.1-linux" / "bin")
+        removed = mcp_installer.prune_uv_pythons(mcps)
+        assert sorted(removed) == ["cpython-3.11-linux", "cpython-3.11.9-linux"]
+        left = sorted(p.name for p in uvp.iterdir())
+        assert left == [".lock", ".temp", "cpython-3.12.1-linux",
+                        "cpython-3.13-linux", "cpython-3.13.14-linux"]
+
+    def test_an_unreadable_venv_config_removes_nothing(self, tmp_path):
+        mcps = self._tree(tmp_path)
+        venv = mcps / "custom" / "a" / "venv"
+        venv.mkdir(parents=True)
+        cfg = venv / "pyvenv.cfg"
+        cfg.write_text("home = /x\n")
+        cfg.chmod(0)
+        try:
+            assert mcp_installer.prune_uv_pythons(mcps) == []
+        finally:
+            cfg.chmod(0o644)
+        assert (mcps / ".uv-python" / "cpython-3.11.9-linux").is_dir()
+
+    def test_nothing_on_windows(self, tmp_path, monkeypatch):
+        mcps = self._tree(tmp_path)
+        monkeypatch.setattr(mcp_installer.sys, "platform", "win32")
+        assert mcp_installer.prune_uv_pythons(mcps) == []
+
+    def test_no_uv_python_dir(self, tmp_path):
+        assert mcp_installer.prune_uv_pythons(tmp_path) == []

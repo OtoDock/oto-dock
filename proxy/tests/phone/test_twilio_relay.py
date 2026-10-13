@@ -65,6 +65,7 @@ class FakeDaemon:
             app = web.Application()
             app.router.add_post("/v1/twilio/inbound/{sid}", self._inbound)
             app.router.add_post("/v1/twilio/status/{sid}", self._inbound)
+            app.router.add_post("/v1/twilio/transfer/{sid}", self._inbound)
             app.router.add_get("/v1/twilio/media/{sid}", self._media)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -119,6 +120,20 @@ def test_webhook_relay_preserves_bytes_headers_and_query(client, daemon):
     assert seen["body"] == body                      # raw bytes, no re-encode
     assert seen["signature"] == "sig=="
     assert seen["content_type"] == "application/x-www-form-urlencoded"
+
+
+def test_transfer_action_relays_like_the_status_callback(client, daemon):
+    body = b"CallSid=CAx&DialCallStatus=no-answer&CallStatus=in-progress"
+    resp = client.post(
+        "/v1/twilio/transfer/7", content=body,
+        headers={"X-Twilio-Signature": "sig==",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert resp.status_code == 200 and resp.text == "<Response><Reject/></Response>"
+    seen = daemon.requests[0]
+    assert seen["path_qs"] == "/v1/twilio/transfer/7" and seen["body"] == body
+    assert seen["signature"] == "sig=="
+    assert client.post("/v1/twilio/transfer/evil", content=b"x").status_code == 404
 
 
 def test_webhook_relay_daemon_down_is_502(client, monkeypatch):

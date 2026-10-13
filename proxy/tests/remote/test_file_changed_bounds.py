@@ -118,7 +118,7 @@ async def test_frames_past_the_inflight_ceiling_are_shed_but_still_stamp(monkeyp
     monkeypatch.setattr(config, "SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", 4)
     cm = SatelliteConnectionManager()
     gate, counter = asyncio.Event(), _Counter()
-    caplog.set_level(logging.WARNING, logger="claude-proxy.satellite")
+    caplog.set_level(logging.WARNING, logger="otodock.satellite")
     with patch("core.session.session_state.get_session_security", return_value=_sec()), \
          _parked_applier(cm, gate, counter):
         for i in range(300):

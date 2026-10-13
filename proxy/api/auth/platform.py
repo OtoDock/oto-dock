@@ -13,14 +13,15 @@ import config
 from core import placement
 from auth.license import get_current_license, get_license_key, set_license_key
 from auth import lan_check
-from auth.providers import UserContext, get_current_user, mask_email, require_admin
+from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_auth
 from storage import database as task_store
 from storage.pg import run_db
 
 from api.auth._router import router
 import contextlib
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 class PlatformSettingsRequest(BaseModel):
@@ -86,6 +87,10 @@ class PlatformSettingsRequest(BaseModel):
 
 class LicenseKeyRequest(BaseModel):
     license_key: str = ""
+
+
+class ReleaseSeenRequest(BaseModel):
+    version: str = ""
 
 
 class SmtpTestRequest(BaseModel):
@@ -394,7 +399,8 @@ async def set_platform_settings(
         )
         if old_on and not new_on:
             # Schedule the cascade so we return the API call immediately.
-            asyncio.create_task(_enforce_user_paired_disabled())
+            spawn(_enforce_user_paired_disabled(),
+                  name="enforce_user_paired_disabled", owner="platform")
     if req.interactive_cli_enabled is not None:
         from core import execution_mode
         await asyncio.to_thread(
@@ -483,7 +489,8 @@ async def set_platform_settings(
             quota_changed = True
     if quota_changed:
         from services.infra import quota_monitor, storage_quota
-        asyncio.create_task(asyncio.to_thread(storage_quota.reapply_all_limits))
+        spawn(asyncio.to_thread(storage_quota.reapply_all_limits),
+              name="reapply_all_limits", owner="platform")
         # Re-evaluate thresholds on the next sweep (~60s) instead of waiting out
         # the monitor's throttle, so a limit change surfaces warnings promptly.
         quota_monitor.request_recheck()
@@ -660,3 +667,59 @@ async def admin_test_smtp(
         req.password, req.tls, req.test_email,
     )
     return {"success": success, "message": message}
+
+
+# --- the release notice and the release dialog -------------------------------
+# features/BACKUP-RESTORE.md "Admins are told a release exists" and "The
+# version in the dashboard".
+
+
+@router.get("/v1/admin/release-notice")
+async def get_release_notice(user: UserContext | None = Depends(get_current_user)):
+    """The running version, the latest release the daily check found and
+    whether it is newer, for the admin banner and the OtoDock tab."""
+    require_admin(user)
+    from services.infra import release_check
+    return await run_db(release_check.notice)
+
+
+@router.post("/v1/admin/release-check")
+async def run_release_check(user: UserContext | None = Depends(get_current_user)):
+    """Check now (a 60-second cooldown answers the stored state)."""
+    require_admin(user)
+    from services.infra import release_check
+    return await release_check.check_now(force=True)
+
+
+@router.get("/v1/users/me/release-card")
+async def get_release_card(user: UserContext | None = Depends(get_current_user)):
+    """Whether this person is eligible to be told the install changed release
+    (the dialog's rule); the dashboard draws the cards from its bundled
+    highlights file and decides a member's show by it."""
+    u = require_auth(user)
+    if u.is_api_key:
+        raise HTTPException(403, "Dashboard only")
+    from services.infra import release_notes
+    return await run_db(release_notes.card_for_user, u.sub, u.role)
+
+
+@router.post("/v1/users/me/release-card/seen")
+async def mark_release_card_seen(
+    req: ReleaseSeenRequest | None = None,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """The person has seen (or need not see) a version's dialog: the one it
+    showed when it parses and is not newer than the running version (a dialog
+    left open across an upgrade must not mark the new version seen), else the
+    running version."""
+    u = require_auth(user)
+    if u.is_api_key:
+        raise HTTPException(403, "Dashboard only")
+    from storage.prefs import user_ui_prefs_store
+    from storage.schema import parse_version
+    running = config.PINNED_OTODOCK_VERSION
+    shown = (req.version if req else "").strip()
+    shown_v, running_v = parse_version(shown), parse_version(running)
+    version = shown if shown_v is not None and running_v is not None and shown_v <= running_v else running
+    await run_db(user_ui_prefs_store.mark_release_seen, u.sub, version)
+    return {"status": "ok", "seen": version}

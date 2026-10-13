@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo, useRef } from 'react'
 import type { FileNode } from '../../api/agents'
+import { dropRoots, type DropRoot } from '../../lib/droppedItems'
 import FileTile from './FileTile'
 
 interface Props {
@@ -21,8 +22,9 @@ interface Props {
   onClearSelection: () => void
   onContextMenu: (node: FileNode, point: { clientX: number; clientY: number }) => void
   onEmptyContextMenu?: (point: { clientX: number; clientY: number }) => void
-  /** Drop target — OS files dragged in. Caller handles the upload. */
-  onDropFiles?: (files: FileList) => void
+  /** Drop target — OS files and folders dragged in, taken while the drop
+   * event runs. Caller walks the folders and handles the upload. */
+  onDropItems?: (roots: DropRoot[]) => void
   /** Internal drag dropped on a folder tile — caller calls /move. */
   onMoveDrop?: (destPath: string, srcPaths: string[]) => void
   renderRename: (node: FileNode) => React.ReactNode
@@ -51,7 +53,7 @@ export default function FileGrid({
   onClearSelection,
   onContextMenu,
   onEmptyContextMenu,
-  onDropFiles,
+  onDropItems,
   onMoveDrop,
   renderRename,
 }: Props) {
@@ -65,36 +67,36 @@ export default function FileGrid({
 
   const onDragEnter = useCallback(
     (e: React.DragEvent) => {
-      if (!onDropFiles || !hasExternalFiles(e)) return
+      if (!onDropItems || !hasExternalFiles(e)) return
       e.preventDefault()
       setDragDepth((d) => d + 1)
     },
-    [onDropFiles],
+    [onDropItems],
   )
   const onDragLeave = useCallback(
     (e: React.DragEvent) => {
-      if (!onDropFiles || !hasExternalFiles(e)) return
+      if (!onDropItems || !hasExternalFiles(e)) return
       setDragDepth((d) => Math.max(0, d - 1))
     },
-    [onDropFiles],
+    [onDropItems],
   )
   const onDragOver = useCallback(
     (e: React.DragEvent) => {
-      if (!onDropFiles || !hasExternalFiles(e)) return
+      if (!onDropItems || !hasExternalFiles(e)) return
       e.preventDefault()
       e.dataTransfer.dropEffect = 'copy'
     },
-    [onDropFiles],
+    [onDropItems],
   )
   const onDrop = useCallback(
     (e: React.DragEvent) => {
-      if (!onDropFiles || !hasExternalFiles(e)) return
+      if (!onDropItems || !hasExternalFiles(e)) return
       e.preventDefault()
       setDragDepth(0)
-      const files = e.dataTransfer.files
-      if (files?.length) onDropFiles(files)
+      const roots = dropRoots(e.dataTransfer)
+      if (roots.length) onDropItems(roots)
     },
-    [onDropFiles],
+    [onDropItems],
   )
 
   // Manual "double-click on the SAME path" detection. The native

@@ -13,16 +13,19 @@ and the MCP config copy for its historical importers.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import secrets
 import shutil
+import stat
 import time
 from pathlib import Path
 
 import config as app_config
 from core import layout
 
-logger = logging.getLogger("claude-proxy.sandbox")
+logger = logging.getLogger("otodock.sandbox")
 
 
 # Hooks source directory (proxy/hooks/)
@@ -64,6 +67,128 @@ def write_no_follow(path: Path, data: bytes, mode: int = 0o644) -> None:
             os.close(fd)
 
 
+#: The marker in the name of an in-flight temp file of ``write_if_changed``
+#: (``.<name>.oto-tmp-<hex>`` beside its target). File sync keeps these
+#: host-local on both sides (``core/remote/file_sync.py``, the satellite's
+#: twin carries the same marker).
+WRITE_TEMP_MARKER = ".oto-tmp-"
+#: A temp older than this is a crashed start's and goes at the next write in
+#: its directory; a younger one is a concurrent start's, still in flight.
+STALE_TEMP_S = 600.0
+_REPLACE_ATTEMPTS = 3
+
+
+def _holds(path: Path, data: bytes, mode: int) -> bool:
+    """Whether ``path`` is a regular file of one link, with ``mode`` and
+    exactly ``data``, judged on the descriptor itself: a link at the name is
+    not followed and a FIFO swapped in cannot block the read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or stat.S_IMODE(st.st_mode) != mode or st.st_size != len(data)):
+            return False
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            return f.read(len(data) + 1) == data
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def is_fresh_write_temp(entry: os.DirEntry, now: float | None = None) -> bool:
+    """A temp of ``write_if_changed`` young enough to be another start's
+    write in flight (a directory sweep leaves it alone)."""
+    if not entry.name.startswith(".") or WRITE_TEMP_MARKER not in entry.name:
+        return False
+    try:
+        mtime = entry.stat(follow_symlinks=False).st_mtime
+    except OSError:
+        return False
+    return (time.time() if now is None else now) - mtime < STALE_TEMP_S
+
+
+def _sweep_stale_temps(directory: Path) -> None:
+    """Remove the temps a crashed start left in ``directory`` (files and
+    links only, never followed); a fresh one belongs to a concurrent start."""
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            if (not entry.name.startswith(".") or WRITE_TEMP_MARKER not in entry.name
+                    or entry.is_dir(follow_symlinks=False) or is_fresh_write_temp(entry)):
+                continue
+            with contextlib.suppress(OSError):
+                os.unlink(entry.path)
+
+
+def write_if_changed(path: Path, data: bytes, mode: int = 0o644) -> bool:
+    """Make ``path`` hold ``data`` with ``mode``; True when it was written.
+
+    A file that already holds them is left alone: the hook files are
+    rewritten at every session start, and a rewrite in place let a hook a
+    sibling session launched read a half-written script. A changed file is
+    written to a temp beside it and renamed onto the name, so a reader sees
+    the old file or the new one, never a part: a link at the name is
+    replaced, never followed, and a directory there is removed. The temp
+    stays beside its target because each scope may be its own XFS quota
+    project, which a rename across refuses. The tree is writable from inside
+    a running sandbox, so after the rename the name must hold the temp's own
+    inode with one link, or the same bytes another start wrote at the same
+    moment: a sibling that swapped or linked the temp during the write is
+    caught, its file removed and the write retried, and a write tampered
+    with every time raises (the session start fails).
+
+    A replace detaches the read-only file bind a running sandbox holds on
+    the name (the kernel drops a mount whose mountpoint is renamed over from
+    another namespace), and that session then sees the new file through its
+    writable dir. So the content of every file the sandbox binds by name
+    must depend only on the scope's paths and the proxy's build: every
+    sandbox dies with the proxy, so a changed file is replaced only at the
+    first start after an upgrade, when no session of the scope runs."""
+    if _holds(path, data, mode):
+        return False
+    _sweep_stale_temps(path.parent)
+    for _ in range(_REPLACE_ATTEMPTS):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        tmp = path.with_name(f".{path.name}{WRITE_TEMP_MARKER}{secrets.token_hex(6)}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.replace(tmp, path)
+            mine = os.fstat(fd)
+            try:
+                there = os.lstat(path)
+            except FileNotFoundError:
+                there = None
+            if (there is not None and (there.st_ino, there.st_dev) == (mine.st_ino, mine.st_dev)
+                    and mine.st_nlink == 1):
+                return True
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        finally:
+            os.close(fd)
+        if _holds(path, data, mode):
+            return True
+        logger.warning("%s was replaced or linked during its write; writing it again", path)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    raise RuntimeError(
+        f"Refusing {path}: it was replaced during every write (possible tampering)"
+    )
+
+
 def _verified_session_dir(agent_name: str, *parts: str) -> Path:
     """Build ``agents/<agent>/parts...`` refusing symlinked components.
 
@@ -102,9 +227,9 @@ def _copy_hook_lf(src: Path, dst: Path) -> None:
     (``/usr/bin/env: 'python3\\r': No such file or directory``) and silently
     bypasses enforcement. Normalize defensively so an editor/git CRLF can never
     break hook execution inside the sandbox (vs ``shutil.copy2``, which copies
-    bytes + perms verbatim). Writes via ``write_no_follow`` — the dst lives
-    in an agent-writable tree, so a planted symlink must not be followed."""
-    write_no_follow(dst, src.read_bytes().replace(b"\r\n", b"\n"), mode=0o755)
+    bytes + perms verbatim). Writes via ``write_if_changed`` — the dst lives
+    in an agent-writable tree that running sessions read from."""
+    write_if_changed(dst, src.read_bytes().replace(b"\r\n", b"\n"), mode=0o755)
 
 
 # ---------------------------------------------------------------------------
@@ -140,24 +265,104 @@ def scope_config_dir(
 
 
 def install_hook_scripts(config_dir: Path) -> None:
-    """Copy the four hook scripts and the stdio interceptor into a session
-    config dir (LF-normalised, executable — a CRLF shebang silently breaks
-    hook execution). The interceptor is copied unconditionally: a missing
-    source must raise, not silently disable the wrap spawn-time config still
-    points at."""
+    """Copy the hook scripts, the credential helper and the stdio
+    interceptor into a session config dir (LF-normalised, executable — a
+    CRLF shebang silently breaks hook execution), and write the command
+    wrappers under its ``bin/``. The interceptor is copied unconditionally:
+    a missing source must raise, not silently disable the wrap spawn-time
+    config still points at."""
     for script_name in HOOK_SCRIPTS:
         src = _HOOKS_DIR / script_name
         if src.exists():
             _copy_hook_lf(src, config_dir / script_name)
     _copy_hook_lf(_INTERCEPTOR_SRC, config_dir / _INTERCEPTOR_SRC.name)
+    write_command_wrappers(config_dir)
+
+
+def write_command_wrappers(config_dir: Path) -> None:
+    """Write ``COMMAND_WRAPPERS`` under ``<config_dir>/bin``, which holds
+    exactly them afterwards. The tree is agent-writable and the sandbox
+    binds the directory read-only first on the session's PATH, where a file
+    left there would run as the next session's command: a link at the
+    directory's name is replaced, every entry that is not a wrapper file is
+    removed (a planted file, a link, a subdirectory whole, a directory at a
+    wrapper's name) but a concurrent start's write in flight, and each
+    wrapper is written by ``write_if_changed``: the directory is bound as a
+    whole, so a session running from it sees a changed wrapper at once,
+    whole, and an unchanged one is not touched."""
+    bin_dir = config_dir / WRAPPER_DIR
+    if bin_dir.is_symlink() or (bin_dir.exists() and not bin_dir.is_dir()):
+        bin_dir.unlink()
+    bin_dir.mkdir(mode=0o755, exist_ok=True)
+    keep = {Path(relpath).name for relpath in COMMAND_WRAPPERS}
+    with os.scandir(bin_dir) as entries:
+        for entry in entries:
+            if entry.name in keep and entry.is_file(follow_symlinks=False):
+                continue
+            if is_fresh_write_temp(entry):
+                continue
+            # A concurrent start of the scope may remove the same entry.
+            with contextlib.suppress(FileNotFoundError):
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+                else:
+                    os.unlink(entry.path)
+    for relpath, content in COMMAND_WRAPPERS.items():
+        write_if_changed(config_dir / relpath, content.encode(), mode=0o755)
 
 
 #: Every hook script a session config dir carries, for both engines
-#: (``proxy/hooks/``; the satellite receives the same set in its start payload).
+#: (``proxy/hooks/``; the satellite receives the same set in its start
+#: payload). ``credential_helper.py`` is not a hook: git and the command
+#: wrappers invoke it (HOOKS.md "The credential helper").
 HOOK_SCRIPTS: tuple[str, ...] = (
     "permission_gate.py", "tool_result_forwarder.py",
-    "subagent_tracker.py", "stop_tracker.py",
+    "subagent_tracker.py", "stop_tracker.py", "credential_helper.py",
 )
+
+#: The file in each engine's state dir that names the hook scripts (the
+#: sandbox binds it read-only beside them, ``SandboxBuilder._hook_file_binds``).
+HOOK_FILE_OF_STATE_DIR: dict[str, str] = {".claude": "settings.json", ".codex": "hooks.json"}
+
+#: The sandbox's PATH: the system dirs only (a user home is not mounted).
+SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+#: The directory under a session config dir that holds the command wrappers,
+#: first on the session's PATH; the sandbox binds it read-only
+#: (``SandboxBuilder._hook_file_binds``).
+WRAPPER_DIR = "bin"
+
+#: The command wrappers every session config dir carries (both engines; the
+#: satellite receives them in the start payload's ``command_wrappers``). Each
+#: hands the command to the credential helper's ``run`` mode, which runs the
+#: real command with the session's token for the host set on that one
+#: process. ``gh`` is GitHub's CLI; the helper finds the real binary on the
+#: PATH with this directory removed. The Windows wrapper stays ASCII (cmd
+#: reads batch files in the OEM code page) and resolves the interpreter
+#: through ``OTO_HOOK_PY`` like the Codex hook wrappers.
+COMMAND_WRAPPERS: dict[str, str] = {
+    f"{WRAPPER_DIR}/gh": (
+        "#!/bin/sh\n"
+        "# The platform's gh: the real gh runs with the session's GitHub token\n"
+        "# in its own environment, fetched per command from the credential\n"
+        "# broker; the session's environment never holds it.\n"
+        'd=$(dirname "$0")\n'
+        'exec "${OTO_HOOK_PY:-python3}" -I "$d/../credential_helper.py" run github.com gh -- "$@"\n'
+    ),
+    f"{WRAPPER_DIR}/gh.cmd": (
+        '@if "%OTO_HOOK_PY%"=="" set "OTO_HOOK_PY=python"\r\n'
+        '@"%OTO_HOOK_PY%" -I "%~dp0..\\credential_helper.py" run github.com gh -- %*\r\n'
+        "@exit /b %errorlevel%\r\n"
+    ),
+}
+
+
+def sandbox_python() -> str:
+    """The interpreter the hook commands, the interceptor wrap and the git
+    helper name inside a local sandbox: resolved on the sandbox's own PATH
+    (the system dirs are bound read-only, so the host path is the sandbox
+    path), never a bare name a directory earlier on PATH could shadow."""
+    return shutil.which("python3", path=SANDBOX_PATH) or "python3"
 
 #: The permission gate's and the Stop hook's transport ceiling: a dashboard
 #: prompt and a turn-end verdict are long polls the proxy bounds itself. One
@@ -287,7 +492,7 @@ def prepare_mcp_config_for_sandbox(
                     env["OTO_MCP_FETCH_TOKEN"] = mcp_broker.mint_token(session_id, name)
                     srv["env"] = env
             wrap_servers_json(
-                config_data, interpreter="python3", interpreter_args=("-I",),
+                config_data, interpreter=sandbox_python(), interpreter_args=("-I",),
                 interceptor_path=f"{sandbox_config_dir}/{_INTERCEPTOR_SRC.name}",
             )
 

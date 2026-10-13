@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.events.common_events import CommonEvent, DONE, TEXT
-from services.scheduler import runner, scheduler, shared
+from services.scheduler import interactive, runner, scheduler, shared
 from storage import database as task_store
 from storage.automation import run_status
 
@@ -508,6 +508,37 @@ async def test_a_turn_the_engine_stopped_fails_the_run_with_its_reason(temp_db, 
     assert row["error_message"] == "Declined by the model's safety classifier (cyber)."
 
 
+async def test_a_stopped_ending_leaves_the_run_interrupted_not_failed(temp_db, monkeypatch):
+    """A review turn or a queued message met the process the person's Stop
+    ended (the pump recorded the ``stopped`` ending and its line as the
+    error): the run reads as the person's stop, with no chat flag to say so,
+    never as an engine failure."""
+    from core.events import stream_pump, turn_ending
+    run_id, session_id = "run-cx6", "66666666-6666-4666-8666-666666666666"
+    layer = _Layer(hold=False)
+    real_start = stream_pump.ChatStreamPump.start
+    ending = turn_ending.TurnEnding(reason=turn_ending.STOPPED, detail="CLI process not running")
+
+    def _start(self):
+        self.last_error = ending.line()
+        self.last_ending = ending
+        return real_start(self)
+
+    monkeypatch.setattr(stream_pump.ChatStreamPump, "start", _start)
+    t, q = _drive(monkeypatch, layer, _task("t-cx6"), run_id, session_id)
+    try:
+        await asyncio.wait_for(t, 20)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+        shared._run_event_buffer.pop(run_id, None)
+    row = temp_db.get_run(run_id)
+    assert row["status"] == run_status.COMPLETED
+    assert row["error_message"] is None
+    assert row["output_text"] == "1\n2\n"
+    assert q.dones() == [({"type": "done", "status": run_status.COMPLETED}, run_status.COMPLETED)]
+
+
 async def test_a_cancel_in_the_pre_slot_window_ends_the_row(temp_db, monkeypatch):
     """The first ``await`` of ``_run_task`` (the target resolve) is reachable
     the instant the run id is returned; a cancel there used to leave the
@@ -538,3 +569,141 @@ async def test_a_cancel_in_the_pre_slot_window_ends_the_row(temp_db, monkeypatch
     assert row["error_message"] == "Interrupted by user"
     assert q.dones() == [({"type": "done", "status": run_status.CANCELLED}, run_status.CANCELLED)]
     assert _registries_clear(run_id, task_id)
+
+
+# ---------------------------------------------------------------------------
+# A Direct LLM worker's continue keeps its conversation
+# ---------------------------------------------------------------------------
+
+class _ColdDirectLayer(_Layer):
+    """A Direct LLM session no longer in memory: it never resumes from a
+    file, and the round must start it again."""
+
+    def __init__(self):
+        super().__init__(hold=False)
+        self.starts: list[tuple[str, object]] = []
+
+    async def is_session_alive(self, session_id):
+        return False
+
+    async def start_session(self, session_id, agent_cfg):
+        self.starts.append((session_id, agent_cfg))
+
+
+async def test_a_direct_workers_continue_keeps_its_id_and_skips_its_prompt_row(temp_db,
+                                                                             monkeypatch):
+    from core.config import task_config_builder
+    run_id, session_id = "run-dc1", "22222222-2222-4222-8222-222222222222"
+    layer = _ColdDirectLayer()
+    task = _task("t-dc1")
+    task.continue_session = session_id
+    t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
+
+    async def _direct_cfg(agent, task_def, sid, **kw):
+        return SimpleNamespace(execution_target="local", execution_path="direct-llm",
+                               interactive=False, resume=False, extra_env={}, chat_id="")
+    monkeypatch.setattr(task_config_builder, "build_task_agent_config", _direct_cfg)
+    try:
+        await asyncio.wait_for(t, 15)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    [(sid, cfg)] = layer.starts
+    assert sid == session_id and cfg.resume is True
+    prompt_rows = [m for m in task_store.get_chat_messages(f"task-{run_id}")
+                   if m["role"] == "user" and m["content"] == "count"]
+    assert cfg.extra_env["_RESUME_SKIP_ROW"] == str(prompt_rows[0]["id"])
+    assert temp_db.get_run(run_id)["session_id"] == session_id
+
+
+# ---------------------------------------------------------------------------
+# A run's first prompt carries the time and parallel-activity lines
+# ---------------------------------------------------------------------------
+
+class _RecordingLayer(_Layer):
+    """Records each send's keywords (the engine's turn site stamps the
+    prompt when ``inject_time`` rides along)."""
+
+    def __init__(self):
+        super().__init__(hold=False)
+        self.sends: list[dict] = []
+
+    async def send_message(self, session_id, prompt, **kw):
+        from core.session import session_state
+        self.sends.append({"prompt": prompt, "zone": session_state.get_session_user_tz(session_id),
+                           **kw})
+        async for ev in super().send_message(session_id, prompt, **kw):
+            yield ev
+
+
+async def test_a_headless_runs_first_prompt_is_stamped_in_the_tasks_zone(temp_db, monkeypatch):
+    run_id, session_id = "run-tz1", "33333333-3333-4333-8333-333333333331"
+    layer = _RecordingLayer()
+    task = _task("t-tz1")
+    task.user_tz = "Europe/Athens"
+    t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
+    try:
+        await asyncio.wait_for(t, 15)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    assert layer.sends[0]["prompt"] == "count"     # the engine's turn site stamps it
+    assert layer.sends[0]["inject_time"] is True
+    assert layer.sends[0]["zone"] == "Europe/Athens"
+
+
+async def test_a_checks_judge_run_gets_no_prelude(temp_db, monkeypatch):
+    from services.scheduler import task_kinds
+    run_id, session_id = "run-tz2", "33333333-3333-4333-8333-333333333332"
+    layer = _RecordingLayer()
+    task = _task("t-tz2")
+    task.task_type = task_kinds.CHECK
+    t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
+    try:
+        await asyncio.wait_for(t, 15)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    assert "inject_time" not in layer.sends[0]
+
+
+@pytest.mark.parametrize("engine,via_argv", [("codex-cli", True), ("claude-code-cli", False)])
+async def test_an_interactive_runs_first_prompt_carries_both_lines(temp_db, monkeypatch, engine, via_argv):
+    from core.config import task_config_builder
+    from core.session import sibling_awareness
+    run_id = f"run-tz3-{via_argv}"
+    session_id = f"33333333-3333-4333-8333-33333333333{int(via_argv)}"
+    layer = _RecordingLayer()
+    task = _task(f"t-tz3-{via_argv}")
+    task.user_tz = "UTC"
+    t, _q = _drive(monkeypatch, layer, task, run_id, session_id)
+    cfg = SimpleNamespace(execution_target="local", execution_path=engine, interactive=True,
+                          resume=False, extra_env={}, chat_id="", interactive_first_prompt="")
+
+    async def _interactive_cfg(agent, task_def, sid, **kw):
+        return cfg
+    monkeypatch.setattr(task_config_builder, "build_task_agent_config", _interactive_cfg)
+    parallel = ("[Parallel activity — for awareness only, no action needed: "
+                "sibling sessions: 'Inbox' (generating). Check one only if your work "
+                "depends on it (peek_session / get_task_result).]")
+
+    async def _line(sid):
+        return parallel
+    monkeypatch.setattr(sibling_awareness, "prelude_line", _line)
+    driven: list[str] = []
+
+    async def _run(sid, chat_id, prompt, first_prompt_in_argv):
+        driven.append(prompt)
+        assert first_prompt_in_argv is via_argv
+    monkeypatch.setattr(interactive, "_run_interactive_task", _run)
+    try:
+        await asyncio.wait_for(t, 15)
+        await _settle(f"task-{run_id}")
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    [prompt] = driven
+    # One line: the Claude TUI would journal a multi-line prompt as a paste.
+    assert prompt.startswith("[Current time: ") and prompt.endswith(f"] {parallel} count")
+    assert "\n" not in prompt
+    assert cfg.interactive_first_prompt == (prompt if via_argv else "")
+    assert layer.sends == []      # no pump for a terminal

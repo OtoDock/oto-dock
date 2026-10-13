@@ -106,6 +106,10 @@ export interface EngineBehaviour {
    *  answers (Codex); false when the proxy denies the call, shows the card
    *  and the answer arrives as the next message (Claude headless). */
   question_tool_holds_turn: boolean
+  /** The instruction files of the repositories in a person's workspace the
+   *  proxy lifts into the session's prompt, the engine's own file first;
+   *  empty when the engine needs none. Optional: absent on an older proxy. */
+  repository_instruction_files?: string[]
 }
 
 /** Which model an unpinned agent on the engine runs, and how its model list

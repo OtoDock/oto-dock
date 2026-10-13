@@ -31,7 +31,9 @@ EXITED = "exited"
 SILENT = "silent"
 # The machine's stream severed or the satellite's process gone mid-turn.
 LOST = "lost"
-# The person's own Stop: stamped on the pump only, never an ERROR event.
+# The person's own Stop: the run's word for a stopped turn, and the ending
+# of a message sent to a session whose process the proxy's own abort ended
+# (a review turn, a queued message) — that is a stop, not a lost machine.
 STOPPED = "stopped"
 REASONS = (DECLINED, LIMIT, ERROR, EXITED, SILENT, LOST, STOPPED)
 # The endings the turn's owner ends the engine process on: a declined turn
@@ -41,7 +43,7 @@ REASONS = (DECLINED, LIMIT, ERROR, EXITED, SILENT, LOST, STOPPED)
 KILLS_PROCESS = frozenset({DECLINED, LIMIT, SILENT})
 # The endings whose card offers to send the message again verbatim: the
 # same words would be declined again, and a limit needs its reset.
-RESEND = frozenset({ERROR, EXITED, SILENT, LOST})
+RESEND = frozenset({ERROR, EXITED, SILENT, LOST, STOPPED})
 # A decline's detail when Codex's Guardian stopped the turn after too many
 # of its actions were denied (``codexErrorInfo: tooManyDenials``, Codex
 # 0.160): not the model's classifier, so the words differ and no model
@@ -50,12 +52,14 @@ DENIALS = "denials"
 
 # The engines' own limit notices: Claude Code's "You've reached your Fable
 # limit. …" / "You've hit your session limit · resets 3pm (UTC)", its
-# usage-credits wording "You're out of usage credits. …" and the older
-# "Claude AI usage limit reached|<epoch>"; Codex's
-# "You've hit your usage limit. …".
+# usage-credits wording "You're out of usage credits. …" and the org's
+# "Your org is out of usage · add funds to continue" (a Team or Enterprise
+# login), the older "Claude AI usage limit reached|<epoch>"; Codex's
+# "You've hit your usage limit. …". A plan fact is not a limit: "Your seat
+# type doesn't include usage credits" stays a plain error.
 _LIMIT_RE = re.compile(
     r"\byou'?ve (?:reached|hit) your\b[^.\n]{0,60}?\blimit\b|\busage limit reached\b"
-    r"|\bout of usage credits\b",
+    r"|\bout of usage\b",
     re.IGNORECASE,
 )
 
@@ -111,7 +115,7 @@ class TurnEnding:
         if self.reason == LOST:
             return ("⚠ The connection to the machine running this chat was lost mid-turn. "
                     "Send the message again once the machine is back.")
-        return "Stopped."
+        return "⚠ The engine was stopped before this message ran. Send it again."
 
     def summary(self) -> str:
         """The run's error message: the reason first, then the engine's words."""
@@ -176,10 +180,12 @@ class TurnEnding:
         """The chat flags the pump writes with the ending's row, or None: a
         process that went (``exited``, ``silent``, ``lost``) lost its partial
         turn, so the next turn re-injects the cancelled context, unless the
-        engine's own history kept it (``graceful``: a Codex interrupt). The
-        engine answered on an ``error``, and a decline or a limit kept its
-        history."""
-        if self.reason == EXITED:
+        engine's own history kept it (``graceful``: a Codex interrupt). A
+        ``stopped`` message met a process the proxy's abort ended: the send
+        consumed the Stop's own flags while it built its batch, so the next
+        turn needs them again. The engine answered on an ``error``, and a
+        decline or a limit kept its history."""
+        if self.reason in (EXITED, STOPPED):
             return {"last_turn_aborted": True, "last_abort_graceful": False}
         if self.reason in (SILENT, LOST):
             return {"last_turn_aborted": True, "last_abort_graceful": self.graceful}

@@ -109,8 +109,10 @@ export default function TerminalView({ ws, chatId, className, agent, artifacts, 
       )}
 
       {pendingPermission && (
-        <div className="absolute inset-x-0 bottom-0 z-20 p-3 bg-linear-to-t from-black/70 to-transparent">
-          <div className="max-w-2xl mx-auto rounded-xl bg-p-bg/95 backdrop-blur-sm border border-p-border shadow-2xl px-3">
+        // The gradient is decoration: clicks beside the card go through to
+        // what is under it (the terminal, a composer popup rising into it).
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 p-3 bg-linear-to-t from-black/70 to-transparent">
+          <div className="pointer-events-auto max-w-2xl mx-auto rounded-xl bg-p-bg/95 backdrop-blur-sm border border-p-border shadow-2xl px-3">
             <PermissionDialog
               requestId={pendingPermission.requestId}
               toolName={permLabel}

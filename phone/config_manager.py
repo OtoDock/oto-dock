@@ -42,6 +42,12 @@ _DEFAULT_PHRASES: dict[str, dict[str, str]] = {
         "pin_retry": "That code wasn't right. Please try again.",
         "pin_fail_goodbye": "Sorry, that code isn't right. Goodbye.",
         "pin_lockout": "Too many failed attempts. Please try again later. Goodbye.",
+        "goodbye": "Goodbye.",
+        "transferring": "One moment, I'm transferring you now.",
+        "transfer_failed": "I'm sorry, the transfer didn't go through. I'm still here.",
+        "cannot_continue": "I'm sorry, I can't continue this call right now. Goodbye.",
+        "transfer_unanswered": "Nobody answered the transfer. Please call again later. Goodbye.",
+        "transfer_unreachable": "The transfer could not be completed. Please call again later. Goodbye.",
     },
     "el": {
         "hold_message": "Μια στιγμή παρακαλώ, θα το ελέγξω.",
@@ -50,30 +56,60 @@ _DEFAULT_PHRASES: dict[str, dict[str, str]] = {
         "pin_retry": "Ο κωδικός δεν ήταν σωστός. Παρακαλώ δοκιμάστε ξανά.",
         "pin_fail_goodbye": "Λυπάμαι, ο κωδικός δεν είναι σωστός. Αντίο σας.",
         "pin_lockout": "Πολλές αποτυχημένες προσπάθειες. Παρακαλώ δοκιμάστε ξανά αργότερα. Αντίο σας.",
+        "goodbye": "Αντίο σας.",
+        "transferring": "Μια στιγμή, σας μεταφέρω τώρα.",
+        "transfer_failed": "Λυπάμαι, η μεταφορά δεν έγινε. Είμαι ακόμα εδώ.",
+        "cannot_continue": "Λυπάμαι, δεν μπορώ να συνεχίσω την κλήση αυτή τη στιγμή. Αντίο σας.",
+        "transfer_unanswered": "Κανείς δεν απάντησε στη μεταφορά. Παρακαλώ καλέστε ξανά αργότερα. Αντίο σας.",
+        "transfer_unreachable": "Η μεταφορά δεν ήταν δυνατή. Παρακαλώ καλέστε ξανά αργότερα. Αντίο σας.",
     },
     "de": {
         "pin_prompt": "Diese Leitung ist geschützt. Bitte geben Sie Ihren Zugangscode über die Tastatur ein und drücken Sie dann die Rautetaste.",
         "pin_retry": "Der Code war nicht richtig. Bitte versuchen Sie es erneut.",
         "pin_fail_goodbye": "Der Code ist leider nicht richtig. Auf Wiederhören.",
         "pin_lockout": "Zu viele Fehlversuche. Bitte versuchen Sie es später erneut. Auf Wiederhören.",
+        "goodbye": "Auf Wiederhören.",
+        "transferring": "Einen Moment, ich verbinde Sie jetzt.",
+        "transfer_failed": "Entschuldigung, die Weiterleitung hat nicht funktioniert. Ich bin noch da.",
+        "cannot_continue": "Entschuldigung, ich kann dieses Gespräch gerade nicht fortsetzen. Auf Wiederhören.",
+        "transfer_unanswered": "Bei der Weiterleitung hat niemand geantwortet. Bitte rufen Sie später noch einmal an. Auf Wiederhören.",
+        "transfer_unreachable": "Die Weiterleitung konnte nicht durchgeführt werden. Bitte rufen Sie später noch einmal an. Auf Wiederhören.",
     },
     "es": {
         "pin_prompt": "Esta línea está protegida. Introduzca su código de acceso en el teclado y pulse la tecla de almohadilla.",
         "pin_retry": "El código no es correcto. Inténtelo de nuevo.",
         "pin_fail_goodbye": "Lo siento, el código no es correcto. Adiós.",
         "pin_lockout": "Demasiados intentos fallidos. Inténtelo de nuevo más tarde. Adiós.",
+        "goodbye": "Adiós.",
+        "transferring": "Un momento, le transfiero ahora.",
+        "transfer_failed": "Lo siento, la transferencia no se ha realizado. Sigo aquí.",
+        "cannot_continue": "Lo siento, no puedo continuar esta llamada ahora. Adiós.",
+        "transfer_unanswered": "Nadie respondió a la transferencia. Por favor, llame de nuevo más tarde. Adiós.",
+        "transfer_unreachable": "No se ha podido completar la transferencia. Por favor, llame de nuevo más tarde. Adiós.",
     },
     "fr": {
         "pin_prompt": "Cette ligne est protégée. Veuillez saisir votre code d'accès sur le clavier, puis appuyez sur la touche dièse.",
         "pin_retry": "Ce code n'est pas correct. Veuillez réessayer.",
         "pin_fail_goodbye": "Désolé, ce code n'est pas correct. Au revoir.",
         "pin_lockout": "Trop de tentatives échouées. Veuillez réessayer plus tard. Au revoir.",
+        "goodbye": "Au revoir.",
+        "transferring": "Un instant, je vous transfère.",
+        "transfer_failed": "Désolé, le transfert n'a pas abouti. Je suis toujours là.",
+        "cannot_continue": "Désolé, je ne peux pas poursuivre cet appel pour le moment. Au revoir.",
+        "transfer_unanswered": "Personne n'a répondu au transfert. Veuillez rappeler plus tard. Au revoir.",
+        "transfer_unreachable": "Le transfert n'a pas pu être effectué. Veuillez rappeler plus tard. Au revoir.",
     },
     "it": {
         "pin_prompt": "Questa linea è protetta. Inserisca il suo codice di accesso sulla tastiera, poi prema il tasto cancelletto.",
         "pin_retry": "Il codice non è corretto. Riprovi per favore.",
         "pin_fail_goodbye": "Mi dispiace, il codice non è corretto. Arrivederci.",
         "pin_lockout": "Troppi tentativi falliti. Riprovi più tardi. Arrivederci.",
+        "goodbye": "Arrivederci.",
+        "transferring": "Un momento, la trasferisco adesso.",
+        "transfer_failed": "Mi dispiace, il trasferimento non è riuscito. Sono ancora qui.",
+        "cannot_continue": "Mi dispiace, non posso continuare questa chiamata adesso. Arrivederci.",
+        "transfer_unanswered": "Nessuno ha risposto al trasferimento. La preghiamo di richiamare più tardi. Arrivederci.",
+        "transfer_unreachable": "Non è stato possibile completare il trasferimento. La preghiamo di richiamare più tardi. Arrivederci.",
     },
 }
 
@@ -108,6 +144,36 @@ class PhoneRoute:
     # (encrypted at rest proxy-side); repr=False so a stray log of the route
     # object can never leak it. Empty = gate off.
     pin: str = field(default="", repr=False)
+    # Where the agent may hand the caller (``transfer_call``): the admin's
+    # list of ``{label, number}``; empty = no transfers on this line.
+    transfer_targets: list = field(default_factory=list)
+    # Identify the caller's language on the first utterance and lock the
+    # call to it (``language`` stays the greeting's and the fallback). An
+    # older proxy never sends the key: off.
+    language_detect: bool = False
+    # A voice for this route alone (the TTS provider's own id), pinned for
+    # every language of the call; "" = the provider's voice for the language.
+    voice_id: str = ""
+
+
+def transfer_target_for(targets: list, wanted: str) -> dict | None:
+    """The configured target an agent named: its label (case-insensitive) or
+    its number (digits compared); None for anything else, never a
+    pass-through number."""
+    want = (wanted or "").strip()
+    if not want:
+        return None
+    want_digits = _DID_DIGITS_RE.sub("", want)
+    for t in targets:
+        if not isinstance(t, dict):
+            continue
+        label = str(t.get("label") or "").strip()
+        number = str(t.get("number") or "").strip()
+        if label and label.casefold() == want.casefold():
+            return t
+        if number and want_digits and _DID_DIGITS_RE.sub("", number) == want_digits:
+            return t
+    return None
 
 
 @dataclass
@@ -186,6 +252,11 @@ class ConfigManager:
                 did=r.get("did") or "",
                 phone_server_id=r.get("phone_server_id"),
                 pin=r.get("pin") or "",
+                transfer_targets=[
+                    t for t in (r.get("transfer_targets") or []) if isinstance(t, dict)
+                ],
+                language_detect=bool(r.get("language_detect", False)),
+                voice_id=str(r.get("voice_id") or "").strip(),
             )
             if route.direction == "inbound":
                 uuid = r.get("audiosocket_uuid")
@@ -466,6 +537,12 @@ class ConfigManager:
     def breath_gain(self) -> float:
         return float(self._s("breath_gain", "0.27"))
 
+    # Diagnostics
+    @property
+    def debug_outgoing_audio(self) -> bool:
+        # Absent = off; nothing seeds it.
+        return self._s("debug_outgoing_audio", "off").lower() in ("on", "true", "1", "yes")
+
     @property
     def breath_min_gap_s(self) -> float:
         """Minimum agent-voice silence before a response gets an inhale —
@@ -676,16 +753,21 @@ class ConfigManager:
                     merged[lang] = data
         return merged
 
-    def pin_phrase(self, language: str, key: str) -> str:
-        """PIN-gate phrase with an explicit fallback chain: route language
-        → en → hardcoded en constant (a gated route must never go
-        mute because its language has no ``pin_*`` translations)."""
+    def phrase(self, language: str, key: str) -> str:
+        """A per-language phrase with the fallback chain route language → en
+        → the in-code English default ("" for a key no default names)."""
         phrases = self.voice_phrases
         for lang in (language, "en"):
             entry = phrases.get(lang)
             if isinstance(entry, dict) and entry.get(key):
                 return entry[key]
-        return _DEFAULT_PHRASES["en"][key]
+        return _DEFAULT_PHRASES["en"].get(key, "")
+
+    def pin_phrase(self, language: str, key: str) -> str:
+        """PIN-gate phrase with an explicit fallback chain: route language
+        → en → hardcoded en constant (a gated route must never go
+        mute because its language has no ``pin_*`` translations)."""
+        return self.phrase(language, key) or _DEFAULT_PHRASES["en"][key]
 
     @property
     def backchannel_phrases(self) -> dict[str, list[str]]:

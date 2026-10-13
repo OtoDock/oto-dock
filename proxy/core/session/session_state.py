@@ -19,7 +19,7 @@ import config
 from storage.automation import run_status
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # ---------------------------------------------------------------------------
 # Module-level state variables
@@ -1619,19 +1619,22 @@ def has_pending_prompt(session_id: str) -> bool:
     )
 
 
+def prompt_waits(request_id: str) -> bool:
+    """Whether this prompt's wait is still open (its card can be answered)."""
+    return request_id in _permission_events or request_id in _question_events
+
+
 async def wait_for_permission(
     request_id: str, session_id: str = "", timeout: float = 120.0,
 ) -> bool:
     """Block until the user responds to a permission request. Returns True if approved.
 
     ``session_id`` indexes the request so an abort/close can release it;
-    pass it for every gate that a warm daemon could leave pending.
+    pass it for every gate that a warm daemon could leave pending. A request
+    opened before (``open_permission_wait``) is adopted with any answer it
+    already has.
     """
-    event = asyncio.Event()
-    _permission_events[request_id] = event
-    if session_id:
-        _session_permission_requests.setdefault(session_id, set()).add(request_id)
-        _permission_request_sessions[request_id] = session_id
+    event = open_permission_wait(request_id, session_id)
     try:
         await asyncio.wait_for(event.wait(), timeout=timeout)
         return _permission_decisions.pop(request_id, True)
@@ -1649,6 +1652,19 @@ async def wait_for_permission(
                 reqs.discard(request_id)
                 if not reqs:
                     _session_permission_requests.pop(session_id, None)
+
+
+def open_permission_wait(request_id: str, session_id: str = "") -> asyncio.Event:
+    """Register a permission request now (it counts as pending and can be
+    answered or released) for a wait that starts later."""
+    event = _permission_events.get(request_id)
+    if event is None:
+        event = asyncio.Event()
+        _permission_events[request_id] = event
+    if session_id:
+        _session_permission_requests.setdefault(session_id, set()).add(request_id)
+        _permission_request_sessions[request_id] = session_id
+    return event
 
 
 def watch_prompt(request_id: str) -> None:

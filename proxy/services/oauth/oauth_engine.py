@@ -31,8 +31,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-# OAuth state TTL — 5 minutes. Matches Authentik's default state TTL.
-_STATE_TTL_SECONDS = 300
+# OAuth state TTL — 5 minutes. Matches Authentik's default state TTL; the
+# browser-binding cookie the start route sets lives as long.
+STATE_TTL_SECONDS = 300
+_STATE_TTL_SECONDS = STATE_TTL_SECONDS
 
 
 @dataclass
@@ -158,6 +160,23 @@ def validate_state(token: str) -> OAuthState | None:
     return state
 
 
+def peek_state_identity(token: str) -> tuple[str, bool] | None:
+    """Non-consuming: the person a live state was minted for and whether
+    the app started it (``mobile``), or None for an unknown or expired
+    state. The callback and the app's exchange judge the caller with it
+    before any exchange."""
+    state = _states.get(token)
+    if state is None or time.monotonic() > state.expiry:
+        return None
+    return state.user_sub, state.mobile
+
+
+def discard_state(token: str) -> None:
+    """Drop a state a callback refused before any exchange (another
+    browser's, another person's): nothing is left for a copied URL."""
+    _states.pop(token, None)
+
+
 def peek_state_extra(token: str) -> dict[str, str]:
     """Non-consuming read of a state's ``extra`` dict.
 
@@ -251,6 +270,19 @@ def validate_admin_consent_state(token: str) -> AdminConsentState | None:
     if time.monotonic() > state.expiry:
         return None
     return state
+
+
+def peek_admin_consent_identity(token: str) -> tuple[str, bool] | None:
+    """Non-consuming: the person and the ``mobile`` flag of a live
+    admin-consent state, or None."""
+    state = _admin_consent_states.get(token)
+    if state is None or time.monotonic() > state.expiry:
+        return None
+    return state.user_sub, state.mobile
+
+
+def discard_admin_consent_state(token: str) -> None:
+    _admin_consent_states.pop(token, None)
 
 
 def _purge_expired_admin_consent() -> None:

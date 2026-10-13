@@ -13,6 +13,94 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-13
+
+### Upgrade notes
+- **Claude Code 2.1.296, Codex 0.162.1, satellite 0.5.147.** Paired machines update at
+  reconnect, which ends their running turns. Haiku 4.5 pins move to Haiku 5.5 at boot, and
+  a Codex terminal's worktrees land in your own folder.
+- **Cartesia speech defaults to `sonic-3.6`,** a retired id follows it, both providers
+  voice every language, your picks and voices stay.
+- **Accounts connect from the address in `DASHBOARD_PUBLIC_URL`.** A connect started
+  elsewhere is refused with the address to use: set that key.
+- **Catalog MCP updates wait seven days after a release** (Update applies at once), config
+  defaults apply until you save a value, git MCPs at a pinned commit update weekly, the
+  Docker tool filter works, PyPI takes extras.
+- **An older server refuses a database a newer release migrated**
+  (`OTODOCK_ALLOW_NEWER_DATABASE` overrides), a yes/no setting written 1, yes or on counts
+  as on, another word stops the start, and backups now hold the tree.
+- **Proxy log lines name `otodock`,** not `claude-proxy`, and `MAX_PARALLEL_SPAWNS` 0 on a
+  delegation MCP allows no workers: clear it for four.
+
+### Added
+- **Calls end and transfer by tool:** `end_call`, `transfer_call` to colleagues and, on
+  another agent's call, `ask_initiating_agent`. The default call prompts say so, a prompt
+  you never edited takes the new text, and the AMI block keeps `call`.
+- **Calls can follow the caller's language.** A route option identifies it on the first
+  words and switches the voice, the route form keeps rare fields under Advanced and can
+  pin one voice, and dictation gains an Automatic language.
+- **A call placed from your chat runs inside it.** On a route tied to you the person's
+  words arrive as messages, the agent speaks back, then the chat resumes.
+- **Pictures and files an MCP returns reach the chat,** saved in your workspace and shown
+  with the result's text. MCP results show their text on Claude again.
+- **Back up and restore the whole install by script.** One dated folder holds the
+  database, env, agents, SSH keys and accounts, restore refuses a newer one, and the
+  installer checks the free disk before it pulls images.
+- **Admins see the version and new releases:** a daily check (off with
+  `OTODOCK_RELEASE_CHECK`) names a newer release, and a dialog shows what is new.
+- **Folders upload whole,** dropped or picked, in the workspace and the chat.
+- **An outbound call can ask for a PIN.** On a route tied to you the person who answers
+  enters it before the agent speaks, and wrong codes end the call. A switch saves a call's
+  outgoing audio (WAV, ten kept), never the caller's.
+- **Claude Haiku 5.5** on Claude Code and Direct LLM: 1M context, adaptive thinking, a
+  twentieth of Sonnet's price up to 100K-token prompts, five times that above. GPT-5.6
+  Terra and GPT-6 Luna get a 1.05M window on Direct LLM, and prompts past 272K tokens cost
+  OpenAI's long-context rate on both engines.
+
+### Fixed
+- **Paired machines sync safely again.** Windows machines send files back (broken since
+  1.7.1) and files the bug dropped return once the machine updates, a file a machine
+  cannot read never counts as deleted, and agents made there validate when written.
+- **Calls repeat nothing and lose nothing.** A first call keeps its start, a transfer
+  survives the hangup, Greek dictation shows at once, an unserved call hears an apology,
+  the log says who hung up, and a call on a Codex agent with MCP credentials starts.
+- **Messages you send are kept, in order.** Sends typed while a chat gets ready go out
+  after its first message, and voice, phone and meeting turns wait.
+- **Delegated workers report when done.** A run waits for its background work, a stuck
+  permission ends in ten minutes, and a Stop ends the run at once, reported as stopped.
+- **Checks that cannot decide refuse.** A task run or call lists no phone chats, a
+  delegation trusts only its token, a password change ends cached checks.
+- **The dashboard is steadier.** Fields keep their size on phones, the map shows only what
+  you may see, a document saves at once and reloads after idling, a waiting permission
+  card pings you, and the file browser shows synced and uploaded files.
+- **Sessions follow what you set up.** Claude and Codex read each repository's instruction
+  file, a retired model runs on its successor, task runs see the time.
+- **Also fixed:** the recover bin survives an upgrade on its own volume, a cut-off
+  satellite update no longer reads rolled back, Sonnet 5.5 cache reads cost $0.10, a paste
+  from Word, Excel or LibreOffice keeps its text, and a sandbox probe the host never
+  answers no longer hangs the start.
+
+### Security
+- **GitHub tokens leave the agent's environment** ([GHSA-9m79-q4pv-8hfj][1.8.0-ghsa],
+  thanks to @jourasharsy). git and gh fetch the account's token per command, and a
+  disconnected account stops on paired machines too.
+- **A session cannot change what judges its tools:** its hook files are read-only in the
+  sandbox, the floor refuses `rm -rf / x` on every engine and mode, a `/sys` write asks
+  instead over `ssh` and on a full-access machine, the pool account's claude.ai connectors
+  no longer load, and a permission hook that cannot run denies the call.
+- **The file tools take cairosvg 2.9.1** (CVE-2026-107378).
+- **Showing, sending, saving or editing a file keeps to the session's role and person.**
+- **Release images carry a signed provenance and an SBOM**, and each is booted before its
+  tag is written. `gh attestation verify` checks them (SECURITY.md).
+- **Sign-ins are single-use:** a 2FA code is good once, restarts too, a double sign-in
+  opens one session, and an account connect finishes in its own browser.
+- **Outbound calls reach the address they checked.** App egress, webhooks, event lookups
+  and Web Push resolve a host once, public only, an egress proxy kept.
+- **Document tokens are narrower.** A token opens only its own push's document, and the
+  editor refuses a sign-in signed out everywhere or due a new password.
+
+[1.8.0-ghsa]: https://github.com/OtoDock/oto-dock/security/advisories/GHSA-9m79-q4pv-8hfj
+
 ## [1.7.1] — 2026-10-07
 
 ### Added
@@ -959,7 +1047,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.7.1...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/OtoDock/oto-dock/compare/v1.7.1...v1.8.0
 [1.7.1]: https://github.com/OtoDock/oto-dock/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/OtoDock/oto-dock/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/OtoDock/oto-dock/compare/v1.6.0...v1.6.1

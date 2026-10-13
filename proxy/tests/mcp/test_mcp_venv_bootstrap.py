@@ -362,16 +362,17 @@ async def test_interpreter_stale_rebuilds_pinned_and_marks(fake_mcps_root):
     future = time.time() + 60
     os.utime(venv, (future, future))
 
-    with patch("services.mcp.mcp_venv_bootstrap._uv_bin_if_present", return_value="/fake/uv"), \
-         patch("services.mcp.mcp_venv_bootstrap._uv_venv_pinned", new_callable=AsyncMock) as pin, \
+    spec = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    with patch("services.mcp.mcp_venv_bootstrap.find_uv", return_value="/fake/uv"), \
          patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
-               return_value=InstallResult(ok=True, log="ok", version_hash="h")) as inst:
+               return_value=InstallResult(ok=True, log="ok", version_hash="h",
+                                          venv_python=spec)) as inst:
         results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
 
     assert results == {"py-mcp": "ok-py-reconcile"}
-    pin.assert_awaited_once()            # rebuild was pinned to the proxy interpreter
     inst.assert_awaited_once()
-    assert not venv.exists()             # old venv removed (pin + install are mocked)
+    assert inst.await_args.kwargs["python_spec"] == spec   # pinned to the proxy
+    assert not venv.exists()             # old venv removed (the install is mocked)
     marker = json.loads((mcp_dir / mcp_venv_bootstrap._RUNTIME_MARKER).read_text())
     assert marker["python"] == f"{sys.version_info[0]}.{sys.version_info[1]}"
 
@@ -537,8 +538,7 @@ async def test_python_requirements_build_runs_for_platform_shipped_folders_only(
                       {"name": f"py-{cat}", "server": {"runtime": "python"}})
         (d / "requirements.txt").write_text("--extra-index-url https://evil.example\nx\n")
         _write_pyvenv(d / "venv", sys.version_info[0], sys.version_info[1] - 1)
-    with patch("services.mcp.mcp_venv_bootstrap._uv_venv_pinned", new_callable=AsyncMock), \
-         patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=True, log="ok", version_hash="h")) as inst:
         results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
     assert [c.args[0].parent.name for c in inst.await_args_list] == ["custom"]
@@ -614,22 +614,218 @@ async def test_a_hung_npm_rebuild_is_killed_and_retried_next_boot(fake_mcps_root
     assert not [p for p in pids.read_text().split() if _alive(int(p))]
 
 
+
+
+# ───── the first venv, a failed pin, a venv outside the sandbox, the prune ─────
+
+
+_SPEC = f"{sys.version_info[0]}.{sys.version_info[1]}"
+
+
+def _custom_py(root: Path, name: str = "py-mcp") -> Path:
+    d = _make_mcp(root, "custom", name, {"name": name, "server": {"runtime": "python"}})
+    (d / "requirements.txt").write_text("requests==2.31\n")
+    return d
+
+
+def _marker(mcp_dir: Path) -> dict:
+    return json.loads((mcp_dir / mcp_venv_bootstrap._RUNTIME_MARKER).read_text())
+
+
 @pytest.mark.asyncio
-async def test_uv_venv_pinned_runs_under_the_installers_environment(tmp_path, monkeypatch):
-    """The pin sees the installer's environment: no platform secret, but the
-    names that say where an interpreter or a package comes from."""
-    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db/x")
-    monkeypatch.setenv("UV_PYTHON_INSTALL_MIRROR", "https://mirror.example/python")
-    monkeypatch.setenv("UV_DEFAULT_INDEX", "https://pypi.example/simple")
-    fake = AsyncMock()
-    fake.communicate = AsyncMock(return_value=(b"", None))
-    fake.returncode = 0
-    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake) as spawn:
-        await mcp_venv_bootstrap._uv_venv_pinned(
-            "/usr/bin/uv", tmp_path / "m" / "venv", (3, 13), tmp_path / "m")
-    env = spawn.await_args.kwargs["env"]
-    assert "DATABASE_URL" not in env
-    assert env["UV_NO_CONFIG"] == "1" and env["UV_LINK_MODE"] == "copy"
-    assert env["UV_PYTHON_INSTALL_DIR"].endswith(".uv-python")
-    assert env["UV_PYTHON_INSTALL_MIRROR"] == "https://mirror.example/python"
-    assert env["UV_DEFAULT_INDEX"] == "https://pypi.example/simple"
+async def test_the_first_venv_is_pinned_to_the_proxy_and_inside_the_sandbox(fake_mcps_root):
+    mcp_dir = _custom_py(fake_mcps_root)
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", venv_python=_SPEC)) as inst:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert results == {"py-mcp": "ok"}
+    kw = inst.await_args.kwargs
+    assert kw["python_spec"] == _SPEC
+    roots = kw["sandbox_roots"]
+    assert (fake_mcps_root.resolve() / ".uv-python") in roots
+    assert mcp_dir.resolve() in roots and Path("/usr").resolve() in roots
+    assert _marker(mcp_dir)["python"] == _SPEC
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pin_is_recorded_and_waits_a_day(fake_mcps_root, caplog):
+    mcp_dir = _custom_py(fake_mcps_root)
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", venv_python="")):
+        assert await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup() == {"py-mcp": "ok"}
+    marker = _marker(mcp_dir)
+    assert "python" not in marker
+    assert marker["python_pin_failed"]["target"] == _SPEC
+
+    # The next start finds the venv on an older interpreter: left alone today.
+    _write_pyvenv(mcp_dir / "venv", sys.version_info[0], sys.version_info[1] - 1)
+    import os
+    future = time.time() + 60
+    os.utime(mcp_dir / "venv", (future, future))
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock) as inst:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert results == {"py-mcp": "fresh"}
+    inst.assert_not_awaited()
+    assert "tried again a day later" in caplog.text
+
+    # A day later it is tried again.
+    from datetime import datetime, timedelta, timezone
+    marker = _marker(mcp_dir)
+    marker["python_pin_failed"]["at"] = (
+        datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    (mcp_dir / mcp_venv_bootstrap._RUNTIME_MARKER).write_text(json.dumps(marker))
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", venv_python=_SPEC)) as inst:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert results == {"py-mcp": "ok-py-reconcile"}
+    assert _marker(mcp_dir)["python"] == _SPEC
+    assert "python_pin_failed" not in _marker(mcp_dir)
+
+
+def _outside_venv(mcp_dir: Path, tmp_path: Path) -> None:
+    venv = mcp_dir / "venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    elsewhere = tmp_path / "home" / ".local" / "share" / "uv" / "python" / "bin"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "python3.13").write_text("")
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {elsewhere}\nversion_info = {sys.version_info[0]}.{sys.version_info[1]}.0\n")
+    (venv / "bin" / "python").symlink_to(elsewhere / "python3.13")
+    (venv / "lib" / "python3.13" / "site-packages" / "x-1.dist-info").mkdir(parents=True)
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_venv_outside_the_sandbox_is_relocated(fake_mcps_root, tmp_path):
+    mcp_dir = _custom_py(fake_mcps_root)
+    _outside_venv(mcp_dir, tmp_path)
+    import os
+    future = time.time() + 60
+    os.utime(mcp_dir / "venv", (future, future))
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", venv_python=_SPEC)) as inst:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert results == {"py-mcp": "ok-py-relocate"}
+    inst.assert_awaited_once()
+    assert not (mcp_dir / "venv").exists()  # removed before the (mocked) rebuild
+
+
+@pytest.mark.asyncio
+async def test_a_community_venv_outside_the_sandbox_is_only_reported(fake_mcps_root, tmp_path, caplog):
+    d = _make_mcp(fake_mcps_root, "community", "pkg-mcp",
+                  {"name": "pkg-mcp", "server": {"runtime": "python", "source": "pypi:x@1"}})
+    _outside_venv(d, tmp_path)
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock) as inst:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert results == {"pkg-mcp": "skipped-community-python"}
+    inst.assert_not_awaited()
+    assert "offers its rebuild" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_pass_ends_with_the_interpreter_prune(fake_mcps_root):
+    with patch("services.mcp.mcp_installer.prune_uv_pythons", return_value=["cpython-3.11"]) as prune:
+        await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    prune.assert_called_once_with(fake_mcps_root)
+
+
+def test_uv_is_found_on_path_last(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_venv_bootstrap.os.path, "expanduser", lambda p: str(tmp_path / "none"))
+    real_isfile = mcp_venv_bootstrap.os.path.isfile
+    monkeypatch.setattr(mcp_venv_bootstrap.os.path, "isfile",
+                        lambda p: False if p in ("/usr/local/bin/uv", "/usr/bin/uv") else real_isfile(p))
+    monkeypatch.setattr(mcp_venv_bootstrap.shutil, "which",
+                        lambda n: "/opt/homebrew/bin/uv" if n == "uv" else None)
+    assert mcp_venv_bootstrap.find_uv() == "/opt/homebrew/bin/uv"
+
+
+def test_the_interpreter_roots_are_the_sandbox_system_binds():
+    from core.sandbox import sandbox
+    binds = set(sandbox._SYSTEM_RO_BINDS) | set(sandbox._SYSTEM_RO_OPTIONAL)
+    assert set(mcp_venv_bootstrap._SYSTEM_INTERPRETER_ROOTS) == binds - {"/snap/bin"}
+
+
+class TestStartFailureCause:
+    def _manifest(self, mcp_dir: Path, runtime: str, command: str = ""):
+        from types import SimpleNamespace
+        return SimpleNamespace(name=mcp_dir.name, mcp_dir=mcp_dir,
+                               server=SimpleNamespace(runtime=runtime, command=command))
+
+    def test_a_missing_venv(self, fake_mcps_root):
+        d = _custom_py(fake_mcps_root)
+        assert mcp_venv_bootstrap.start_failure_cause(
+            self._manifest(d, "python", "venv/bin/python")) == "its venv/ is missing"
+
+    def test_an_interpreter_outside_the_sandbox(self, fake_mcps_root, tmp_path):
+        d = _custom_py(fake_mcps_root)
+        _outside_venv(d, tmp_path)
+        cause = mcp_venv_bootstrap.start_failure_cause(self._manifest(d, "python", "venv/bin/python"))
+        assert "outside the folders the session sandbox binds" in cause
+
+    def test_node_modules_missing(self, fake_mcps_root):
+        d = _make_mcp(fake_mcps_root, "community", "n", {"name": "n"})
+        (d / "package.json").write_text("{}")
+        assert mcp_venv_bootstrap.start_failure_cause(self._manifest(d, "node", "node")) \
+            == "its node_modules/ is missing"
+
+    def test_nothing_wrong(self, fake_mcps_root):
+        d = _custom_py(fake_mcps_root)
+        _write_pyvenv(d / "venv", sys.version_info[0], sys.version_info[1])
+        assert mcp_venv_bootstrap.start_failure_cause(self._manifest(d, "python", "venv/bin/python")) \
+            == "its command venv/bin/python is missing"
+        (d / "venv" / "bin").mkdir()
+        (d / "venv" / "bin" / "python").symlink_to("/usr/bin/env")
+        assert mcp_venv_bootstrap.start_failure_cause(self._manifest(d, "python", "venv/bin/python")) == ""
+
+    def test_each_cause_is_logged_once(self, fake_mcps_root, caplog, monkeypatch):
+        monkeypatch.setattr(mcp_venv_bootstrap, "_causes_logged", set())
+        d = _custom_py(fake_mcps_root)
+        m = self._manifest(d, "python", "venv/bin/python")
+        mcp_venv_bootstrap.log_start_failures([m, m])
+        mcp_venv_bootstrap.log_start_failures([m])
+        assert caplog.text.count("MCP py-mcp failed to start: its venv/ is missing") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_cli_session_reports_why_a_failed_mcp_did_not_start(fake_mcps_root, caplog, monkeypatch):
+    """The init frame names failed MCPs by their config key; the session maps
+    them to manifests and logs the cause the folder shows."""
+    from types import SimpleNamespace
+    from core.layers.cli import session as cli_session
+    from services.mcp import mcp_registry
+    monkeypatch.setattr(mcp_venv_bootstrap, "_causes_logged", set())
+    d = _custom_py(fake_mcps_root, "camo")
+    m = SimpleNamespace(name="camo", mcp_dir=d,
+                        server=SimpleNamespace(runtime="python", command="venv/bin/python"))
+    monkeypatch.setattr(mcp_registry, "get_manifest_by_config_key",
+                        lambda key: m if key == "playwright" else None)
+    await cli_session.PersistentSession._log_mcp_start_failures(["playwright", "unknown"])
+    assert "MCP camo failed to start: its venv/ is missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rebuild_leaves_no_venv_reading_fresh(fake_mcps_root, tmp_path):
+    """The success mark goes before the venv: a rebuild whose install fails
+    is stale at the next start, not an empty venv read as fresh."""
+    mcp_dir = _custom_py(fake_mcps_root)
+    _outside_venv(mcp_dir, tmp_path)
+    mcp_venv_bootstrap._write_marker(
+        mcp_dir, requirements_sha256=mcp_venv_bootstrap._requirements_hash(mcp_dir / "requirements.txt"),
+        python=_SPEC)
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=False, log="network down")):
+        assert await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup() == {"py-mcp": "failed"}
+    marker = _marker(mcp_dir)
+    assert "requirements_sha256" not in marker and "python" not in marker
+    (mcp_dir / "venv").mkdir(exist_ok=True)   # what the failed install left behind
+    assert mcp_venv_bootstrap._venv_is_stale(mcp_dir / "requirements.txt", mcp_dir / "venv", mcp_dir)
+
+
+@pytest.mark.asyncio
+async def test_without_uv_a_venv_reads_reconciled_and_is_not_rebuilt_daily(fake_mcps_root, monkeypatch):
+    mcp_dir = _custom_py(fake_mcps_root)
+    monkeypatch.setattr(mcp_venv_bootstrap, "find_uv", lambda: None)
+    with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", venv_python="")):
+        assert await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup() == {"py-mcp": "ok"}
+    marker = _marker(mcp_dir)
+    assert marker["python"] == _SPEC and "python_pin_failed" not in marker

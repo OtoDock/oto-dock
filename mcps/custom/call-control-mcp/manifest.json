@@ -1,0 +1,45 @@
+{
+  "name": "call-control-mcp",
+  "server_name": "call-control",
+  "label": "Call controls",
+  "description": "The call tools of a phone session: end the call, hand the caller to a colleague configured on the line, ask the agent that placed the call. Attached to every call by the platform; assigned to no agent.",
+  "version": "1.0.0",
+  "category": "core",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": [
+      "server.py"
+    ]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {
+    "OTO_CALL_ASK_BACK": "${session.call_ask_back}"
+  },
+  "assignment_mode": "explicit",
+  "exclude_from": [],
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "end_call",
+        "tier": "open"
+      },
+      {
+        "tool": "transfer_call",
+        "tier": "open"
+      },
+      {
+        "tool": "ask_initiating_agent",
+        "tier": "open"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

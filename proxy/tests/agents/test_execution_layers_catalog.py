@@ -148,6 +148,37 @@ class TestAutoModel:
         assert entry["auto_model_label"] and entry["auto_model_label"] != declared
 
 
+class TestModelSuccessors:
+    """Each engine names the retired ids whose successor it offers, so the
+    chat page maps a sticky pick (or a stale agent default) through it."""
+
+    def test_an_engine_lists_the_retired_ids_it_offers_a_successor_for(self, client, temp_db):
+        import config
+        catalog = _catalog(client)
+        for layer, entry in catalog.items():
+            offered = {m["value"] for m in entry["models"] if m["value"]}
+            assert entry["model_successors"] == {
+                old: config.successor_model(old) for old in config.MODEL_SUCCESSORS
+                if config.successor_model(old) in offered
+            }, layer
+        # The chain's end, whatever the link: Opus 4.8 and Opus 5 both name 5.5.
+        assert catalog["claude-code-cli"]["model_successors"]["claude-opus-4-8[1m]"] == "claude-opus-5-5"
+        assert catalog["claude-code-cli"]["model_successors"]["claude-opus-5"] == "claude-opus-5-5"
+
+    def test_a_retired_id_an_admin_re_added_is_not_mapped(self, client, temp_db):
+        from storage.billing import subscription_store
+        subscription_store.add_model("claude-code-cli", "claude-opus-5", "Opus 5 (kept)",
+                                     provider="anthropic")
+        entry = _catalog(client)["claude-code-cli"]
+        assert "claude-opus-5" not in entry["model_successors"]
+        assert entry["model_successors"]["claude-opus-4-8[1m]"] == "claude-opus-5-5"
+
+    def test_a_successor_the_engine_does_not_offer_is_left_out(self, client, temp_db):
+        _set_enabled("claude-code-cli", "claude-opus-5-5", False)
+        entry = _catalog(client)["claude-code-cli"]
+        assert "claude-opus-5" not in entry["model_successors"]
+
+
 class TestResolverFactoring:
     def test_agent_resolution_and_layer_resolution_agree_for_an_unpinned_agent(self, client, temp_db):
         import config

@@ -203,6 +203,44 @@ async def test_a_timeout_kills_the_script_and_a_dropped_link_kills_them_all(sat)
 
 
 @pytest.mark.asyncio
+async def test_a_timeout_signals_the_whole_group_and_a_trap_still_runs(sat):
+    """The timeout's SIGTERM reaches the shell and its child together (a
+    child-first walk let the shell run its next line on a loaded machine);
+    a script that traps it cleans up, as on the local run, and one that
+    ignores it is killed after the grace."""
+    cfg, agents = sat
+    sm = SessionManager(cfg)
+    ws = _WS()
+    script = "#!/bin/sh\ntrap 'echo cleaned; exit 3' TERM\necho start\nsleep 30 &\nwait\necho never\n"
+    await sm.step_run(_frame(script, timeout=1), ws)
+    ack = ws.ack()
+    assert ack["timed_out"] is True and "cleaned" in ack["output"] and "never" not in ack["output"]
+    ws2 = _WS()
+    started = asyncio.get_running_loop().time()
+    await sm.step_run(_frame("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n", timeout=1), ws2)
+    assert ws2.ack()["timed_out"] is True and asyncio.get_running_loop().time() - started < 15
+    assert sm._steps == {}
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_link_ends_a_script_that_ignores_term(sat):
+    """The link's SIGTERM is followed by SIGKILL after the grace, as at the
+    timeout: a script cannot outlive the link by trapping TERM."""
+    cfg, agents = sat
+    sm = SessionManager(cfg)
+    ws = _WS()
+    task = asyncio.create_task(sm.step_run(
+        _frame("#!/bin/sh\ntrap '' TERM\necho armed\nwhile :; do sleep 1; done\n", timeout=600), ws))
+    for _ in range(100):
+        if sm._steps and "armed" in ws.output():
+            break
+        await asyncio.sleep(0.05)
+    assert sm.kill_steps("test") == 1
+    await asyncio.wait_for(task, timeout=15)
+    assert ws.ack()["exit_code"] not in (0, None) and sm._steps == {}
+
+
+@pytest.mark.asyncio
 async def test_the_scripts_exit_is_the_verdict_and_nothing_it_left_behind_survives(sat):
     """A child left holding the pipe neither stretches the run to its
     timeout nor outlives it: the verdict is the script's own exit."""

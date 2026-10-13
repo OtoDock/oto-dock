@@ -307,6 +307,25 @@ def test_last_signal_end_turn_and_mid_turn(tmp_path, _capture):
     assert C.tail_rollout("sls3", "cls3", str(p2))["last_signal"] == "tool_use"
 
 
+def test_the_signal_carries_its_lines_own_time(tmp_path, _capture):
+    """``last_signal_at`` is the journal time of the line behind the signal
+    (the clock of the host Codex runs on): a terminal parked on a dialog
+    compares it with the gate's own stamp."""
+    from datetime import datetime
+    path = tmp_path / "r-ts.jsonl"
+    path.write_text(
+        _meta("tidts1")
+        + _line({"timestamp": "2026-10-09T01:00:00.000Z", "type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}})
+        + _line({"timestamp": "2026-10-09T01:00:02.500Z", "type": "response_item", "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Working"}]}})
+    )
+    stats = C.tail_rollout("sts1", "cts1", str(path))
+    assert stats["last_signal"] == "tool_use"
+    assert stats["last_signal_at"] == datetime.fromisoformat("2026-10-09T01:00:02.500+00:00").timestamp()
+
+
 def test_last_signal_none_for_non_turn_batch(tmp_path, _capture):
     # session_meta / reasoning items aren't turn-relevant — last_signal stays None.
     path = _write(

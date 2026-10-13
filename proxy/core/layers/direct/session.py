@@ -14,6 +14,7 @@ Architecture:
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -80,6 +81,9 @@ class DirectSession:
         # _apply_deferred_tools once the MCP tool list is known; None means
         # every tool is resident (deferral off / below the threshold).
         self.catalog = None
+        # Set by an accepted end_call / transfer_call builtin: the tool loop
+        # ends the turn after the tool result instead of calling the model.
+        self.line_closing: bool = False
 
         # Populate tools from MCP manager
         if mcp_manager:
@@ -182,15 +186,6 @@ _direct_sessions: dict[str, DirectSession] = {}
 _direct_sessions_lock = asyncio.Lock()
 
 
-async def active_agent_names() -> set[str]:
-    """Agent slugs with a pooled direct-API session (mirrors the cli/codex
-    enumerators; a DirectSession has no subprocess to die, so pool membership
-    IS liveness). Consumed by the agents-map activity pulse."""
-    async with _direct_sessions_lock:
-        return {s.agent_name for s in _direct_sessions.values()
-                if getattr(s, "agent_name", "")}
-
-
 async def create_direct_session(
     session_id: str,
     agent_name: str,
@@ -204,6 +199,8 @@ async def create_direct_session(
     enable_http_transport: bool = False,
     tool_timeout: int = TOOL_CALL_TIMEOUT,
     external: bool = False,
+    call_tools: bool = False,
+    call_ask_back: bool = False,
 ) -> DirectSession:
     """Create a new direct session with MCP servers started.
 
@@ -215,6 +212,8 @@ async def create_direct_session(
             (``layer.direct_mcp_policy``) — sidecar HTTP MCPs + the chat
             call cap for chats, tasks and meetings; stdio-only + 60 s for
             phone calls.
+        call_ask_back: a phone session on an outbound call another agent
+            placed: the ask tool joins the call tools.
     """
     if not system_prompt:
         # Fallback: basic prompt without user/permission context (phone path, etc.)
@@ -248,6 +247,14 @@ async def create_direct_session(
     )
     if api_key:
         session.api_key = api_key
+    # The call tools: on a phone session when the builder says the daemon
+    # acts on them (an older daemon keeps the markers, so the model must not
+    # see a tool nothing answers); in a chat of an agent that places calls
+    # (phone-mcp among its servers) as the companion of an outbound call
+    # that runs inside the chat. The CLI engines carry them through the
+    # call-control MCP, which a direct session never attaches.
+    if call_tools_wanted(phone_mode, call_tools, has_phone_mcp=_has_phone_mcp(session)):
+        session.tools.extend(direct_builtins.call_tool_defs(ask_back=phone_mode and call_ask_back))
     # The MCP tool list is known only now (the prompt was built before the
     # servers started), so the deferred-tools split + catalog addendum
     # happen here, before the session is visible to anyone.
@@ -265,6 +272,33 @@ async def create_direct_session(
         f"tools≈{tool_catalog.estimate_tokens(session.tools)} tokens)"
     )
     return session
+
+
+def call_tools_wanted(phone_mode: bool, call_tools: bool, *, has_phone_mcp: bool) -> bool:
+    """Whether a direct session registers ``end_call`` and ``transfer_call``:
+    a phone session only on the builder's word (the daemon's capability),
+    a chat session of a phone-mcp agent always (its in-session calls)."""
+    if phone_mode:
+        return call_tools
+    return has_phone_mcp
+
+
+def _has_phone_mcp(session) -> bool:
+    """Whether the phone MCP is among the session's servers (its mcpServers
+    key is its manifest's server name)."""
+    manager = session.mcp_manager
+    if manager is None:
+        return False
+    try:
+        from services.mcp import mcp_registry
+        from services.phone.call_control import PHONE_MCP
+        manifest = mcp_registry.get_manifest(PHONE_MCP)
+    except Exception:
+        return False
+    if manifest is None:
+        return False
+    key = getattr(manifest, "server_name", "") or manifest.name
+    return key in getattr(manager, "servers", {})
 
 
 def _registry_facts() -> tuple[set[str], dict[str, list[str]]]:
@@ -370,6 +404,41 @@ async def reap_idle_direct_sessions() -> None:
             await _reap_idle_direct_pass()
         except Exception as e:
             logger.error(f"Direct session reaper error: {e}")
+
+
+_BINARY_PLACEHOLDER_RE = re.compile(r"^\[binary data: [^\]\n]*\]\n?", re.M)
+
+
+# A model sees at most this many of one result's kept pictures: every one
+# rides the session's history into each later request.
+_RESULT_PICTURES_SHOWN = 4
+
+
+async def _keep_result_files(session_id: str, tool_calls: list[dict], results: list[dict], *,
+                             with_pictures: bool) -> None:
+    """Hand each MCP result's image blocks and embedded resources to
+    ``services/mcp/result_files`` (back on the main loop: the MCP manager
+    ran the tools on its own); a kept result's ``[binary data]`` lines give
+    way to the line naming the saved files and, ``with_pictures``, the chat
+    copies of its pictures ride as the result's ``images`` (the adapter
+    places them inside the tool result)."""
+    by_id = {tc["id"]: tc for tc in tool_calls}
+    for result in results:
+        blocks = result.pop("file_blocks", None)
+        if not blocks:
+            continue
+        from services.mcp import result_files
+        name = (by_id.get(result["tool_use_id"]) or {}).get("name") or ""
+        content = str(result.get("content") or "")
+        text = _BINARY_PLACEHOLDER_RE.sub("", content).strip()
+        kept = await result_files.keep_blocks(
+            session_id, name, blocks, text, is_error=content[:6].lower().startswith("error"),
+        )
+        if kept is None:
+            continue
+        result["content"] = "\n".join(t for t in (text, kept.line) if t) or "(empty result)"
+        if with_pictures and kept.vision:
+            result["images"] = kept.vision[:_RESULT_PICTURES_SHOWN]
 
 
 async def run_direct_stream(
@@ -742,6 +811,13 @@ async def run_direct_stream(
                         "content": reason,
                     })
 
+                # The pictures and files of a tool its MCP opts in
+                # (``result_files``): kept and shown, the saved paths named
+                # in the tool's text, the pictures beside it for a model the
+                # adapter shows them to.
+                await _keep_result_files(session.session_id, tool_calls, results,
+                                         with_pictures=adapter.tool_result_images)
+
                 # The turn's record (session_events.post_tool) — the direct
                 # placement's ONE source, denied calls included (flagged).
                 from core.session import session_events as _events
@@ -773,6 +849,12 @@ async def run_direct_stream(
                 result_messages = adapter.format_tool_results(results)
                 session.messages.extend(result_messages)
 
+                if session.line_closing:
+                    # The daemon accepted an end or a transfer: the line
+                    # closes as the farewell drains, so a model call after
+                    # the tool result would only be transcript.
+                    session.line_closing = False
+                    break
                 tool_calls = []
                 continue
 

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import functools
 import logging
+import os
 import random
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -124,14 +125,38 @@ def _background_manifest_gate() -> asyncio.Semaphore:
 _MANIFEST_PAGE_SIZE = 4096
 
 
-def manifest_request(cm, machine_id: str, agent_slug: str) -> dict:
+def manifest_request(cm, machine_id: str, agent_slug: str, *,
+                     report_skipped: bool = False) -> dict:
     """The ``request_manifest`` frame for ``machine_id``: paged when the
     satellite pages (asking an older one would be ignored, and an older
-    proxy never asks, so the wire stays compatible both ways)."""
+    proxy never asks, so the wire stays compatible both ways).
+    ``report_skipped`` asks a 0.5.145 satellite to list what it could not
+    read as entries with ``skipped`` and no hash (only the merge reads
+    those; the caller checks the satellite's version)."""
     msg = {"type": "request_manifest", "agent_slug": agent_slug}
     if cm.satellite_supports_paged_manifest(machine_id):
         msg["page_size"] = _MANIFEST_PAGE_SIZE
+    if report_skipped:
+        msg["report_skipped"] = True
     return msg
+
+
+def _keep_mtime(agent_slug: str, rel_path: str, mtime: float) -> None:
+    """Give a just-pulled platform copy the mtime its machine gave it (a
+    restore: the pull's own time would make old bytes look newest). Opened
+    beneath the agents root with no component followed; best-effort."""
+    import config as _cfg
+    from services.infra import safe_fs
+    try:
+        fd = safe_fs.open_beneath(_cfg.AGENTS_DIR, f"{agent_slug}/{rel_path}", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.utime(fd, (mtime, mtime))
+    except OSError as e:
+        logger.debug("keep_mtime: %s/%s kept the pull's time: %s", agent_slug, rel_path, e)
+    finally:
+        os.close(fd)
 
 
 def _platform_bytes(agent_dir, rel_path: str) -> bytes | None:
@@ -432,6 +457,9 @@ class RemoteWorkspaceSyncMixin:
                         )
                         continue
                     pulled += 1
+                    if action.keep_mtime is not None:
+                        await _asyncio.to_thread(
+                            _keep_mtime, agent_slug, rp, action.keep_mtime)
                     if action.base_hash:
                         try:
                             base_mtime = dest.stat().st_mtime
@@ -545,10 +573,17 @@ class RemoteWorkspaceSyncMixin:
                     # must apply the same rules or the diff churns.
                     ignore_rules=self._cm.effective_ignore_rules(machine_id),
                 )
+            # What the manifest can be trusted with is the asked connection's
+            # (a satellite updating mid-merge answers on a new one: a check
+            # after the reply would judge this manifest by that version).
+            report_skipped = self._cm.satellite_supports_skipped_manifest(machine_id)
+            absence_unknown = self._cm.satellite_absence_unreliable(machine_id)
+            restore_holds = self._cm.satellite_restores_holds(machine_id)
             try:
                 ack = await self._cm.send_command(
                     machine_id,
-                    manifest_request(self._cm, machine_id, agent_slug),
+                    manifest_request(self._cm, machine_id, agent_slug,
+                                     report_skipped=report_skipped),
                     timeout=30.0,
                 )
             except Exception as e:
@@ -558,6 +593,10 @@ class RemoteWorkspaceSyncMixin:
                 )
                 return
             remote_entries = ack.get("files", []) or []
+            if not report_skipped:
+                # Only an asked satellite may answer an entry without a hash.
+                remote_entries = [e for e in remote_entries
+                                  if not (isinstance(e, dict) and e.get("skipped"))]
             remote_size = {
                 e.get("path", ""): int(e.get("size", 0) or 0)
                 for e in remote_entries
@@ -570,6 +609,9 @@ class RemoteWorkspaceSyncMixin:
             )
             tombstones = await _asyncio.to_thread(
                 file_tombstones_store.load_for_agent, agent_slug,
+            )
+            holds = await _asyncio.to_thread(
+                file_tombstones_store.load_holds_for_agent, agent_slug,
             )
             clock_offset = self._cm.get_clock_offset(machine_id)
             satellite_user = target_username or ""  # the satellite-side writer (slug)
@@ -634,6 +676,9 @@ class RemoteWorkspaceSyncMixin:
                     writable_libraries=writable_libraries,
                     scrub_dirs=_lib_ro,
                     knowledge_rw=session_knowledge_rw,
+                    absence_unknown=absence_unknown,
+                    holds=holds,
+                    restore_holds=restore_holds,
                 )
 
             # Sync-delta telemetry (alert-only, never blocks or filters the
@@ -823,6 +868,9 @@ class RemoteWorkspaceSyncMixin:
                             return
                         n["pull"] += 1
                         pulled_to_platform = True
+                        if action.keep_mtime is not None:
+                            await _asyncio.to_thread(
+                                _keep_mtime, agent_slug, rp, action.keep_mtime)
                         if action.base_hash:
                             try:
                                 base_mtime = dest.stat().st_mtime

@@ -37,12 +37,19 @@ from services.phone.phone_identity import (
     RouteIdentity, resolve_route_identity,
     remember_call_identity, pop_call_identity,  # noqa: F401 — re-exported for the handler + tests
 )
+from services.phone import call_control
+from ws import phone_attach
+from adapters.phone import is_outbound
 from core.session import session_kind
 from core.session.visibility import PHONE_CHAT_OWNER
 from ws import wire_events as wire
 from core.events import common_events as _ce
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
+
+# Another turn starter bringing the call's chat a turn (a stored wake's
+# replay): how long a caller's turn waits for it.
+_CLAIM_WAIT_S = 5.0
 
 
 def _validated_reuse_sid(existing_sid, agent_name: str) -> str:
@@ -262,11 +269,18 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
     call_type: str = "inbound"
     phone_context_override: str = ""
     phone_mode = False
+    # The daemon understands ``call_control`` frames (its warmup says so):
+    # the session carries the call tools instead of the markers alone.
+    call_tools = False
+    transfer_targets: list[dict] = []
     trigger_payload: dict | None = None
     # Who the caller IS on this call (services/phone/phone_identity.py) — the
     # heal rebuilds the same identity; the teardown prunes an ephemeral tree.
     route_identity: RouteIdentity | None = None
     ephemeral_home: str = ""
+    # A call that runs inside the caller's own chat (ws/phone_attach.py):
+    # the socket borrows the chat's session instead of warming one.
+    attach: phone_attach.CallAttach | None = None
 
     # Turns stream from tasks so this receive loop stays responsive to
     # "abort" (barge-in) and follow-up "chat" while a turn is in flight.
@@ -280,12 +294,37 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
         async with send_lock:
             await websocket.send_json(payload)
 
+    async def _close() -> None:
+        """The attach's terminal signal to the daemon: its socket closes (the
+        receive loop below then ends and the teardown runs)."""
+        with contextlib.suppress(Exception):
+            await websocket.close(code=1000)
+
     async def _run_turn(turn_id: int, prompt: str, barge_in_chars) -> None:
         """Run one chat turn: producer -> pump -> WS frames stamped with turn_id."""
         nonlocal first_turn, interrupted_last_turn
         producer: asyncio.Task | None = None
         t_sent = time.monotonic()   # sent→first_text: the engine leg, proxy-side
+        from core.events import input_queue
+        queue = input_queue.get(chat_id)
+        claim = None
         try:
+            # The chat's turn starters take turns: the call waits a moment
+            # for another one bringing the chat a turn, and supersedes the
+            # pump the chat has: its own previous turn's (abandoned, still
+            # draining), or a turn the platform drove into this live session
+            # (a delegate-result wake, a background nudge; the dashboard
+            # never starts one on a call's chat). That turn still completes
+            # under the session lock before the caller's runs and keeps
+            # writing its rows; superseded, it leaves the turn-end stamp and
+            # the ready broadcast to the pump that owns the chat now. A
+            # caller's turn is never refused for a wake.
+            claim = await input_queue.claim_when_free(
+                chat_id, timeout=_CLAIM_WAIT_S, supersede=True)
+            if claim is None:
+                await _send({"type": wire.ERROR, "turn": turn_id, "data": {
+                    "message": "The chat is busy with another turn; say it again in a moment."}})
+                return
             # The user row and the first title land on the chat's writer
             # lane, off the loop, before the turn runs (its rows follow them).
             from core.events import chat_writer
@@ -345,6 +384,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         trigger_payload=trigger_payload,
                         route_identity=route_identity,
                         session_id=session_id,
+                        call_tools=call_tools,
+                        transfer_targets=transfer_targets,
                     )
                     heal_cfg.resume = can_resume
                     try:
@@ -395,12 +436,19 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
             async def _produce():
                 try:
                     async with layer.session_lock(local_session_id):
-                        async for event in layer.send_message(
-                            local_session_id, dispatch_prompt,
-                            barge_in_chars=barge_in_chars,
-                            inject_time=True,
-                        ):
-                            await event_queue.put(event)
+                        # The call tools name the turn whose engine turn
+                        # runs: the daemon refuses an action from a turn
+                        # the caller already interrupted.
+                        call_control.set_turn(local_session_id, turn_id)
+                        try:
+                            async for event in layer.send_message(
+                                local_session_id, dispatch_prompt,
+                                barge_in_chars=barge_in_chars,
+                                inject_time=True,
+                            ):
+                                await event_queue.put(event)
+                        finally:
+                            call_control.set_turn(local_session_id, None)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -426,6 +474,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 source_type=session_kind.PHONE.source_type,
             )
             _active_pumps[chat_id] = pump
+            queue.release(claim)
+            claim = None
             pump.start()
 
             # Attach as phone subscriber and stream events
@@ -465,6 +515,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 await _send({"type": wire.ERROR, "turn": turn_id,
                              "data": {"message": str(e)}})
         finally:
+            queue.release(claim)
             turn_producers.pop(turn_id, None)
 
     try:
@@ -485,10 +536,28 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     await _send({"type": wire.ERROR, "data": {"message": "Agent name required in warmup 'model' field"}})
                     continue
                 llm_mode = msg.get("llm_mode", "proxy")  # echoed back for phone server compat
+                if msg.get("attach_grant"):
+                    # An in-session call: the chat's session, no build, no
+                    # slot. A second warmup on the same socket (the live
+                    # pipeline adopting the pre-warm client) is answered again.
+                    if attach is None or attach.ended:
+                        result = await phone_attach.begin(msg, _send, _close)
+                        if isinstance(result, str):
+                            await _send({"type": wire.ERROR, "data": {"message": result}})
+                            continue
+                        attach = result
+                        session_id, chat_id = attach.session_id, attach.chat_id
+                    await _send({
+                        "type": wire.WARMUP_READY,
+                        "data": {"session_id": attach.session_id, "llm_mode": llm_mode},
+                    })
+                    continue
                 phone_mode = msg.get("phone_mode", False)
                 call_type = msg.get("call_type", "inbound")
                 phone_context_override = msg.get("phone_context_override", "")
                 existing_sid = msg.get("session_id")  # pre-warmed session to reuse
+                # An older daemon never sends the flag and keeps the markers.
+                call_tools = bool(msg.get("call_control", False))
 
                 # Phone server sends these so the framework can
                 # resolve the route → trigger linkage and build the
@@ -523,6 +592,15 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         await asyncio.to_thread(phone_route_store.get_route, phone_route_id)
                         if phone_route_id else None
                     )
+                    # The prompt lists the route's targets only on a line that
+                    # can hand the caller over (the daemon's warmup says; an
+                    # outbound AMI call's media leg names no channel to move).
+                    # An older daemon never says: today's shape.
+                    can_transfer = bool(msg.get("transfer", True))
+                    transfer_targets = [
+                        t for t in ((route or {}).get("transfer_targets") or [])
+                        if isinstance(t, dict)
+                    ] if can_transfer else []
                     reuse_sid = await asyncio.to_thread(
                         _validated_reuse_sid, existing_sid, model_name,
                     )
@@ -578,6 +656,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                                 phone_context_override=phone_context_override,
                                 phone_mode=phone_mode, trigger_payload=None,
                                 route_identity=route_identity, session_id=session_id,
+                                call_tools=call_tools, transfer_targets=transfer_targets,
                             )
                             # Built only to read execution_path: the seat the
                             # build acquired goes straight back (keep_binding:
@@ -600,6 +679,10 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                             f"chat={chat_id}, identity={route_identity.label} "
                             f"({(time.monotonic() - t_warm) * 1000:.0f}ms)"
                         )
+                        if call_tools:
+                            # The call moved to this socket: its tools too.
+                            call_control.bind(session_id, _send,
+                                              ask_back=is_outbound(call_type))
                         await _send({
                             "type": wire.WARMUP_READY,
                             "data": {"session_id": session_id, "llm_mode": llm_mode},
@@ -639,6 +722,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         trigger_payload=trigger_payload,
                         route_identity=route_identity,
                         session_id=session_id,
+                        call_tools=call_tools,
+                        transfer_targets=transfer_targets,
                     )
                     ephemeral_home = (
                         _external_home_for(route_identity, model_name)
@@ -669,6 +754,11 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         })
                         continue
 
+                    if call_tools:
+                        # Bound before the engine starts: a tool call can
+                        # come as soon as the first turn runs.
+                        call_control.bind(session_id, _send,
+                                          ask_back=is_outbound(call_type))
                     await layer.start_session(session_id, agent_cfg)
                     phone_started = True
                     remember_call_identity(session_id, route_identity.label)
@@ -715,6 +805,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     logger.error(f"WS warmup failed: {e}", exc_info=True)
                     from core.concurrency import release_chat_slot
                     release_chat_slot(session_id)
+                    if session_id:
+                        call_control.unbind(session_id, _send)
                     if agent_cfg is not None and not phone_started:
                         # Built, then the spawn failed before binding.
                         release_config_seat(session_id, agent_cfg)
@@ -732,6 +824,9 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     })
                     continue
 
+                if attach is not None:
+                    await phone_attach.utterance(attach, msg)
+                    continue
                 if not session_id or not layer or not chat_id:
                     await _send({
                         "type": wire.ERROR,
@@ -760,6 +855,9 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 # committed — the client resends regardless, which the model
                 # absorbs harmlessly).
                 turn_id = msg.get("turn")
+                if attach is not None:
+                    await phone_attach.abort(attach, msg)
+                    continue
                 producer = turn_producers.get(turn_id)
                 if producer and not producer.done():
                     graceful = False
@@ -778,6 +876,13 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     interrupted_last_turn = True
                 else:
                     logger.info(f"WS abort: turn {turn_id} not in flight")
+
+            elif msg_type == wire.PHONE_IN_CALL_CONTROL_RESULT:
+                # The daemon's verdict on a call tool (services/phone/call_control.py).
+                data = msg.get("data") or {}
+                if session_id and not call_control.resolve(
+                        session_id, str(data.get("request_id") or ""), data):
+                    logger.info(f"WS call control: unmatched result on session={session_id}")
 
             elif msg_type == wire.PHONE_IN_CLOSE:
                 logger.info(f"WS close requested: session={session_id}")
@@ -804,6 +909,11 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 t.cancel()
         if turn_tasks:
             await asyncio.gather(*turn_tasks, return_exceptions=True)
+        if attach is not None:
+            # The chat keeps its session; the call's pump finishes its notes.
+            phone_attach.end(attach)
+        elif session_id:
+            call_control.unbind(session_id, _send)
         # Cleanup session on disconnect
         if session_id and layer:
             try:

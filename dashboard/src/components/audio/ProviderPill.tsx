@@ -163,7 +163,8 @@ export function ProviderPill({ provider, languages }: { provider: AudioProvider;
                     defaultValue={provider.voices[lang] || ''}
                     onBlur={e => { if (e.target.value !== (provider.voices[lang] || '')) saveVoice(lang, e.target.value) }}
                     className="flex-1 min-w-0 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
-                    placeholder="Voice UUID"
+                    placeholder={provider.voice_defaults?.[lang] || 'Voice id'}
+                    title={provider.voice_defaults?.[lang] ? 'Blank: the voice shipped for this language' : ''}
                   />
                   <SavedBadge show={saved === `voice_${lang}`} />
                 </div>
@@ -214,7 +215,7 @@ export function ProviderPill({ provider, languages }: { provider: AudioProvider;
                     <input
                       defaultValue={num(provider.advanced.model_id)}
                       onBlur={e => { if (e.target.value !== num(provider.advanced.model_id)) saveAdvancedStr('model_id', e.target.value) }}
-                      placeholder={isStt ? 'nova-3' : 'sonic-3.5'}
+                      placeholder={provider.model_defaults?.model_id || ''}
                       className="w-40 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
                     />
                     <SavedBadge show={saved === 'adv_model_id'} />

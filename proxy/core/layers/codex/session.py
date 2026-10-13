@@ -34,8 +34,8 @@ from core.layers.codex.app_server_client import (
 from core.layers.codex.helpers import will_retry
 from core.events import turn_ending, turn_life
 from core.layers.codex.codex_approvals import (
-    UNTRUSTED_POLICY, approval_for_sandbox, build_sandbox_policy,
-    is_untrusted_policy_rejection, make_server_request_handler,
+    UNTRUSTED_POLICY, approval_policy, build_sandbox_policy,
+    is_untrusted_policy_rejection, make_server_request_handler, untrusted_fallback,
 )
 # One wait slice of the main turn's loop: on every silent slice the life
 # check decides whether the silence passed its ceiling (turn_life).
@@ -119,16 +119,17 @@ class CodexAppServerSession:
         mcp_server_names: list[str] | None = None,
         local_model: bool = False,
         hooks_floor: bool = False,
-        plan_mode: bool = False,
+        permission_mode: str = "default",
     ):
         self.session_id = session_id
         self.agent_name = agent_name
         self.model = model
         self.sandbox_mode = sandbox_mode          # SandboxMode enum string
-        # The platform ``plan`` mode: the Codex plan collaboration mode. Kept
-        # apart from the sandbox: a judge (CHECKS.md) is read-only and NOT
-        # planning.
-        self.plan_mode = bool(plan_mode)
+        # The platform mode: it picks the approval policy of an attended
+        # chat and the plan collaboration mode, apart from the sandbox (a
+        # judge, CHECKS.md, is read-only and NOT planning; a machine paired
+        # with full access runs default under danger-full-access).
+        self.permission_mode = permission_mode or "default"
         self.working_dir = working_dir
         self.config_dir = config_dir              # host path to .codex/ (CODEX_HOME)
         self.extra_env = extra_env or {}
@@ -141,33 +142,30 @@ class CodexAppServerSession:
         # longer warm cap).
         self.mcp_server_names: list[str] = list(mcp_server_names or [])
         self.local_model = local_model
-        # Unattended sessions (task / phone / meeting / trigger / internal):
-        # run the PreToolUse permission_gate floor under the app-server. With
-        # `approvalPolicy: never` + full access the JSON-RPC approval bridge
-        # never fires (Codex auto-approves MCP calls itself), so the hook is
-        # the ONLY gate — decide_tool_permission does not wait for a human on
-        # these client types (critical-tier MCP tools and the external floor
-        # deny-and-inform, everything else is allowed); the one exception is
-        # a meeting participant, which inherits the parent chat's mode and
-        # may wait on that human exactly as a Claude participant does. Trust rides
-        # thread/start.config (bypass_hook_trust); the gate emits JSON only
-        # to deny (OTO_HOOK_DENY_ONLY) and the PostToolUse forwarder stays
-        # quiet (OTO_HOOK_NO_FORWARD — the JSON-RPC stream already carries
-        # tool results). Attended sessions keep the bridge (a hook there
-        # would block-and-wait twice).
+        # Every thread runs permission_gate.py as its PreToolUse hook: trust
+        # rides thread/start and thread/resume (bypass_hook_trust), the gate
+        # emits JSON only to deny (OTO_HOOK_DENY_ONLY) and the PostToolUse
+        # forwarder stays quiet (OTO_HOOK_NO_FORWARD — the JSON-RPC stream
+        # already carries tool results). ``hooks_floor`` names the sessions
+        # nobody answers (task / phone / meeting / trigger / internal / app):
+        # the hook judges every call there, and decide_tool_permission waits
+        # for a human only for a meeting participant, which inherits the
+        # parent chat's mode. An ATTENDED chat's gate runs OTO_HOOK_BRIDGED:
+        # it judges only the turns Codex runs under `never` (dontAsk / auto,
+        # where the bridge never fires) and stands aside while the bridge
+        # asks, so no call meets two judges and none meets none.
         self.hooks_floor = hooks_floor
 
         # Thread persistence: pre-populated for resume; captured on thread/start.
         self.thread_id: str | None = thread_id
-        # Approval policy is derived from the sandbox mode (the gating matrix):
-        # danger-full-access (dontAsk/auto) → never; an ATTENDED chat (no hook
-        # floor — a person answers the bridge) → "untrusted", so every
-        # command and patch reaches decide_tool_permission like Claude's hook
-        # (HOOKS.md "Attended Codex chats"); unattended → on-request, the
-        # floor gates. A daemon that rejects "untrusted" (a future Codex)
-        # drops this session to on-request once, logged (_untrusted_rejected).
+        # The approval policy (codex_approvals.approval_policy): an ATTENDED
+        # chat → "untrusted" in every mode that asks, so every command and
+        # patch reaches decide_tool_permission like Claude's hook, and
+        # "never" in dontAsk / auto (the hook judges); unattended → from the
+        # sandbox. A daemon that rejects "untrusted" (a future Codex) drops
+        # this session to the fallback once, logged (_untrusted_rejected).
         self._untrusted_rejected = False
-        self.approval_policy: str = self._policy_for(sandbox_mode)
+        self.approval_policy: str = self._policy_for()
 
         self.last_activity: float = time.monotonic()
         self.lock = asyncio.Lock()
@@ -263,16 +261,18 @@ class CodexAppServerSession:
         overrides = self._thread_overrides()
         if self.thread_id:
             # Resume an existing thread (survives proxy restart via codex_thread_id).
+            # ``excludeTurns``: the thread's history stays in its rollout,
+            # unread here (Codex deprecates hydrating it into the answer).
             try:
                 await self._client.request("thread/resume", {
-                    "threadId": self.thread_id, **overrides,
+                    "threadId": self.thread_id, "excludeTurns": True, **overrides,
                 })
                 logger.info(f"Codex [{self.session_id[:8]}] resumed thread {self.thread_id}")
             except AppServerError as e:
                 if self._note_untrusted_rejection(e):
                     overrides = self._thread_overrides()
                     await self._client.request("thread/resume", {
-                        "threadId": self.thread_id, **overrides,
+                        "threadId": self.thread_id, "excludeTurns": True, **overrides,
                     })
                 else:
                     # Rollout gone (CODEX_HOME wiped / fresh machine) → start fresh.
@@ -703,19 +703,28 @@ class CodexAppServerSession:
         if self.translator is not None:
             self.translator._model = model
 
-    def set_sandbox_mode(self, sandbox_mode: str, plan_mode: bool | None = None) -> None:
+    def set_mode(self, permission_mode: str, sandbox_mode: str) -> None:
+        """A mid-session mode change: the platform mode and its resolved
+        sandbox, applied with the approval policy on the next turn/start."""
+        self.permission_mode = permission_mode or "default"
         self.sandbox_mode = sandbox_mode
-        if plan_mode is not None:
-            self.plan_mode = bool(plan_mode)
-        # Keep the approval policy in lock-step with the sandbox mode.
-        self.approval_policy = self._policy_for(sandbox_mode)
+        self.approval_policy = self._policy_for()
 
-    def _policy_for(self, sandbox_mode: str) -> str:
+    @property
+    def plan_mode(self) -> bool:
+        return self.permission_mode == "plan"
+
+    def _policy_for(self) -> str:
         """The approval policy for this session's mode: attended (no hook
         floor) chats ask for every command and patch, unless the daemon
-        rejected that policy once (then on-request for the session)."""
-        attended = not self.hooks_floor and not self._untrusted_rejected
-        return approval_for_sandbox(sandbox_mode, attended=attended)
+        rejected that policy once (then ``untrusted_fallback`` for the
+        session)."""
+        policy = approval_policy(
+            self.permission_mode, self.sandbox_mode, attended=not self.hooks_floor,
+        )
+        if policy == UNTRUSTED_POLICY and self._untrusted_rejected:
+            return untrusted_fallback(self.sandbox_mode)
+        return policy
 
     def _note_untrusted_rejection(self, error: Exception) -> bool:
         """The daemon refused the ``untrusted`` approval policy: log once,
@@ -724,7 +733,7 @@ class CodexAppServerSession:
         if self.approval_policy != UNTRUSTED_POLICY or not is_untrusted_policy_rejection(error):
             return False
         self._untrusted_rejected = True
-        self.approval_policy = self._policy_for(self.sandbox_mode)
+        self.approval_policy = self._policy_for()
         logger.warning(
             f"Codex [{self.session_id[:8]}] rejected approvalPolicy 'untrusted' "
             f"({error}); this attended chat falls back to '{self.approval_policy}' — "
@@ -777,16 +786,22 @@ class CodexAppServerSession:
         """Thread-level config sent on thread/start | thread/resume.
 
         ``sandbox`` is the simple SandboxMode enum (``permission_to_sandbox``
-        output); ``approvalPolicy`` is mode-derived — ``never`` for
-        danger-full-access, ``on-request`` otherwise, so a sandbox escape fires
-        an approval we route through ``decide_tool_permission``. turn/start
-        re-asserts these per turn (with the structured sandboxPolicy) so a
-        mid-session mode change takes effect.
+        output); ``approvalPolicy`` is mode-derived (``_policy_for``).
+        turn/start re-asserts these per turn (with the structured
+        sandboxPolicy) so a mid-session mode change takes effect.
         """
         overrides: dict = {
             "approvalPolicy": self.approval_policy,
             "approvalsReviewer": "user",
             "sandbox": self.sandbox_mode,
+            # Codex runs a user-layer hooks.json only when trusted; the
+            # app-server has no CLI flag for it (the TUI's
+            # --dangerously-bypass-hook-trust), the per-thread `config` map
+            # is the switch (codex-rs app-server/src/config_manager.rs). The
+            # platform wrote the hook it is trusting. Every thread, attended
+            # included: the trust is fixed per thread while the mode moves
+            # per turn, so the gate decides per call whether it judges.
+            "config": {"bypass_hook_trust": True},
         }
         if self.model:
             overrides["model"] = self.model
@@ -794,13 +809,6 @@ class CodexAppServerSession:
             overrides["effort"] = self.effort
         if self.working_dir:
             overrides["cwd"] = self.working_dir
-        if self.hooks_floor:
-            # Codex runs a user-layer hooks.json only when trusted; the
-            # app-server has no CLI flag for it (the TUI's
-            # --dangerously-bypass-hook-trust), the per-thread `config` map
-            # is the switch (codex-rs app-server/src/config_manager.rs). The
-            # platform wrote the hook it is trusting.
-            overrides["config"] = {"bypass_hook_trust": True}
         return overrides
 
     async def _connect_with_retry(self, env: dict, cwd: str | None) -> None:
@@ -1123,13 +1131,19 @@ class CodexAppServerSession:
         if codex_dir and codex_dir not in env.get("PATH", ""):
             env["PATH"] = codex_dir + ":" + env.get("PATH", "/usr/bin:/bin")
         env.update(self.extra_env)  # subscription auth (CODEX_HOME, etc.)
-        if self.hooks_floor:
-            # Codex's PreToolUse hook rejects permissionDecision:"allow" —
-            # permission_gate.py emits JSON only to DENY; and the PostToolUse
-            # forwarder would double every tool card the JSON-RPC stream
-            # already renders, so it exits early. Hooks inherit this env.
-            env["OTO_HOOK_DENY_ONLY"] = "1"
-            env["OTO_HOOK_NO_FORWARD"] = "1"
+        # Codex's PreToolUse hook rejects permissionDecision:"allow" —
+        # permission_gate.py emits JSON only to DENY; and the PostToolUse
+        # forwarder would double every tool card the JSON-RPC stream
+        # already renders, so it exits early. Hooks inherit this env.
+        env["OTO_HOOK_DENY_ONLY"] = "1"
+        env["OTO_HOOK_NO_FORWARD"] = "1"
+        if not self.hooks_floor:
+            # A person answers this chat's bridge: the gate judges only the
+            # turns Codex reports as "bypassPermissions" (approvalPolicy
+            # never), the bridge every other one.
+            env["OTO_HOOK_BRIDGED"] = "1"
+        else:
+            env.pop("OTO_HOOK_BRIDGED", None)
         return env
 
 
@@ -1169,7 +1183,7 @@ async def create_codex_session(
     mcp_server_names: list[str] | None = None,
     local_model: bool = False,
     hooks_floor: bool = False,
-    plan_mode: bool = False,
+    permission_mode: str = "default",
 ) -> CodexAppServerSession:
     """Create, register, and **start** a Codex app-server session."""
     session = CodexAppServerSession(
@@ -1188,7 +1202,7 @@ async def create_codex_session(
         mcp_server_names=mcp_server_names,
         local_model=local_model,
         hooks_floor=hooks_floor,
-        plan_mode=plan_mode,
+        permission_mode=permission_mode,
     )
     async with _codex_sessions_lock:
         _codex_sessions[session_id] = session

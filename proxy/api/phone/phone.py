@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from adapters.phone import DIRECTIONS, INBOUND, is_outbound
+from adapters.phone import DIRECTIONS, INBOUND, PHONE_CONTEXT, PHONE_OUTBOUND, is_outbound
 from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_user
 from services.phone import phone_adapters
 from storage.agents import agent_store
@@ -31,11 +31,14 @@ from storage.phone import phone_call_log_store
 from storage.phone import phone_route_store
 from storage.phone import phone_server_store
 from storage.automation import trigger_store
-from services.phone.phone_config import ensure_ami_user, ensure_register_secret, notify_phone_config_changed
+from services.phone.phone_config import (
+    OUTBOUND_PIN_CAPABILITY, daemon_capability, ensure_ami_user, ensure_register_secret,
+    notify_phone_config_changed,
+)
 from auth import roles
-from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE
+from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE, pin_allowed
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -59,10 +62,19 @@ class PhoneRouteCreate(BaseModel):
     name: str = ""
     agent: str = "personal-assistant"
     language: str = "en"
+    # Identify the caller's language on the first utterance (the route's
+    # language stays the greeting's and the fallback). On for new routes.
+    language_detect: bool = True
     llm_mode: str = "proxy"
+    # Where the agent may hand the caller: [{label, number}], the only
+    # numbers transfer_call ever dials.
+    transfer_targets: list[dict] = []
     phone_server_id: int | None = None
     stt_provider_id: int | None = None
     tts_provider_id: int | None = None
+    # A voice for this route only (the TTS provider's own id); "" = the
+    # provider's voice for the call's language.
+    voice_id: str = ""
     greeting: str = ""
     phone_context_override: str = ""
     backchannel_mode: str = "on"       # per-route filler toggle: on | off
@@ -102,10 +114,13 @@ class PhoneRouteUpdate(BaseModel):
     name: str | None = None
     agent: str | None = None
     language: str | None = None
+    language_detect: bool | None = None
     llm_mode: str | None = None
+    transfer_targets: list[dict] | None = None
     phone_server_id: int | None = None
     stt_provider_id: int | None = None
     tts_provider_id: int | None = None
+    voice_id: str | None = None
     greeting: str | None = None
     phone_context_override: str | None = None
     backchannel_mode: str | None = None
@@ -237,10 +252,7 @@ def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
     server-computed ``warnings`` (identity advisories)."""
     out = []
     for r in routes:
-        pin_configured = (
-            r["direction"] == INBOUND
-            and bool(phone_route_store.get_route_pin(r["id"]))
-        )
+        pin_configured = bool(phone_route_store.get_route_pin(r["id"]))
         out.append({
             **r,
             "pin_configured": pin_configured,
@@ -285,6 +297,25 @@ def _validate_pin_value(value: str) -> None:
     """6 digits; the error never echoes the value."""
     if not _PIN_RE.fullmatch(value or ""):
         raise HTTPException(status_code=400, detail="The PIN must be 6 digits")
+
+
+_PIN_SCOPE = (
+    "PIN protection is for inbound routes and for outbound routes tied to "
+    "a platform user"
+)
+_PIN_DAEMON = "The phone server does not gate outbound calls yet: update it first"
+_PIN_STRANDED = "This route has a PIN configured. Remove the PIN before this change."
+
+
+def _require_pin_allowed(route: dict) -> None:
+    """A PIN may be set on ``route`` (the post-save row): the scope rule
+    (``phone_identity.pin_allowed``), and on an outbound route a connected
+    daemon that gates outbound calls, since a released daemon gates inbound
+    calls only and would dial without asking for the code."""
+    if not pin_allowed(route):
+        raise HTTPException(status_code=400, detail=_PIN_SCOPE)
+    if is_outbound(route.get("direction")) and not daemon_capability(OUTBOUND_PIN_CAPABILITY):
+        raise HTTPException(status_code=409, detail=_PIN_DAEMON)
 
 
 def _tied_user_label(sub: str, user: dict | None = None) -> str:
@@ -366,8 +397,10 @@ def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[
     """Server-computed advisories shown next to the route (the standing
     marker; the save-time refusal is ``_require_no_pin_acknowledged``).
 
-    - A user-tied inbound line without a PIN, or a user-tied outbound route:
-      whoever is on the line acts as that user.
+    - A user-tied inbound line without a PIN, or a user-tied outbound route
+      without one: whoever is on the line acts as that user. An outbound
+      route's PIN that no connected daemon asks for (a released daemon gates
+      inbound calls only).
     - A tied platform admin on an admin-only agent: calls run with manager
       rights (the cap for phone lines).
     - A tied user that no longer qualifies (deleted / lost access / locked):
@@ -389,14 +422,20 @@ def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[
             return warnings
         user = task_store.get_user(sub) or {}
         who = _tied_user_label(sub, user)
+        if pin_configured is None:
+            pin_configured = bool(phone_route_store.get_route_pin(route["id"]))
         if is_outbound(route.get("direction")):
-            warnings.append(
-                f"Outbound calls on this route run as {who}: whoever answers "
-                "acts as that user."
-            )
+            if not pin_configured:
+                warnings.append(
+                    f"Outbound calls on this route run as {who}: whoever answers "
+                    "acts as that user. Set a PIN on the route."
+                )
+            elif not daemon_capability(OUTBOUND_PIN_CAPABILITY):
+                warnings.append(
+                    "No connected phone server gates outbound calls: the PIN is "
+                    "not asked for until the phone server is updated."
+                )
         else:
-            if pin_configured is None:
-                pin_configured = bool(phone_route_store.get_route_pin(route["id"]))
             if not pin_configured:
                 warnings.append(
                     f"This line has no PIN: anyone who dials it runs as {who}. "
@@ -433,6 +472,63 @@ def _validate_background_sound(value: str) -> None:
                 f"{sorted(_BACKGROUND_SOUNDS)}"
             ),
         )
+
+
+_TRANSFER_TARGETS_MAX = 20
+_TRANSFER_LABEL_MAX = 40
+# ASCII digits only: Python's ``\d`` takes every Unicode digit, which the
+# AMI Exten and the TwiML would then dial.
+_TRANSFER_NUMBER_RE = re.compile(r"\+?[0-9]{2,20}")
+
+
+def _validate_transfer_targets(targets) -> list[dict]:
+    """The route's transfer targets: at most 20 entries of ``{label,
+    number}``, a label of 1 to 40 characters unique on the route, a number
+    of 2 to 20 digits with an optional leading plus. Returns the normalised
+    list (stripped strings, nothing else kept)."""
+    if not isinstance(targets, list):
+        raise HTTPException(status_code=400, detail="transfer_targets must be a list")
+    if len(targets) > _TRANSFER_TARGETS_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"transfer_targets: at most {_TRANSFER_TARGETS_MAX} targets on a route")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(targets, start=1):
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=400, detail=f"transfer_targets: entry {i} must be an object")
+        label = str(entry.get("label") or "").strip()
+        number = str(entry.get("number") or "").strip()
+        if not label or len(label) > _TRANSFER_LABEL_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"transfer_targets: entry {i} needs a label of 1 to {_TRANSFER_LABEL_MAX} characters")
+        if not _TRANSFER_NUMBER_RE.fullmatch(number):
+            raise HTTPException(
+                status_code=400,
+                detail=f"transfer_targets: entry {i} ({label}) needs a number of 2 to 20 digits, "
+                       "with an optional leading +")
+        if label.casefold() in seen:
+            raise HTTPException(
+                status_code=400, detail=f"transfer_targets: the label {label!r} is used twice")
+        seen.add(label.casefold())
+        out.append({"label": label, "number": number})
+    return out
+
+
+_VOICE_ID_MAX = 120
+
+
+def _validate_voice_id(value) -> str:
+    """A per-route voice id as the admin pasted it from the provider's
+    library: at most 120 characters, no whitespace; "" keeps the provider's
+    voice for the call's language."""
+    value = str(value or "").strip()
+    if len(value) > _VOICE_ID_MAX or any(ch.isspace() for ch in value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"voice_id must be at most {_VOICE_ID_MAX} characters with no spaces")
+    return value
 
 
 def _validate_trigger_slug(slug: str, agent: str) -> None:
@@ -474,10 +570,10 @@ async def create_phone_route(
     _validate_direction(data.get("direction", INBOUND))
     if req.pin is not None:
         _validate_pin_value(req.pin)
-        if data["direction"] != INBOUND:
-            raise HTTPException(
-                status_code=400, detail="PIN protection is for inbound routes only")
+        _require_pin_allowed(data)
     _validate_background_sound(data.get("background_sound", "off"))
+    data["transfer_targets"] = _validate_transfer_targets(data.get("transfer_targets") or [])
+    data["voice_id"] = _validate_voice_id(data.get("voice_id"))
     if data.get("trigger_slug"):
         await asyncio.to_thread(
             _validate_trigger_slug, data["trigger_slug"], data["agent"],
@@ -572,28 +668,30 @@ async def update_phone_route(
         _validate_direction(data["direction"])
     if data.get("background_sound") is not None:
         _validate_background_sound(data["background_sound"])
+    if data.get("transfer_targets") is not None:
+        data["transfer_targets"] = _validate_transfer_targets(data["transfer_targets"])
+    if data.get("voice_id") is not None:
+        data["voice_id"] = _validate_voice_id(data["voice_id"])
     existing = await asyncio.to_thread(phone_route_store.get_route, route_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Route not found")
-    post_direction = data.get("direction") or existing["direction"]
+    post_edit = {**existing, **data}
     if req.pin is not None:
         _validate_pin_value(req.pin)
-        if post_direction != INBOUND:
-            raise HTTPException(
-                status_code=400, detail="PIN protection is for inbound routes only")
+        _require_pin_allowed(post_edit)
     stored_pin = await asyncio.to_thread(phone_route_store.get_route_pin, route_id)
-    if (is_outbound(data.get("direction"))
-            and existing["direction"] == INBOUND
-            and stored_pin):
-        # A silent flip would strand the encrypted credential AND disarm the
-        # PIN without anyone noticing — make the admin remove it first.
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This route has a PIN configured. Remove the PIN before "
-                "changing the route to outbound."
-            ),
-        )
+    if stored_pin and not pin_allowed(post_edit):
+        # A silent flip (to outbound in caller identity, or an outbound route
+        # from a user to callers) would strand the encrypted credential AND
+        # disarm the PIN without anyone noticing — make the admin remove it
+        # first (the route form does so on the admin's confirm).
+        raise HTTPException(status_code=409, detail=_PIN_STRANDED)
+    if (stored_pin and is_outbound(post_edit.get("direction"))
+            and not is_outbound(existing.get("direction"))):
+        # A stored PIN going outbound with its route is judged as if it were
+        # being set there: without a daemon that gates outbound calls the
+        # route would dial ungated with a secret nobody asks for.
+        _require_pin_allowed(post_edit)
     if data.get("trigger_slug"):
         # Resolve effective agent (post-edit) before validating the trigger
         # belongs to it — the same PUT may rebind both fields.
@@ -749,15 +847,13 @@ async def set_phone_route_pin(
     req: SecretSet,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Set the route's inbound PIN (6 digits). The value is never echoed
-    back, never logged, and never appears in route responses."""
+    """Set the route's PIN (6 digits). The value is never echoed back, never
+    logged, and never appears in route responses."""
     u = require_admin(user)
     route = await asyncio.to_thread(phone_route_store.get_route, route_id)
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
-    if route["direction"] != INBOUND:
-        raise HTTPException(
-            status_code=400, detail="PIN protection is for inbound routes only")
+    _require_pin_allowed(route)
     _validate_pin_value(req.value)
     await asyncio.to_thread(phone_route_store.set_route_pin, route_id, req.value)
     logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route_id}")
@@ -1021,7 +1117,7 @@ async def delete_phone_server_twilio_auth_token(
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap + health (adapter-driven)
+# Bootstrap and health, driven by the server's adapter
 # ---------------------------------------------------------------------------
 
 async def _get_server_or_404(server_id: int) -> dict:
@@ -1161,6 +1257,14 @@ async def get_phone_settings(user: UserContext | None = Depends(get_current_user
         for k, v in all_settings.items()
         if k.startswith(_PHONE_SETTING_PREFIX)
     }
+
+
+@router.get("/v1/admin/phone/settings/defaults")
+async def get_phone_prompt_defaults(user: UserContext | None = Depends(get_current_user)):
+    """The shipped call prompts: what the seed writes and the dashboard's
+    Restore Default restores."""
+    require_admin(user)
+    return {"context_inbound": PHONE_CONTEXT, "context_outbound": PHONE_OUTBOUND}
 
 
 @router.put("/v1/admin/phone/settings")

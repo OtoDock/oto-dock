@@ -30,7 +30,7 @@ from auth import rate_limiter, webhook_providers
 from auth.lan_check import client_address
 from services.webhooks import webhook_dispatcher
 
-logger = logging.getLogger("claude-proxy.api.webhooks")
+logger = logging.getLogger("otodock.api.webhooks")
 router = APIRouter()
 
 # The refusals counted against the client address in ``webhook_receive_ip``:

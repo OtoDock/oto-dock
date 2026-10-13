@@ -91,10 +91,20 @@ export function PlainCredsAccountForm({ integration, account, ops, onDone }: Pro
         </div>
       )}
 
+      {account?.missing_required?.length ? (
+        <div className="text-xs text-amber-700 dark:text-amber-400">
+          This account needs {account.missing_required.join(', ')} before
+          its agents can use it.
+        </div>
+      ) : null}
+
       {fields.map((field: CredentialField) => (
         <div key={field.key}>
           <label className="block text-sm text-p-text-secondary mb-1">
             {field.label}
+            {field.required === false && (
+              <span className="text-p-text-light ml-1">(optional)</span>
+            )}
           </label>
           <input
             type={field.input_type === 'password' ? 'password' : 'text'}

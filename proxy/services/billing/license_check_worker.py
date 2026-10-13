@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 import config
 from services.billing import relay_client
 
-logger = logging.getLogger("claude-proxy.license-check-worker")
+logger = logging.getLogger("otodock.license-check-worker")
 
 # How often the loop wakes to decide whether a check is due.
 _INTERVAL_SECONDS = 3600

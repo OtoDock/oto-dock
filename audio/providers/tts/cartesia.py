@@ -25,6 +25,7 @@ from audio.capabilities import TTSCapabilities
 from audio.constants import SAMPLE_RATE
 from audio.log_policy import log_transcript
 from audio.providers.credential_resolver import CredentialResolver
+from audio.providers.model_succession import DEFAULT_MODELS, MODEL_SUCCESSORS
 from audio.providers.tts.base import TTSProvider
 
 logger = logging.getLogger(__name__)
@@ -35,10 +36,10 @@ def _output_format(sample_rate: int) -> dict:
     return {"container": "raw", "encoding": "pcm_s16le", "sample_rate": sample_rate}
 
 
-# Default Cartesia model. Admin-overridable per provider via ``advanced.model_id``
-# (Cartesia deprecates model IDs periodically — e.g. sonic / sonic-2 / sonic-turbo were retired
-# 2026-06-01 — so the operator sets the current one in the TTS pill without a code change).
-_MODEL_ID = "sonic-3.5"
+# Default Cartesia model (``audio.providers.model_succession``, which also
+# names the retired ids and their successor). Admin-overridable per provider
+# via ``advanced.model_id``.
+_MODEL_ID = DEFAULT_MODELS[("tts", "cartesia")]["model_id"]
 
 # Cartesia Sonic bills per character (~$40 / 1M chars on the Pro tier, 2026-06-03).
 # Varies by plan — verify and override per instance via advanced.rate_override_per_unit.
@@ -49,13 +50,19 @@ class CartesiaTTS(TTSProvider):
     """Streaming text-to-speech via Cartesia WebSocket."""
 
     capabilities = TTSCapabilities(supports_streaming=True, supports_endpointing=False, is_local=False)
+    model_successors = MODEL_SUCCESSORS[("tts", "cartesia")]
 
-    # Public-library voices (account-independent ids), production-verified on
-    # a live install; Sonic is multilingual, so the ``en`` voice covers every
-    # language without its own entry. Admin-configured voices always win.
+    # Public-library voices (account-independent ids), one native voice per
+    # shipped language, each checked by a live synthesis: Skylar, Despina,
+    # Klara, Marta (Castilian), Lise, Elena. An admin's voice for a language
+    # wins over the shipped one.
     default_voices = {
-        "en": "79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e",
+        "en": "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4",
         "el": "50849023-76e9-46c7-af52-9ec39888a165",
+        "de": "2578354e-4b18-4d28-832c-5943344b7085",
+        "es": "de38f545-c574-44e8-9b54-a7d6fec1c6b1",
+        "fr": "045b0ec6-3bed-4bc8-b797-b90a7bb5b445",
+        "it": "00e9ec78-2002-41dd-8d19-6b1d3b17a461",
     }
 
     def __init__(
@@ -74,7 +81,7 @@ class CartesiaTTS(TTSProvider):
         self.voices: dict[str, str] = voices or {}
         self.voice_id: str = voice_id or ""
         self._advanced = advanced or {}
-        self._model_id = self._advanced.get("model_id") or _MODEL_ID
+        self._model_id = self.live_model_id(self._advanced.get("model_id")) or _MODEL_ID
         self._t_first_send = 0.0   # first-audio isolation stamps (per context)
         self._sent_chars = 0
 
@@ -91,6 +98,10 @@ class CartesiaTTS(TTSProvider):
     @classmethod
     def cost_per_unit(cls) -> float:
         return _COST_PER_CHAR
+
+    @classmethod
+    def default_model_ids(cls) -> dict[str, str]:
+        return dict(DEFAULT_MODELS[("tts", "cartesia")])
 
     def _voice(self) -> dict:
         return {"mode": "id", "id": self.voice_id}

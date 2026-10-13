@@ -35,6 +35,7 @@ class OutboundCall:
         "_answer_ready", "question_history",
         "_transcript_updated", "_transcript_version",
         "route_id", "warmup_client", "pregen_task",
+        "transferred_to", "in_session", "pin_attempts", "pin_outcome", "hung_up",
     )
 
     def __init__(
@@ -53,6 +54,14 @@ class OutboundCall:
         self.transcript: list[dict[str, str]] = []  # [{role, text}, ...]
         self.outcome: str | None = None
         self.error: str | None = None
+        # The PIN gate's result on a route tied to a user: the attempts and,
+        # for a call it refused, the gate's outcome word (the terminal
+        # report's), set by the pipeline before the status update.
+        self.pin_attempts: int = 0
+        self.pin_outcome: str = ""
+        # The person hung up before the agent ended the call: the log reads
+        # ``hangup`` (the record's FAILED status is the agent's result).
+        self.hung_up: bool = False
         self.audio_uuid = audio_uuid
         self.created_at = time.time()
         self.connected_at: float | None = None
@@ -71,6 +80,12 @@ class OutboundCall:
         # pipeline waits for it (or cancels it on a timeout) rather than
         # sending the opening prompt a second time on the same session.
         self.pregen_task: asyncio.Task | None = None
+        # The label of the target the call was handed to (the call ends
+        # COMPLETED; the call log reads ``transferred``).
+        self.transferred_to: str = ""
+        # A call that runs inside the calling agent's own chat: the proxy's
+        # ``{session_id, grant}`` the live client attaches with.
+        self.in_session: dict | None = None
         # Question/answer support for mid-call Q&A with the calling agent
         self.pending_question: str | None = None
         self.question_answer: str | None = None
@@ -103,6 +118,10 @@ class OutboundCall:
             result["pending_question"] = self.pending_question
         if self.question_history:
             result["question_history"] = self.question_history
+        if self.transferred_to:
+            result["transferred_to"] = self.transferred_to
+        if self.in_session:
+            result["in_session"] = True
         return result
 
 
@@ -191,7 +210,17 @@ class CallManager:
 
         err = (call.error or "").lower()
         if call.status == CallStatus.COMPLETED:
-            outcome = "completed"
+            outcome = "transferred" if call.transferred_to else "completed"
+            if outcome == "transferred":
+                # A Twilio Dial that already failed before this report (the
+                # action answered in the Dial's first second) reads so now;
+                # a later answer corrects the row through the proxy.
+                from telephony.transfer import dial_outcome
+                outcome = dial_outcome(call.audio_uuid or "") or outcome
+        elif call.pin_outcome:
+            outcome = call.pin_outcome
+        elif call.hung_up:
+            outcome = "hangup"
         elif "no-answer" in err or "no answer" in err:
             outcome = "no_answer"
         elif "busy" in err:
@@ -212,7 +241,7 @@ class CallManager:
             "transport": "",
             "call_uuid": call.audio_uuid or "",
             "outcome": outcome,
-            "pin_attempts": 0,
+            "pin_attempts": call.pin_attempts,
             "started_at": _iso(call.created_at),
             "ended_at": _iso(call.ended_at),
             "duration_s": int(call.duration_s) if call.duration_s is not None else None,

@@ -13,7 +13,7 @@ summary (shown on the Meetings tabs).
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
@@ -129,7 +129,9 @@ async def test_admission_denial_notifies_with_reason():
         await MO.start_meeting("m1")
 
     notify.assert_awaited_once_with(
-        "m1", "The platform host is low on memory (123 MB free).")
+        "m1", "The platform host is low on memory (123 MB free).", claim=ANY)
+    # The meeting's claim on the chat goes to the failure's pump.
+    assert notify.await_args.kwargs["claim"] is not None
     # Every participant names its MCP config, so a Direct-LLM
     # participant reserves for its stdio MCPs.
     kw = acquire.await_args.kwargs
@@ -267,4 +269,79 @@ async def test_participant_pool_refusal_is_the_meeting_reason():
         await MO.start_meeting("m1")
 
     notify.assert_awaited_once_with(
-        "m1", "The meeting could not start: The agent pool's Claude subscription cap is reached: x.")
+        "m1", "The meeting could not start: The agent pool's Claude subscription cap is reached: x.",
+        claim=ANY)
+
+
+@pytest.mark.asyncio
+async def test_a_chat_that_stays_busy_gets_the_line_without_a_pump(monkeypatch):
+    """The failure's pump takes the chat's claim; another starter holding
+    it past the wait leaves the line on the chat's lane and its viewers."""
+    from core.events import chat_writer, input_queue
+    from core.session import session_state
+    monkeypatch.setattr(MO, "_FAIL_CLAIM_WAIT_S", 0.1)
+    frames: list = []
+    monkeypatch.setattr(session_state, "broadcast_chat_frame",
+                        lambda cid, f: frames.append((cid, f)))
+    mid = _make_meeting(chat_id="chat-mf-3")
+    q = input_queue.get("chat-mf-3")
+    held = q.try_claim()
+    try:
+        await MO._notify_meeting_failed(mid, "no room")
+        assert _active_pumps.get("chat-mf-3") is None
+        # Another starter's claim is never released by the failure.
+        assert q.claimed
+        await chat_writer.drain("chat-mf-3", timeout=5)
+        rows = [json.loads(r["event_data"]) for r in task_store.get_chat_messages("chat-mf-3")
+                if r.get("event_type") == "system"]
+        assert rows and rows[-1]["subtype"] == "meeting_failed"
+        assert rows[-1]["message"] == "no room"
+        assert frames and frames[-1][1]["subtype"] == "meeting_failed"
+        assert frames[-1][1]["chat_id"] == "chat-mf-3"
+    finally:
+        q.release(held)
+        input_queue._registry.pop("chat-mf-3", None)
+
+
+@pytest.mark.asyncio
+async def test_a_handed_claim_is_released_once_the_failure_pump_registers(monkeypatch):
+    from core.events import input_queue
+    monkeypatch.setattr(MO, "_FAIL_PUMP_LINGER_S", 0.2)
+    mid = _make_meeting(chat_id="chat-mf-4")
+    q = input_queue.get("chat-mf-4")
+    claim = q.try_claim()
+    notify = asyncio.create_task(MO._notify_meeting_failed(mid, "r", claim=claim))
+    for _ in range(50):
+        if _active_pumps.get("chat-mf-4") is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert _active_pumps.get("chat-mf-4") is not None
+    assert not q.claimed
+    await notify
+    input_queue._registry.pop("chat-mf-4", None)
+
+
+@pytest.mark.asyncio
+async def test_a_meeting_whose_chat_stays_busy_fails_with_the_reason(monkeypatch):
+    from core.events import input_queue
+    monkeypatch.setattr(MO, "_START_CLAIM_WAIT_S", 0.1)
+    notify = AsyncMock()
+    q = input_queue.get("chat-x")
+    held = q.try_claim()
+    try:
+        with patch.object(MO.task_store, "get_meeting",
+                          return_value=_pending_meeting_row()), \
+             patch.object(MO.task_store, "get_chat", return_value={}), \
+             patch.object(MO.task_store, "update_meeting"), \
+             patch.object(MO.task_store, "update_meeting_if", return_value=True), \
+             patch.object(MO, "build_meeting_agent_config", new=AsyncMock()) as build, \
+             patch.object(MO, "_notify_meeting_failed", new=notify):
+            await MO.start_meeting("m1")
+        notify.assert_awaited_once_with(
+            "m1", "The meeting could not start: the chat stayed busy with another turn.",
+            wait=False)
+        build.assert_not_awaited()
+        assert q.claimed
+    finally:
+        q.release(held)
+        input_queue._registry.pop("chat-x", None)

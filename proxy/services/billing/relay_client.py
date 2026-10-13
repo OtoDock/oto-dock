@@ -46,7 +46,7 @@ import time
 
 import config
 
-logger = logging.getLogger("claude-proxy.relay-client")
+logger = logging.getLogger("otodock.relay-client")
 
 
 class RelayNotConfigured(RuntimeError):

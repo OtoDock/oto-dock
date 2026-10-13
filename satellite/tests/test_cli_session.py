@@ -60,10 +60,16 @@ class TestWriteCliHooks:
         assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "SubagentStop", "Stop"}
         stop = settings["hooks"]["Stop"][0]["hooks"][0]
         assert "stop_tracker.py" in stop["command"] and stop["timeout"] == config.HOOK_WAIT_S
+        # The gate blocks the call when it cannot run (Claude Code 2.1.295+,
+        # the proxy builder writes the same); the trackers never block.
+        assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] == "block"
+        for event in ("PostToolUse", "SubagentStop", "Stop"):
+            assert "onFailure" not in settings["hooks"][event][0]["hooks"][0], event
         # Claude Code ≥ 2.1.275 would sync the pool account's claude.ai skills
         # and plugins into the session — both off (mirrors the proxy builder).
         assert settings["syncClaudeAiSkills"] is False
         assert settings["syncClaudeAiPlugins"] is False
+        assert settings["disableClaudeAiConnectors"] is True
         # Every built-in plugin but the four the platform keeps (Claude Code
         # 2.1.287+) is off by name, as the proxy builder writes them.
         from satellite.sessions.cli_session import DISABLED_BUILTIN_PLUGINS
@@ -201,6 +207,45 @@ class TestCLISessionStart:
         assert captured_env["PROXY_URL"] == "http://100.1.2.3:8400"
         assert captured_env["ANTHROPIC_API_KEY"] == "sk-test"
         assert "CLAUDECODE" not in captured_env
+        # The credential helper's variables and the wrappers' dir first on
+        # PATH, set after the path translation (a machine path as it is).
+        import os
+        import sys
+        claude_dir = tmp_agent_dir / "users" / "alice" / ".claude"
+        assert captured_env["OTO_HOOKS_DIR"] == str(claude_dir)
+        assert captured_env["OTO_HOOK_PY"] == sys.executable
+        assert captured_env["PATH"].startswith(str(claude_dir / "bin") + os.pathsep)
+
+    @pytest.mark.asyncio
+    async def test_writes_the_command_wrappers_the_payload_carries(
+        self, tmp_agent_dir, cli_config, sat_config,
+    ):
+        """``command_wrappers`` land under the config dir's bin/ with their
+        directory created, executable, bytes as sent; a name that escapes the
+        dir is dropped."""
+        cli_config["command_wrappers"] = {
+            "bin/gh": "#!/bin/sh\nexec x \"$@\"\n",
+            "bin/gh.cmd": "@echo off\r\nx %*\r\n",
+            "../evil": "no", "/abs/evil": "no", "": "no", "bin/empty": "",
+        }
+        session = CLISession("sess-1", tmp_agent_dir, cli_config, sat_config)
+        mock_proc = AsyncMock()
+        mock_proc.pid = 1
+        mock_proc.returncode = None
+        mock_proc.stdout = AsyncMock()
+        mock_proc.stderr = AsyncMock()
+        mock_proc.stderr.read = AsyncMock(return_value=b"")
+        init_event = json.dumps({"type": "system", "subtype": "init", "mcp_servers": []}).encode() + b"\n"
+        mock_proc.stdout.readline = AsyncMock(return_value=init_event)
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            await session.start()
+        claude_dir = tmp_agent_dir / "users" / "alice" / ".claude"
+        gh = claude_dir / "bin" / "gh"
+        assert gh.read_bytes() == b"#!/bin/sh\nexec x \"$@\"\n" and gh.stat().st_mode & 0o111
+        assert (claude_dir / "bin" / "gh.cmd").read_bytes() == b"@echo off\r\nx %*\r\n"
+        assert not (claude_dir / "bin" / "empty").exists()
+        assert not (tmp_agent_dir / "users" / "alice" / "evil").exists()
+        assert not Path("/abs/evil").exists()
 
     @pytest.mark.asyncio
     async def test_resume_uses_resume_flag(self, tmp_agent_dir, sat_config):
@@ -523,3 +568,90 @@ class TestCLISessionOneReader:
             await nxt
         await second.aclose()
         assert forwarded == []
+
+
+class TestCLISessionPermissionAnswer:
+    """The answer to the CLI's own ``can_use_tool`` request (a heredoc that
+    writes a file asks even under bypass) must be in the shape the CLI
+    parses: ``response.response`` with ``behavior`` (0.5.140; the proxy's
+    ``engine_prompts.answer_frame``). Before, the satellite wrote
+    ``response.permission``, which the CLI ignored, so the request was
+    refused at once by a proxy that knew it."""
+
+    def _session(self, tmp_agent_dir, cli_config, sat_config):
+        session = CLISession("sess-p", tmp_agent_dir, cli_config, sat_config)
+        session.proc = _FakeProc([])
+        return session
+
+    def _request(self, rid, tool_input):
+        return {"type": "control_request", "request_id": rid,
+                "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": tool_input}}
+
+    @pytest.mark.asyncio
+    async def test_an_allow_carries_the_input_the_cli_printed(self, tmp_agent_dir, cli_config, sat_config):
+        session = self._session(tmp_agent_dir, cli_config, sat_config)
+        session._note_control_request(self._request("r1", {"command": "cat <<EOF > f\nx\nEOF"}))
+        proxy_frame = {"subtype": "success", "request_id": "r1",
+                       "response": {"behavior": "allow", "updatedInput": {"command": "changed"}}}
+        await session.send_permission_response("r1", True, response=proxy_frame)
+        frame = _frames(session.proc)[-1]
+        assert frame == {"type": "control_response", "response": {
+            "subtype": "success", "request_id": "r1",
+            "response": {"behavior": "allow", "updatedInput": {"command": "cat <<EOF > f\nx\nEOF"}}}}
+        assert "r1" not in session._prompt_inputs
+
+    @pytest.mark.asyncio
+    async def test_a_deny_carries_the_proxys_message_and_nothing_else(
+        self, tmp_agent_dir, cli_config, sat_config,
+    ):
+        session = self._session(tmp_agent_dir, cli_config, sat_config)
+        proxy_frame = {"subtype": "success", "request_id": "r2", "response": {
+            "behavior": "deny", "message": "Not now.", "updatedPermissions": [{"type": "setMode"}]}}
+        await session.send_permission_response("r2", True, response=proxy_frame)
+        assert _frames(session.proc)[-1]["response"]["response"] == {
+            "behavior": "deny", "message": "Not now."}
+
+    @pytest.mark.asyncio
+    async def test_an_older_proxys_boolean_still_answers(self, tmp_agent_dir, cli_config, sat_config):
+        session = self._session(tmp_agent_dir, cli_config, sat_config)
+        await session.send_permission_response("r3", True)
+        await session.send_permission_response("r4", False)
+        allow, deny = (f["response"] for f in _frames(session.proc))
+        assert allow == {"subtype": "success", "request_id": "r3", "response": {"behavior": "allow"}}
+        assert deny["response"]["behavior"] == "deny" and deny["response"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_a_frame_for_another_request_is_not_taken(self, tmp_agent_dir, cli_config, sat_config):
+        session = self._session(tmp_agent_dir, cli_config, sat_config)
+        other = {"request_id": "rX", "response": {"behavior": "deny", "message": "x"}}
+        await session.send_permission_response("r5", True, response=other)
+        assert _frames(session.proc)[-1]["response"]["response"]["behavior"] == "allow"
+
+    def test_the_remembered_inputs_are_bounded(self, tmp_agent_dir, cli_config, sat_config):
+        from satellite.sessions import cli_session as cs
+        session = CLISession("sess-q", tmp_agent_dir, cli_config, sat_config)
+        for i in range(cs._PROMPT_INPUTS_MAX + 10):
+            session._note_control_request(self._request(f"r{i}", {"n": i}))
+        session._note_control_request({"type": "control_request", "request_id": "z",
+                                       "request": {"subtype": "interrupt"}})
+        assert len(session._prompt_inputs) == cs._PROMPT_INPUTS_MAX
+        assert "r0" not in session._prompt_inputs and "z" not in session._prompt_inputs
+
+    @pytest.mark.asyncio
+    async def test_the_session_manager_passes_the_proxys_response(self, tmp_path):
+        from satellite.config import SatelliteConfig
+        from satellite.sessions.session_manager import SessionManager
+        sm = SessionManager(SatelliteConfig(
+            machine_id="m", machine_secret="s", platform_url="ws://localhost:8400/v1/satellite",
+            agents_dir=tmp_path / "agents", mcps_dir=tmp_path / "mcps"))
+        got = []
+
+        class _S:
+            async def send_permission_response(self, rid, approved, response=None):
+                got.append((rid, approved, response))
+        sm.sessions["s1"] = _S()
+        frame = {"request_id": "r", "response": {"behavior": "allow"}}
+        await sm.control_response({"session_id": "s1", "request_id": "r", "approved": True,
+                                   "response": frame})
+        await sm.control_response({"session_id": "s1", "request_id": "r", "approved": False})
+        assert got == [("r", True, frame), ("r", False, None)]

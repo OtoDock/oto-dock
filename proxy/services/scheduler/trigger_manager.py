@@ -32,7 +32,7 @@ from core.session import visibility as _vis
 if TYPE_CHECKING:
     from auth.webhook_providers.base import NormalizedEvent
 
-logger = logging.getLogger("claude-proxy.triggers")
+logger = logging.getLogger("otodock.triggers")
 
 
 # Slug must be URL-safe and human-readable. Lowercase letters, digits,
@@ -820,6 +820,32 @@ def _check_debounce(trigger_id: str, debounce_seconds: int) -> float | None:
     return None
 
 
+# A vendor event's linked task runs once however many subscriptions deliver
+# the event (a repository hook and its organization's, relay fan-in): keyed
+# by task and the vendor key, for the dispatcher ring's ten minutes. The
+# bearer path keeps its documented behaviour (the header keys app
+# deliveries only). Checked and set with no await between, so two
+# deliveries racing on the loop cannot both pass.
+_VENDOR_TASK_WINDOW_S = 600.0
+_VENDOR_TASK_MAX = 1000
+_vendor_task_fires: dict[str, float] = {}
+
+
+def _first_vendor_task_fire(task_id: str, event_id: str) -> bool:
+    now = time.monotonic()
+    key = f"{task_id}|{event_id}"
+    seen = _vendor_task_fires.get(key)
+    if seen is not None and now - seen < _VENDOR_TASK_WINDOW_S:
+        return False
+    if len(_vendor_task_fires) >= _VENDOR_TASK_MAX:
+        for k in [k for k, t in _vendor_task_fires.items() if now - t >= _VENDOR_TASK_WINDOW_S]:
+            _vendor_task_fires.pop(k, None)
+        while len(_vendor_task_fires) >= _VENDOR_TASK_MAX:
+            _vendor_task_fires.pop(next(iter(_vendor_task_fires)))
+    _vendor_task_fires[key] = now
+    return True
+
+
 async def _fire_app_handler(
     trigger_row: dict, body: dict, vendor_event: "NormalizedEvent | None", event_id: str,
 ) -> dict:
@@ -873,6 +899,11 @@ async def fire_trigger(
     under ``actor``/``subject``/``target``/``event_type`` keys for
     ``${trigger.*}`` token resolution in manifest agent_context blocks.
     Generic webhook fires + phone fires leave it None.
+
+    ``event_id`` keys an app handler's delivery (a replay answers
+    ``duplicate``): the bearer caller's ``X-OtoDock-Event-Id``, or on the
+    vendor path ``event_normalizer.vendor_event_key``, which also runs a
+    linked task once per event however many subscriptions deliver it.
     """
     trigger_id = trigger_row["id"]
 
@@ -891,7 +922,12 @@ async def fire_trigger(
     # 2. Task — only the linked path exists in the current model (legacy
     # _fire_inline_prompt path removed; `prompt_template` column dropped).
     task_run_id: str | None = None
-    if trigger_row.get("task_id"):
+    duplicate = False
+    if (trigger_row.get("task_id") and vendor_event is not None and event_id
+            and not _first_vendor_task_fire(trigger_row["task_id"], event_id)):
+        actions.append("duplicate")
+        duplicate = True
+    elif trigger_row.get("task_id"):
         try:
             task_run_id = await _fire_linked_task(
                 trigger_row, body, trigger_source, vendor_event,
@@ -901,11 +937,14 @@ async def fire_trigger(
         except Exception as e:
             errors.append(f"task: {e}")
             logger.exception(f"Trigger {trigger_id[:8]} task fire failed")
+            # A fire that failed did not run the event: another
+            # subscription's delivery of it may still run it.
+            if vendor_event is not None and event_id:
+                _vendor_task_fires.pop(f"{trigger_row['task_id']}|{event_id}", None)
 
     # 2b. App handler (APPS.md "Handlers"): the delivery row is the fire;
     # its verdict lands on the row later (``trigger_store.set_last_error``).
     delivery_id: str | None = None
-    duplicate = False
     if trigger_row.get("app_id"):
         try:
             out = await _fire_app_handler(trigger_row, body, vendor_event, event_id)

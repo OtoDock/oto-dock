@@ -727,3 +727,31 @@ def test_an_anonymous_action_call_learns_nothing_of_a_dormant_personal_app(monke
         headers = {}
 
     assert asyncio.run(app_actions._step_caller(_Req(), "app-1")) is None
+
+
+def test_two_subscriptions_delivering_one_vendor_event_wake_the_handler_once(agent_tree, monkeypatch):
+    # A repository hook and its organization's hook (or two accounts) on one
+    # repository: two triggers aimed at one handler, the same vendor event
+    # delivered through each. The vendor key makes the second a duplicate.
+    from auth.webhook_providers.base import NormalizedEvent
+    from services.webhooks import webhook_dispatcher
+    monkeypatch.setattr(app_handlers, "schedule_drain", lambda app_id: None)
+    hooked = _row("hooked2", [], handlers={"on_trigger": ["github"]})
+    ids = []
+    for name in ("Repo hook", "Org hook"):
+        r = client.post("/v1/triggers", json={"name": name, "scope": "agent", "agent": AGENT,
+                                              "app_slug": "hooked2", "handler": "github"})
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["trigger"]["id"])
+    event = NormalizedEvent(event_type="push", vendor_event_id="g-1", global_event_id="g-1")
+
+    async def deliver(trigger_id: str):
+        return await webhook_dispatcher._fan_out_fire(
+            triggers=[trigger_store.get_trigger(trigger_id)], body={"ref": "main"},
+            event=event, trigger_source=f"webhook:github/sub-{trigger_id}/push",
+            event_id="github:g-1")
+
+    assert asyncio.run(deliver(ids[0])) == (1, [])
+    assert asyncio.run(deliver(ids[1])) == (0, [])          # the duplicate, neither fired nor failed
+    first = deliveries.find_event(hooked["id"], "github", "github:g-1")
+    assert first and [d["id"] for d in deliveries.recent(hooked["id"])] == [first["id"]]

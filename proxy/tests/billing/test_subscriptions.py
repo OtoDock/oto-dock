@@ -1018,6 +1018,8 @@ class TestScopeStickyAndPersistedBindings:
         # Claude Code's usage-credits wording of the limit notice (in the 2.1.281
         # binary too; first met live on 2026-10-04 and unknown to the regex until then).
         assert sp.throttle_cooldown_for("You're out of usage credits. Switch to another model") == sp._THROTTLE_COOLDOWN_S
+        # The org's wording of the same notice (a Team or Enterprise login).
+        assert sp.throttle_cooldown_for("Your org is out of usage · add funds to continue") == sp._THROTTLE_COOLDOWN_S
         assert sp.throttle_cooldown_for("connection reset by peer") is None
         assert sp.throttle_cooldown_for("") is None
 

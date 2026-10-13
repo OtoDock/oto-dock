@@ -26,15 +26,16 @@ from auth.providers.local_provider import LocalAuthProvider
 from auth.providers.oidc_provider import OIDCAuthProvider, ensure_oidc_discovery
 from auth import rate_limiter
 from auth.rate_limiter import hit as rate_limit_hit, record_successful_login
-from auth.totp import consume_2fa_session_token, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, validate_2fa_session_token, verify_recovery_code, verify_totp
+from auth.totp import StepTokenBusy, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, release_2fa_session_token, reserve_2fa_session_token, spend_2fa_session_token, totp_step, verify_recovery_code
 from services.agents import offboarding_sessions
 from storage import database as task_store
 from storage.pg import run_db
 
 from api.auth._common import build_feature_flags, user_payload
 from api.auth._router import router
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 _local_provider = LocalAuthProvider()
@@ -681,60 +682,77 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
             headers={"Retry-After": str(retry_after)},
         )
 
-    sub = validate_2fa_session_token(req.totp_session_token)
-    if not sub:
+    # The step token is this request's from here until it is spent or given
+    # back: a second request carrying it meanwhile is refused, so one token
+    # never opens two sessions.
+    try:
+        step = reserve_2fa_session_token(req.totp_session_token)
+    except StepTokenBusy:
+        raise HTTPException(status_code=409, detail="This sign-in is already being completed")
+    if step is None:
         raise HTTPException(status_code=401, detail="2FA session expired. Please log in again.")
+    sub = step.sub
+    spent = False
+    try:
+        user = await run_db(task_store.get_user, sub)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
 
-    user = await run_db(task_store.get_user, sub)
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        # Re-check the LAN restriction at step 2: step 1 verified it, but the step
+        # token is portable for its 5-minute TTL — a local_only login must not be
+        # completable from off-LAN with a token minted on-LAN.
+        if not check_local_auth_allowed(request, user):
+            raise HTTPException(status_code=403, detail="This account can only be accessed from the local network")
 
-    # Re-check the LAN restriction at step 2: step 1 verified it, but the step
-    # token is portable for its 5-minute TTL — a local_only login must not be
-    # completable from off-LAN with a token minted on-LAN.
-    if not check_local_auth_allowed(request, user):
-        raise HTTPException(status_code=403, detail="This account can only be accessed from the local network")
+        # Decrypt TOTP secret
+        totp_enc = user.get("totp_secret_enc")
+        if not totp_enc:
+            raise HTTPException(status_code=400, detail="2FA not configured for this account")
 
-    # Decrypt TOTP secret
-    totp_enc = user.get("totp_secret_enc")
-    if not totp_enc:
-        raise HTTPException(status_code=400, detail="2FA not configured for this account")
+        secret = decrypt_totp_secret(totp_enc)
+        code = req.code.strip()
 
-    secret = decrypt_totp_secret(totp_enc)
-    code = req.code.strip()
+        # Try TOTP first. A code is good once: its step must be past the one
+        # the account accepted last (the last gate, so a refused attempt above
+        # spends no code).
+        step_no = totp_step(secret, code)
+        if step_no is not None:
+            if not await run_db(task_store.claim_totp_step, sub, step_no):
+                raise HTTPException(status_code=401, detail="This code was already used: wait for the next one")
+        else:
+            # Try recovery code. Serialize + RE-READ the stored codes inside the
+            # lock so a concurrent request can't match the same code against a stale
+            # copy: the second caller sees the already-consumed list and is rejected.
+            async with _recovery_consume_lock:
+                fresh = await run_db(task_store.get_user, sub)
+                recovery_enc = fresh.get("totp_recovery_enc") if fresh else None
+                matched = False
+                if recovery_enc:
+                    hashed_codes = decrypt_recovery_codes(recovery_enc)
+                    matched, remaining = verify_recovery_code(code, hashed_codes)
+                    if matched:
+                        new_enc = encrypt_recovery_codes(remaining)
+                        await run_db(
+                            task_store.update_user_auth_fields, sub, totp_recovery_enc=new_enc
+                        )
+                        logger.info(f"2FA recovery code used for {mask_email(user['email'])} ({len(remaining)} remaining)")
+                if not matched:
+                    raise HTTPException(status_code=401, detail="Invalid 2FA code")
 
-    # Try TOTP first
-    if len(code) == 6 and code.isdigit() and verify_totp(secret, code):
-        pass  # TOTP verified
-    else:
-        # Try recovery code. Serialize + RE-READ the stored codes inside the
-        # lock so a concurrent request can't match the same code against a stale
-        # copy: the second caller sees the already-consumed list and is rejected.
-        async with _recovery_consume_lock:
-            fresh = await run_db(task_store.get_user, sub)
-            recovery_enc = fresh.get("totp_recovery_enc") if fresh else None
-            matched = False
-            if recovery_enc:
-                hashed_codes = decrypt_recovery_codes(recovery_enc)
-                matched, remaining = verify_recovery_code(code, hashed_codes)
-                if matched:
-                    new_enc = encrypt_recovery_codes(remaining)
-                    await run_db(
-                        task_store.update_user_auth_fields, sub, totp_recovery_enc=new_enc
-                    )
-                    logger.info(f"2FA recovery code used for {mask_email(user['email'])} ({len(remaining)} remaining)")
-            if not matched:
-                raise HTTPException(status_code=401, detail="Invalid 2FA code")
-
-    # 2FA verified — issue session. Spend the step token so a replay can't
-    # mint a second session (failed attempts above did NOT consume it).
-    consume_2fa_session_token(req.totp_session_token)
-    await record_successful_login(sub)
-    # The right code guessed nothing; the wrong ones stay counted.
-    rate_limiter.release_attempt("2fa", bucket_key)
-    response = await _login_response(user, "local")
-    logger.info(f"2FA verified: {mask_email(user['email'])}")
-    return response
+        # The factor is accepted: the step token never opens another session.
+        spend_2fa_session_token(step)
+        spent = True
+        await record_successful_login(sub)
+        # The right code guessed nothing; the wrong ones stay counted.
+        rate_limiter.release_attempt("2fa", bucket_key)
+        response = await _login_response(user, "local")
+        logger.info(f"2FA verified: {mask_email(user['email'])}")
+        return response
+    finally:
+        # Every other exit (a wrong code, a refusal, an error, a cancelled
+        # request) gives the token back, so a typo retries with it.
+        if not spent:
+            release_2fa_session_token(step)
 
 
 @router.get("/auth/callback", include_in_schema=False)
@@ -1058,6 +1076,8 @@ async def change_my_password(
 
     pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, u.sub, pw_hash)
+    # The write moved the token epoch: no cached pass may outlive it.
+    token_holder.forget(u.sub)
     logger.info(f"User {mask_email(u.email)} changed their password")
     # Their warm chats hold session tokens the change just invalidated:
     # close them so the next message re-warms with fresh ones.
@@ -1137,12 +1157,14 @@ async def totp_setup(
     qr_uri = get_totp_uri(secret, u.email)
     recovery_codes = generate_recovery_codes()
 
-    # Store encrypted secret (but don't enable yet — user must verify first)
+    # Store encrypted secret (but don't enable yet — user must verify first).
+    # A new secret starts its own step count: no code of the old one verifies
+    # against it.
     enc_secret = encrypt_totp_secret(secret)
     enc_recovery = encrypt_recovery_codes(hash_recovery_codes(recovery_codes))
     await asyncio.to_thread(
         task_store.update_user_auth_fields, u.sub,
-        totp_secret_enc=enc_secret, totp_recovery_enc=enc_recovery,
+        totp_secret_enc=enc_secret, totp_recovery_enc=enc_recovery, totp_last_step=0,
     )
 
     return {
@@ -1167,8 +1189,12 @@ async def totp_verify(
         raise HTTPException(400, "Run /totp/setup first")
 
     secret = decrypt_totp_secret(db_user["totp_secret_enc"])
-    if not verify_totp(secret, req.code.strip()):
+    step_no = totp_step(secret, req.code.strip())
+    if step_no is None:
         raise HTTPException(400, "Invalid code. Try again.")
+    # The enrolment code counts as used, as a sign-in's would.
+    if not await asyncio.to_thread(task_store.claim_totp_step, u.sub, step_no):
+        raise HTTPException(400, "This code was already used: wait for the next one")
 
     # Enable 2FA
     await asyncio.to_thread(
@@ -1254,7 +1280,7 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
             except Exception:
                 logger.warning("Password-reset email send failed for %s",
                                mask_email(email))
-        asyncio.create_task(_send_reset())
+        spawn(_send_reset(), name="send_reset", owner="identity")
 
     # Always return success (prevent enumeration)
     return {"status": "ok", "message": "If your email is registered, you'll receive a reset link."}
@@ -1303,6 +1329,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
 
     pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, sub, pw_hash)
+    token_holder.forget(sub)
     logger.info(f"Password reset completed for {mask_email(user['email'])}")
     await offboarding_sessions.close_person_sessions(
         sub, user.get("username") or "", "password_changed")
@@ -1348,5 +1375,6 @@ async def accept_invite(req: AcceptInviteRequest, request: Request):
 
     pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, user["sub"], pw_hash)
+    token_holder.forget(user["sub"])
     logger.info(f"Invite accepted for {mask_email(user['email'])}")
     return {"status": "ok", "email": user["email"]}

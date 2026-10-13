@@ -69,13 +69,14 @@ KNOWN_LAYOUT_SITES: dict[str, tuple[str, dict[str, int]]] = {
 KNOWN_OS_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "proxy/services/infra/safe_fs.py": ("vendored into file-tools with no proxy import: probes its own kernel for openat2", {"linux": 1, "sys.platform": 1}),
     "mcps/custom/file-tools-mcp/safe_fs.py": ("the byte copy of services/infra/safe_fs.py the file-tools image runs (the copy test pins it)", {"linux": 1, "sys.platform": 1}),
-    "proxy/services/mcp/mcp_installer.py": ("vendored byte-for-byte into the satellite and self-contained by its docstring: its sys.platform reads (the venv layout, `cmd /c`, and the bounded run's process-group spawn and tree kill) and the package families (a manifest vocabulary) stay", {"win32": 5, "windows": 3, "darwin": 1, "linux": 1, "sys.platform": 5, "platform.system": 1}),
+    "proxy/services/mcp/mcp_installer.py": ("vendored byte-for-byte into the satellite and self-contained by its docstring: its sys.platform reads (the venv layout, `cmd /c`, the bounded run's process-group spawn and tree kill, and the interpreter prune that a Windows junction keeps POSIX-only) and the package families (a manifest vocabulary) stay", {"win32": 6, "windows": 3, "darwin": 1, "linux": 1, "sys.platform": 6, "platform.system": 1}),
     "mcps/custom/computer-mcp/environment.py": ("an MCP process probing its own host (os_kind / display_backend)", {"darwin": 4, "linux": 2, "windows": 1, "sys.platform": 1}),
     "mcps/custom/computer-mcp/executor.py": ("an MCP process probing its own host", {"darwin": 2, "windows": 1}),
     "mcps/custom/computer-mcp/screen.py": ("an MCP process probing its own host", {"windows": 1}),
     "mcps/custom/computer-mcp/server.py": ("an MCP process probing its own host", {"darwin": 1, "windows": 1}),
     "mcps/custom/ssh-hosts/server.py": ("an MCP process reading its own host for the ControlMaster question", {"platform.system": 1}),
     "satellite/terminal/otodock_cli.py": ("the standalone otodock terminal client: its fallback import branch has no package, so it cannot read config.HOST", {"win32": 2, "sys.platform": 2}),
+    "proxy/hooks/credential_helper.py": ("a hook-dir script that imports nothing of the proxy: it replaces itself with the real command on POSIX and runs it as a child elsewhere", {"os.name": 1}),
 }
 
 

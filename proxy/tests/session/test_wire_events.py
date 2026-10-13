@@ -45,7 +45,7 @@ def test_every_frame_is_a_constant_and_every_constant_a_frame():
     # Every FRAMES key is the value of an upper-case module constant.
     values = set(_constants(wire).values())
     assert names <= values, sorted(names - values)
-    assert len(names) == 115
+    assert len(names) == 116
     # No frame name is spelled twice.
     assert len(_frame_constants()) == len(names)
 
@@ -66,7 +66,7 @@ def test_per_chat_is_derived_from_the_table():
     assert wire.STEERED in wire.PER_CHAT_FRAMES
     # A retired prompt's card belongs to the viewed chat's stream.
     assert wire.FRAMES[wire.PROMPT_RETIRED] == wire.Frame(True, None)
-    assert len(wire.PER_CHAT_FRAMES) == 57
+    assert len(wire.PER_CHAT_FRAMES) == 58
 
 
 def test_the_persisted_spellings():
@@ -117,7 +117,8 @@ def test_the_other_vocabularies_beside_the_wire():
     assert wire.ITEM_QUESTION_PROMPT not in wire.FRAMES and wire.ITEM_MODE_RESTORED not in wire.FRAMES
     assert wire.ITEM_KINDS >= {wire.IMAGES, wire.UI, wire.DOCUMENT_PREVIEW, wire.PERMISSION_PROMPT}
     assert wire.NOTIFY_SERVER_KICK.startswith("_")
-    assert wire.PHONE_FRAMES == {"warmup_ready", "session", "text", "tool_start", "tool_end", "done", "error"}
+    assert wire.PHONE_FRAMES == {"warmup_ready", "session", "text", "tool_start", "tool_end", "done", "error",
+                                 "call_control"}
     assert wire.SYSTEM_SUBTYPES >= {"session_reseeded", "meeting_started", "bg_wake", "context_compressed"}
     assert wire.REASON_POOL_CAP in wire.WARMUP_FAILED_REASONS
     assert wire.REASON_BELOW_EDITOR in wire.WARMUP_FAILED_REASONS
@@ -236,7 +237,8 @@ def test_the_dashboard_mirror_equals_the_authority():
         "QUEUED": wire.UNDELIVERED_QUEUED, "TURN_FAILED": wire.UNDELIVERED_TURN_FAILED,
         "STOPPED": wire.UNDELIVERED_STOPPED}
     from core.events import input_queue
-    assert _ts_const_object(text, "QUEUE_WAITING") == {"RECONNECT": input_queue.WAITING_RECONNECT}
+    assert _ts_const_object(text, "QUEUE_WAITING") == {"RECONNECT": input_queue.WAITING_RECONNECT,
+                                                       "TERMINAL": input_queue.WAITING_TERMINAL}
     # The artifact kinds' replayable set derives from the facts table in
     # lib/kinds/artifact.ts — bound by tests/core/test_kinds.py (phase 9).
     # Every frame has a payload interface in the union.

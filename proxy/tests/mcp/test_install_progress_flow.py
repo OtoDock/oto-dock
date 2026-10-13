@@ -794,7 +794,7 @@ async def test_a_0_5_137_satellite_removes_a_retired_mcp_from_any_category(monke
     from services.mcp import mcp_sync
     folder = _McpFolder({**_SHIPPED, "retired-core": "core", "retired": "community"}, "0.5.137")
     _platform(monkeypatch, folder, _SHIPPED)
-    with caplog.at_level("INFO", logger="claude-proxy.mcp-sync"):
+    with caplog.at_level("INFO", logger="otodock.mcp-sync"):
         result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
     [frame] = folder.frames
     assert frame["remove_any_category"] is True

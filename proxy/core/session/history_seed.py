@@ -29,7 +29,7 @@ import logging
 from storage import database as task_store
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Total digest budget (~12k tokens). Retention may pass its own max_chars.
 SEED_MAX_CHARS = 48_000

@@ -24,7 +24,7 @@ A manager who binds their personal user account to an agent as its service
 identity (see ``service_agent_bindings.account_owner_sub``) doesn't get a
 separate dir — the resolver reads from the user's existing ``{username}/``
 dir directly. One credential, two routes. There is no platform "service
-account" token tree (removed for open source).
+account" token tree (removed before the public release).
 
 Multiple MCPs sharing a provider_id share the token dir, so one OAuth
 grant powers every MCP of that provider. The dir name MUST match the
@@ -43,7 +43,7 @@ from pathlib import Path
 
 import config
 
-logger = logging.getLogger("claude-proxy.oauth-account-store")
+logger = logging.getLogger("otodock.oauth-account-store")
 
 
 # ---------------------------------------------------------------------------

@@ -24,13 +24,12 @@ import logging
 import re
 import time
 
-import httpx
 
 from auth.webhook_providers.base import NormalizedEvent
 from services.webhooks import vendor_http
 from services.webhooks.event_normalizer import walk_path
 
-logger = logging.getLogger("claude-proxy.event-enrichment")
+logger = logging.getLogger("otodock.event-enrichment")
 
 _LOOKUP_TIMEOUT_SECONDS = 3.0     # per vendor call
 _EVENT_BUDGET_SECONDS = 5.0       # whole-event ceiling
@@ -118,7 +117,7 @@ async def _enrich(event: NormalizedEvent, *, row: dict, lookups: list[dict]) -> 
         method = str(request.get("method", "GET")).upper()
         expected = request.get("expected_status") or [200]
         try:
-            async with httpx.AsyncClient(timeout=_LOOKUP_TIMEOUT_SECONDS) as client:
+            async with vendor_http.client(url, timeout=_LOOKUP_TIMEOUT_SECONDS) as client:
                 resp = await client.request(method, url, headers=headers)
         except Exception:
             continue

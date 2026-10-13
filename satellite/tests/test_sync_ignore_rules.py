@@ -194,6 +194,19 @@ def test_no_policy_means_legacy_walk(tmp_path):
     assert any(p.startswith("workspace/proj/target/") for p in snap)
 
 
+def test_codex_worktrees_stay_on_the_machine(tmp_path):
+    # Codex's managed worktrees (the terminal's git-worktree-root beside
+    # .codex) are whole checkouts: a hidden dir the walk skips like any other
+    # hidden dir but the two engine config dirs, on both sides of the sync.
+    ws = tmp_path / "workspace"
+    (ws / ".codex-worktrees" / "repo-1").mkdir(parents=True)
+    (ws / ".codex-worktrees" / "repo-1" / "app.py").write_text("x")
+    (ws / "keep.md").write_text("k")
+    snap = snapshot_agent_dir(tmp_path)
+    assert "workspace/keep.md" in snap
+    assert not any(".codex-worktrees" in p for p in snap)
+
+
 def test_fingerprint_flips_with_rules(tmp_path):
     ws = tmp_path / "workspace"
     _mk_cargo_project(ws)

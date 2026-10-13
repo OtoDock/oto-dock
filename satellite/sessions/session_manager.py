@@ -844,7 +844,9 @@ class SessionManager:
             session.request_stop_turn(drain_bg=msg.get("drain_bg", False))
 
     async def control_response(self, msg: dict) -> None:
-        """Forward a native permission answer to the CLI's control channel."""
+        """Forward a permission answer to the CLI's control channel: the
+        decision in the CLI's shape under ``response`` (a 1.8.0 proxy), the
+        ``approved`` boolean for an older one."""
         session_id = msg.get("session_id", "")
         session = self.sessions.get(session_id)
         if not session:
@@ -853,7 +855,10 @@ class SessionManager:
             return
         request_id = msg.get("request_id", "")
         approved = bool(msg.get("approved", False))
-        await session.send_permission_response(request_id, approved)
+        response = msg.get("response")
+        await session.send_permission_response(
+            request_id, approved, response=response if isinstance(response, dict) else None,
+        )
 
     async def interrupt_turn(self, msg: dict) -> None:
         """Soft-stop the current turn: write ``control_request {interrupt}``
@@ -1547,19 +1552,24 @@ class SessionManager:
         most ``_MANIFEST_PAGE_BYTES`` of text, ``more`` true on all but the
         last, in order on one lane, so a large tree never needs a frame past
         the socket's cap; a proxy that does not ask gets one frame (an older
-        proxy resolves its wait on the first frame it sees)."""
+        proxy resolves its wait on the first frame it sees).
+
+        ``report_skipped`` (asked by a 0.5.145+ proxy) adds the files and
+        folders the walk could not read (``compute_manifest``); an older
+        proxy never asks and never sees an entry without a hash."""
         agent_slug = msg.get("agent_slug", "")
         command_id = msg.get("command_id", "")
         agent_dir = self.config.agents_dir / agent_slug
 
         page_size = msg.get("page_size")
         paged = isinstance(page_size, int) and not isinstance(page_size, bool) and page_size > 0
+        report_skipped = msg.get("report_skipped") is True
 
         def _walk() -> list:
             # A big tree's manifest (walk + hash, even cache-warm) and its
             # pages (one serialization per entry to size them) would stall
             # the event loop that heartbeats and PTY frames share.
-            manifest = file_sync.compute_manifest(agent_dir)
+            manifest = file_sync.compute_manifest(agent_dir, report_skipped=report_skipped)
             return _manifest_pages(manifest, page_size) if paged else manifest
 
         walked = await asyncio.to_thread(_walk)
@@ -1759,8 +1769,10 @@ class SessionManager:
         try:
             rel = file_path.relative_to(agent_dir).as_posix()
             snap[rel] = file_sync._hash_file(file_path)
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            # The next turn-end scan then reports the file once more: the
+            # platform receives bytes it already holds.
+            logger.debug("push snapshot refresh skipped for %s: %s", file_path, exc)
 
     async def file_pull(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Read and send a file back to the platform, registered by its

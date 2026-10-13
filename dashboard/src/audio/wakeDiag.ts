@@ -3,7 +3,7 @@
 //
 // OFF by default. Switched on by the "Record diagnostics" button under the
 // closed "Troubleshooting" disclosure of the wake-word settings (the phone
-// app has no address bar) or by the desktop shortcut `?wakeDiag=1`; both write one sessionStorage key, which is what
+// app has no address bar) or by the desktop shortcut `/user-settings?wakeDiag=1`; both write one sessionStorage key, which is what
 // survives the wake navigation (it replaces the search string) and a
 // WebView reload. While on, the listener hands this store the exact
 // 16 kHz frames it feeds the spotter (kept as the last 30 s in an Int16
@@ -210,14 +210,16 @@ export function exportWakeDiag(): { name: string; json: string } {
 }
 
 /** Save to a LOCAL file: the Android app's Downloads bridge when present,
- * else a browser download. Returns a short status for the badge. */
+ * else a browser download. Returns a short status for the badge; in the app
+ * the file is only handed over (the app's own message reports the write,
+ * which on Android 7 to 9 first asks for the storage permission). */
 export function saveWakeDiag(): string {
   if (!ensureRing()) return 'recorder is off'
   const { name, json } = exportWakeDiag()
   if (hasNativeBridge()) {
     if (!saveNativeFile(base64(new TextEncoder().encode(json)), name, 'application/json')) return 'save failed'
     wakeDiagEvent('saved', { name })
-    return `saved ${name} to Downloads`
+    return `handed ${name} to Downloads`
   }
   try {
     const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))

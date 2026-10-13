@@ -45,7 +45,9 @@ def resolved_dir(monkeypatch, tmp_path):
         from fastapi import HTTPException
         if raw_path not in folders:
             raise HTTPException(403, "access denied")
-        return folders[raw_path]
+        return local_templates._Folder(
+            raw=raw_path, rel=raw_path.strip("/"), platform=folders[raw_path], agent="pa",
+        )
 
     monkeypatch.setattr(local_templates, "_resolve_template_dir", _resolve)
     return folders
@@ -128,3 +130,37 @@ def test_the_snapshot_is_deleted_after_the_check(temp_db, resolved_dir, tmp_path
     assert r.status_code == 200 and r.json()["ok"] is True
     assert not seen["root"].exists()
     assert str(seen["root"]) != str(resolved_dir["/workspace/weather-tools"])
+
+
+def test_a_package_on_a_remote_machine_is_read_from_it(temp_db, resolved_dir, tmp_path, monkeypatch):
+    """A remote session's package folder is checked as the machine holds it
+    (the platform's copy arrives at the turn's end), and what the snapshot
+    leaves out there is still judged: a ``.env`` the machine lists is
+    refused without being pulled."""
+    from core.remote import remote_file_flow
+    machine = tmp_path / "machine"
+    machine.mkdir()
+    pkg = _package(machine)
+    (pkg / ".env").write_text("SECRET=1\n")
+    resolved_dir["/workspace/weather-tools"] = tmp_path / "not-on-the-platform"
+    pulled: list[str] = []
+
+    async def _entries(session_id, rel_prefix, *, agent=""):
+        return [
+            {"path": f"workspace/{p.relative_to(machine).as_posix()}", "size": p.stat().st_size}
+            for p in sorted(machine.rglob("*")) if p.is_file()
+        ]
+
+    async def _pull(session_id, rel_path, dest, *, agent="", max_bytes=None):
+        pulled.append(rel_path)
+        dest.write_bytes((machine / rel_path.removeprefix("workspace/")).read_bytes())
+        return True
+
+    monkeypatch.setattr(remote_file_flow, "is_remote_session", lambda sid: sid == "sid-1")
+    monkeypatch.setattr(remote_file_flow, "list_remote_entries", _entries)
+    monkeypatch.setattr(remote_file_flow, "pull_into", _pull)
+    r = _client(_session_user()).post("/v1/mcps/local-package/validate", json={"path": "/workspace/weather-tools"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert ".env: a .env file is refused" in "\n".join(body["errors"])
+    assert sorted(pulled) == ["workspace/weather-tools/README.md", "workspace/weather-tools/manifest.json"]

@@ -29,8 +29,9 @@ from api.agents._router import router
 from core.session import session_kind
 from auth import roles
 from core import layout
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.agents")
+logger = logging.getLogger("otodock.agents")
 
 
 
@@ -118,6 +119,23 @@ class DeleteAgentRequest(BaseModel):
     confirm_slug: str
 
 
+def _check_default_effort(effort: str | None) -> None:
+    """400 unless ``effort`` is empty (the default) or a level some
+    registered engine offers. Not only the agent's own engines: every
+    engine folds a level it lacks onto its ladder (Claude reads ``ultra``
+    as ``max``), and the settings page saves the engines and the effort in
+    separate requests, which a per-agent check would race."""
+    if not effort:
+        return
+    from core.session.session_manager import get_all_layers
+    offered = {lvl for layer in get_all_layers().values()
+               for lvl in layer.capabilities.effort_levels}
+    if effort not in offered:
+        from core.execution_layer import EFFORT_LADDER
+        levels = ", ".join(lvl for lvl in EFFORT_LADDER if lvl in offered)
+        raise HTTPException(400, f"default_effort must be one of: {levels} (or empty for the default)")
+
+
 class SetDefaultForNewUsersBody(BaseModel):
     enabled: bool
     role: str | None = None  # required when enabled=True; one of viewer/editor/manager
@@ -195,6 +213,7 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
     # Validate default_scope
     if req.default_scope not in ("user", "agent"):
         raise HTTPException(400, "default_scope must be 'user' or 'agent'")
+    _check_default_effort(req.default_effort)
 
     # Create folder structure
     try:
@@ -309,6 +328,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     _req_default_scope = getattr(req, "default_scope", None)
     if _req_default_scope is not None and _req_default_scope not in ("user", "agent"):
         raise HTTPException(400, "default_scope must be 'user' or 'agent'")
+    _check_default_effort(getattr(req, "default_effort", None))
 
     # Per-agent default execution mode. Only meaningful for CLI execution
     # layers — reject when the agent's default model only runs on direct-llm
@@ -677,8 +697,8 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
 
     if _lib_consumers:
         from services.knowledge import library_projector
-        asyncio.create_task(
-            library_projector.teardown_source(name, consumers=_lib_consumers))
+        spawn(library_projector.teardown_source(name, consumers=_lib_consumers),
+              name="teardown_source", owner="agents")
         logger.info("knowledge-library teardown on agent delete: %s → %d consumers",
                     name, len(_lib_consumers))
 
@@ -712,6 +732,10 @@ async def list_agent_conversations(
     """List all conversations for an agent. Managers + admins only."""
     u = require_auth(user)
     limit = max(1, min(limit, config.MAX_PAGE_SIZE))  # cap page size
+    # A person's tab: an agent-scope session (a task run, a trigger, a call)
+    # reads no caller's transcript, whatever role its agent row carries.
+    if u.is_no_user_session:
+        raise HTTPException(status_code=403, detail="The conversations list is for people")
     # Operators only (manager + admin). Phone transcripts are agent-scope and
     # shared across the agent's managers/admins BY DESIGN (phone is not per-user),
     # so there is no per-user filter — but viewers + editors must not see them.

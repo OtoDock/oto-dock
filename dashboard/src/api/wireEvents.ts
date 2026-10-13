@@ -99,6 +99,7 @@ export const WIRE = {
   CHAT_ROWS: 'chat_rows',
   CHAT_META: 'chat_meta',
   CHAT_MOVED: 'chat_moved',
+  CHAT_VIEW_ONLY: 'chat_view_only',
   ENGINE_SWITCHED: 'engine_switched',
   SWITCH_ENGINE_DENIED: 'switch_engine_denied',
   LIVENESS: 'liveness',
@@ -253,6 +254,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   chat_rows: { perChat: true, persisted: null },
   chat_meta: { perChat: true, persisted: null },
   chat_moved: { perChat: false, persisted: null },
+  chat_view_only: { perChat: true, persisted: null },
   engine_switched: { perChat: false, persisted: null },
   switch_engine_denied: { perChat: false, persisted: null },
   liveness: { perChat: false, persisted: null },
@@ -328,6 +330,7 @@ export const SYSTEM_SUBTYPE = {
   MEETING_AGENT_LEFT: 'meeting_agent_left',
   MEETING_FAILED: 'meeting_failed',
   MACHINE_RECONNECTING: 'machine_reconnecting',
+  ENGINE_PROMPT_REFUSED: 'engine_prompt_refused',
   // Dashboard-synthesised (never sent by the proxy).
   NO_SUBSCRIPTION: 'no_subscription',
   POOL_CAP: 'pool_cap',
@@ -453,6 +456,8 @@ export interface DelegateResultFrame extends PerChat {
   reason?: TurnEndingReason
   resets_at?: string
   verdict?: Record<string, unknown>
+  // Background work still running when the worker's turn ended.
+  background_pending?: number
   files?: DelegateResultFile[]
   files_skipped?: DelegateResultSkipped[]
 }
@@ -484,8 +489,8 @@ export interface DoneFrame extends PerChat { type: typeof WIRE.DONE }
 /** A turn's typed ending rides the pump's error frame as `reason`
  *  (`core/events/turn_ending.REASONS`); a `done` follows it once the turn's
  *  rows landed. A bare error (one refused message) carries no `chat_id`. */
-export type TurnEndingReason = 'declined' | 'limit' | 'error' | 'exited' | 'silent' | 'lost'
-export const RESEND_REASONS: ReadonlySet<string> = new Set(['error', 'exited', 'silent', 'lost'])
+export type TurnEndingReason = 'declined' | 'limit' | 'error' | 'exited' | 'silent' | 'lost' | 'stopped'
+export const RESEND_REASONS: ReadonlySet<string> = new Set(['error', 'exited', 'silent', 'lost', 'stopped'])
 export interface ErrorFrame extends PerChat {
   type: typeof WIRE.ERROR
   message: string
@@ -552,9 +557,11 @@ export interface QueueChip extends QueueAttachments {
   waiting?: string
 }
 /** `QueueChip.waiting` (the proxy's `input_queue.WAITING_*`): the chat's
- *  machine is reconnecting, the message goes out when it is back. */
+ *  machine is reconnecting, the message goes out when it is back; or a
+ *  teammate's terminal is open on the chat, it goes out when that closes. */
 export const QUEUE_WAITING = {
   RECONNECT: 'reconnect',
+  TERMINAL: 'terminal',
 } as const
 /** On the author's sockets only: the message handed back to the composer. */
 export interface QueueReturned extends QueueAttachments { returned?: boolean; text?: string }
@@ -628,7 +635,9 @@ export interface WarmupReadyFrame {
   resolved_target?: string
   resolved_label?: string
 }
-export interface WarmupFailedFrame { type: typeof WIRE.WARMUP_FAILED; chat_id: string; error: string; reason?: string }
+/** `chat_id` is absent when the warmup was refused before a chat was minted
+ * (a send below the editor role on a Shared-only agent writes nothing). */
+export interface WarmupFailedFrame { type: typeof WIRE.WARMUP_FAILED; chat_id?: string; error: string; reason?: string }
 export interface PreWarmupReadyFrame { type: typeof WIRE.PRE_WARMUP_READY; session_id: string }
 export interface ChatHistoryFrame {
   type: typeof WIRE.CHAT_HISTORY
@@ -675,6 +684,9 @@ export interface ChatReadFrame { type: typeof WIRE.CHAT_READ; chat_id: string }
 export interface ChatRowsFrame { type: typeof WIRE.CHAT_ROWS; chat_id: string; agent?: string }
 export interface ChatMetaFrame { type: typeof WIRE.CHAT_META; chat_id: string; delegate_role?: string; project_id?: string }
 export interface ChatMovedFrame { type: typeof WIRE.CHAT_MOVED; chat_id: string; new_target: string; resolved_label?: string }
+/** The viewed chat is driven from outside (`kind`: `phone`): sent before the
+ *  read-only history of a full resume; the page re-resumes on `ready`. */
+export interface ChatViewOnlyFrame { type: typeof WIRE.CHAT_VIEW_ONLY; chat_id: string; kind: string }
 export interface EngineSwitchedFrame { type: typeof WIRE.ENGINE_SWITCHED; chat_id: string; execution_path: string; model: string }
 export interface SwitchEngineDeniedFrame { type: typeof WIRE.SWITCH_ENGINE_DENIED; chat_id: string; message: string; process_alive?: boolean }
 export interface LivenessFrame { type: typeof WIRE.LIVENESS; chat_id: string; process_alive: boolean }
@@ -752,7 +764,7 @@ export type WireFrame =
   | ModeChangedFrame | ModelChangedFrame | ExecutionModeChangedFrame | PlanStatusFrame | ServerTurnStartFrame
   | WarmupStartedFrame | WarmupHeartbeatFrame | WarmupReadyFrame | WarmupFailedFrame | PreWarmupReadyFrame
   | ChatHistoryFrame | ChatHistoryDeltaFrame | ChatStatusFrame | ChatStatusSnapshotFrame | ChatReadFrame | ChatRowsFrame | ChatMetaFrame
-  | ChatMovedFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TitleUpdatedFrame | TurnCompleteFrame
+  | ChatMovedFrame | ChatViewOnlyFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TitleUpdatedFrame | TurnCompleteFrame
   | PtyOutputFrame | PtyExitFrame | PtyPermissionFrame | PtyArtifactFrame | PtyStatusFrame
   | NotificationFrame | NotificationSilentFrame | NotificationCountFrame | ShareInboxFrame | FileUpdatedFrame
   | AppPushFrame | AppStateFrame | OpenAppFrame | AppDeployedFrame | CatalogFrame

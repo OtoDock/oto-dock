@@ -37,7 +37,8 @@ import websockets
 
 from audio.capabilities import STTCapabilities
 from audio.providers.credential_resolver import CredentialResolver
-from audio.providers.stt.base import STTProvider, TranscriptResult, Word
+from audio.providers.model_succession import DEFAULT_MODELS
+from audio.providers.stt.base import LanguageGuess, STTProvider, TranscriptResult, Word
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,10 @@ _WS_BASE = "wss://api.elevenlabs.io"
 # usage today); docs note the realtime delta.
 _COST_PER_SECOND = 0.0000611
 
-_BATCH_MODEL = "scribe_v2"
-_REALTIME_MODEL = "scribe_v2_realtime"
+# The defaults live in ``audio.providers.model_succession`` with the other
+# providers'.
+_BATCH_MODEL = DEFAULT_MODELS[("stt", "elevenlabs")]["batch_model_id"]
+_REALTIME_MODEL = DEFAULT_MODELS[("stt", "elevenlabs")]["model_id"]
 
 # Input rates the realtime endpoint accepts as pcm_<rate>.
 _PCM_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
@@ -89,9 +92,9 @@ _MIN_VOICED_ARM_S = 0.12
 
 
 def _to_elevenlabs_lang(tag: str | None) -> str | None:
-    """BCP-47 → ISO 639-1 (``el-GR`` → ``el``); ``multi``/empty → ``None``
-    (omit the param — Scribe auto-detects)."""
-    if not tag or tag == "multi":
+    """BCP-47 → ISO 639-1 (``el-GR`` → ``el``); ``multi``/``auto``/empty →
+    ``None`` (omit the param — Scribe auto-detects)."""
+    if not tag or tag in ("multi", "auto"):
         return None
     return tag.split("-", 1)[0].lower()
 
@@ -151,8 +154,8 @@ class ElevenLabsSTT(STTProvider):
             api_key=resolver(row.get("credential_key", "")),
             endpointing_ms=int(advanced.get("call_endpointing_ms", 500)),
             vad_silence_offset_ms=int(advanced.get("vad_silence_offset_ms", 50)),
-            model=advanced.get("model_id") or _REALTIME_MODEL,
-            batch_model=advanced.get("batch_model_id") or _BATCH_MODEL,
+            model=cls.live_model_id(advanced.get("model_id")) or _REALTIME_MODEL,
+            batch_model=cls.live_model_id(advanced.get("batch_model_id")) or _BATCH_MODEL,
             silence_gate_rms=int(advanced.get("silence_gate_rms", _SILENCE_GATE_RMS)),
         )
 
@@ -162,14 +165,17 @@ class ElevenLabsSTT(STTProvider):
 
     @classmethod
     def default_advanced_settings(cls) -> dict:
-        # model ids surfaced so the admin pill SHOWS what runs when unset.
+        # The model ids are placeholders (``default_model_ids``), never
+        # stored: a row that stores none follows a later default.
         return {
             "call_endpointing_ms": 500,
             "chat_endpointing_ms": 1500,
-            "model_id": _REALTIME_MODEL,
-            "batch_model_id": _BATCH_MODEL,
             "silence_gate_rms": _SILENCE_GATE_RMS,
         }
+
+    @classmethod
+    def default_model_ids(cls) -> dict[str, str]:
+        return dict(DEFAULT_MODELS[("stt", "elevenlabs")])
 
     @classmethod
     def validate_advanced(cls, settings: dict) -> dict[str, str]:
@@ -236,13 +242,44 @@ class ElevenLabsSTT(STTProvider):
             duration = max(duration, end)
 
         self._log_transcript("Scribe file", text)
+        try:
+            probability = float(doc.get("language_probability") or 0.0)
+        except (TypeError, ValueError):
+            probability = 0.0
         return TranscriptResult(
             text=text,
             language=doc.get("language_code") or (lang or "en"),
             audio_seconds=duration,
             words=words,
             provider_used="elevenlabs",
+            language_confidence=probability if not lang else 0.0,
         )
+
+    async def identify_language(self, audio_wav: bytes) -> LanguageGuess | None:
+        """One utterance through the batch endpoint with no language: Scribe
+        names the language and its probability."""
+        result = await self.transcribe_file(audio_wav, language=None)
+        lang = (result.language or "").split("-", 1)[0].lower()
+        if not lang:
+            return None
+        return LanguageGuess(language=lang, confidence=result.language_confidence, text=result.text)
+
+    async def restart(self, language: str) -> bool:
+        """Reopen the stream in ``language`` with the stored rate, interims
+        and endpointing (the language lock mid-call)."""
+        with contextlib.suppress(Exception):
+            await self.close()
+        try:
+            await self.start(
+                language=language, sample_rate=self._active_rate,
+                interim_results=self._interim_results,
+                endpointing_ms=self._endpointing_override,
+            )
+        except Exception as e:
+            logger.warning(f"ElevenLabs STT restart in {language} failed: {e}")
+            return False
+        logger.info(f"ElevenLabs STT restarted in {language}")
+        return True
 
     # ── Streaming surface ──────────────────────────────────────────
 

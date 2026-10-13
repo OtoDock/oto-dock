@@ -15,11 +15,30 @@ import { useChatStore } from '../store/chatStore'
 import { useTransferStore } from '../store/transferStore'
 import type { PendingFile } from '../store/types'
 
-import { uploadWithProgress } from './uploadWithProgress'
+import { canRead, UNREADABLE_ITEM, type CollectedFile } from './droppedItems'
+import { queryClient } from './queryClient'
+import { reserveUploadFolder, uploadWithProgress } from './uploadWithProgress'
+
+/** The workspace tree shows what landed at once; the server's own
+ *  `file_updated` frame covers the other tabs and a teammate's view. */
+function refreshTree(agent: string): void {
+  queryClient.invalidateQueries({ queryKey: ['agent-files', agent] })
+}
+
+/** A folder's files behind one chip. A retry carries the folder reserved
+ * before (`path`) and how many files landed in it (`done`). */
+export interface ChatUploadFolder {
+  name: string
+  files: CollectedFile[]
+  path?: string
+  done?: number
+}
 
 export interface ChatUploadEntry {
   fileId: string
-  file: File
+  /** One file, or (`folder`) a folder's files behind one chip. */
+  file?: File
+  folder?: ChatUploadFolder
   agent: string
   abort: AbortController
 }
@@ -45,6 +64,10 @@ function patchFile(fileId: string, patch: Partial<PendingFile>): void {
   const chatId = locateChatId(fileId)
   if (chatId) useChatStore.getState().updatePendingFile(chatId, fileId, patch)
 }
+
+/** Patch a pending file in the chat slice that holds it now (a no-op once
+ * it is removed): the composer's folder intake uses it while a walk runs. */
+export { patchFile as patchPendingFile }
 
 // transferStore.prune() normally runs from the workspace TransferPopup's
 // open-while interval; chat-originated transfers must not depend on that
@@ -99,19 +122,20 @@ async function pump(): Promise<void> {
       const entry = queue.shift()!
       if (entry.abort.signal.aborted) continue
       if (!locateChatId(entry.fileId)) continue // removed while queued
-      await uploadOne(entry)
+      if (entry.folder) await uploadFolder(entry, entry.folder)
+      else if (entry.file) await uploadOne(entry, entry.file)
     }
   } finally {
     running = false
   }
 }
 
-async function uploadOne(entry: ChatUploadEntry): Promise<void> {
+async function uploadOne(entry: ChatUploadEntry, file: File): Promise<void> {
   const ts = useTransferStore.getState()
   const clientId = `local:chat-${entry.fileId}`
   patchFile(entry.fileId, {
     queued: false, uploading: true,
-    uploadSent: 0, uploadTotal: entry.file.size,
+    uploadSent: 0, uploadTotal: file.size,
   })
   // Chat uploads land in the default target (uploads/files) — targetDir ''.
   // Pre-link the relPath is the bare filename → no workspace section, which
@@ -119,14 +143,14 @@ async function uploadOne(entry: ChatUploadEntry): Promise<void> {
   // path and the workspace popup picks it up for phase 2.
   ts.beginLocalUpload({
     clientId, agent: entry.agent, targetDir: '',
-    filename: entry.file.name, bytesTotal: entry.file.size,
+    filename: file.name, bytesTotal: file.size,
   })
 
   let lastPct = -1
   let lastWrite = 0
   try {
     const resp = await uploadWithProgress(
-      entry.file, entry.agent, '',
+      file, entry.agent, '',
       (sent, total) => {
         useTransferStore.getState().updateLocalUpload(clientId, sent)
         const pctNow = total > 0 ? Math.floor((sent / total) * 100) : 0
@@ -142,7 +166,7 @@ async function uploadOne(entry: ChatUploadEntry): Promise<void> {
     patchFile(entry.fileId, {
       uploading: false, queued: false,
       uploadedPath: resp.path,
-      name: resp.filename || entry.file.name,
+      name: resp.filename || file.name,
       uploadSent: resp.size, uploadTotal: resp.size,
       transferId: resp.transfer_id, remotePush: resp.remote_push,
     })
@@ -151,6 +175,7 @@ async function uploadOne(entry: ChatUploadEntry): Promise<void> {
       relPath: resp.path,
       remotePush: resp.remote_push,
     })
+    refreshTree(entry.agent)
   } catch (e: any) {
     useTransferStore.getState().failLocalUpload(clientId)
     if (e?.name === 'AbortError') return // user removed the file — chip is gone
@@ -158,5 +183,68 @@ async function uploadOne(entry: ChatUploadEntry): Promise<void> {
       uploading: false, queued: false,
       error: e?.message || 'Upload failed',
     })
+  }
+}
+
+/** A folder behind one chip: a fresh folder reserved in the chat's upload
+ * folder (or the one a retry carries), then its files one after another
+ * into their places in it, from the first not landed yet. The chip's
+ * progress is the folder's bytes; the first file that fails fails the chip
+ * and keeps the reservation and the count, so a Retry resumes there (the
+ * files already up stay in the workspace, as they do when the chip is
+ * removed). */
+async function uploadFolder(entry: ChatUploadEntry, folder: ChatUploadFolder): Promise<void> {
+  const total = folder.files.reduce((a, f) => a + f.file.size, 0)
+  let index = folder.done ?? 0
+  let done = folder.files.slice(0, index).reduce((a, f) => a + f.file.size, 0)
+  patchFile(entry.fileId, {
+    queued: false, uploading: true, uploadSent: done, uploadTotal: total,
+  })
+  let current = ''
+  let lastWrite = 0
+  // The tree refreshes once the folder exists on the server (empty or not)
+  // and again when the last file lands or the chip fails after some did.
+  let landed = false
+  try {
+    let path = folder.path
+    if (!path) {
+      const reserved = await reserveUploadFolder(entry.agent, folder.name, entry.abort.signal)
+      path = reserved.path
+      patchFile(entry.fileId, { folderPath: path, name: reserved.name })
+      landed = true
+    }
+    for (; index < folder.files.length; index++) {
+      const { file, relDir } = folder.files[index]
+      current = relDir ? `${relDir}/${file.name}` : file.name
+      if (!(await canRead(file))) throw new Error(UNREADABLE_ITEM)
+      await uploadWithProgress(
+        file, entry.agent, relDir ? `${path}/${relDir}` : path,
+        (sent) => {
+          const now = Date.now()
+          if (now - lastWrite >= PROGRESS_MIN_INTERVAL_MS) {
+            lastWrite = now
+            patchFile(entry.fileId, { uploadSent: done + sent, uploadTotal: total })
+          }
+        },
+        entry.abort.signal,
+      )
+      done += file.size
+      landed = true
+      patchFile(entry.fileId, { filesDone: index + 1 })
+    }
+    patchFile(entry.fileId, {
+      uploading: false, queued: false,
+      uploadedPath: path,
+      uploadSent: total, uploadTotal: total,
+    })
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === 'AbortError') return // user removed the chip
+    const why = (e instanceof Error && e.message) || 'Upload failed'
+    patchFile(entry.fileId, {
+      uploading: false, queued: false,
+      error: current ? `${current}: ${why}` : why,
+    })
+  } finally {
+    if (landed) refreshTree(entry.agent)
   }
 }

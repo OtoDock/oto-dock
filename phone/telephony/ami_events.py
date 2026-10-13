@@ -8,9 +8,15 @@ matched digits into the live call's transport via ``inject_dtmf``.
 
 Correlation: the inbound dialplan's register curl carries ``${UNIQUEID}`` in
 ``dial_event``; ``main._handle_connection`` registers ``(server_key,
-uniqueid) → connection`` here for the call's duration. Uniqueids are only
-unique per Asterisk instance, so events match registrations for their own
-server only.
+uniqueid) → connection`` here for the call's duration. An outbound call's
+media leg registers nothing, so its channel comes from the PBX's
+``OriginateResponse`` event (class ``call``), which echoes the ``ActionID``
+the daemon's Originate named and reports the dialled channel: for
+``Local/<n>@from-internal`` that is the ``;1`` half, the one that runs the
+AudioSocket context and reads the far end's digits. The event and the
+AudioSocket connection arrive in either order; ``bind_outbound`` and
+``_on_originate`` meet in the middle. Uniqueids are only unique per Asterisk
+instance, so events match registrations for their own server only.
 
 The event connection doubles as the actions surface for the future
 transfer feature (AMI ``Redirect`` rides ``send_action`` on the same live
@@ -26,6 +32,7 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import re
 import time
 from typing import Callable
 
@@ -48,12 +55,28 @@ ACTION_TIMEOUT_S = 10.0
 
 _VALID_DIGITS = frozenset("0123456789*#ABCD")
 
+#: Asterisk uniqueid shape (``epoch.seq``, optional systemname prefix): a
+#: register payload's or an event's value is checked before it keys the
+#: registration map. A failed originate reports ``<unknown>``, which fails it.
+UNIQUEID_RE = re.compile(r"[\w.\-/]{1,64}\Z")
+#: A channel name's alphabet, what Asterisk emits: the technology, the
+#: dialled string (an E.164 ``+``, a ``*``/``#`` feature code, a dial prefix)
+#: and the ``@<context>-<seq>;1`` of a Local channel. The dialplan's register
+#: filter is a subset. A name is checked before it keys a Redirect.
+_CHANNEL_CHAR = re.compile(r"[A-Za-z0-9/@;._!:*#+\-]")
+CHANNEL_RE = re.compile(_CHANNEL_CHAR.pattern + r"{1,160}\Z")
+#: How long an expected originate, or a reported one, waits for its other
+#: half (the Originate's ring bound is 30 s).
+ORIGINATE_TTL_S = 120.0
+
 #: Reserved manager key for the flat single-Asterisk legacy config (cannot
 #: collide with numeric server ids).
 FLAT_SERVER_KEY = "_flat"
 
 #: on_dtmf(server_key, uniqueid, digit, duration_ms)
 DtmfHandler = Callable[[str, str, str, int], None]
+#: on_originate(server_key, action_id, response, uniqueid, channel, reason)
+OriginateHandler = Callable[[str, str, str, str, str, str], None]
 
 
 class AmiEventClient:
@@ -74,6 +97,7 @@ class AmiEventClient:
         *,
         server_key: str,
         on_dtmf: DtmfHandler,
+        on_originate: OriginateHandler | None = None,
         ping_interval_s: float = PING_INTERVAL_S,
         read_timeout_s: float = READ_TIMEOUT_S,
         backoff_min_s: float = BACKOFF_MIN_S,
@@ -85,6 +109,7 @@ class AmiEventClient:
         self.secret = secret
         self.server_key = server_key
         self.on_dtmf = on_dtmf
+        self.on_originate = on_originate
         self.ping_interval_s = ping_interval_s
         self.read_timeout_s = read_timeout_s
         self.backoff_min_s = backoff_min_s
@@ -277,7 +302,16 @@ class AmiEventClient:
     # -- events ---------------------------------------------------------------
 
     def _handle_event(self, packet: dict) -> None:
-        if packet.get("Event") != "DTMFEnd":
+        event = packet.get("Event")
+        if event == "OriginateResponse":
+            if self.on_originate is not None:
+                self.on_originate(
+                    self.server_key, packet.get("ActionID", ""), packet.get("Response", ""),
+                    packet.get("Uniqueid", ""), packet.get("Channel", ""),
+                    packet.get("Reason", ""),
+                )
+            return
+        if event != "DTMFEnd":
             return
         if packet.get("Direction", "Received") != "Received":
             return
@@ -308,6 +342,15 @@ class AmiListenerManager:
         self._clients: dict[str, tuple[tuple, AmiEventClient, asyncio.Task]] = {}
         #: (server_key, uniqueid) → (conn, ami_channel)
         self._calls: dict[tuple[str, str], tuple[object, str]] = {}
+        # The outbound binding's two halves, each waiting for the other:
+        # (server_key, action_id) → (audio_uuid, at) for an Originate sent;
+        # (server_key, audio_uuid) → (uniqueid, channel, at) once the PBX
+        # reported it; (server_key, audio_uuid) → conn for a media leg that
+        # arrived first; (server_key, audio_uuid) → uniqueid once registered.
+        self._expected: dict[tuple[str, str], tuple[str, float]] = {}
+        self._originated: dict[tuple[str, str], tuple[str, str, float]] = {}
+        self._awaiting: dict[tuple[str, str], object] = {}
+        self._outbound_regs: dict[tuple[str, str], str] = {}
         self._lock = asyncio.Lock()
         self._stopped = False
 
@@ -331,7 +374,7 @@ class AmiListenerManager:
                 host, port, username, secret = coords
                 client = self._client_factory(
                     host, port, username, secret,
-                    server_key=key, on_dtmf=self._on_dtmf,
+                    server_key=key, on_dtmf=self._on_dtmf, on_originate=self._on_originate,
                 )
                 task = asyncio.create_task(client.run())
                 self._clients[key] = (coords, client, task)
@@ -343,6 +386,8 @@ class AmiListenerManager:
             for key in list(self._clients):
                 await self._stop_client(key)
             self._calls.clear()
+            for table in (self._expected, self._originated, self._awaiting, self._outbound_regs):
+                table.clear()
 
     async def _stop_client(self, key: str) -> None:
         coords, client, task = self._clients.pop(key)
@@ -414,9 +459,99 @@ class AmiListenerManager:
         self._calls.pop((server_key, uniqueid), None)
 
     def call_channel(self, server_key: str, uniqueid: str) -> str:
-        """The registered Asterisk channel (future Redirect target)."""
+        """The registered Asterisk channel (the Redirect target)."""
         entry = self._calls.get((server_key, uniqueid))
         return entry[1] if entry else ""
+
+    def action_client(self, server_key: str) -> AmiEventClient | None:
+        """The live event connection of a server, the actions surface a
+        transfer's ``Redirect`` rides; None when no listener covers it."""
+        entry = self._clients.get(server_key)
+        return entry[1] if entry else None
+
+    # -- outbound calls: the channel from OriginateResponse -------------------
+
+    def expect_originate(self, server_key: str, action_id: str, audio_uuid: str) -> None:
+        """An Originate named ``action_id`` goes out for the call whose media
+        leg will present ``audio_uuid``: the PBX's ``OriginateResponse`` with
+        that id names the call's channel."""
+        self._sweep_originates()
+        self._expected[(server_key, action_id)] = (audio_uuid, time.monotonic())
+
+    def bind_outbound(self, server_key: str, audio_uuid: str, conn) -> bool:
+        """The call's media leg arrived: registered at once when the PBX has
+        reported its channel (True), else held until the report lands or
+        ``unbind_outbound`` ends the wait (False)."""
+        self._sweep_originates()
+        key = (server_key, audio_uuid)
+        if key in self._originated:
+            self._bind_outbound(key, conn)
+            return True
+        self._awaiting[key] = conn
+        return False
+
+    def unbind_outbound(self, server_key: str, audio_uuid: str) -> None:
+        """The call ended: whatever half waited goes, and a registration made
+        for it is dropped. Safe for a call that never bound."""
+        key = (server_key, audio_uuid)
+        self._awaiting.pop(key, None)
+        self._originated.pop(key, None)
+        uniqueid = self._outbound_regs.pop(key, None)
+        if uniqueid is not None:
+            self.unregister_call(server_key, uniqueid)
+
+    def outbound_bound(self, server_key: str, audio_uuid: str) -> bool:
+        return (server_key, audio_uuid) in self._outbound_regs
+
+    def _bind_outbound(self, key: tuple[str, str], conn) -> None:
+        uniqueid, channel, _ = self._originated.pop(key)
+        self.register_call(key[0], uniqueid, conn, channel)
+        self._outbound_regs[key] = uniqueid
+        logger.info(
+            f"AMI events [{key[0]}] outbound call {key[1][:8]} bound to its channel "
+            f"(signalled DTMF)"
+        )
+
+    def _on_originate(
+        self, server_key: str, action_id: str, response: str,
+        uniqueid: str, channel: str, reason: str,
+    ) -> None:
+        self._sweep_originates()
+        expected = self._expected.pop((server_key, action_id), None)
+        if expected is None:
+            return      # another manager client's originate, or one long expired
+        audio_uuid = expected[0]
+        if "Success" not in response:
+            # A failed originate reports no channel (Uniqueid <unknown>); the
+            # dial watchdog fails the call as before.
+            logger.info(
+                f"AMI events [{server_key}] originate of call {audio_uuid[:8]} failed "
+                f"(reason {reason or 'unknown'})"
+            )
+            return
+        if not UNIQUEID_RE.fullmatch(uniqueid) or not CHANNEL_RE.fullmatch(channel):
+            # The uniqueid is an epoch and a sequence; the channel carries
+            # the dialled number, so only its shape is logged.
+            outside = "".join(sorted(set(_CHANNEL_CHAR.sub("", channel))))
+            logger.warning(
+                f"AMI events [{server_key}] OriginateResponse for call {audio_uuid[:8]} "
+                f"names an unusable channel (uniqueid {uniqueid[:80]!r}, a channel of "
+                f"{len(channel)} characters with {outside!r} outside the alphabet) "
+                f"— in-band digit detection only"
+            )
+            return
+        key = (server_key, audio_uuid)
+        self._originated[key] = (uniqueid, channel, time.monotonic())
+        conn = self._awaiting.pop(key, None)
+        if conn is not None:
+            self._bind_outbound(key, conn)
+
+    def _sweep_originates(self) -> None:
+        cutoff = time.monotonic() - ORIGINATE_TTL_S
+        for k in [k for k, v in self._expected.items() if v[1] < cutoff]:
+            del self._expected[k]
+        for k in [k for k, v in self._originated.items() if v[2] < cutoff]:
+            del self._originated[k]
 
     # -- dispatch -------------------------------------------------------------
 

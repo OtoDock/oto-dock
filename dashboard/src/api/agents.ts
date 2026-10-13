@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import type { EngineDescriptor } from './engineDescriptor'
 import { useAuth } from '../contexts/AuthContext'
@@ -193,6 +193,11 @@ export type LayerCapabilities = EngineDescriptor & {
   // the list. Optional: absent on an older proxy.
   auto_model?: string
   auto_model_label?: string
+  // Retired model id → the model it runs as today, for the retired ids whose
+  // successor this engine offers (the server's MODEL_SUCCESSORS rule). The
+  // chat page maps a sticky pick or a stale agent default through it.
+  // Optional: absent on an older proxy.
+  model_successors?: Record<string, string>
 }
 
 export const useExecutionLayers = () =>
@@ -364,10 +369,22 @@ export const useSetDefaultAgent = () => {
   })
 }
 
+/** What a delete changes: the listing, open file contents, and the recover
+ * bin (a delete lands there: its count and list follow at once). */
+export function invalidateAfterDelete(qc: QueryClient, agent: string): void {
+  qc.invalidateQueries({ queryKey: ['agent-files', agent] })
+  qc.invalidateQueries({ queryKey: ['agent-file-content', agent] })
+  qc.invalidateQueries({ queryKey: ['agent-recover-bin', agent] })
+}
+
 export const useDeleteAgentPath = () => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ agent, path, recursive }: { agent: string; path: string; recursive?: boolean }) => {
+    // `skipInvalidate`: one delete of a batch, whose caller refreshes once
+    // after the whole batch settles.
+    mutationFn: async ({ agent, path, recursive }: {
+      agent: string; path: string; recursive?: boolean; skipInvalidate?: boolean
+    }) => {
       const res = await apiFetch(`/v1/agents/${agent}/delete`, {
         method: 'POST',
         body: JSON.stringify({ path, recursive: recursive ?? false }),
@@ -376,8 +393,7 @@ export const useDeleteAgentPath = () => {
       return res.json()
     },
     onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
-      qc.invalidateQueries({ queryKey: ['agent-file-content', vars.agent] })
+      if (!vars.skipInvalidate) invalidateAfterDelete(qc, vars.agent)
     },
   })
 }

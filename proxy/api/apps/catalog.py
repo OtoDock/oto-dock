@@ -30,7 +30,7 @@ from core.session.visibility import is_phone_chat_owner, is_shared_chat_owner
 from ws import wire_events as wire
 from core import layout
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 # Feeds answered by the host page from its own state (they existed before
 # the catalog); the rest are answered by the platform.

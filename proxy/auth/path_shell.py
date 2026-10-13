@@ -34,6 +34,7 @@ from auth.path_shell_subst import (
     lift_substitutions,
     subst_end,
 )
+from auth.path_shell_remote import local_view, remote_command
 from core.session.external_identity import is_external_ctx
 from auth import roles
 
@@ -166,19 +167,123 @@ for _cmd in _BASH_TIER_ADMIN:
 _TIER_ORDER: dict[str, int] = {"": 0, "read": 1, "edit": 2, "extended": 3, "ask": 3, "admin": 4}
 
 # ---------------------------------------------------------------------------
-# Dangerous pattern blocklist — deny regardless of role (except admin+admin_agent)
+# The command floor: the catastrophe patterns refuse for every role on every
+# host (an admin on an admin agent included); the host-state patterns refuse
+# where the command runs on a host that does not let them ask
+# (``_host_state_asks``, ``_floor_denial``).
 # ---------------------------------------------------------------------------
 
-_DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # Recursive force-delete at root or home. The target ends at the end of
-    # the string or at a separator: a newline is deliberately not one here,
-    # because the raw scan also sees heredoc DATA lines — the multi-line
-    # forms (`rm -rf /` followed by a line, `rm -rf \<newline>/`) are
-    # caught by the per-segment scan in _check_command_string instead.
+# The two writes that end the machine or the satellite running the session:
+# the kernel's SysRq trigger and the system power state (``_ends_the_host``).
+_ENDS_THE_HOST_REASON = "Write to /proc/sysrq-trigger or /sys/power/state blocked"
+# A /proc path that is one of the session's own descriptors (``tee
+# /proc/self/fd/2``), the same object as /dev/fd/N: not host state.
+_PROC_FD_RE = re.compile(r"^/proc/(?:self|thread-self|\d+)/fd/\d+$")
+
+
+def _normalised(path: str) -> str:
+    """A write target as the kernel resolves its spelling: quotes and
+    backslash escapes dropped, repeated slashes and `.` and `..` components
+    folded (lexically; a link on the way is not followed)."""
+    p = path.replace("'", "").replace('"', "").replace("\\", "")
+    if not p.startswith("/"):
+        return p
+    return posixpath.normpath("/" + p.lstrip("/"))
+
+
+def _ends_the_host(path: str) -> bool:
+    """``path`` names the SysRq trigger (``/proc/sysrq-trigger``, or the
+    bare name after a ``cd /proc``) or the power state (``/sys/power/state``),
+    either also through a ``/proc/<pid>/root``."""
+    p = _normalised(path)
+    if p in ("/proc/sysrq-trigger", "sysrq-trigger", "/sys/power/state"):
+        return True
+    return p.startswith("/proc/") and p.endswith(("/root/proc/sysrq-trigger",
+                                                 "/root/sys/power/state"))
+
+
+def _host_state_path(path: str) -> bool:
+    """``path`` is under /proc or /sys, a descriptor of the session's own
+    excepted."""
+    p = _normalised(path)
+    under = p in ("/proc", "/sys") or p.startswith(("/proc/", "/sys/"))
+    return under and not _PROC_FD_RE.match(p)
+
+
+def _host_state_write_floor(paths, *, asks: bool) -> tuple[PathDecision | None, bool]:
+    """The floor on a segment's parsed write targets (its write paths and
+    redirect targets), each on its normalised path, which reaches what the
+    raw patterns cannot see (a quoted path, a `..`, a ``>&`` target): a write
+    to the SysRq trigger or the power state is refused everywhere; another
+    write under /proc or /sys is refused where the host-state patterns
+    refuse and makes the call destructive where they ask. Returns (the
+    denial or None, destructive)."""
+    destructive = False
+    for rp in paths:
+        if not rp or _is_pseudo_path(rp) or has_placeholder(rp):
+            continue
+        if _ends_the_host(rp):
+            return PathDecision(False, f"Bash denied: {_ENDS_THE_HOST_REASON}"), False
+        if _host_state_path(rp):
+            if not asks:
+                root = "/proc" if _normalised(rp).startswith("/proc") else "/sys"
+                return PathDecision(False, f"Bash denied: Write to {root} blocked"), False
+            destructive = True
+    return None, destructive
+
+
+class _TargetWrite:
+    """A write to the SysRq trigger or the power state in the raw text, read
+    the way the other floor patterns read it (heredoc data, quoted text): a
+    redirection into it (``>``, ``>>``, ``>|``, ``>&``, ``&>``, a numbered
+    stream), a ``tee`` or ``dd of=`` onto it, or the last operand of a copy;
+    each candidate word is judged on its normalised path. A path assembled at
+    run time (a variable, a glob, a substitution's output) or an interpreter's
+    own write is not in the text and not seen. Each context is one linear
+    pass with bounded words: the gate runs on the event loop."""
+
+    _WORD = r"[^\s<>;&|()`]{1,1024}"
+    _REDIRECT = re.compile(r">[>|&]?[ \t]*(" + _WORD + ")")
+    _DD_OF = re.compile(r"\bof=(" + _WORD + ")")
+    _OPERANDS = r"((?:[ \t]+[^\s<>;&|()`#][^\s<>;&|()`]{0,1023}){1,33})"
+    _TEE = re.compile(r"\btee\b" + _OPERANDS)
+    _COPY = re.compile(r"\b(?:cp|mv|install|ln|rsync)\b" + _OPERANDS)
+
+    def search(self, text: str) -> bool | None:
+        plain = text.replace("'", "").replace('"', "").replace("\\", "")
+        if "sysrq-trigger" not in plain and "power" not in plain:
+            return None
+        for regex in (self._REDIRECT, self._DD_OF):
+            if any(_ends_the_host(m.group(1)) for m in regex.finditer(text)):
+                return True
+        for m in self._TEE.finditer(text):
+            if any(_ends_the_host(w) for w in m.group(1).split()):
+                return True
+        if any(_ends_the_host(m.group(1).split()[-1]) for m in self._COPY.finditer(text)):
+            return True
+        return None
+
+
+# A floor entry: a compiled pattern, or a matcher with the same ``search``.
+_Matcher = re.Pattern[str] | _TargetWrite
+
+_CATASTROPHE_PATTERNS: list[tuple[_Matcher, str]] = [
+    # Recursive force-delete at root or home: the r/f flags in any order
+    # with other letters (`-Rf`, `-rfv`), the root or home (`/`, `~`, `~/`,
+    # or a glob right under them: `/*`, `/*/`, `/**`, `~/*`; quoted or not)
+    # among the first operands (`rm -rf / x`,
+    # `rm -rf --no-preserve-root /`). Blanks only, and the very end (`\Z`,
+    # where `$` would match before a final newline): the raw scan also
+    # sees heredoc DATA lines, and the multi-line forms (`rm -rf /`
+    # followed by a line, `rm -rf \<newline>/`) are caught by the
+    # per-segment scan in _check_command_string instead. The operands stop
+    # at a separator or a comment and are bounded: the gate runs on the
+    # event loop, and an unbounded run is quadratic on a long command.
     (re.compile(
-        r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r"
-        r"|--recursive\s+--force|--force\s+--recursive)"
-        r"\s+(/\s*$|/\s*[;&|]|/\*|~\s*$|~\s*[;&|])"
+        r"\brm[ \t]+(?:-[a-zA-Z]*(?:[rR][a-zA-Z]*f|f[a-zA-Z]*[rR])[a-zA-Z]*"
+        r"|--recursive[ \t]+--force|--force[ \t]+--recursive)"
+        r"(?:[ \t]+(?!#)[^ \t\n;&|]+){0,16}?[ \t]+"
+        r"(['\"]?)(?:/|~/?)(?:\*[^ \t\n;&|'\"]*)?\1(?=[ \t;&|]|\Z)"
     ), "Recursive force-delete of / or ~ is blocked"),
 
     # Fork bombs
@@ -188,17 +293,67 @@ _DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r">\s*/dev/(?:sd[a-z]|nvme|vd[a-z]|xvd[a-z])"), "Direct device write blocked"),
     (re.compile(r"\bdd\b.*\bof\s*=\s*/dev/"), "dd to device blocked"),
 
-    # /proc and /sys writes
-    (re.compile(r">\s*/proc/"), "Write to /proc blocked"),
-    (re.compile(r">\s*/sys/"), "Write to /sys blocked"),
-
-    # Kernel module operations
-    (re.compile(r"\b(insmod|modprobe|rmmod)\b"), "Kernel module operations blocked"),
+    # A write to the SysRq trigger or the power state.
+    (_TargetWrite(), _ENDS_THE_HOST_REASON),
 
     # Sensitive file reads. A `\b` before the leading slash needs a word
     # character before it, which a space or a quote is not.
     (re.compile(r"\bcat\b.*(?<![\w/])/etc/shadow\b"), "Reading /etc/shadow blocked"),
 ]
+
+# The floor's patterns that judge the state of the host the command RUNS on
+# (its /proc, its /sys, its kernel modules). They read a command's local view
+# (``path_shell_remote.local_view``): the words an ``ssh`` sends to another
+# host are that host's matter, and the remote command asks instead of being
+# refused (``_classify_command``). On a paired machine with full filesystem
+# access they ask too (``_host_state_asks``). Every catastrophe pattern
+# refuses wherever the command runs.
+_HOST_STATE_PATTERNS: list[tuple[_Matcher, str]] = [
+    (re.compile(r">[|&]?\s*/proc/"), "Write to /proc blocked"),
+    (re.compile(r">[|&]?\s*/sys/"), "Write to /sys blocked"),
+    (re.compile(r"\b(insmod|modprobe|rmmod)\b"), "Kernel module operations blocked"),
+]
+
+# Every floor pattern, for the callers that judge text with no host (an
+# undeclared tool's arguments: ``path_policy._unknown_tool_dangerous_scan``).
+_DANGEROUS_PATTERNS: list[tuple[_Matcher, str]] = _CATASTROPHE_PATTERNS + _HOST_STATE_PATTERNS
+
+
+def _host_state_asks(ctx: SecurityContext) -> bool:
+    """The host-state patterns ask instead of refusing: on a paired machine
+    whose pairing grants full filesystem access (paired for host management;
+    its path gate admits every host path), for a role the admin tier admits
+    there (``_classify_command``'s gate for docker, systemctl and ssh, so the
+    ``ssh`` rule already held for exactly these roles). The local sandbox, a
+    machine with home-only access and a lower role keep the refusal."""
+    placement = ctx.placement
+    return placement.is_remote and placement.allow_full_fs and roles.can_edit(ctx.role)
+
+
+def _floor_denial(text: str, *, remote_host: bool = False,
+                  host_asks: bool = False) -> PathDecision | None:
+    """The catastrophe floor on ``text``: every catastrophe pattern on the
+    whole text and, for a command this host runs, the host-state patterns
+    on its local view. ``remote_host``: the text runs on another host;
+    ``host_asks``: this host lets them ask (``_host_state_asks``). Either
+    way the caller weighs a host-state match (``_host_state_seen``)."""
+    for pattern, reason in _CATASTROPHE_PATTERNS:
+        if pattern.search(text):
+            return PathDecision(False, f"Bash denied: {reason}")
+    if remote_host or host_asks:
+        return None
+    local = local_view(text)
+    for pattern, reason in _HOST_STATE_PATTERNS:
+        if pattern.search(local):
+            return PathDecision(False, f"Bash denied: {reason}")
+    return None
+
+
+def _host_state_seen(text: str) -> bool:
+    """A host-state pattern in the part of ``text`` that runs on the host
+    ``text`` itself runs on."""
+    local = local_view(text)
+    return any(pattern.search(local) for pattern, _ in _HOST_STATE_PATTERNS)
 
 # Redirect targets that are not files: the null device and the standard
 # streams (``/dev/fd/N`` is the same object as a numbered stream), and Bash's
@@ -593,6 +748,11 @@ def _split_command_segments(command: str) -> list[str]:
             current = []
             i += 2
             continue
+        if ch == "|" and current and current[-1] == ">":
+            # `>|`: a redirection past noclobber, not a pipe.
+            current.append(ch)
+            i += 1
+            continue
         if ch == "|" and i + 1 < len(command) and command[i + 1] == "|":
             seg = "".join(current).strip()
             if seg:
@@ -661,9 +821,11 @@ def _extract_command_name(segment: str) -> str | None:
 
 
 def _extract_redirect_targets(segment: str) -> list[str]:
-    """Extract file paths from >, >>, 2>, 2>> redirect operators.
+    """Extract file paths from >, >>, >|, 2>, 2>> and >&WORD redirect operators.
 
-    Skips fd redirects (>&, 2>&1). Returns raw path strings.
+    ``>&WORD`` writes both streams to WORD unless WORD is a descriptor (all
+    digits) or ``-`` (close): those are skipped (2>&1). Returns raw path
+    strings.
     """
     targets: list[str] = []
     i = 0
@@ -690,15 +852,14 @@ def _extract_redirect_targets(segment: str) -> list[str]:
 
         # Detect redirect operators
         if ch == ">":
-            # Check if preceded by a digit (stderr redirect 2>)
-            # Skip fd-to-fd redirects: >&, 2>&1
             next_i = i + 1
             if next_i < len(segment) and segment[next_i] == ">":
                 next_i += 1  # >>
-            if next_i < len(segment) and segment[next_i] == "&":
-                i = next_i + 1  # skip >&N or >>&N
-                continue
-
+            if next_i < len(segment) and segment[next_i] == "|":
+                next_i += 1  # >| (past noclobber)
+            dup = next_i < len(segment) and segment[next_i] == "&"
+            if dup:
+                next_i += 1
             # Move past the operator
             i = next_i
             # Skip whitespace
@@ -711,6 +872,8 @@ def _extract_redirect_targets(segment: str) -> list[str]:
                 i += 1
             if path_chars:
                 raw = "".join(path_chars).strip("'\"")
+                if dup and (raw.isdigit() or raw == "-"):
+                    continue  # a descriptor, not a file
                 targets.append(raw)
             continue
 
@@ -738,7 +901,8 @@ def _filter_redirect_tokens(args: list[str]) -> list[str]:
         # keep them out of the positional path args. A spaced heredoc operator
         # (`<< EOF` / `<< 'EOF'`) consumes its delimiter the same way — the
         # delimiter is a sentinel, not a path.
-        if arg in (">", ">>", "2>", "2>>", "1>", "1>>", "<", "0<", "<<", "<<-"):
+        if arg in (">", ">>", ">|", ">&", "&>", "&>>", "2>", "2>>", "1>", "1>>", "<", "0<",
+                   "<<", "<<-"):
             skip_next = True  # next token is the target / heredoc delimiter
             continue
         # Fused redirect: >/path, >>/path, 2>/path, </path, 0</path, and the
@@ -827,7 +991,7 @@ def _extract_path_args(
         # without the flag check, `rg -e PAT /path` would drop `/path`.)
         value_flags = _VALUE_FLAGS_BY_CMD.get(cmd_name, set())
         program_flags = _PROGRAM_FLAGS_BY_CMD.get(cmd_name, set())
-        positional: list[str] = []
+        positional = []
         skip_next = False
         pattern_from_flag = False
         for arg in args:
@@ -867,8 +1031,9 @@ def _extract_path_args(
         # the protected-file check. `mv` removes its sources: writes as well.
         value_flags = _COPY_VALUE_FLAGS.get(cmd_name, set())
         takes_target = cmd_name != "rsync"
-        positional: list[str] = []
+        positional = []
         target_dir: str | None = None
+        dest: str | None
         expect: str | None = None
         options_done = False
         for arg in args:
@@ -1218,7 +1383,8 @@ def _path_looking_tokens(segment: str) -> list[str]:
 
 def _classify_segment(
     segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
-    dangerous_only: bool = False,
+    dangerous_only: bool = False, remote_host: bool = False,
+    host_asks: bool = False,
 ) -> PathDecision:
     """Classify one pipeline segment → PathDecision(allowed, permission_tier,
     destructive). Command substitutions are lifted out first: each inner is
@@ -1235,14 +1401,20 @@ def _classify_segment(
     _check_command_string) reaches every nested level, but SKIP the tier /
     admin-role-gate / cross-user PATH checks — an admin-on-admin agent is
     unrestricted beyond the irreversible-catastrophe floor. Allows anything the
-    floor doesn't deny."""
+    floor doesn't deny.
+
+    ``remote_host``: the segment runs on another host (an ``ssh``'s remote
+    command, always with ``dangerous_only``): only the catastrophe patterns
+    refuse there. ``host_asks``: the host-state patterns ask on this host
+    (``_host_state_asks``); the caller weighs their matches."""
     lifted, inners = lift_substitutions(segment)
     sub_tier, sub_destructive = "read", False
     for inner in inners:
         if not inner.strip():
             continue
         r = _check_command_string(inner, ctx, is_remote=is_remote, depth=depth + 1,
-                                  dangerous_only=dangerous_only)
+                                  dangerous_only=dangerous_only, remote_host=remote_host,
+                                  host_asks=host_asks)
         if not r.allowed:
             return r
         t = r.permission_tier or "read"
@@ -1252,13 +1424,17 @@ def _classify_segment(
     if inners:
         # The lifted text is a new normalised form of the segment: the
         # catastrophe floor runs on it like on every other one.
-        for pattern, reason in _DANGEROUS_PATTERNS:
-            if pattern.search(lifted):
-                return PathDecision(False, f"Bash denied: {reason}")
+        denied = _floor_denial(lifted, remote_host=remote_host, host_asks=host_asks)
+        if denied is not None:
+            return denied
     outer = _classify_command(lifted, ctx, is_remote=is_remote, depth=depth,
-                              dangerous_only=dangerous_only)
-    if not outer.allowed or dangerous_only:
+                              dangerous_only=dangerous_only, remote_host=remote_host,
+                              host_asks=host_asks)
+    if not outer.allowed:
         return outer
+    if dangerous_only:
+        return PathDecision(allowed=True, permission_tier=outer.permission_tier,
+                            destructive=outer.destructive or sub_destructive)
     if not inners and not has_placeholder(segment):
         return outer
     tier = "ask"
@@ -1296,10 +1472,14 @@ def _remote_protected_denial(
 
 def _classify_command(
     segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
-    dangerous_only: bool = False,
+    dangerous_only: bool = False, remote_host: bool = False,
+    host_asks: bool = False,
 ) -> PathDecision:
     """Classify a segment whose substitutions were already lifted: shell
-    structure, wrappers, the command's tier, role gate and path arguments."""
+    structure, wrappers, the command's tier, role gate and path arguments.
+    An ``ssh`` segment's remote command is judged as the other host's
+    (``_ssh_remote_decision``) besides the segment's own classification."""
+    state_asks = host_asks or remote_host
 
     def _bash_path_decision(rp: str, *, writing: bool) -> PathDecision:
         if is_remote:
@@ -1312,14 +1492,21 @@ def _classify_command(
         f`` reads f, ``: > f`` truncates), so those are checked like a
         command's. ``[[ … ]]`` and ``(( … ))`` are exempt: there ``<``/``>``
         are comparison operators, not redirects."""
+        head = seg.lstrip()
+        comparison = head.startswith("[[") or head.startswith("((")
+        state_destructive = False
+        if not comparison:
+            denied, state_destructive = _host_state_write_floor(
+                _extract_redirect_targets(seg), asks=state_asks)
+            if denied is not None:
+                return denied
         if dangerous_only:
-            if is_remote:
+            if is_remote and not remote_host:
                 denied = _remote_protected_denial(None, seg, ctx)
                 if denied is not None:
                     return denied
-            return PathDecision(allowed=True, permission_tier="read")
-        head = seg.lstrip()
-        if head.startswith("[[") or head.startswith("(("):
+            return PathDecision(allowed=True, permission_tier="read", destructive=state_destructive)
+        if comparison:
             return PathDecision(allowed=True, permission_tier="read")
         tier = "read"
         for rp in _extract_redirect_targets(seg):
@@ -1335,7 +1522,7 @@ def _classify_command(
             d = _bash_path_decision(rp, writing=False)
             if not d.allowed:
                 return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
-        return PathDecision(allowed=True, permission_tier=tier)
+        return PathDecision(allowed=True, permission_tier=tier, destructive=state_destructive)
 
     # 1. Shell structure — subshell parens, leading keywords (``do``/``then``/
     #    ``if``/``!``/``{``) and case labels are peeled off so the command
@@ -1350,9 +1537,9 @@ def _classify_command(
         # Re-run the catastrophe floor on the peeled body, as every unwrap
         # level does: ``( rm -rf / )`` hides the bare root behind the closing
         # paren's boundary in the raw scan.
-        for pattern, reason in _DANGEROUS_PATTERNS:
-            if pattern.search(body):
-                return PathDecision(False, f"Bash denied: {reason}")
+        denied = _floor_denial(body, remote_host=remote_host, host_asks=host_asks)
+        if denied is not None:
+            return denied
     segment = body
 
     # 2. Wrappers — recurse on the inner command string, or re-classify the
@@ -1360,10 +1547,12 @@ def _classify_command(
     kind, inner = _unwrap_segment(segment)
     if kind == "string":
         return _check_command_string(inner, ctx, is_remote=is_remote, depth=depth + 1,
-                                     dangerous_only=dangerous_only)
+                                     dangerous_only=dangerous_only, remote_host=remote_host,
+                                     host_asks=host_asks)
     if kind == "segment" and inner != segment and inner.strip():
         return _classify_segment(inner, ctx, is_remote=is_remote, depth=depth + 1,
-                                 dangerous_only=dangerous_only)
+                                 dangerous_only=dangerous_only, remote_host=remote_host,
+                                 host_asks=host_asks)
 
     # 3. Plain command. A segment with no command word (``F=/x``, ``x=1 y=2``,
     #    ``> out``) is structure — exactly like ``export F=/x`` — not a parse
@@ -1406,7 +1595,8 @@ def _classify_command(
     if cmd_name == "find":
         for exec_inner in _find_exec_inners(segment):
             r = _check_command_string(exec_inner, ctx, is_remote=is_remote, depth=depth + 1,
-                                      dangerous_only=dangerous_only)
+                                      dangerous_only=dangerous_only, remote_host=remote_host,
+                                      host_asks=host_asks)
             if not r.allowed:
                 return r
             find_exec_destructive = find_exec_destructive or r.destructive
@@ -1414,17 +1604,37 @@ def _classify_command(
             if _TIER_ORDER.get(inner_tier, 0) > _TIER_ORDER.get(find_exec_tier, 0):
                 find_exec_tier = inner_tier
 
+    # ssh — the remote command runs on the other host: its catastrophes are
+    # refused, a host-state write there asks (destructive) instead.
+    ssh_destructive = False
+    if cmd_name == "ssh":
+        remote = remote_command(segment)
+        if remote:
+            r = _check_command_string(remote, ctx, is_remote=is_remote, depth=depth + 1,
+                                      dangerous_only=True, remote_host=True)
+            if not r.allowed:
+                return r
+            ssh_destructive = r.destructive
+
     # Floor pass: the dangerous scan (in the caller) + the recursions above are the
     # whole check — skip tier / role-gate / path (admin unrestricted beyond it).
     # On a machine the floor still refuses the paths the remote resolver marks
     # protected (the machine's own OtoDock state, the OAuth credentials, the
-    # agent's CLI config): those hold for every role, the admin's included.
+    # agent's CLI config): those hold for every role, the admin's included —
+    # but not in a command another host runs.
     if dangerous_only:
-        if is_remote:
+        if is_remote and not remote_host:
             denied = _remote_protected_denial(cmd_name, segment, ctx)
             if denied is not None:
                 return denied
-        return PathDecision(allowed=True, permission_tier="read")
+        denied, state_destructive = _host_state_write_floor(
+            [*_extract_path_args(cmd_name, segment)[1], *_extract_redirect_targets(segment)],
+            asks=state_asks)
+        if denied is not None:
+            return denied
+        return PathDecision(allowed=True, permission_tier="read",
+                            destructive=find_exec_destructive or ssh_destructive
+                            or state_destructive)
 
     # ===== Non-admin: tier classification + admin-role-gate + path checks =====
     # Unknown command → "ask" (prompt in default/acceptEdits, run in dontAsk/auto)
@@ -1453,11 +1663,17 @@ def _classify_command(
                 f"commands touch host state outside the sandbox.",
             )
 
-    destructive = cmd_name in _DESTRUCTIVE_COMMANDS or find_exec_destructive
+    destructive = (cmd_name in _DESTRUCTIVE_COMMANDS or find_exec_destructive
+                   or ssh_destructive)
     if cmd_name == "find" and _find_has_delete(segment):
         destructive = True
 
     read_paths, write_paths = _extract_path_args(cmd_name, segment)
+    denied, state_destructive = _host_state_write_floor(
+        [*write_paths, *_extract_redirect_targets(segment)], asks=state_asks)
+    if denied is not None:
+        return denied
+    destructive = destructive or state_destructive
     for rp in read_paths:
         if has_placeholder(rp):
             continue
@@ -1493,7 +1709,8 @@ def _classify_command(
 
 def _check_command_string(
     command: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
-    dangerous_only: bool = False,
+    dangerous_only: bool = False, remote_host: bool = False,
+    host_asks: bool = False,
 ) -> PathDecision:
     """Check one command string: _DANGEROUS_PATTERNS (re-run at EVERY recursion
     level) + per-segment classify. Recursed for ``bash -c``/``eval`` inners +
@@ -1501,7 +1718,13 @@ def _check_command_string(
 
     ``dangerous_only`` threads the admin catastrophe-floor pass through the whole
     recursion: the dangerous scan still runs at every level, but _classify_segment
-    skips tier / role-gate / path (see its docstring)."""
+    skips tier / role-gate / path (see its docstring).
+
+    ``remote_host``: the string is an ``ssh``'s remote command, run on another
+    host. ``host_asks``: the host it runs on lets the host-state patterns ask
+    (``_host_state_asks``). Either way its catastrophes are refused and a
+    host-state match (a /proc or /sys write, a kernel module) makes the
+    decision destructive instead of refused."""
     if depth > _MAX_BASH_DEPTH:
         return PathDecision(False, "Bash denied: command nesting too deep")
     command = command.strip()
@@ -1510,27 +1733,33 @@ def _check_command_string(
     # Dangerous patterns — the universal hard-deny (incl. admin-on-admin, via the
     # dangerous_only floor pass). Re-run here so an unwrapped inner (whose
     # quotes/parens defeated the outer raw scan, e.g. `bash -c "rm -rf /"`) is
-    # still caught.
-    for pattern, reason in _DANGEROUS_PATTERNS:
-        if pattern.search(command):
-            return PathDecision(False, f"Bash denied: {reason}")
+    # still caught. The host-state patterns read the command's local view:
+    # the words an ``ssh`` sends to another host are judged as that host's.
+    denied = _floor_denial(command, remote_host=remote_host, host_asks=host_asks)
+    if denied is not None:
+        return denied
+    state_asks = remote_host or host_asks
+    state_seen = state_asks and _host_state_seen(command)
     try:
         segments = _split_command_segments(command)
     except ValueError as e:
         return PathDecision(False, f"Bash denied: {e}")
     if not segments:
-        return PathDecision(allowed=True, permission_tier="read")
+        return PathDecision(allowed=True, permission_tier="read", destructive=state_seen)
     max_tier = "read"
-    saw_destructive = False
+    saw_destructive = state_seen
     for segment in segments:
         # A segment is a normalised form the raw scan never saw: a joined
         # line continuation (`rm -rf \<newline>/`) or a lifted heredoc
-        # substitution only exist here.
-        for pattern, reason in _DANGEROUS_PATTERNS:
-            if pattern.search(segment):
-                return PathDecision(False, f"Bash denied: {reason}")
+        # substitution only exist here, so a host-state match that asks is
+        # weighed here too.
+        denied = _floor_denial(segment, remote_host=remote_host, host_asks=host_asks)
+        if denied is not None:
+            return denied
+        saw_destructive = saw_destructive or (state_asks and _host_state_seen(segment))
         res = _classify_segment(segment, ctx, is_remote=is_remote, depth=depth,
-                                dangerous_only=dangerous_only)
+                                dangerous_only=dangerous_only, remote_host=remote_host,
+                                host_asks=host_asks)
         if not res.allowed:
             return res
         t = res.permission_tier or "read"
@@ -1587,6 +1816,7 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
     # per-role RBAC for in-tree). Local sessions keep agent-tree RBAC (bwrap is
     # the real boundary). Threaded into the recursion via _classify_segment.
     is_remote = ctx.placement.is_remote
+    host_asks = _host_state_asks(ctx)
 
     # Admin on admin agent: unrestricted for normal ops (tier / cross-user PATH
     # checks skipped) EXCEPT the irreversible-catastrophe floor — _DANGEROUS_PATTERNS
@@ -1600,12 +1830,13 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
     # classified, an admin's on an admin agent included.
     if ctx.is_admin_agent and roles.is_admin(ctx.role) and not getattr(ctx, "read_only", False):
         floor = _check_command_string(command, ctx, is_remote=is_remote, depth=0,
-                                      dangerous_only=True)
+                                      dangerous_only=True, host_asks=host_asks)
         if not floor.allowed:
             return floor
         return PathDecision(allowed=True, permission_tier="admin")
 
-    return _check_command_string(command, ctx, is_remote=is_remote, depth=0)
+    return _check_command_string(command, ctx, is_remote=is_remote, depth=0,
+                                 host_asks=host_asks)
 
 
 # ---------------------------------------------------------------------------

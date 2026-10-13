@@ -7,6 +7,9 @@ import { fireEvent, render, screen } from '@testing-library/react'
 // x; a received item has the x and Open. The panel passes it through by
 // props, so it renders with no QueryClient and no router.
 
+const authUser = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }))
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: authUser.current }) }))
+
 import NotificationPanel from '@/components/chat/notifications/NotificationPanel'
 import ShareInboxSection from '@/components/sharing/ShareInboxSection'
 import NotificationBell from '@/components/chat/notifications/NotificationBell'
@@ -43,6 +46,30 @@ describe('ShareInboxSection', () => {
     expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }), 'lite')
     fireEvent.click(screen.getByRole('button', { name: 'Decline' }))
     expect(onDecline).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }))
+  })
+
+  it('a Shared-only agent is offered for everyone at the editor tier and not below it', () => {
+    const pool = { name: 'pool', display_name: 'Ops Pool', color: '', collaborative: false, default_scope: 'agent' }
+    const withPool = [...agents, pool] as unknown as AgentSummary[]
+    const onAccept = vi.fn()
+    authUser.current = { role: 'member', agents: ['alpha', 'lite', 'pool'], agent_roles: { lite: 'viewer', pool: 'editor' } }
+    const first = render(<ShareInboxSection items={[mkItem({})]} agents={withPool}
+      onAccept={onAccept} onDecline={noop} onHide={noop} onOpen={noop} />)
+    const select = screen.getByLabelText('Place in') as HTMLSelectElement
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Lite', 'Ops Pool (for everyone there)'])
+    expect(screen.queryByTestId('share-inbox-for-everyone')).toBeNull()
+    fireEvent.change(select, { target: { value: 'pool' } })
+    expect(screen.getByTestId('share-inbox-for-everyone').textContent).toContain(
+      'Ops Pool is Shared only: its chats run as the agent, so the app goes to its apps for everyone there, and Nora is told.')
+    fireEvent.click(screen.getByRole('button', { name: 'Add for everyone' }))
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }), 'pool')
+    first.unmount()
+    // Below the editor tier there the agent is not offered at all.
+    authUser.current = { role: 'member', agents: ['alpha', 'lite', 'pool'], agent_roles: { lite: 'viewer', pool: 'viewer' } }
+    render(<ShareInboxSection items={[mkItem({})]} agents={withPool}
+      onAccept={noop} onDecline={noop} onHide={noop} onOpen={noop} />)
+    expect(Array.from((screen.getByLabelText('Place in') as HTMLSelectElement).options).map((o) => o.value)).toEqual(['lite'])
+    authUser.current = null
   })
 
   it('with no agent to place into, the item says so and keeps Decline', () => {

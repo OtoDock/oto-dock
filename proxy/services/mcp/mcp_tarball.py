@@ -44,7 +44,7 @@ from pathlib import Path
 
 from services.mcp import mcp_installer
 
-logger = logging.getLogger("claude-proxy.mcp-tarball")
+logger = logging.getLogger("otodock.mcp-tarball")
 
 # --- Config ---
 

@@ -65,6 +65,17 @@ class TwilioRestClient:
             ("StatusCallback", status_callback),
             ("StatusCallbackMethod", "POST"),
         ] + [("StatusCallbackEvent", e) for e in status_events]
+        return await self._post(url, data, "Twilio call create rejected")
+
+    async def update_call(self, call_sid: str, twiml: str) -> dict:
+        """`POST /2010-04-01/Accounts/{sid}/Calls/{CallSid}.json` with new
+        inline TwiML: the live call leaves our media stream and runs it (a
+        transfer is a ``<Dial>``)."""
+        url = (f"{self._base_url}/2010-04-01/Accounts/"
+               f"{self._account_sid}/Calls/{call_sid}.json")
+        return await self._post(url, [("Twiml", twiml)], "Twilio call update rejected")
+
+    async def _post(self, url: str, data: list[tuple[str, str]], refused: str) -> dict:
         timeout = aiohttp.ClientTimeout(total=15)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -75,7 +86,7 @@ class TwilioRestClient:
                     body = await resp.text()
                     if resp.status >= 400:
                         raise TwilioRestError(
-                            f"Twilio call create rejected ({resp.status})",
+                            f"{refused} ({resp.status})",
                             status=resp.status, body=body,
                         )
                     return await resp.json(content_type=None)

@@ -31,7 +31,7 @@ from auth.webhook_providers.base import (
 # practice); the handshake signs nothing outside it.
 _ZOOM_PLAIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-+/=]{1,256}")
 
-logger = logging.getLogger("claude-proxy.webhook-providers.generic")
+logger = logging.getLogger("otodock.webhook-providers.generic")
 
 
 _ALGORITHMS = {
@@ -244,11 +244,14 @@ class GenericWebhookProvider(WebhookProvider):
         event_id = self.extract_event_id(
             body=body, headers=headers, manifest_block=manifest_block,
         )
+        # The manifest's event_id_field names the vendor's per-delivery id
+        # (WEBHOOKS.md "Dedup ids must be unique per logical delivery").
         return normalize_event(
             body=body,
             headers=headers,
             manifest_block=norm_block,
             vendor_event_id=event_id,
+            global_event_id=event_id,
         )
 
 

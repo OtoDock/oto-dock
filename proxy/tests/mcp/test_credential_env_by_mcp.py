@@ -71,10 +71,11 @@ def test_env_by_mcp_skips_credless_and_excluded(monkeypatch):
     assert result.secret_keys == set()          # nothing to strip
 
 
-def test_oauth_env_injection_is_bash_not_secret(monkeypatch):
-    """OAuth env = credentials_dir PATHS (kept in the flat env) + env_injection
-    (GH_TOKEN, bash-only). Neither is a PURE secret → secret_keys stays empty;
-    the injection names land in bash_env_keys (→ OTO_STRIP_KEYS)."""
+def test_oauth_git_entries_are_bash_not_secret(monkeypatch):
+    """OAuth env = credentials_dir PATHS (kept in the flat env) + the git
+    helper entries (GIT_CONFIG_*, bash-only, no secret). Neither is a PURE
+    secret → secret_keys stays empty; the git names land in bash_env_keys
+    (→ OTO_STRIP_KEYS)."""
     from services.mcp import mcp_registry
     monkeypatch.setattr(
         mcp_registry, "get_agent_mcps_all_placements",
@@ -87,7 +88,7 @@ def test_oauth_env_injection_is_bash_not_secret(monkeypatch):
     )
     monkeypatch.setattr(
         credential_resolver, "_resolve_oauth_mcp",
-        lambda *a, **k: {"GH_TOKEN": "tok", "WS_DIR": "/virt"},
+        lambda *a, **k: {"GIT_CONFIG_COUNT": "2", "WS_DIR": "/virt"},
     )
     monkeypatch.setattr(
         mcp_registry, "get_credentials_dirs",
@@ -96,6 +97,6 @@ def test_oauth_env_injection_is_bash_not_secret(monkeypatch):
 
     result = credential_resolver.resolve_credentials("agent", "user-1")
 
-    assert result.env_by_mcp == {"gh": {"GH_TOKEN": "tok", "WS_DIR": "/virt"}}
-    assert result.bash_env_keys == {"GH_TOKEN"}   # env_injection (oauth_env - paths)
-    assert result.secret_keys == set()            # OAuth contributes NO pure secrets
+    assert result.env_by_mcp == {"gh": {"GIT_CONFIG_COUNT": "2", "WS_DIR": "/virt"}}
+    assert result.bash_env_keys == {"GIT_CONFIG_COUNT"}   # the git entries (oauth_env - paths)
+    assert result.secret_keys == set()                    # OAuth contributes NO pure secrets

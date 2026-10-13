@@ -48,8 +48,9 @@ from core.session import session_kind
 from core.session.transcript_tailer import leaves_turn_open
 from ws import chat_phase
 from ws import wire_events as wire
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.interactive")
+logger = logging.getLogger("otodock.interactive")
 
 # Terminal auto-RESPONSE sequences the mirror xterm emits but that are NOT user
 # input (DA/DSR/CPR replies, focus reports, DECRPM/kitty/XTWINOPS/OSC/DCS
@@ -278,6 +279,8 @@ class InteractiveSession:
     # The hook-driven park already pinged the open dialog (see
     # park_on_native_dialog) — the transcript fold must not ping it again.
     _native_park_pinged = False
+    # The gate's stamp of the latest hook park (see _apply_turn_signal).
+    _parked_at: float | None = None
     # No turn-end waiters on a partial instance (the turn-complete funnel
     # reads it); __init__ gives every real session its own list.
     _turn_end_waiters: "list[TurnCompleteCb] | tuple[()]" = ()
@@ -540,6 +543,10 @@ class InteractiveSession:
         # gated off (the paste would land in the dialog). Cleared on any
         # reopen or on a real end_turn (ESC dismissed the question).
         self._question_parked = False
+        # When the hook parked it, by the clock of the CLI's host (the gate's
+        # ``hook_sent_at``): a tail batch whose reopening line was journaled
+        # before the park is a read that raced the park, not a new turn.
+        self._parked_at = None
         # The chat ROW's owner (lazy) — for shared-only agents it is the
         # synthetic agent::<slug>, which the status broadcast fans out to
         # every user of the agent; self.user_sub would reach only one.
@@ -730,7 +737,8 @@ class InteractiveSession:
             try:
                 res = prev_evict("superseded")
                 if asyncio.iscoroutine(res):
-                    self._loop.create_task(res)
+                    spawn(res,
+                          name="evict_superseded_viewer", owner="interactive_session")
             except Exception:
                 logger.exception("interactive %s: viewer evict failed", self.session_id[:8])
         if self.pty is None:
@@ -776,7 +784,7 @@ class InteractiveSession:
             try:
                 res = ev(reason)
                 if asyncio.iscoroutine(res):
-                    self._loop.create_task(res)
+                    spawn(res, name="evict_viewer", owner="interactive_session")
             except Exception:
                 logger.exception("interactive %s: evict_viewer failed", self.session_id[:8])
 
@@ -790,7 +798,7 @@ class InteractiveSession:
         try:
             res = self.on_status(state)
             if asyncio.iscoroutine(res):
-                self._loop.create_task(res)
+                spawn(res, name="status", owner="interactive_session")
         except Exception:
             logger.exception("interactive %s: on_status failed", self.session_id[:8])
 
@@ -859,7 +867,7 @@ class InteractiveSession:
             try:
                 res = cb(mirror_data)
                 if asyncio.iscoroutine(res):
-                    self._loop.create_task(res)
+                    spawn(res, name="mirror_output", owner="interactive_session")
             except Exception:
                 logger.exception("interactive %s: output listener failed", self.session_id[:8])
 
@@ -1270,7 +1278,7 @@ class InteractiveSession:
                     "interactive %s: undelivered-input breadcrumb persist "
                     "failed", self.session_id[:8],
                 )
-        self._loop.create_task(_write())
+        spawn(_write(), name="write", owner="interactive_session")
 
     def set_pending_seed(self, digest: str) -> None:
         """Stash a restored-history digest (DB-fallback) to prepend to the cold
@@ -1305,7 +1313,8 @@ class InteractiveSession:
             "interactive %s: queued server prompt [%s] (depth=%d)",
             self.session_id[:8], source, len(self._prompt_queue),
         )
-        self._loop.create_task(self._try_drain_prompt_queue())
+        spawn(self._try_drain_prompt_queue(),
+              name="try_drain_prompt_queue", owner="interactive_session")
         return item
 
     def cancel_prompt(self, item: dict) -> bool:
@@ -1341,19 +1350,31 @@ class InteractiveSession:
             logger.exception("interactive: on_injected hook failed [%s]", item.get("source", "?"))
 
     def _apply_turn_signal(self, last_signal: str | None,
-                           question_pending: bool = False) -> None:
+                           question_pending: bool = False,
+                           signal_at: float | None = None) -> None:
         """Fold a tailer batch's ``last_signal`` into the turn-open state.
         ``question_pending`` tracks the question-parked flag alongside: set on
         a question fold, cleared by the next turn-relevant signal (reopen or
         real end_turn); signal-less batches leave it untouched. A batch with
         a signal is activity: the CLI journaled turn work, which covers a turn
-        it opened with no input (a background subagent's result, a self-wake)."""
+        it opened with no input (a background subagent's result, a self-wake).
+
+        ``signal_at`` is the journal time of the line behind the signal: while
+        a hook park holds the turn, a reopen journaled before the park (an
+        earlier call's lines, read before the park and folded after it) is
+        dropped, so the composer hold stays on and a send cannot land in the
+        dialog. A line from after the park (the answer) folds as always."""
+        if (signal_at is not None and not question_pending
+                and leaves_turn_open(last_signal) and self._question_parked
+                and self._parked_at is not None and signal_at < self._parked_at):
+            return
         if last_signal is not None or question_pending:
             self._note_activity(io=False)
         if question_pending:
             self._question_parked = True
         elif last_signal is not None:
             self._question_parked = False
+            self._parked_at = None
         if leaves_turn_open(last_signal):
             self._set_turn_open(True)
         elif last_signal == "end_turn":
@@ -1367,7 +1388,7 @@ class InteractiveSession:
                 # turn never stamps last_response_at / lights the unread dot.
                 self._turn_end_effects()
 
-    def park_on_native_dialog(self, tool_name: str) -> None:
+    def park_on_native_dialog(self, tool_name: str, *, sent_at: float | None = None) -> None:
         """The permission hook saw the CLI open a dialog that blocks the turn
         on the human — the AskUserQuestion cards (hook ``allow``), the
         ExitPlanMode approval (hook ``defer``) or Codex's request_user_input
@@ -1387,13 +1408,17 @@ class InteractiveSession:
         prompt only, and the whole turn lands in order with the answer (a
         hook-written card was tried and dropped — it could not be answered
         from the history and the late-arriving text rendered below it).
-        Loop thread (called from the hook handler)."""
+        ``sent_at`` is the gate's ``hook_sent_at`` (the clock of the host the
+        CLI runs on), kept so a tail batch read before the park cannot reopen
+        the turn (``_apply_turn_signal``). Loop thread (called from the hook
+        handler)."""
         if self._closed or not self.chat_id:
             return
         logger.info("interactive %s: parked on the native %s dialog",
                     self.session_id[:8], tool_name)
         self._note_activity(io=False)
         self._question_parked = True
+        self._parked_at = sent_at
         if self._turn_open:
             self._set_turn_open(False)
         else:
@@ -1476,10 +1501,10 @@ class InteractiveSession:
         # records the end for the session's bookkeeping.
         try:
             from core.session import session_events
-            self._loop.create_task(session_events.turn_end(
+            spawn(session_events.turn_end(
                 self.session_id, source="transcript",
                 engine=self.transcript_kind, driven_by="cli",
-            ))
+            ), name="turn_end", owner="interactive_session")
         except Exception:
             logger.debug("interactive %s: turn_end observation failed",
                          self.session_id[:8], exc_info=True)
@@ -1559,7 +1584,8 @@ class InteractiveSession:
     def _fire_inject_backstop(self) -> None:
         self._inject_backstop_handle = None
         if self._prompt_queue and not self._closing and not self._closed:
-            self._loop.create_task(self._try_drain_prompt_queue())
+            spawn(self._try_drain_prompt_queue(),
+                  name="try_drain_prompt_queue", owner="interactive_session")
 
     def _prompt_gates_blocked(
         self, *, for_satellite: bool = False, steering: bool = False,
@@ -1813,7 +1839,8 @@ class InteractiveSession:
             if reason == "not_attached" and not self.otodock_attached:
                 # The local terminal detached while the frame was in flight —
                 # the proxy path owns the queue again.
-                self._loop.create_task(self._try_drain_prompt_queue())
+                spawn(self._try_drain_prompt_queue(),
+                      name="try_drain_prompt_queue", owner="interactive_session")
         self._arm_inject_backstop()
 
     def _tailer(self):
@@ -1832,7 +1859,8 @@ class InteractiveSession:
         self._tail_handle = None
         if self._closed or not self.chat_id:
             return
-        self._loop.create_task(self._tail_and_maybe_complete())
+        spawn(self._tail_and_maybe_complete(),
+              name="tail_and_maybe_complete", owner="interactive_session")
 
     def _run_resume_tail(self) -> None:
         """Resume-check fired: read the transcript now. If the CLI resumed on
@@ -1842,7 +1870,8 @@ class InteractiveSession:
         self._resume_tail_handle = None
         if self._closed or not self.chat_id or self._turn_open:
             return
-        self._loop.create_task(self._tail_and_maybe_complete())
+        spawn(self._tail_and_maybe_complete(),
+              name="tail_and_maybe_complete", owner="interactive_session")
 
     def _run_midturn_tail(self) -> None:
         """Periodic mid-turn tail (local): persist the open turn's rows as they
@@ -1883,7 +1912,8 @@ class InteractiveSession:
         :meth:`_maybe_fire_turn_complete`)."""
         last_signal = result.get("last_signal")
         self._apply_turn_signal(last_signal,
-                                question_pending=bool(result.get("question_pending")))
+                                question_pending=bool(result.get("question_pending")),
+                                signal_at=result.get("last_signal_at"))
         self._post_batch_effects(result)
         if result.get("turn_complete") or result.get("question_pending"):
             self._maybe_fire_turn_complete(
@@ -1989,9 +2019,9 @@ class InteractiveSession:
             self._title_timer = None
         try:
             from services import title_generator
-            self._loop.create_task(title_generator.request_chat_title(
+            spawn(title_generator.request_chat_title(
                 self.chat_id, assistant_excerpt=assistant_excerpt,
-            ))
+            ), name="request_chat_title", owner="interactive_session")
         except Exception:
             logger.exception(
                 "interactive %s: title request failed to schedule",
@@ -2003,7 +2033,8 @@ class InteractiveSession:
         self._title_timer = None
         if self._closing or self._closed or not self._title_armed:
             return
-        self._loop.create_task(self._title_timer_task())
+        spawn(self._title_timer_task(),
+              name="title_timer_task", owner="interactive_session")
 
     async def _title_timer_task(self) -> None:
         """Force one full tail pass (so the locally-starved transcript catches
@@ -2031,7 +2062,8 @@ class InteractiveSession:
         order."""
         if self._closed or not self.chat_id or not lines:
             return
-        self._loop.create_task(self._persist_forwarded_lines(list(lines)))
+        spawn(self._persist_forwarded_lines(list(lines)),
+              name="persist_forwarded_lines", owner="interactive_session")
 
     async def _persist_forwarded_lines(self, lines: list[str]) -> None:
         tailer = self._tailer()
@@ -2131,7 +2163,8 @@ class InteractiveSession:
         # to the delivery ladder instead). Skipped while parked on a question:
         # an injected prompt would land in (and fight) the question dialog.
         if self._prompt_queue and not self._closing and not question:
-            self._loop.create_task(self._try_drain_prompt_queue())
+            spawn(self._try_drain_prompt_queue(),
+                  name="try_drain_prompt_queue", owner="interactive_session")
 
         # (3) one-time interactive-TASK completion callback, and the one-shot
         # turn-end waiters (a borrowed-terminal round's) — the same gates.
@@ -2159,7 +2192,7 @@ class InteractiveSession:
         try:
             res = cb(last_message)
             if asyncio.iscoroutine(res):
-                self._loop.create_task(res)
+                spawn(res, name="turn_complete", owner="interactive_session")
         except Exception:
             logger.exception(
                 "interactive %s: on_turn_complete failed", self.session_id[:8]
@@ -2206,14 +2239,14 @@ class InteractiveSession:
             else:
                 title = f"{label} finished"
                 body = "Response ready"
-            self._loop.create_task(notification_manager.fire_ephemeral(
+            spawn(notification_manager.fire_ephemeral(
                 self.user_sub,
                 title=title,
                 body=body,
                 chat_id=self.chat_id,
                 interactive=True,
                 cli_attached=self.otodock_attached,
-            ))
+            ), name="fire_ephemeral", owner="interactive_session")
         except Exception:
             logger.exception(
                 "interactive %s: turn notification failed", self.session_id[:8]
@@ -2298,7 +2331,8 @@ class InteractiveSession:
             return
         logger.info("interactive %s: pty exited code=%r", self.session_id[:8], code)
         self.exit_code = code
-        self._loop.create_task(self.close(reason="exited", _signal_child=False))
+        spawn(self.close(reason="exited", _signal_child=False),
+              name="close", owner="interactive_session")
 
     async def close(self, *, reason: str = "closed", _signal_child: bool = True) -> None:
         """Tear down: stop the drainer, kill the PTY, release the slot, purge
@@ -2394,6 +2428,12 @@ class InteractiveSession:
             self._turn_open = False
         else:
             self._set_turn_open(False)
+            # Messages a teammate queued while this terminal refused them go
+            # out now (core/events/input_queue.py, WAITING_TERMINAL).
+            from core.events import input_queue
+            if self.chat_id and input_queue.peek(self.chat_id):
+                input_queue.clear_waiting(self.chat_id, input_queue.WAITING_TERMINAL)
+                input_queue.arm(self.chat_id)
 
         self._closed = True
         self._output_listeners.clear()
@@ -2409,7 +2449,8 @@ class InteractiveSession:
         if self._prompt_queue:
             pending = list(self._prompt_queue)
             self._prompt_queue.clear()
-            self._loop.create_task(_redeliver_pending(self, pending))
+            spawn(_redeliver_pending(self, pending),
+                  name="redeliver_pending", owner="interactive_session")
 
         for notify in ([self.on_close] if self.on_close is not None else []) + closers:
             try:
@@ -2576,14 +2617,6 @@ def streaming_chat_ids() -> set[str]:
     runs an interactive session, so nothing is excluded here."""
     return {s.chat_id for s in _sessions.values()
             if s.chat_id and s.alive and s._turn_open}
-
-
-def live_agent_names() -> set[str]:
-    """Agent slugs with a live PTY session (local or satellite) — the
-    interactive half of the agents-map activity pulse (the headless halves
-    are the per-layer ``active_agent_names`` enumerators)."""
-    return {s.agent_name for s in _sessions.values()
-            if getattr(s, "agent_name", "") and s.alive}
 
 
 async def _register_session(
@@ -2929,7 +2962,8 @@ async def tail_live_sessions() -> None:
             )
             session._apply_turn_signal(
                 _r.get("last_signal"),
-                question_pending=bool(_r.get("question_pending")))
+                question_pending=bool(_r.get("question_pending")),
+                signal_at=_r.get("last_signal_at"))
             # Crash backstop for interactive tasks: if the post-output debounce
             # missed a turn-end (busy loop), the 60s sweep still completes it.
             if _r.get("turn_complete") or _r.get("question_pending"):

@@ -25,7 +25,7 @@ from auth.providers import (
 )
 from core.session import visibility as _vis
 
-logger = logging.getLogger("claude-proxy.notification-api")
+logger = logging.getLogger("otodock.notification-api")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 

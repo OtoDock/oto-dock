@@ -1,10 +1,50 @@
 import { useState } from 'react'
 import { usePlatformSettings, useSetLicense, useLicenseAction } from './PlatformPage.hooks'
+import { useReleaseCheck, useReleaseNotice } from '../../components/admin/releaseNotice'
+import { useAuth } from '../../contexts/AuthContext'
+import { serverVersion } from '../../lib/session/serverInfo'
 
 // ---------------------------------------------------------------------------
 // OtoDock tab — this install's relationship with the OtoDock cloud:
-// license/billing plus, where offered, the hosted-relay connection.
+// license/billing plus, where offered, the hosted-relay connection; and the
+// install itself: the running version and the daily release check.
 // ---------------------------------------------------------------------------
+
+export function ThisInstallCard() {
+  const { authConfig } = useAuth()
+  // On the OtoDock cloud the operator upgrades: the version alone, no check.
+  const cloud = !!authConfig?.cloud
+  const { data } = useReleaseNotice(true)
+  const check = useReleaseCheck()
+  const running = data?.running || serverVersion() || 'unknown'
+
+  let status: string
+  if (!data || cloud) status = ''
+  else if (!data.enabled) status = `Release checks are off (${data.reason}).`
+  else if (data.newer) status = `OtoDock ${data.latest} is available.`
+  else if (data.latest) status = `Up to date (the latest release is ${data.latest}).`
+  else status = 'No release check has run yet.'
+
+  return (
+    <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
+      <h3 className="text-sm font-semibold text-p-text mb-1">This install</h3>
+      <p className="text-sm text-p-text" data-testid="running-version">OtoDock {running}</p>
+      {status && <p className="text-xs text-p-text-light mt-1">{status}</p>}
+      {data?.enabled && !cloud && (
+        <div className="mt-2 flex items-center gap-3 flex-wrap text-[11px] text-p-text-light">
+          {data.newer && data.url && (
+            <a href={data.url} target="_blank" rel="noopener noreferrer" className="text-brand underline">Release notes</a>
+          )}
+          {data.checked_at && <span>checked {data.checked_at.slice(0, 16).replace('T', ' ')}</span>}
+          <button onClick={() => check.mutate()} disabled={check.isPending} className="text-brand underline disabled:opacity-50">
+            {check.isPending ? 'Checking…' : 'Check now'}
+          </button>
+          {data.error && <span className="text-amber-700 dark:text-amber-400">Last check failed: {data.error}</span>}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function LicenseBillingCard() {
   const { data } = usePlatformSettings()
@@ -128,6 +168,7 @@ function LicenseBillingCard() {
 export default function OtodockTab() {
   return (
     <div className="space-y-6">
+      <ThisInstallCard />
       <LicenseBillingCard />
     </div>
   )

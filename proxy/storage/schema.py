@@ -497,12 +497,246 @@ def init_schema(conn) -> None:
     init_file_transfers(conn)
     init_knowledge_libraries(conn)
     init_checks(conn)
+    init_schema_meta(conn)
     logger.info("PostgreSQL schema initialized (all tables created)")
+
+
+# ---------------------------------------------------------------------------
+# The release that migrated this database (schema_meta)
+# ---------------------------------------------------------------------------
+# One row. Its own table, not a platform_settings key: that bag is written by
+# the admin settings route and overlaid by OTODOCK_FORCED_SETTINGS, and a fact
+# that gates the boot must be neither; restore.sh recreates the public schema
+# before it feeds a dump, so a dump that does not carry the table leaves none
+# behind (features/BACKUP-RESTORE.md).
+
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-(rc(\d+)|dev))?$")
+
+
+def parse_version(text: str | None) -> tuple[int, int, int, tuple[int, int]] | None:
+    """The one version rule, shared with the release check and the scripts
+    (BACKUP-RESTORE.md "One version rule"): ``X.Y.Z`` is a release,
+    ``X.Y.Z-rcN`` is older than it, ``X.Y.Z-dev`` older than every rc, a
+    leading ``v`` is dropped. Anything else is unknown (None): no refusal, no
+    notice, no row write."""
+    m = _VERSION_RE.match((text or "").strip())
+    if not m:
+        return None
+    suffix = m.group(4)
+    if suffix is None:
+        pre = (0, 0)
+    elif suffix == "dev":
+        pre = (-2, 0)
+    else:
+        pre = (-1, int(m.group(5)))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), pre)
+
+
+def is_dev_version(text: str | None) -> bool:
+    """A developer's working tree (``-dev``): never refused, never recorded."""
+    return (text or "").strip().endswith("-dev")
+
+
+def init_schema_meta(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            created_by TEXT NOT NULL DEFAULT '',
+            last_migrated_by TEXT NOT NULL,
+            last_migrated_at TIMESTAMPTZ NOT NULL,
+            upgraded_from TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+
+def read_platform_version(conn) -> dict | None:
+    """The ``schema_meta`` row, or None when the table or the row is absent (a
+    database from before 1.8.0, or one no release has migrated yet)."""
+    present = conn.execute("SELECT to_regclass('schema_meta') AS t").fetchone()["t"]
+    if present is None:
+        return None
+    row = conn.execute(
+        "SELECT created_by, last_migrated_by, last_migrated_at, upgraded_from "
+        "FROM schema_meta WHERE id = 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def newer_database_refusal(db_version: str, running: str) -> str:
+    return (
+        f"this database was last migrated by OtoDock {db_version} and this server "
+        f"runs {running}. Migrations only run forward, so an older release cannot "
+        f"serve it: upgrade this server to {db_version} or later, or restore a "
+        f"backup taken on {running} (scripts/restore.sh). To start anyway set "
+        f"OTODOCK_ALLOW_NEWER_DATABASE=true: the server then runs against a schema "
+        f"it does not know, and data the newer release wrote may be misread or lost."
+    )
+
+
+def platform_version_preflight(conn, running: str, *, allow_newer: bool = False) -> str:
+    """Before ``init_schema``: the refusal text when a NEWER release migrated
+    this database and nothing lets the boot go on, else ''. A ``-dev`` build
+    and ``OTODOCK_ALLOW_NEWER_DATABASE`` turn the refusal into a WARNING; an
+    unknown version on either side skips the check with a WARNING."""
+    meta = read_platform_version(conn)
+    if meta is None:
+        return ""
+    db_version = meta["last_migrated_by"]
+    db_v, run_v = parse_version(db_version), parse_version(running)
+    if run_v is None:
+        logger.warning(
+            "the platform version %r is not a release number: the database's "
+            "version (%s) is not checked", running, db_version)
+        return ""
+    if db_v is None:
+        logger.warning("schema_meta names %r, not a release number: not checked", db_version)
+        return ""
+    if db_v <= run_v:
+        return ""
+    text = newer_database_refusal(db_version, running)
+    if is_dev_version(running):
+        logger.warning("%s (a -dev build: the boot goes on)", text)
+        return ""
+    if allow_newer:
+        logger.warning("%s (OTODOCK_ALLOW_NEWER_DATABASE is set: the boot goes on)", text)
+        return ""
+    return text
+
+
+def record_platform_version(conn, running: str) -> None:
+    """After ``run_migrations``, in the same transaction: the row says which
+    release migrated the database last. The version only rises; a fresh
+    database (no users yet) remembers the release that created it; a database
+    from before the row (a 1.7.1 install meeting 1.8.0) gets ``created_by ''``
+    and this boot's time as the upgrade. Unknown and ``-dev`` versions write
+    nothing. Two processes booting together serialize on the row lock, and
+    the insert tolerates the loser."""
+    run_v = parse_version(running)
+    if run_v is None or is_dev_version(running):
+        return
+    row = conn.execute(
+        "SELECT last_migrated_by FROM schema_meta WHERE id = 1 FOR UPDATE"
+    ).fetchone()
+    if row is None:
+        fresh = conn.execute("SELECT NOT EXISTS (SELECT 1 FROM users) AS fresh").fetchone()["fresh"]
+        conn.execute(
+            "INSERT INTO schema_meta (id, created_by, last_migrated_by, last_migrated_at, upgraded_from) "
+            "VALUES (1, %s, %s, now(), '') ON CONFLICT (id) DO NOTHING",
+            (running if fresh else "", running),
+        )
+        return
+    old = parse_version(row["last_migrated_by"])
+    if old is None:
+        # A row this rule cannot read (a later release's suffix): never lowered.
+        logger.warning("schema_meta names %r, not a release number: the row is left as it is",
+                       row["last_migrated_by"])
+        return
+    if old < run_v:
+        conn.execute(
+            "UPDATE schema_meta SET last_migrated_by = %s, upgraded_from = %s, "
+            "last_migrated_at = now() WHERE id = 1",
+            (running, row["last_migrated_by"]),
+        )
+
+
+def migrate_database(conn, running: str, *, allow_newer: bool = False) -> None:
+    """The one guarded entry that migrates the database (the proxy's
+    startup; the standalone scheduler reaches the proxy over its internal
+    API): the version preflight, the schema, the migrations, the row. The
+    refusal is logged critical and raised."""
+    refusal = platform_version_preflight(conn, running, allow_newer=allow_newer)
+    if refusal:
+        logger.critical(refusal)
+        raise RuntimeError(refusal)
+    init_schema(conn)
+    run_migrations(conn)
+    record_platform_version(conn, running)
 
 
 # ---------------------------------------------------------------------------
 # Migrations (idempotent column additions)
 # ---------------------------------------------------------------------------
+
+# The first day the Windows hash bug (satellite 0.5.130–0.5.143) could run:
+# an idle-merge delete recorded since then for an agent a Windows machine
+# syncs may have been read off a manifest that left the file out.
+_WINDOWS_HASH_BUG_SINCE = "2026-10-01"
+
+
+def _windows_or_unknown(capabilities) -> bool:
+    """Whether a machine's stored capabilities say Windows, or cannot be
+    read at all (counted in: a hold only delays a delete). A machine that
+    never connected stores ``{}`` and never ran the bug."""
+    from core import host_os
+    try:
+        caps = json.loads(capabilities) if isinstance(capabilities, str) else capabilities
+    except ValueError:
+        return True
+    if not isinstance(caps, dict):
+        return True
+    if not caps.get("os"):
+        return False
+    row = host_os.of(caps.get("os"))
+    return row is not None and row.name == host_os.WINDOWS
+
+
+def _hold_windows_hash_deletes(conn) -> None:
+    """One-shot (1.8.0): turn the Windows hash bug's idle-merge deletes into
+    holds (``file_tombstones_store.HOLD_ORIGIN``). Deleting those tombstones
+    would let an idle machine's older bytes reach the platform first and win
+    over the Windows machine's newer copy; a hold never deletes, and the
+    fixed Windows satellite brings its copy back. Scope: tombstones with
+    origin ``satellite-idle-delete`` since the bug began, of an agent tied
+    to a Windows machine (or one whose capabilities cannot be read, or a
+    machine since removed) by its sync state or a remote target naming it.
+    Flag-guarded and inside a SAVEPOINT: a failure retries at the next
+    start."""
+    flag = "windows_hash_holds"
+    if conn.execute("SELECT 1 FROM platform_settings WHERE key = %s", (flag,)).fetchone():
+        return
+    from storage.files.file_tombstones_store import HOLD_ORIGIN
+    conn.execute("SAVEPOINT windows_hash_holds")
+    try:
+        candidates = {r["agent_slug"] for r in conn.execute(
+            "SELECT DISTINCT agent_slug FROM file_tombstones "
+            "WHERE origin = 'satellite-idle-delete' AND deleted_at >= %s",
+            (_WINDOWS_HASH_BUG_SINCE,),
+        ).fetchall()}
+        held = 0
+        if candidates:
+            machines = {r["id"]: _windows_or_unknown(r["capabilities"]) for r in conn.execute(
+                "SELECT id, capabilities FROM remote_machines").fetchall()}
+            tied: set[str] = set()
+            for r in conn.execute("SELECT DISTINCT machine_id, agent_slug FROM sync_state").fetchall():
+                if machines.get(r["machine_id"], True):
+                    tied.add(r["agent_slug"])
+            for r in conn.execute(
+                    "SELECT machine_id, agent_slug FROM agent_remote_targets "
+                    "UNION SELECT machine_id, agent_slug FROM user_remote_targets "
+                    "WHERE agent_slug <> ''").fetchall():
+                if machines.get(r["machine_id"], True):
+                    tied.add(r["agent_slug"])
+            for agent in sorted(candidates & tied):
+                held += conn.execute(
+                    "UPDATE file_tombstones SET origin = %s "
+                    "WHERE agent_slug = %s AND origin = 'satellite-idle-delete' "
+                    "AND deleted_at >= %s",
+                    (HOLD_ORIGIN, agent, _WINDOWS_HASH_BUG_SINCE),
+                ).rowcount
+        conn.execute(
+            "INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+            "ON CONFLICT (key) DO NOTHING", (flag,),
+        )
+        conn.execute("RELEASE SAVEPOINT windows_hash_holds")
+        if held:
+            logger.warning(
+                "Windows hash bug: %d delete record(s) since %s held until the "
+                "Windows machine restores or the record expires",
+                held, _WINDOWS_HASH_BUG_SINCE)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT windows_hash_holds")
+        logger.exception("Windows hash hold migration failed — will retry next startup")
+
 
 def run_migrations(conn) -> None:
     """Post-launch schema migration hook.
@@ -858,6 +1092,23 @@ def run_migrations(conn) -> None:
         "ALTER TABLE phone_routes "
         "ADD COLUMN IF NOT EXISTS remember_callers BOOLEAN NOT NULL DEFAULT TRUE"
     )
+    # 2026-10-10: the call tools' transfer targets and the per-call language
+    # identification. Existing routes keep today's behaviour (no targets,
+    # detection off); the route form defaults detection on for new routes.
+    conn.execute(
+        "ALTER TABLE phone_routes "
+        "ADD COLUMN IF NOT EXISTS transfer_targets JSONB NOT NULL DEFAULT '[]'"
+    )
+    conn.execute(
+        "ALTER TABLE phone_routes "
+        "ADD COLUMN IF NOT EXISTS language_detect BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    # 2026-10-12: a voice for the route alone; '' keeps the provider's voice
+    # for the call's language, so existing routes change nothing.
+    conn.execute(
+        "ALTER TABLE phone_routes "
+        "ADD COLUMN IF NOT EXISTS voice_id TEXT NOT NULL DEFAULT ''"
+    )
     conn.execute(
         "ALTER TABLE phone_call_log "
         "ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT ''"
@@ -917,6 +1168,8 @@ def run_migrations(conn) -> None:
             conn.execute("ROLLBACK TO SAVEPOINT cron_dow_std")
             logger.exception("cron dow migration failed — will retry next startup")
 
+    _hold_windows_hash_deletes(conn)
+
     # Tasks seeded from an agent template or an app bundle were pinned to the
     # literal 'UTC' until 2026-09-19; the seeders now leave an agent-scope
     # row NULL so it follows the platform timezone. There is deliberately NO
@@ -952,6 +1205,13 @@ def run_migrations(conn) -> None:
     # pre-existing row = never bumped, so nothing signed in before the
     # upgrade is refused.
     conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS token_epoch_at TEXT")
+
+    # The TOTP step accepted last (1.8.0, auth/totp.py): 0 on every
+    # pre-existing row, so the first code after the upgrade passes. A constant
+    # default adds the column without rewriting the table.
+    conn.execute(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step BIGINT NOT NULL DEFAULT 0"
+    )
 
     # The single-column agent index on chats (1.7.1): idx_chats_agent_updated
     # covers it by its prefix, and every chats UPDATE rewrote it for nothing.
@@ -1001,6 +1261,18 @@ def run_migrations(conn) -> None:
         "WHERE scope = 'internal' AND target_kind = 'chat' AND decision = 'pending'"
     )
     _rewrite_share_checks(conn)
+    # 1.8.0: a deleted person's waiting messages go with them; rows a 1.7.x
+    # deletion left behind could never be sent. One-shot.
+    _QUEUE_FLAG = "chat_input_queue_orphans_swept"
+    if not conn.execute("SELECT 1 FROM platform_settings WHERE key = %s",
+                        (_QUEUE_FLAG,)).fetchone():
+        gone = conn.execute(
+            "DELETE FROM chat_input_queue q WHERE q.author_sub <> '' AND NOT EXISTS "
+            "(SELECT 1 FROM users u WHERE u.sub = q.author_sub)").rowcount
+        if gone:
+            logger.info("chat_input_queue: %d waiting message(s) of deleted people removed", gone)
+        conn.execute("INSERT INTO platform_settings (key, value) VALUES (%s, 'done') "
+                     "ON CONFLICT (key) DO NOTHING", (_QUEUE_FLAG,))
     # The 1.7.0 unique index keyed every unrevoked internal row and would
     # refuse a re-share after a decline; the three per-kind indexes replace
     # it. Here, never in init_shares: the CREATE no-ops on an existing table

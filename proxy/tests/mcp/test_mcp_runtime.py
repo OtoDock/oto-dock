@@ -20,7 +20,8 @@ def test_the_converge_signal_applies_per_runtime():
     assert applies({"runtime": "python", "source": "pypi:x"})
     assert applies({"runtime": "node", "source": "npm:x"})
     assert applies({"runtime": "docker", "source": "ghcr:x"})
-    assert not applies({"runtime": "python", "source": "git+https://x"})  # no converge path
+    assert applies({"runtime": "python", "source": "git+https://x"})  # an admin's Update builds it
+    assert not applies({"runtime": "python", "source": "remote:x"})    # no converge path
     assert not applies({"runtime": "hosted"})                  # not a runtime
     assert not applies({"runtime": ""}) and not applies({})
 

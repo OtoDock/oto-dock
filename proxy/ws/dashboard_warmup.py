@@ -36,7 +36,7 @@ from core.config.config_builder import (
 )
 from services.engines import subscription_pool
 from services.engines.subscription_pool import NoSubscriptionError
-from core.sandbox.session_config_dir import AgentStateRefused
+from core.sandbox.session_config_dir import AgentStateRefused, refuse_agent_state_below_editor
 from core.session.history_seed import consume_pending_seed_digest
 from core.config.task_config_builder import (
     resolve_task_identity, run_allows_knowledge_rw,
@@ -45,8 +45,9 @@ from core.session import warmup_registry, visibility as _vis
 from core import execution_mode
 from core.session import interactive_session
 import functools
+from typing import TYPE_CHECKING
 from storage.pg import run_db
-from core.events import chat_writer
+from core.events import chat_writer, input_queue
 # Imported by ws/dashboard.py AFTER its helpers are defined —
 # safe intra-unit circularity (see the class assembly there).
 from ws.dashboard import (
@@ -62,15 +63,29 @@ from ws.dashboard_prewarm import (
     _schedule_pre_warmup_rollback,
 )
 from core.session import session_kind
-from ws.dashboard_chat_text import grace_layer
+from ws.dashboard_chat_text import grace_layer, live_model
 from auth import roles
 from auth.providers import acting_role_of
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 
-class WarmupController:
+def _engine_default_model(execution_path: str) -> str:
+    """What an unpinned agent runs on ``execution_path`` (its declared
+    default, or the tier below it), or "" when nothing is enabled there."""
+    try:
+        return config.resolve_layer_default_model(execution_path)
+    except RuntimeError:
+        return ""
+
+
+class WarmupController(_Host):
     """Session warmup + spawn: pre-warm, warmup (inline reuse or backgrounded
     spawn tail), deferred mode/model re-apply, and the single create/resume
     funnel every spawn path goes through."""
@@ -145,7 +160,7 @@ class WarmupController:
             return
 
         permission_mode = msg.get("permission_mode", "default")
-        requested_model = msg.get("model", "")
+        requested_model = await live_model(msg.get("model", ""))
         requested_exec_path = msg.get("execution_path", "")
 
         # Resolve current per-agent role — needed for both the match check
@@ -179,23 +194,26 @@ class WarmupController:
         if self._pre_warmed_sid:
             old_sid = self._pre_warmed_sid
             self._pre_warmed_sid = None
-            old_agent = self._pre_warmed_agent
+            old_exec_path = self._pre_warmed_exec_path
             self._pre_warmed_agent = None
             self._pre_warmed_exec_path = ""
             self._pre_warmed_model = ""
-            old_role = self._pre_warmed_role or "manager"
             self._pre_warmed_role = ""
             self._pre_warmed_at = 0.0
-            try:
-                old_layer = get_execution_layer(old_agent, user_sub=self.user_sub, role=old_role) if old_agent else None
-                if old_layer:
-                    await old_layer.close_session(old_sid)
-            except Exception:
-                pass
-            from core.concurrency import release_chat_slot
-            release_chat_slot(old_sid)
+            # Ours to close only while the registry still holds it: another
+            # tab's warmup may have claimed it (claim_by_key) and be running
+            # its chat on it, or the reaper has it and closes it itself.
             from core.session import prewarm_session_registry as _prewarm
-            await _prewarm.discard(old_sid)
+            if await _prewarm.claim(old_sid):
+                try:
+                    from core.session.session_manager import layer_for_prewarm
+                    old_layer = layer_for_prewarm(old_sid, old_exec_path)
+                    if old_layer:
+                        await old_layer.close_session(old_sid)
+                except Exception:
+                    pass
+                from core.concurrency import release_chat_slot
+                release_chat_slot(old_sid)
 
         agent_cfg = None
         started = False
@@ -431,6 +449,9 @@ class WarmupController:
         # session is live now, so kick the turn. The prompt was persisted at
         # send-time in _do_warmup (server_kick skips re-persist). The
         # backgrounded path enqueues its own _server_kick after warmup_ready.
+        if (outcome == "inline" and not msg.get("text") and self.chat_id
+                and input_queue.peek(self.chat_id)):
+            input_queue.arm(self.chat_id)
         if outcome == "inline" and msg.get("text") and self.session_id and self.chat_id:
             holder = grace_layer(self.session_id, self.layer) if self.layer else None
             await self._handle_chat({
@@ -466,7 +487,7 @@ class WarmupController:
         warmup_role, self.layer = await run_db(_warm_role_layer)
         effective_exec_path = resolve_execution_path(agent, requested_exec_path)  # actual path for storage (never "remote")
         permission_mode = msg.get("permission_mode", "default")
-        requested_model = msg.get("model", "")  # frontend sends current selection
+        requested_model = await live_model(msg.get("model", ""))  # frontend sends current selection
         # Dashboard light/dark mode → seeds Claude's TUI theme (interactive only).
         requested_theme = msg.get("theme", "")
         cid = msg.get("chat_id")
@@ -624,6 +645,24 @@ class WarmupController:
         # to a mint too.
         minted = False
         if not self.chat_id:
+            # A Shared-only agent's chats run as the agent, which takes the
+            # editor tier: a caller below it is refused before the chat is
+            # minted, so the agent's one history never holds their prompt
+            # (an existing pool chat is held by the drive gate above).
+            chat_owner = await run_db(_vis.chat_history_owner, agent, self.user_sub)
+            if _vis.is_shared_chat_owner(chat_owner) and not roles.can_edit(warmup_role):
+                refusal = ""
+                try:
+                    refuse_agent_state_below_editor(_vis.SCOPE_AGENT, warmup_role)
+                except AgentStateRefused as e:
+                    refusal = str(e)
+                logger.info(f"WS dashboard warmup refused before the mint (below the editor tier) agent={agent}")
+                await self._send({
+                    "type": wire.WARMUP_FAILED,
+                    "error": refusal,
+                    "reason": wire.REASON_BELOW_EDITOR,
+                })
+                return "skip"
             # Resolve the model + role that form the pre-warm match key (the tail
             # checks them after awaiting the eager pre-warm). Model precedence:
             # deferred (user changed during warmup) > requested (sent with warmup
@@ -634,16 +673,16 @@ class WarmupController:
             new_chat_pick = "" if self.deferred_for else self.deferred_model
             target_model = new_chat_pick or requested_model or config.get_cli_model(agent)
             # A chat-switch race can leave the OTHER chat's model in the
-            # selector when a new chat spawns on a different engine — a
+            # selector when a new chat spawns on a different engine, and a
+            # stale page can name a model the engine no longer serves — a
             # foreign model would bake into the chat row and 400 every turn
-            # (see _model_allowed_for_path). Fall back to the layer's first
-            # model (the agent default may belong to the agent's PRIMARY
-            # layer, which is exactly what a cross-layer chat isn't on).
+            # (see _model_allowed_for_path). Fall back to the engine's own
+            # default (the agent default may belong to the agent's PRIMARY
+            # layer, which is exactly what a cross-layer chat isn't on), never
+            # its first row: the catalog is tier-ordered, so that is the
+            # engine's most expensive model.
             if not _model_allowed_for_path(target_model, effective_exec_path):
-                fallback_model = next(
-                    (m["value"] for m in config.get_layer_models(effective_exec_path) if m.get("value")),
-                    "",
-                )
+                fallback_model = await run_db(_engine_default_model, effective_exec_path)
                 logger.warning(
                     f"WS dashboard warmup: model={target_model} is not a "
                     f"{effective_exec_path} model — using {fallback_model or 'the layer default'}"
@@ -671,18 +710,12 @@ class WarmupController:
                     permission_mode = self.deferred_mode
                     self.deferred_mode = ""
             # The chat row first, then the prompt — both on the chat's lane.
-            chat_owner = await run_db(_vis.chat_history_owner, self.agent_name, self.user_sub)
-            row_mode, row_model, row_exec_mode = permission_mode, chat_model, chat_exec_mode
-            if _vis.is_shared_chat_owner(chat_owner) and not roles.can_edit(warmup_role):
-                # A Shared-only chat runs as the agent (editor tier and up):
-                # a caller below it never leaves its picks on the shared row.
-                row_mode, row_model, row_exec_mode = "default", "", ""
             await chat_writer.submit(
                 self.chat_id,
                 functools.partial(
                     task_store.create_chat, self.chat_id, chat_owner,
-                    self.agent_name, row_mode, model=row_model,
-                    execution_path=effective_exec_path, execution_mode=row_exec_mode,
+                    self.agent_name, permission_mode, model=chat_model,
+                    execution_path=effective_exec_path, execution_mode=chat_exec_mode,
                 ),
                 label="create_chat",
             )
@@ -978,6 +1011,10 @@ class WarmupController:
                             f"chat={wcid}, agent={w_agent}, model={chat_model}"
                             f"{reuse_note}"
                         )
+                        if not (self.deferred_mode and self.deferred_for in ("", wcid)):
+                            await self._give_reused_session_the_chats_mode(
+                                w_layer, reuse_sid, permission_mode,
+                            )
                     else:
                         new_sid = str(uuid.uuid4())
                         res = await self._create_or_resume_session(
@@ -1154,13 +1191,20 @@ class WarmupController:
                     await asyncio.wait_for(hb_task, timeout=1.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     hb_task.cancel()
+                # A -p first turn is about to be kicked: what is sent before it
+                # starts keeps waiting behind it (core/events/input_queue.py).
+                if res is not None and not res.interactive and msg.get("text"):
+                    input_queue.hold_first_turn(wcid)
                 # Terminal event emitted; drop the registry entry so the next
                 # chat reusing this WS doesn't see stale state.
                 await warmup_registry.unregister(wcid)
                 self._attached_warmups.discard(wcid)
 
             if res is None:
-                return  # spawn failed — warmup_failed already emitted, no kick
+                # Spawn failed — warmup_failed already emitted, no kick: what
+                # this person sent while it got ready goes back to them.
+                await self._return_warmup_sends(wcid, "turn_failed")
+                return
             # Re-apply any deferred mode/model the user set during the spawn —
             # only if they're still on this chat (else the deferred value
             # belongs to the chat they switched to, handled by that chat's flow).
@@ -1201,6 +1245,9 @@ class WarmupController:
                             f"chat={wcid[:8]} session={res.session_id[:8]}"
                         )
                         isess.submit_prompt(stamped)
+                # What was sent while it got ready is typed after it.
+                if input_queue.peek(wcid):
+                    input_queue.arm(wcid)
                 return
             # Server-owned first turn. If the WS is gone (refresh/navigate during
             # the spawn), there is no main loop to drive the kick — run it
@@ -1218,6 +1265,9 @@ class WarmupController:
             kick_text = msg.get("text", "")
             if seed_digest and kick_text:
                 kick_text = f"{seed_digest}\n\n{kick_text}"
+            if not kick_text and input_queue.peek(wcid):
+                # No first turn: what was sent while it got ready goes now.
+                input_queue.arm(wcid)
             if kick_text:
                 if self._ws_gone:
                     await self._run_kick_headless(
@@ -1243,6 +1293,37 @@ class WarmupController:
 
         self._warmup_task = asyncio.create_task(_spawn_tail())
         return "bg"
+
+    async def _return_warmup_sends(self, chat_id: str, reason: str) -> None:
+        """A warmup that ends with no first turn (failed, stopped): the
+        messages this person queued while it got ready go back to their
+        composer with the card; a teammate's stay."""
+        input_queue.first_turn_started(chat_id)
+        q = await input_queue.loaded(chat_id)
+        await input_queue.return_items(chat_id, q.take(self.user_sub or ""), reason)
+
+    async def _give_reused_session_the_chats_mode(self, layer, sid: str, mode: str) -> None:
+        """A pre-warm spawned with the page's mode of that moment; a pick made
+        while it spawned was consumed into the chat's row at the mint. The
+        chat's mode wins and reaches the reused session the way a live pick
+        does (``_handle_mode_change``): the stored mode the hooks judge by,
+        and the engine's own control command where it has one. The caller
+        skips this while a later pick waits (``deferred_mode``): that one
+        lands after ``warmup_ready`` and wins."""
+        old = get_session_mode(sid) or "default"
+        if old == mode:
+            return
+        set_session_mode(sid, mode)
+        caps = layer.capabilities_for(sid)
+        if "set_permission_mode" in (caps.control_commands if caps.supports_control_commands else []):
+            try:
+                await layer.change_mode(sid, mode)
+            except Exception as e:
+                logger.warning(f"WS dashboard warmup: mode change on the reused session failed: {e}")
+        logger.info(
+            f"WS dashboard warmup: reused session={sid[:8]} takes the chat's mode={mode} "
+            f"(pre-warmed as {old})"
+        )
 
     async def _reapply_deferred_after_warmup(self, chat_id: str, *,
                                              from_warmup: bool = False) -> None:

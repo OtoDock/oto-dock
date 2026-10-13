@@ -184,6 +184,51 @@ def test_gate_deny_only_env_suppresses_ask():
     assert out is None
 
 
+_BRIDGED = {"OTO_HOOK_DENY_ONLY": "1", "OTO_HOOK_BRIDGED": "1"}
+_FLOOR_DENY = {"decision": "deny", "reason": "Blocked: the command writes to the host's kernel state (host_state)."}
+
+
+def test_bridged_gate_stands_aside_on_a_turn_the_bridge_asks_in():
+    # An attended Codex chat in a prompting mode: Codex reports "default"
+    # (untrusted / on-request), its approval request carries the card, so
+    # the gate posts nothing — a deny the platform would give is not printed.
+    for mode in ("default", "acceptEdits", "plan"):
+        out = _run_gate({"tool_name": "Bash", "tool_input": {"command": "x"},
+                         "permission_mode": mode}, _FLOOR_DENY, extra_env=_BRIDGED)
+        assert out is None, mode
+
+
+def test_bridged_gate_judges_a_never_turn_with_the_floors_reason():
+    # Don't Ask / auto: Codex runs never ("bypassPermissions"), no request
+    # comes, so the gate posts and prints the platform's deny with its reason.
+    out = _run_gate({"tool_name": "Bash", "tool_input": {"command": "x"},
+                     "permission_mode": "bypassPermissions"}, _FLOOR_DENY, extra_env=_BRIDGED)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert out["hookSpecificOutput"]["permissionDecisionReason"] == _FLOOR_DENY["reason"]
+    # An allow stays silent (deny-only): Codex runs the command.
+    assert _run_gate({"tool_name": "Bash", "tool_input": {"command": "ls"},
+                      "permission_mode": "bypassPermissions"},
+                     {"decision": "allow"}, extra_env=_BRIDGED) is None
+
+
+def test_bridged_gate_judges_an_unnamed_turn():
+    # A missing or unknown permission_mode is judged: a turn with no judge is
+    # the failure to avoid.
+    for stdin in ({"tool_name": "Bash", "tool_input": {"command": "x"}},
+                  {"tool_name": "Bash", "tool_input": {"command": "x"}, "permission_mode": "dontAsk"}):
+        out = _run_gate(stdin, _FLOOR_DENY, extra_env=_BRIDGED)
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_unbridged_deny_only_gate_judges_every_turn():
+    # An unattended Codex session (no OTO_HOOK_BRIDGED) is judged in every
+    # mode, a "default" turn included.
+    out = _run_gate({"tool_name": "Bash", "tool_input": {"command": "x"},
+                     "permission_mode": "default"}, _FLOOR_DENY,
+                    extra_env={"OTO_HOOK_DENY_ONLY": "1"})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 def test_gate_forwards_permission_mode():
     # The CLI reports its LIVE mode (Shift+Tab) on every hook call; the gate
     # must forward it to the proxy, which uses it as the effective mode for
@@ -346,10 +391,12 @@ def test_gate_unreadable_stdin_still_decides(tmp_path):
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
-def test_gate_crash_exits_zero_with_breadcrumb(tmp_path):
-    # An unexpected crash enforces nothing (both CLIs run the tool on a
-    # non-zero exit) — so it must exit 0 with no output instead of surfacing
-    # "hook exited with code 1" in the TUI, and leave a traceback breadcrumb.
+def test_gate_crash_exits_zero_with_a_deny_and_a_breadcrumb(tmp_path):
+    # An unexpected crash must not surface "hook exited with code 1" in the
+    # TUI (both CLIs run the tool on a non-zero exit, and Claude Code's
+    # onFailure block cannot see an exit 0 with no output): it exits 0 with a
+    # deny in the gate's own JSON, which both CLIs honour, and leaves a
+    # traceback breadcrumb.
     prelude = (
         "import sys, urllib.request\n"
         "def _boom(*a, **k): raise RuntimeError('boom')\n"
@@ -357,7 +404,8 @@ def test_gate_crash_exits_zero_with_breadcrumb(tmp_path):
     )
     proc = _run_gate_custom(prelude, "{}", str(tmp_path))
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == ""
+    assert '"permissionDecision": "deny"' in proc.stdout
+    assert "gate error" in proc.stdout
     log = tmp_path / ".oto-dock" / "hook-error.log"
     assert log.exists()
     assert "RuntimeError" in log.read_text()

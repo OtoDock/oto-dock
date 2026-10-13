@@ -15,15 +15,15 @@ import contextlib
 import ipaddress
 import logging
 import logging.handlers
-import re
 import signal
 import socket
 import sys
 import time
 from datetime import datetime, timezone
 
-from telephony.ami_events import AmiListenerManager
+from telephony.ami_events import CHANNEL_RE, UNIQUEID_RE, AmiListenerManager
 from telephony.audio_socket import AudioSocketConnection, AudioSocketError
+from telephony.transfer import AmiTransfer, dial_outcome
 from calls import pin_failures
 from calls.call_manager import CallManager, CallStatus
 from calls.call_registry import registry as call_registry
@@ -32,7 +32,7 @@ from calls.http_api import OutboundCallAPI
 from proxy.client import fetch_pin_failures, report_call
 from proxy.management_ws import ManagementWSClient
 from pipeline import CallPipeline
-from pipeline.providers import prewarm_fillers
+from pipeline.providers import prewarm_fillers, prewarm_turn_classifier
 import config
 
 # Track active calls
@@ -186,11 +186,6 @@ def _raise_nofile_limit(log: logging.Logger) -> None:
     except (ValueError, OSError) as e:
         log.warning(f"RLIMIT_NOFILE soft limit not raised: {e}")
 
-# Asterisk uniqueid shape (``epoch.seq``, optional systemname prefix) — the
-# register payload's dial_event is caller-supplied JSON, so the value is
-# validated before it can key the AMI DTMF registration map.
-_UNIQUEID_RE = re.compile(r"[\w.\-/]{1,64}\Z")
-
 # Shared call manager for outbound calls
 _call_manager = CallManager()
 
@@ -285,12 +280,15 @@ async def _run_call(
     caller_info: dict | None,
     cfg: ConfigManager,
     logger: logging.Logger,
+    transfer=None,
 ) -> None:
     """Shared per-call body for every media transport (AudioSocket, Twilio).
 
     ``resolution_uuid`` is the key the call was RESOLVED by — the AudioSocket
     first-frame UUID / outbound ``audio_uuid`` / Twilio session token — not
     the transport's own ``call_uuid`` correlation label (Twilio: callSid).
+    ``transfer`` is the call's transfer handle (``telephony/transfer.py``),
+    None when this line cannot hand the caller over.
     """
     started_at = datetime.now(timezone.utc).isoformat()
     if len(_active_calls) >= cfg.max_live_calls:
@@ -339,12 +337,15 @@ async def _run_call(
             outbound_call_id=outbound_call.call_id,
             audiosocket_uuid=resolution_uuid,
             caller_info=outbound_caller_info,
+            transfer=transfer,
         )
+        pipeline._in_session = outbound_call.in_session is not None
     else:
         pipeline = CallPipeline(
             conn, route=route, cfg=cfg,
             audiosocket_uuid=resolution_uuid,
             caller_info=caller_info,
+            transfer=transfer,
         )
 
     # Track this call
@@ -372,9 +373,15 @@ async def _run_call(
         if not is_outbound:
             # ``pipeline.llm`` is None when the call never warmed a session
             # (PIN refused, early hangup).
+            outcome = outcome_override or pipeline.state.call_outcome
+            if outcome == "transferred":
+                # A Twilio Dial that failed before the cleanup finished (the
+                # action answered in the Dial's first second) reads so now;
+                # a later answer corrects the row through the proxy.
+                outcome = dial_outcome(conn.call_uuid or "") or outcome
             _spawn_call_report(_inbound_report(
                 conn, resolution_uuid, route, caller_info,
-                outcome=outcome_override or pipeline.state.call_outcome,
+                outcome=outcome,
                 pin_attempts=pipeline.state.pin_attempts,
                 started_at=started_at,
                 duration_s=int(time.monotonic() - t0),
@@ -478,28 +485,89 @@ async def _handle_connection(
     # gate. Registration lives ONLY on this AudioSocket path — the Twilio
     # path enters _run_call directly and must never register.
     ami_reg: tuple[str, str] | None = None
+    # A transfer moves the registered channel (inbound AudioSocket calls
+    # only: an outbound call's media leg names no channel).
+    transfer = None
     if not is_outbound and ami_manager is not None:
         uniqueid = str(
             (caller_info or {}).get("dial_event", {}).get("uniqueid", "") or "")
         server_key = ami_manager.resolve_server_key(route.phone_server_id)
-        if server_key is not None and _UNIQUEID_RE.fullmatch(uniqueid):
+        if server_key is not None and UNIQUEID_RE.fullmatch(uniqueid):
             channel = str(
                 (caller_info or {}).get("dial_event", {}).get("channel", "") or "")
+            if not CHANNEL_RE.fullmatch(channel):
+                # Digits still route by uniqueid; a name past the alphabet
+                # keys no Redirect (the transfer says the PBX named none).
+                channel = ""
             ami_manager.register_call(server_key, uniqueid, conn, channel)
             ami_reg = (server_key, uniqueid)
+            transfer = AmiTransfer(ami_manager, server_key, uniqueid, channel)
         elif route.pin:
             logger.info(
                 f"Call {call_uuid}: AMI DTMF unavailable (no listener for the "
                 f"server, or the dialplan register curl predates the "
                 f"dial_event uniqueid field) — in-band digit detection only."
             )
+    # An outbound call's channel comes from the PBX's OriginateResponse (the
+    # listener keeps it under the call's audio uuid); the media leg and the
+    # event arrive in either order, so the binding may land after this point.
+    outbound_bind: tuple[str, str] | None = None
+    if is_outbound and ami_manager is not None:
+        server_key = ami_manager.resolve_server_key(route.phone_server_id)
+        if server_key is not None:
+            outbound_bind = (server_key, call_uuid)
+            if ami_manager.bind_outbound(server_key, call_uuid, conn):
+                logger.info(f"Call {call_uuid}: signalled DTMF bound from the PBX's OriginateResponse")
+            else:
+                logger.info(
+                    f"Call {call_uuid}: waits for the PBX's OriginateResponse to bind "
+                    f"signalled DTMF (in-band detection meanwhile)"
+                )
 
     try:
         await _run_call(
-            conn, call_uuid, route, is_outbound, caller_info, cfg, logger)
+            conn, call_uuid, route, is_outbound, caller_info, cfg, logger,
+            transfer=transfer)
     finally:
         if ami_reg is not None and ami_manager is not None:
             ami_manager.unregister_call(*ami_reg)
+        if outbound_bind is not None and ami_manager is not None:
+            if route.pin and not ami_manager.outbound_bound(*outbound_bind):
+                logger.warning(
+                    f"Call {call_uuid}: no OriginateResponse arrived for this outbound "
+                    f"call; the PIN gate heard in-band tones only (the AMI user needs "
+                    f"read=call)"
+                )
+            ami_manager.unbind_outbound(*outbound_bind)
+
+
+def _wire_config(mgmt: ManagementWSClient, cfg: ConfigManager,
+                 ami_manager: AmiListenerManager, logger: logging.Logger) -> None:
+    """Every config push loads ``cfg`` from here on, the newest one first.
+
+    The proxy answers the daemon's capabilities frame with a ``config_update``
+    (the outbound PINs an older daemon never holds) within milliseconds of
+    ``config_full``; a push that landed before the handler existed would
+    otherwise stay unread until the next route save, so the handler runs
+    once on the socket's latest push, whichever it is (both carry the same
+    version, so nothing is skipped by comparing them). Each load re-seeds the
+    PIN lockout windows (one seed at a time), refreshes the filler clips
+    (content-keyed: only changed combos re-synth, unused ones are pruned),
+    loads the Smart Turn model off the loop (the call that paid the load lost
+    its first two seconds of audio), reconciles the AMI listeners (``apply``
+    is Lock-serialized: tasks from the sync callback never interleave) and
+    refreshes the PBX addresses. None of it blocks the start: the call path
+    self-heals if a call lands first."""
+    def _on_config_changed(data: dict) -> None:
+        cfg.load(data)
+        _start_pin_seed(logger)
+        asyncio.create_task(prewarm_fillers(cfg))
+        asyncio.create_task(asyncio.to_thread(prewarm_turn_classifier, cfg))
+        asyncio.create_task(ami_manager.apply(cfg))
+        _schedule_pbx_refresh(cfg, logger)
+
+    mgmt.on_config_changed = _on_config_changed
+    _on_config_changed(mgmt.latest_config())
 
 
 async def _run_server() -> None:
@@ -520,11 +588,6 @@ async def _run_server() -> None:
     logger = logging.getLogger("phone-server")
     _raise_nofile_limit(logger)
 
-    # Suppress harmless Deepgram SDK cancel noise
-    logging.getLogger("deepgram.clients.common.v1.abstract_async_websocket").setLevel(
-        logging.CRITICAL
-    )
-
     logger.info("Starting Phone Server")
     logger.info(f"  Proxy: {config.PROXY_URL}")
 
@@ -536,46 +599,24 @@ async def _run_server() -> None:
 
     logger.info("Waiting for config from proxy...")
     try:
-        config_data = await asyncio.wait_for(mgmt.wait_for_config(), timeout=30.0)
+        await asyncio.wait_for(mgmt.wait_for_config(), timeout=30.0)
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for config from proxy — exiting")
         mgmt.stop()
         return
 
-    # 2. Initialize ConfigManager
+    # 2. The config manager and the AMI event listeners, fed by every push
+    #    from here on (the newest one first), before anything else awaits.
     cfg = ConfigManager()
-    cfg.load(config_data)
+    ami_manager = AmiListenerManager()
+    _wire_config(mgmt, cfg, ami_manager, logger)
 
     # The PIN lockout windows, before the first call (bounded: a slow proxy
     # never holds the start; a config push retries until one lands).
-    seed = _start_pin_seed(logger)
-    if seed is not None:
+    seed = _pin_seed_task
+    if seed is not None and not seed.done():
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(asyncio.shield(seed), timeout=10.0)
-
-    # Pre-warm each enabled route's filler clips so the first call never pays the
-    # synth latency. Background — never blocks server startup; the call
-    # path self-heals if a call lands first.
-    asyncio.create_task(prewarm_fillers(cfg))
-
-    # Persistent AMI event listeners (signalled DTMF for AudioSocket calls).
-    # apply() is Lock-serialized internally — scheduling it as a task from
-    # the sync WS callback can never interleave two reconciles.
-    ami_manager = AmiListenerManager()
-    asyncio.create_task(ami_manager.apply(cfg))
-    _schedule_pbx_refresh(cfg, logger)
-
-    # 3. Register config update callback: reload config, then refresh filler clips
-    # for any combos whose voice/provider/phrases changed (content-keyed → only
-    # changed combos re-synth; unused combos are pruned).
-    def _on_config_changed(data: dict) -> None:
-        cfg.load(data)
-        _start_pin_seed(logger)
-        asyncio.create_task(prewarm_fillers(cfg))
-        asyncio.create_task(ami_manager.apply(cfg))
-        _schedule_pbx_refresh(cfg, logger)
-
-    mgmt.on_config_changed = _on_config_changed
 
     # Dashboard duplex sessions: the proxy opens them over the management
     # socket; the manager dials back the per-session engine socket.
@@ -592,11 +633,12 @@ async def _run_server() -> None:
     # endpoint (/v1/calls/register) + the Twilio signaling surface (inbound
     # webhook, media WS, status callbacks). The same aiohttp app serves all.
     api = OutboundCallAPI(_call_manager, cfg)
+    api.ami_manager = ami_manager
     from calls.twilio_http import TwilioCallAPI
     twilio_api = TwilioCallAPI(
         cfg, _call_manager,
-        run_call=lambda conn, uuid, route, is_outbound, caller_info: _run_call(
-            conn, uuid, route, is_outbound, caller_info, cfg, logger),
+        run_call=lambda conn, uuid, route, is_outbound, caller_info, transfer=None: _run_call(
+            conn, uuid, route, is_outbound, caller_info, cfg, logger, transfer=transfer),
         active_count=lambda: len(_active_calls),
         release_warmup=api._close_warmup_client,
     )

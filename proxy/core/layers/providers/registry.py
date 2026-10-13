@@ -7,7 +7,7 @@ all built-in adapters on import.
 import logging
 from core.layers.providers.base import ProviderAdapter
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _ADAPTERS: dict[str, ProviderAdapter] = {}
 

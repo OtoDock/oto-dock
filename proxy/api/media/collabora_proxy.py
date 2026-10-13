@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebS
 
 import config
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 # RFC 7230 hop-by-hop headers — must not be forwarded across a proxy.
@@ -107,23 +107,94 @@ def _query_param(scope: dict, name: str) -> str:
     return parse_qs(raw).get(name, [""])[0]
 
 
-def _collabora_authorized(scope: dict, cookies: dict) -> bool:
+async def _collabora_authorized(scope: dict, cookies: dict) -> bool:
     """Gate the proxy so it isn't an open relay to the Collabora backend.
 
     In sub-path mode the editor is same-origin with the dashboard, so a browser
-    request carries the ``session`` cookie; the editing WS / WOPI-bearing
-    requests additionally carry a WOPI ``access_token``. Either proves a real
-    user, so we allow on the FIRST that validates and reject otherwise.
+    request carries the ``session`` cookie; a request may instead carry a WOPI
+    ``access_token`` query parameter. Either passes when it validates AND its
+    person still holds on the HTTP routes' own rules (``wopi.person_holds``:
+    the users row, the token epoch a sign out everywhere or a password set
+    moves, the forced password change and the 2FA enrolment), read once per
+    person and issue time per 10 s, so an editor's burst of asset requests
+    costs one read.
     """
     from auth.providers import validate_session_jwt
+    from api.media.wopi import person_holds, validate_wopi_token
     sc = cookies.get("session")
-    if sc and validate_session_jwt(sc):
-        return True
-    from api.media.wopi import validate_wopi_token
+    if sc:
+        payload = validate_session_jwt(sc)
+        if payload and await person_holds(payload.get("sub") or "", payload.get("iat")):
+            return True
     tok = _query_param(scope, "access_token")
-    if tok and validate_wopi_token(tok):
-        return True
+    if tok:
+        claims = validate_wopi_token(tok)
+        if claims and await person_holds(claims.get("user_sub") or "", claims.get("iat")):
+            return True
     return False
+
+
+# An open editor socket judges the credential that admitted it again at
+# this interval (the dashboard socket's): a sign out everywhere, a password
+# change or the forced change closes it within the window.
+_RELAY_REVALIDATE_S = 60.0
+
+
+async def _socket_still_authorized(scope: dict, cookies: dict) -> bool:
+    """``_collabora_authorized`` for an open socket: the handshake's cookie
+    is judged without its expiry (the sliding refresh renews only the
+    browser's copy, the sign-in is what counts): its signature, its purpose,
+    the revocation of its sign-in, then its person. Likewise the token. A
+    store that could not be read keeps the socket (as the dashboard socket's
+    revalidation does): only a person known to no longer hold closes it."""
+    import jwt
+    import config
+    from api.media.wopi import person_standing
+    from auth import session_revocation
+
+    async def holds(sub: str, iat) -> bool:
+        return await person_standing(sub, iat) is not False
+
+    sc = cookies.get("session")
+    if sc:
+        try:
+            payload = jwt.decode(sc, config.JWT_SECRET, algorithms=["HS256"],
+                                 options={"verify_exp": False})
+        except jwt.InvalidTokenError:
+            payload = None
+        if (payload and payload.get("purpose") == "session"
+                and not session_revocation.is_revoked(session_revocation.session_cookie_id(payload))
+                and await holds(payload.get("sub") or "", payload.get("iat"))):
+            return True
+    tok = _query_param(scope, "access_token")
+    if tok:
+        try:
+            claims = jwt.decode(tok, config.WOPI_SECRET, algorithms=["HS256"],
+                                options={"verify_exp": False})
+        except jwt.InvalidTokenError:
+            claims = None
+        if (claims and claims.get("purpose") == "wopi"
+                and await holds(claims.get("user_sub") or "", claims.get("iat"))):
+            return True
+    return False
+
+
+async def _close_when_unauthorized(websocket: WebSocket, upstream, scope: dict,
+                                   cookies: dict, path: str) -> None:
+    """Re-judge an open editor socket every ``_RELAY_REVALIDATE_S``; when it
+    no longer holds, close both ends (the browser's with 1008: Collabora's
+    reconnect is then refused at the handshake and it says it cannot
+    connect)."""
+    while True:
+        await asyncio.sleep(_RELAY_REVALIDATE_S)
+        if await _socket_still_authorized(scope, cookies):
+            continue
+        logger.info(f"Collabora WS closed: its sign-in no longer holds ({path[:60]})")
+        with contextlib.suppress(Exception):
+            await upstream.close()
+        with contextlib.suppress(Exception):
+            await websocket.close(code=1008, reason="sign-in ended")
+        return
 
 
 def _raw_subpath(scope: dict) -> str:
@@ -201,7 +272,7 @@ async def proxy_collabora_http(path: str, request: Request):
         raise HTTPException(status_code=404, detail="Not found")
     # Same-origin CORS preflight carries neither cookie nor token; it returns no
     # data, so let it through (and the admin block above still applies).
-    if request.method != "OPTIONS" and not _collabora_authorized(request.scope, request.cookies):
+    if request.method != "OPTIONS" and not await _collabora_authorized(request.scope, request.cookies):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     headers = {
@@ -309,7 +380,7 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
 
     encoded_path = _raw_subpath(websocket.scope)
     # Block the admin WS + reject an unauthenticated relay before accepting.
-    if _is_blocked_subpath(encoded_path) or not _collabora_authorized(
+    if _is_blocked_subpath(encoded_path) or not await _collabora_authorized(
         websocket.scope, websocket.cookies,
     ):
         await websocket.close(code=1008, reason="unauthorized")
@@ -376,11 +447,18 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
                 except websockets.ConnectionClosed:
                     pass
 
-            await asyncio.gather(
-                client_to_upstream(),
-                upstream_to_client(),
-                return_exceptions=True,
-            )
+            watch = asyncio.create_task(_close_when_unauthorized(
+                websocket, upstream, websocket.scope, dict(websocket.cookies), path))
+            try:
+                await asyncio.gather(
+                    client_to_upstream(),
+                    upstream_to_client(),
+                    return_exceptions=True,
+                )
+            finally:
+                watch.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watch
             # Field diagnosis for "preview died by itself": record WHY the
             # upstream document socket ended (1000/1001 = orderly; 1006/None =
             # dropped, e.g. missed pongs under load or a container restart).

@@ -64,6 +64,20 @@ def replace_check_results(results: dict[str, dict]) -> str:
     return now
 
 
+def put_check_result(mcp_name: str, info: dict) -> None:
+    """Write one MCP's result in place of the persisted one (an update that
+    applied an older release than the newest keeps the newest offered). The
+    check time stays."""
+    now = _now()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM mcp_update_checks WHERE mcp_name = %s", (mcp_name,))
+        conn.execute(
+            "INSERT INTO mcp_update_checks (mcp_name, info, checked_at) VALUES (%s, %s, %s)",
+            (mcp_name, json.dumps(info), now),
+        )
+        conn.commit()
+
+
 def delete_check_result(mcp_name: str) -> bool:
     """Drop one MCP's persisted result (an applied update retires its offer).
     The check time stays: the check itself still happened."""

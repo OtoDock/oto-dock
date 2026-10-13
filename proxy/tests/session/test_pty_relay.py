@@ -306,7 +306,7 @@ async def test_spawn_slot_admits_the_configured_number_then_waits_the_settle(mon
             entered.append((i, asyncio.get_running_loop().time()))
 
     t0 = asyncio.get_running_loop().time()
-    with caplog.at_level("INFO", logger="claude-proxy.pty_relay"):
+    with caplog.at_level("INFO", logger="otodock.pty_relay"):
         await asyncio.gather(*(one(i) for i in range(3)))
     times = sorted(t - t0 for _i, t in entered)
     assert times[0] < 0.05 and times[1] < 0.05
@@ -360,3 +360,24 @@ async def test_a_returncode_read_before_the_pidfd_reader_ran_releases_wait():
     assert proc.returncode == 0
     assert await asyncio.wait_for(waiter, 2) == 0
     os.close(w)
+
+
+@pytest.mark.asyncio
+async def test_a_trimmed_local_ring_replays_the_paste_mode_it_dropped():
+    """The local ring tracks the program's bracketed-paste toggle: once the
+    toggle has left the ring, a replay starts with the mode."""
+    loop = asyncio.get_running_loop()
+    _, on_output = _collector()
+    fut, on_exit = _exit_future(loop)
+    proc = spawn_pty(
+        ["sh", "-c", "printf '\\033[?2004h'; i=0; while [ $i -lt 40 ]; do "
+                     "printf '0123456789ABCDEF\\n'; i=$((i+1)); done; sleep 2"],
+        env=_ENV, scrollback_limit=64, on_output=on_output, on_exit=on_exit,
+    )
+    try:
+        await asyncio.sleep(0.6)
+        sb = proc.scrollback()
+        assert sb.startswith(b"\x1b[?2004h") and b"\x1b[?2004h" not in sb[8:]
+    finally:
+        proc.terminate()
+    await asyncio.wait_for(fut, 5)

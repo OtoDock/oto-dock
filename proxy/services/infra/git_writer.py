@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("claude-proxy.git-writer")
+logger = logging.getLogger("otodock.git-writer")
 
 # Commit identifiers reaching `git show` / `git checkout` MUST be plain hex
 # SHAs. Anything else (a leading `-`, e.g. `--output=/etc/foo`) would be parsed

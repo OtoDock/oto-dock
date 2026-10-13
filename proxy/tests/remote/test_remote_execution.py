@@ -25,7 +25,8 @@ def test_load_hook_scripts_loads_all_hooks():
         re._HOOK_SCRIPTS_CACHE = None  # don't leak forced state to other tests
 
     assert set(HOOK_SCRIPTS) == {"permission_gate.py", "tool_result_forwarder.py",
-                                 "subagent_tracker.py", "stop_tracker.py"}
+                                 "subagent_tracker.py", "stop_tracker.py",
+                                 "credential_helper.py"}
     for name in HOOK_SCRIPTS:
         assert name in scripts, f"hook script not loaded: {name}"
         assert scripts[name].strip(), f"hook script empty: {name}"

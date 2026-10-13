@@ -19,11 +19,11 @@ from core.layers.codex.session import CodexAppServerSession
 
 
 def _session(**kw) -> CodexAppServerSession:
-    return CodexAppServerSession(
-        session_id="11111111-2222-4333-8444-555555555555", agent_name="support",
-        model="gpt-6", sandbox_mode="danger-full-access", working_dir="",
-        config_dir="/tmp/codex-home", **kw,
-    )
+    return CodexAppServerSession(**{
+        "session_id": "11111111-2222-4333-8444-555555555555", "agent_name": "support",
+        "model": "gpt-6", "sandbox_mode": "danger-full-access", "working_dir": "",
+        "config_dir": "/tmp/codex-home", **kw,
+    })
 
 
 def test_the_unattended_kinds_are_the_no_human_set():
@@ -32,22 +32,34 @@ def test_the_unattended_kinds_are_the_no_human_set():
     assert session_kind.attended("dashboard") and session_kind.attended("")
 
 
-def test_thread_overrides_carry_hook_trust_only_for_the_floor():
-    plain = _session()._thread_overrides()
-    assert "config" not in plain and plain["approvalPolicy"] == "never"
-    floored = _session(hooks_floor=True)._thread_overrides()
+def test_every_thread_trusts_the_hook():
+    """The trust is fixed per thread while the mode moves per turn, so an
+    attended chat trusts its hook too; the gate decides per call whether it
+    judges (OTO_HOOK_BRIDGED)."""
+    attended = _session(permission_mode="dontAsk")._thread_overrides()
+    assert attended["config"] == {"bypass_hook_trust": True}
+    assert attended["approvalPolicy"] == "never" and attended["approvalsReviewer"] == "user"
+    asking = _session(permission_mode="default", sandbox_mode="workspace-write")._thread_overrides()
+    assert asking["config"] == {"bypass_hook_trust": True}
+    assert asking["approvalPolicy"] == "untrusted"
+    floored = _session(hooks_floor=True, permission_mode="auto")._thread_overrides()
     assert floored["config"] == {"bypass_hook_trust": True}
-    assert floored["approvalPolicy"] == "never" and floored["approvalsReviewer"] == "user"
+    assert floored["approvalPolicy"] == "never"
 
 
-def test_daemon_env_marks_deny_only_and_no_forward(monkeypatch):
+def test_daemon_env_marks_deny_only_no_forward_and_bridged(monkeypatch):
     from core.sandbox import env_builder
     monkeypatch.setattr(env_builder, "build_session_env", lambda *a, **k: {"PATH": "/usr/bin"})
     monkeypatch.setattr(app_config, "CODEX_BIN", "/usr/bin/codex", raising=False)
     env = _session(hooks_floor=True)._build_env()
     assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
+    assert "OTO_HOOK_BRIDGED" not in env
+    # A stray value from the session's own env never reaches a floored session.
+    env = _session(hooks_floor=True, extra_env={"OTO_HOOK_BRIDGED": "1"})._build_env()
+    assert "OTO_HOOK_BRIDGED" not in env
     env = _session()._build_env()
-    assert "OTO_HOOK_DENY_ONLY" not in env and "OTO_HOOK_NO_FORWARD" not in env
+    assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
+    assert env["OTO_HOOK_BRIDGED"] == "1"
 
 
 @pytest.mark.asyncio
@@ -97,6 +109,30 @@ def test_forwarder_stays_quiet_under_the_hook_floor(monkeypatch):
     assert len(calls) == 1
 
 
+def test_subagent_tracker_stays_quiet_on_app_server_threads(monkeypatch):
+    # The thread router owns a Codex app-server session's sub-agents; a
+    # SubagentStop at a child turn end would park a reused child as finished.
+    path = pathlib.Path(app_config.BASE_DIR) / "hooks" / "subagent_tracker.py"
+    spec = importlib.util.spec_from_file_location("subagent_tracker_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    calls: list = []
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda *a, **k: calls.append(a) or io.BytesIO(b"{}"))
+    for var, value in (("PROXY_URL", "http://127.0.0.1:1"), ("PROXY_API_KEY", "k"),
+                       ("OTO_SESSION_ID", "s"), ("OTO_HOOK_NO_FORWARD", "1")):
+        monkeypatch.setenv(var, value)
+    monkeypatch.delenv("OTO_INTERACTIVE", raising=False)
+    stop = json.dumps({"agent_id": "thread-2", "hook_event_name": "SubagentStop"})
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(stop))
+    mod.main()
+    assert calls == []
+    # A headless Claude session (no flag) still reports it.
+    monkeypatch.delenv("OTO_HOOK_NO_FORWARD")
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(stop))
+    mod.main()
+    assert len(calls) == 1
+
+
 def test_attended_chats_send_untrusted_and_fall_back_once_on_rejection():
     """An attended app-server chat (no floor) asks for every command and
     patch through the bridge (approvalPolicy "untrusted"); a daemon that
@@ -111,11 +147,11 @@ def test_attended_chats_send_untrusted_and_fall_back_once_on_rejection():
     )
     assert attended.approval_policy == "untrusted"
     assert attended._thread_overrides()["approvalPolicy"] == "untrusted"
-    attended.set_sandbox_mode("read-only")
-    assert attended.approval_policy == "untrusted"
-    attended.set_sandbox_mode("danger-full-access")
-    assert attended.approval_policy == "never"
-    attended.set_sandbox_mode("workspace-write")
+    attended.set_mode("plan", "read-only")
+    assert attended.approval_policy == "untrusted" and attended.plan_mode
+    attended.set_mode("dontAsk", "danger-full-access")
+    assert attended.approval_policy == "never" and not attended.plan_mode
+    attended.set_mode("default", "workspace-write")
     # The rejection: once, then on-request for the session.
     assert attended._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is True
     assert attended.approval_policy == "on-request"
@@ -129,13 +165,52 @@ def test_attended_chats_send_untrusted_and_fall_back_once_on_rejection():
     assert fresh._note_untrusted_rejection(AppServerError("thread not found")) is False
     assert fresh.approval_policy == "untrusted"
     # Unattended: the floor, never untrusted.
-    floored = _session(hooks_floor=True, sandbox_mode="workspace-write") if False else CodexAppServerSession(
-        session_id="11111111-2222-4333-8444-555555555559", agent_name="support",
-        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
-        config_dir="/tmp/codex-home", hooks_floor=True,
-    )
+    floored = _session(hooks_floor=True, sandbox_mode="workspace-write")
     assert floored.approval_policy == "on-request"
     assert _session(hooks_floor=True).approval_policy == "never"
+
+
+def test_a_full_access_machines_default_mode_asks_through_the_bridge():
+    """On a machine paired with full access default and acceptEdits run under
+    danger-full-access: the policy stays untrusted (the cards), never only in
+    dontAsk / auto, and a mode switch moves it both ways on the next turn."""
+    chat = _session(permission_mode="default")  # sandbox danger-full-access
+    assert chat.approval_policy == "untrusted"
+    chat.set_mode("acceptEdits", "danger-full-access")
+    assert chat.approval_policy == "untrusted"
+    chat.set_mode("dontAsk", "danger-full-access")
+    assert chat.approval_policy == "never"
+    chat.set_mode("auto", "danger-full-access")
+    assert chat.approval_policy == "never"
+    chat.set_mode("default", "danger-full-access")
+    assert chat.approval_policy == "untrusted"
+    # A daemon that refuses untrusted: never there (no command leaves a
+    # sandbox, so on-request would judge nothing), the hook judges with the
+    # stored mode; a workspace sandbox falls back to on-request.
+    from core.layers.codex.app_server_client import AppServerError
+    assert chat._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is True
+    assert chat.approval_policy == "never"
+    chat.set_mode("default", "workspace-write")
+    assert chat.approval_policy == "on-request"
+    chat.set_mode("dontAsk", "danger-full-access")
+    assert chat.approval_policy == "never"
+
+
+@pytest.mark.asyncio
+async def test_a_layer_mode_change_moves_the_policy_on_the_next_turn(monkeypatch):
+    from core.layers.codex import layer as codex_layer
+    chat = _session(permission_mode="default", sandbox_mode="workspace-write")
+
+    async def _get(_sid):
+        return chat
+    monkeypatch.setattr(codex_layer, "get_codex_session", _get)
+    monkeypatch.setattr(codex_layer, "set_session_mode", lambda *_a: None)
+    lay = codex_layer.CodexCLIExecutionLayer.__new__(codex_layer.CodexCLIExecutionLayer)
+    await lay.change_mode(chat.session_id, "dontAsk")
+    assert (chat.permission_mode, chat.sandbox_mode) == ("dontAsk", "danger-full-access")
+    assert chat._thread_overrides()["approvalPolicy"] == "never"
+    await lay.change_mode(chat.session_id, "plan")
+    assert chat.plan_mode and chat.approval_policy == "untrusted"
 
 
 def test_layer_and_remote_payload_share_the_floor_rule():
@@ -147,3 +222,43 @@ def test_layer_and_remote_payload_share_the_floor_rule():
         assert helpers.codex_hooks_floor(client_type) is True
         assert helpers.codex_hooks_floor(client_type, interactive=True) is False
     assert helpers.codex_hooks_floor("dashboard") is False
+
+
+class _Stop(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("untrusted_retry", [False, True])
+async def test_a_resume_asks_for_no_turns(monkeypatch, untrusted_retry):
+    """``thread/resume`` sends ``excludeTurns`` (Codex deprecates hydrating
+    the history into the answer, which nothing here reads), on the retry
+    after an ``untrusted`` refusal too, and never on ``thread/start``."""
+    from core.layers.codex.app_server_client import AppServerError
+    calls = []
+
+    class _Client:
+        def set_server_request_handler(self, h):
+            pass
+
+        async def request(self, method, params=None):
+            calls.append((method, dict(params or {})))
+            if method == "thread/resume" and untrusted_retry and len(calls) == 1:
+                raise AppServerError("approvalPolicy untrusted is not supported")
+            raise _Stop()
+
+    s = _session(thread_id="thread-1")
+    if untrusted_retry:
+        monkeypatch.setattr(s, "approval_policy", codex_session.UNTRUSTED_POLICY)
+
+    async def _connect(env, cwd):
+        s._client = _Client()
+    monkeypatch.setattr(s, "_connect_with_retry", _connect)
+    monkeypatch.setattr(s, "_build_env", lambda: {})
+    with pytest.raises(_Stop):
+        await s.start()
+    resumes = [p for m, p in calls if m == "thread/resume"]
+    assert resumes and all(p.get("excludeTurns") is True and p["threadId"] == "thread-1"
+                           for p in resumes)
+    assert len(resumes) == (2 if untrusted_retry else 1)
+    assert "excludeTurns" not in s._thread_overrides()

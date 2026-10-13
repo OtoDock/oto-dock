@@ -20,7 +20,7 @@ import config
 from auth.providers.base import AuthProvider, AuthResult
 from auth import roles
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Lazy re-discovery guard — module-level so it is shared across all callers
 # and provider instances. `at` is the monotonic time of the LAST attempt

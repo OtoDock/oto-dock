@@ -101,7 +101,7 @@ from services.scheduler.runner import (  # noqa: F401
     _run_task_body,
 )
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 _scheduler = AsyncIOScheduler(timezone=config.get_platform_timezone())
 _current_tz: str = config.get_platform_timezone()  # tracks last-known timezone

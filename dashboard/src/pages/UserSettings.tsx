@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { useFlag } from '../hooks/useFlag'
 import { AudioPrefsSection } from '../components/audio/AudioPrefsSection'
 import { ScrollableTabs } from '../components/ScrollableTabs'
 import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection, NotificationsSection, AppsSection } from './UserSettings.general'
@@ -35,7 +36,7 @@ export default function UserSettings() {
   // feature (feature_flags.remote_machines_available === false). The
   // admin-disabled case (allow_user_paired_machines) keeps the tab and
   // shows its "disabled by admin" message instead.
-  const remoteMachinesAvailable = user?.feature_flags?.remote_machines_available !== false
+  const remoteMachinesAvailable = useFlag('remote_machines_available')
   const settingsTabs = remoteMachinesAvailable
     ? SETTINGS_TABS
     : SETTINGS_TABS.filter(t => t.id !== 'remote-machines')

@@ -154,3 +154,45 @@ async def test_bodyless_result_keeps_old_shape(temp_db):
         await pump._process_event(CommonEvent(DONE, {}))
     finally:
         pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_results_pictures_go_to_the_result_files_service(temp_db, monkeypatch):
+    """A Codex MCP result's `result_blocks` are handed to
+    `services/mcp/result_files.keep` (which decides whether the tool is kept)
+    and never ride a frame or the persisted block."""
+    from services.mcp import result_files
+    calls = []
+
+    async def _keep(session_id, tool_name, blobs, text="", **kw):
+        calls.append((session_id, tool_name, [b.kind for b in blobs], text,
+                      kw.get("wait_for_push"), kw.get("is_error")))
+        return None
+
+    monkeypatch.setattr(result_files, "keep", _keep)
+    temp_db.create_chat("tr-rf", "user-admin", "a1")
+    pump = _mk_pump("tr-rf")
+    try:
+        q = pump.attach()
+        image = {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}
+        await pump._process_event(CommonEvent(TOOL_USE, {
+            "name": "mcp__maps__static_map", "tool_id": "m1"}))
+        await pump._process_event(CommonEvent(TOOL_RESULT, {
+            "name": "mcp__maps__static_map", "tool_id": "m1",
+            "result_content": "Route", "result_blocks": [image]}))
+        # A meeting participant's result names its own session.
+        await pump._process_event(CommonEvent(TOOL_USE, {
+            "name": "mcp__maps__static_map", "tool_id": "m2"}))
+        await pump._process_event(CommonEvent(TOOL_RESULT, {
+            "name": "mcp__maps__static_map", "tool_id": "m2", "is_error": True,
+            "result_blocks": [image], "result_session_id": "participant-1"}))
+        assert calls == [
+            ("sess-tr-rf", "mcp__maps__static_map", ["image"], "Route", False, False),
+            ("participant-1", "mcp__maps__static_map", ["image"], "", False, True),
+        ]
+        frames = json.dumps([f for f in _drain(q)])
+        assert "iVBORw0KGgo=" not in frames
+        assert "result_blocks" not in json.dumps(pump._turn_blocks)
+        assert "result_session_id" not in frames
+    finally:
+        pump.producer.cancel()

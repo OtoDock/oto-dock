@@ -21,7 +21,7 @@ from services.mcp import mcp_registry
 from storage.mcp import mcp_store
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.mcp-api")
+logger = logging.getLogger("otodock.mcp-api")
 router = APIRouter(dependencies=[Depends(require_user)])
 
 
@@ -102,6 +102,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
     _in_t2 = _deployment.in_docker_compose()
     docker_unmanaged: set[str] = set()
     docker_statuses: dict[str, str] = {}
+    docker_stale: set[str] = set()
     for name, m in manifests.items():
         if not _mt.is_container(m.server):
             continue
@@ -111,9 +112,10 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         if states.get(name, False):
             try:
                 from services.mcp import docker_manager
-                docker_statuses[name] = await asyncio.to_thread(
-                    docker_manager.get_container_status, m
-                )
+                status, images = await asyncio.to_thread(docker_manager.container_state, m)
+                docker_statuses[name] = status
+                if status in docker_manager.PRESENT and docker_manager.image_stale(m, images):
+                    docker_stale.add(name)
             except Exception:
                 docker_statuses[name] = docker_manager.UNKNOWN
 
@@ -251,6 +253,9 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             else:
                 from services.mcp import docker_manager
                 entry["docker_status"] = docker_statuses.get(name, docker_manager.NOT_CHECKED)
+                # The container still serves the image an update replaced (its
+                # recreate did not happen): a Restart switches it.
+                entry["docker_image_stale"] = name in docker_stale
 
         # Generic tool filter. Dashboard renders
         # the regex field when `tool_filter_supported` is true; greys it
@@ -383,15 +388,22 @@ async def set_mcp_tool_filter(
         )
 
     regex = (body.regex or "").strip()
+    from services.mcp import docker_manager
+    if regex and docker_manager.dotenv_quote(regex) is None:
+        raise HTTPException(
+            400,
+            "The regex may not hold a line break or another control character, "
+            "nor an odd run of backslashes before a quote or at its end.",
+        )
     await asyncio.to_thread(mcp_store.set_tool_filter_regex, name, regex)
 
-    # Restart Docker container (if applicable) so the new
-    # ENABLED_TOOLS_FLAG takes effect. Stdio MCPs pick up the new value
-    # on their next session spawn — no proxy-side restart needed.
+    # Recreate the Docker container (if it exists) so the new filter takes
+    # effect; a disabled or stopped MCP gets the new .env at its next start.
+    # Stdio MCPs pick up the new value on their next session spawn — no
+    # proxy-side restart needed.
     docker_restarted = False
     if _mt.is_container(m.server):
         try:
-            from services.mcp import docker_manager
             docker_restarted = await asyncio.to_thread(
                 docker_manager.restart_container, m,
             )
@@ -541,9 +553,19 @@ async def docker_restart(name: str, user: UserContext = Depends(get_current_user
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
     from services.mcp import docker_manager
-    ok = await asyncio.to_thread(docker_manager.restart_container, m)
+    status = await asyncio.to_thread(docker_manager.get_container_status, m)
+    if status not in docker_manager.PRESENT and status != docker_manager.STOPPED:
+        raise HTTPException(409, "There is no container to restart: start it instead.")
+    state = await asyncio.to_thread(mcp_store.get_mcp_state, name) or {}
+    if not state.get("enabled"):
+        raise HTTPException(409, "The MCP is disabled: enable it to run its container.")
+    ok = await asyncio.to_thread(docker_manager.restart_container, m, start_exited=True)
     if not ok:
-        raise HTTPException(500, "Failed to restart container")
+        raise HTTPException(
+            500,
+            "Failed to restart the container. When an update just changed its "
+            "image and that image is not on this server, run Update again.",
+        )
     return {"status": "restarted", "name": name}
 
 
@@ -1357,7 +1379,8 @@ async def check_mcp_updates(user: UserContext = Depends(get_current_user)):
     """
     require_admin(user)
     from services.mcp import mcp_updater
-    return await mcp_updater.detect_available_updates()
+    state = await mcp_updater.detect_available_updates()
+    return {**state, "auto_update_enabled": await asyncio.to_thread(mcp_updater.auto_update_enabled)}
 
 
 @router.get("/v1/admin/mcps/update-state")
@@ -1365,11 +1388,13 @@ async def get_mcp_update_state(user: UserContext = Depends(get_current_user)):
     """The last update check as persisted (admin): its ordinary results, the
     pending source changes and the switched ones not yet dismissed, so the
     MCP Servers page shows them on load without a new check.
-    ``{updates: {name: info}, checked, checked_at}``; ``checked_at`` is empty
-    when no check has run yet."""
+    ``{updates: {name: info}, checked, checked_at, auto_update_enabled}``;
+    ``checked_at`` is empty when no check has run yet."""
     require_admin(user)
     from services.community import mcp_source_swap
-    return await asyncio.to_thread(mcp_source_swap.build_update_state)
+    from services.mcp import mcp_updater
+    state = await asyncio.to_thread(mcp_source_swap.build_update_state)
+    return {**state, "auto_update_enabled": await asyncio.to_thread(mcp_updater.auto_update_enabled)}
 
 
 @router.post("/v1/admin/mcps/{name}/update")

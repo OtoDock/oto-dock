@@ -36,7 +36,7 @@ import httpx
 
 from services.mcp import mcp_manifest_types as _mt
 
-logger = logging.getLogger("claude-proxy.community-catalog")
+logger = logging.getLogger("otodock.community-catalog")
 
 
 # Catalog URLs are env-overridable for DEV/TEST only (point an install at a
@@ -405,12 +405,16 @@ def augment_entry(
     - ``installed_version`` (str | None): version reported by the local
       manifest, if installed.
     - ``update_available`` (bool): true if the catalog version is strictly NEWER
-      than the installed one (docker; not merely different) OR — for node/python,
-      whose catalog version is empty (unbounded) — the catalog **integration
-      manifest** changed (``manifest_hash`` differs from the installed one). A
-      package-version update for node/python is detected separately by the
-      registry probe in ``mcp_updater.detect_available_updates`` (Browse has no
-      network), so this surface only reflects catalog-derived signals.
+      than the installed one (docker, git+; not merely different) OR — for
+      node/python, whose catalog version is empty (unbounded), and for docker
+      and git+ under the same version — the catalog **integration manifest**
+      changed (``manifest_hash`` differs from the installed one) or the
+      source's detail the hash leaves out did (a git+ ref, a pypi: source's
+      extras). A package-version update for node/python is detected
+      separately by the registry probe in ``mcp_updater.detect_available_updates``
+      (Browse has no network), so this surface only reflects catalog-derived
+      signals.
+    - ``trust`` (str): the catalog's tier for the entry (``trust_tier``).
     - ``enabled_for_agents`` (list[str]): agent slugs that have this MCP
       assigned via the manager UI.
     - ``pending_request`` (int | None): open request id when
@@ -434,16 +438,27 @@ def augment_entry(
     # and the converge would be a downgrade, so the signal needs the same
     # version, as ``mcp_updater.detect_available_updates`` requires.
     entry_rt = _mt.runtime_of(entry.get("runtime"))
+    # A container and a git+ entry carry their version of record in the
+    # catalog: the hash signal needs the same version (an install ahead of
+    # the catalog is never an update).
+    pinned_entry = bool(entry_rt and entry_rt.container) or is_git_source(entry.get("source"))
+    same_version = not pinned_entry or str(catalog_version) == str(local_version)
     if (
         installed
         and not update_available
         and installed_manifest_hashes
         and manifest_hash_signal_applies(entry)
-        and (not (entry_rt and entry_rt.container) or str(catalog_version) == str(local_version))
+        and same_version
     ):
         catalog_hash = entry.get("manifest_hash")
         installed_hash = installed_manifest_hashes.get(name)
         if catalog_hash and installed_hash and catalog_hash != installed_hash:
+            update_available = True
+    # What the hash cannot see: a git+ ref or the extras of a pypi: source.
+    if installed and not update_available and same_version:
+        from services.mcp import mcp_registry
+        local = mcp_registry.get_manifest(name)
+        if local is not None and source_detail_differs(local.server.source, entry.get("source")):
             update_available = True
     # An entry whose source moved is not an update the Browse button can
     # apply (the install gate refuses it): the MCP Servers page carries the
@@ -460,6 +475,15 @@ def augment_entry(
             if mcp_source_swap.judged(from_identity) and from_identity != to_identity:
                 update_available = False
                 source_changed = True
+    # A git+ entry the catalog pins to a tag or a branch is one the install
+    # from the catalog refuses (a ref can move upstream with no catalog
+    # change): no button until the catalog pins a commit.
+    catalog_unpinned = False
+    if installed and update_available and is_git_source(entry.get("source")):
+        from services.community import community_installer
+        if not community_installer.git_ref_is_commit(entry.get("source")):
+            update_available = False
+            catalog_unpinned = True
     pending_request: int | None = None
     pending_request_count = 0
     if pending_requests is not None:
@@ -474,10 +498,12 @@ def augment_entry(
         "installed_version": local_version,
         "update_available": update_available,
         "source_changed": source_changed,
+        "catalog_unpinned": catalog_unpinned,
         "enabled_for_agents": sorted(enabled_for_agents.get(name, [])),
         "pending_request": pending_request,
         "pending_request_count": pending_request_count,
         "platform_compat_ok": platform_version_ok(entry.get("platform_min_version")),
+        "trust": trust_tier(entry),
     }
 
 
@@ -494,22 +520,62 @@ def _collect_installed_versions() -> dict[str, str]:
     return {name: m.version for name, m in manifests.items()}
 
 
-NON_CONVERGEABLE_SOURCE_PREFIXES = ("git+", "remote:")
+NON_CONVERGEABLE_SOURCE_PREFIXES = ("remote:",)
 
 
 def manifest_hash_signal_applies(entry: dict[str, Any]) -> bool:
     """Whether a catalog ``manifest_hash`` mismatch is an update the updater can
-    apply: npm/pypi entries converge to the catalog folder, docker entries
-    re-fetch it; skill packages (runtime ``none``) reinstall from theirs.
-    git+ and remote entries have no converge path, so a mismatch there would
-    badge an update nobody can run: they pick up manifest changes with a
-    version bump or a reinstall."""
+    apply: npm/pypi and git+ entries converge to the catalog folder (a git+
+    one at the weekly run when the catalog pins a commit, else only on an
+    admin's Update), docker entries re-fetch it; skill
+    packages (runtime ``none``) reinstall from theirs. Remote entries have no
+    converge path, so a mismatch there would badge an update nobody can run:
+    they pick up manifest changes with a reinstall."""
     rt = _mt.runtime_of(entry.get("runtime"))
     if rt is None:
         return False
     if not rt.process:
         return True
     return not str(entry.get("source") or "").startswith(NON_CONVERGEABLE_SOURCE_PREFIXES)
+
+
+def is_git_source(source: Any) -> bool:
+    return isinstance(source, str) and source.startswith("git+")
+
+
+def source_detail_differs(installed_source: Any, catalog_source: Any) -> bool:
+    """Whether the catalog's source names the same package with another
+    detail the manifest hash cannot see (it leaves ``server.source`` out): a
+    git+ ref, or the extras of a ``pypi:`` source (compared as PEP 685 sets,
+    so an order or case difference is none). The package itself is the
+    source pass's (``mcp_source_swap``), never judged here."""
+    from services.mcp import mcp_installer
+    if not isinstance(installed_source, str) or not isinstance(catalog_source, str):
+        return False
+    if is_git_source(installed_source) and is_git_source(catalog_source):
+        mine = mcp_installer.parse_source(installed_source)
+        theirs = mcp_installer.parse_source(catalog_source)
+        return bool(mine and theirs and theirs.version and mine.version != theirs.version)
+    if installed_source.startswith("pypi:") and catalog_source.startswith("pypi:"):
+        mine = mcp_installer.parse_source(installed_source)
+        theirs = mcp_installer.parse_source(catalog_source)
+        if mine is None or theirs is None:
+            return False
+        return mcp_installer.normalized_extras(mine) != mcp_installer.normalized_extras(theirs)
+    return False
+
+
+# The catalog's word on who stands behind an entry (``registry.json``'s
+# ``trust``): OtoDock wrote or forked it, a vendor or a maintained upstream
+# ships it and the catalog reviewed it, or a community package that follows
+# its upstream. An entry the catalog has not tagged, or a word this platform
+# does not know, reads third-party. Nothing gates on it; Browse shows it.
+TRUST_TIERS = ("first-party", "maintained", "third-party")
+
+
+def trust_tier(entry: dict[str, Any]) -> str:
+    value = entry.get("trust")
+    return value if value in TRUST_TIERS else "third-party"
 
 
 def _collect_installed_manifest_hashes() -> dict[str, str]:

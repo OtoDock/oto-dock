@@ -38,6 +38,7 @@ from core.session.session_state import (
     _chat_streaming_state,
     set_session_mode,
     get_subagent_registry,
+    prompt_waits,
 )
 from core.events.bg_command_state import get_bg_command_registry
 from core.session.transcript_tool_events import result_summary, truncate_result
@@ -71,8 +72,9 @@ from services.title_generator import (
     TITLE_TOOL_THRESHOLD as _TITLE_TOOL_THRESHOLD,
 )
 from core.session import session_kind
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Text and thinking deltas coalesce per pump: a delta goes out at once when
 # none went out in the last window, else it joins one pending frame flushed
@@ -85,6 +87,15 @@ _VIEWER_QUEUE_MAX = 2048
 # Pump-local item (not a wire type): the viewer fell behind and must resync
 # through a resume (chat_history, then a fresh live_state).
 PUMP_RESYNC = "resync"
+# A card retired because its hook caller went away is followed by the
+# hook's retry of the same call (hooks/permission_gate.py: a stream that
+# died silently is noticed at its 150 s read timeout, then retried with
+# backoff): the retry's card shows without a second ping until this long
+# after the retire; a later retry pings again.
+_RETRY_QUIET_S = 180.0
+# The drivers whose turns never ping for a held prompt: a task run reports
+# by its notification mode, a meeting turn is not the person's own.
+_NO_PING_DRIVERS = (session_kind.TASK.source_type, session_kind.MEETING.source_type)
 
 
 class _ViewerQueue(asyncio.Queue):
@@ -241,6 +252,49 @@ def turn_ended_block(ending: "turn_ending.TurnEnding") -> dict:
     return block
 
 
+#: Chats holding a wake stored while another turn had them: the next pump's
+#: end on the chat replays it (``_replay_stored_wakes``), so a wake refused
+#: by a phone, voice or meeting turn is not left for the next warmup.
+_stored_wake_chats: set[str] = set()
+
+
+def note_stored_wake(chat_id: str) -> None:
+    """A wake was stored on ``chat_id``: its next pump end replays it."""
+    _stored_wake_chats.add(chat_id)
+
+
+async def _replay_stored_wakes(chat_id: str) -> None:
+    """The stored wakes of a chat whose turn just ended, through the
+    delivery's sweep of one chat (its starters ask the chat's claim; a
+    refused one stores the wake again for the next pump end)."""
+    from services.scheduler import delivery
+    try:
+        chat = await run_db(task_store.get_chat, chat_id)
+        if chat:
+            await delivery._redeliver_chat(chat)
+    except Exception:
+        logger.exception(f"chat={chat_id[:8]}: the stored wakes' replay failed")
+
+
+_replays: set[asyncio.Task] = set()
+
+
+def _spawn_replay(chat_id: str) -> None:
+    task = asyncio.create_task(_replay_stored_wakes(chat_id))
+    _replays.add(task)
+    task.add_done_callback(_replays.discard)
+
+
+# The "needs your input" pings in flight (``ChatStreamPump._ping_needs_input``).
+_pings: set[asyncio.Task] = set()
+
+
+def _call_key(perm_data: dict) -> str:
+    """One tool call's identity across the hook's retries: its name and input."""
+    return f"{perm_data.get('tool_name') or ''}\0" + json.dumps(
+        perm_data.get("tool_input") or {}, sort_keys=True, default=str)
+
+
 def store_chat_wake(chat_id: str, prompt: str, person: str = "") -> bool:
     """Store ``prompt`` as the chat's durable wake for ``person``, the person
     the chat's turn runs as, at their role on the chat's agent now; "" names
@@ -252,8 +306,11 @@ def store_chat_wake(chat_id: str, prompt: str, person: str = "") -> bool:
         from auth.providers import acting_role_of
         agent = (task_store.get_chat(chat_id) or {}).get("agent") or ""
         role = acting_role_of(person, agent)
-    return bool(task_store.append_pending_delegate_wake(
+    stored = bool(task_store.append_pending_delegate_wake(
         chat_id, prompt, person=person, role=role))
+    if stored:
+        note_stored_wake(chat_id)
+    return stored
 
 
 def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
@@ -384,6 +441,7 @@ class ChatStreamPump:
         source_type: str = "chat",
         chat_owner: str = "",
         chat_agent: str = "",
+        driver_tells_parked: bool = False,
     ):
         self.chat_id = chat_id
         self.session_id = session_id
@@ -399,6 +457,10 @@ class ChatStreamPump:
         # producers get it from the start job's result.
         self._chat_owner = chat_owner
         self._chat_agent = chat_agent
+        # The driver tells the person itself when the turn parks on a prompt
+        # nobody watches (the delegate echo's watchdog): no ping of our own
+        # while no viewer is attached.
+        self.driver_tells_parked = driver_tells_parked
 
         self._ws_queues: list[_ViewerQueue] = []
         self._done = False
@@ -553,6 +615,11 @@ class ChatStreamPump:
         # Permission gating: only one blocking prompt shown at a time
         self._permission_active: dict | None = None  # currently shown permission
         self._permission_buffer: list[dict] = []  # queued permissions waiting
+        # The "needs your input" ping: the cards shown with one (or quietly,
+        # as a retried call's card) by request id -> call key, and the calls
+        # whose pinged card was retired with its caller gone, key -> when.
+        self._pinged: dict[str, str] = {}
+        self._retried: dict[str, float] = {}
 
         # Stop-and-send flags ({"fired": bool, "note": bool}) — assigned ONLY
         # by dashboard_chat._start_new_stream, whose producer drains
@@ -635,6 +702,8 @@ class ChatStreamPump:
 
     async def resolve_active_permission(self):
         """Current permission resolved. Forward next from buffer if any."""
+        if self._permission_active is not None:
+            self._pinged.pop(self._permission_active.get("request_id") or "", None)
         self._permission_active = None
         live = _chat_streaming_state.get(self.chat_id)
         if live:
@@ -657,6 +726,9 @@ class ChatStreamPump:
         transcript's record of the review."""
         if not request_id:
             return
+        key = self._pinged.pop(request_id, None)
+        if caller_gone and key is not None:
+            self._retried[key] = time.monotonic()
         self._permission_buffer[:] = [
             p for p in self._permission_buffer if p.get("request_id") != request_id]
         if caller_gone:
@@ -683,6 +755,7 @@ class ChatStreamPump:
         """
         self._permission_active = None
         self._permission_buffer.clear()
+        self._pinged.clear()
         _pending_permissions.pop(self.session_id, None)
         live = _chat_streaming_state.get(self.chat_id)
         if live:
@@ -705,42 +778,95 @@ class ChatStreamPump:
             )
         elif evt_type == wire.ITEM_QUESTION_PROMPT:
             # Codex request_user_input: the daemon HOLDS the turn open on this
-            # question, so the turn-end ping never fires for it. Surface the card
-            # and fire a "needs your input" ephemeral NOW (away/FCM aware) so a
-            # user who stepped away still gets pinged. Do NOT touch chat_status —
-            # the turn is still streaming (no "ready" flip mid-held-turn).
+            # question, so the turn-end ping never fires for it. Do NOT touch
+            # chat_status — the turn is still streaming (no "ready" flip
+            # mid-held-turn).
             await self._forward(
                 {"pump_type": wire.PUMP_QUESTION_PROMPT, "perm_data": perm_data},
             )
-            _q_cid = self.chat_id
-
-            def _row_meeting_label() -> tuple[dict | None, bool, str]:
-                row = task_store.get_chat(_q_cid)
-                if not row:
-                    return None, False, ""
-                return (
-                    row,
-                    bool(task_store.get_active_meeting_for_chat(_q_cid)),
-                    notification_manager.agent_label(row["agent"]) if row.get("agent") else "",
-                )
-
-            chat, _in_meeting, _label = await run_db(_row_meeting_label)
-            if chat and self.source_type != session_kind.TASK.source_type and not _in_meeting:
-                qs = (perm_data.get("tool_input") or {}).get("questions") or []
-                first_q = (qs[0].get("question") if qs and isinstance(qs[0], dict)
-                           else "") or "Waiting for your answer"
-                asyncio.create_task(notification_manager.fire_ephemeral(
-                    chat["user_sub"],
-                    title=f"{_label or chat.get('agent') or ''} needs your input",
-                    body=first_q,
-                    chat_id=self.chat_id,
-                ))
+            qs = (perm_data.get("tool_input") or {}).get("questions") or []
+            first_q = (qs[0].get("question") if qs and isinstance(qs[0], dict)
+                       else "") or "Waiting for your answer"
+            self._ping_needs_input(perm_data, first_q)
         else:
             forward_data = {"pump_type": wire.PUMP_PERMISSION_PROMPT, "perm_data": perm_data}
             # Include meeting agent identity so the frontend can show which agent is asking
             if perm_data.get("meeting_agent"):
                 forward_data["meeting_agent"] = perm_data["meeting_agent"]
             await self._forward(forward_data)
+            # The tool's input stays out of the body: it rides the push to
+            # the phone, and a command or a URL can carry a secret.
+            self._ping_needs_input(perm_data, f"Allow {perm_data.get('tool_name') or 'a tool'}?")
+
+    def _ping_needs_input(self, perm_data: dict, body: str) -> None:
+        """A held prompt just shown pings its person: the "needs your input"
+        ephemeral (away and FCM aware), the only signal of a card that waits
+        mid-turn (the turn-end ping waits for the turn). Never for a task or
+        meeting turn, a meeting participant's card, a driver that sends its
+        own parked notice, a card whose wait already ended (a dropped
+        connection retires several at once, and retiring the active one shows
+        the next for a moment), or the retry of a hook call whose first card
+        pinged before its caller went away. Synchronous up to the spawn: the
+        card is never held by the chat row read."""
+        rid = str(perm_data.get("request_id") or "")
+        if (not rid or (self.driver_tells_parked and not self.has_viewers)
+                or perm_data.get("meeting_agent")
+                or self.source_type in _NO_PING_DRIVERS or not prompt_waits(rid)):
+            return
+        key = _call_key(perm_data)
+        now = time.monotonic()
+        for k, at in list(self._retried.items()):
+            if now - at > _RETRY_QUIET_S:
+                del self._retried[k]
+        self._pinged[rid] = key
+        if self._retried.pop(key, None) is not None:
+            return
+        task = asyncio.create_task(self._send_ping(rid, key, body))
+        _pings.add(task)
+        task.add_done_callback(_pings.discard)
+
+    async def _send_ping(self, request_id: str, key: str, body: str) -> None:
+        sent = False
+        try:
+            sent = await self._fire_ping(request_id, body)
+        finally:
+            if not sent:
+                # Nothing reached the person, so the call's retry must not
+                # stay quiet: before its retire the card is forgotten, after
+                # it the retire's entry goes.
+                if self._pinged.pop(request_id, None) is None:
+                    self._retried.pop(key, None)
+
+    async def _fire_ping(self, request_id: str, body: str) -> bool:
+        chat_id = self.chat_id
+
+        def _row_meeting_label() -> tuple[dict | None, bool, str]:
+            row = task_store.get_chat(chat_id)
+            if not row:
+                return None, False, ""
+            return (
+                row,
+                bool(task_store.get_active_meeting_for_chat(chat_id)),
+                notification_manager.agent_label(row["agent"]) if row.get("agent") else "",
+            )
+
+        try:
+            chat, in_meeting, label = await run_db(_row_meeting_label)
+        except Exception:
+            logger.debug("chat=%s: the needs-input ping's chat read failed", chat_id[:8],
+                         exc_info=True)
+            return False
+        # Answered or released while the row was read: nothing waits.
+        if not chat or in_meeting or not prompt_waits(request_id):
+            return False
+        await notification_manager.fire_ephemeral(
+            chat["user_sub"],
+            title=f"{label or chat.get('agent') or ''} needs your input",
+            body=body,
+            chat_id=chat_id,
+            mid_turn=True,
+        )
+        return True
 
     async def _queue_or_show_permission(self, perm_data: dict):
         """Show permission if none active, otherwise buffer it."""
@@ -1506,9 +1632,8 @@ class ChatStreamPump:
                         _title_cid = self.chat_id
 
                         def _fire_title(_f=None) -> None:
-                            asyncio.create_task(
-                                title_generator.request_chat_title(_title_cid)
-                            )
+                            spawn(title_generator.request_chat_title(_title_cid),
+                                  name="request_chat_title", owner="stream_pump")
 
                         if save_fut is not None:
                             save_fut.add_done_callback(_fire_title)
@@ -1697,6 +1822,9 @@ class ChatStreamPump:
                         self.chat_id, return_upto=self._return_upto,
                         viewers=self.has_viewers,
                     )
+                    if self.chat_id in _stored_wake_chats:
+                        _stored_wake_chats.discard(self.chat_id)
+                        _spawn_replay(self.chat_id)
 
                 # Signal any remaining subscribers (a later attach gets it too)
                 self._flush_deltas()
@@ -1773,12 +1901,12 @@ class ChatStreamPump:
         if self.source_type == session_kind.TASK.source_type:
             return
         if not in_meeting:
-            asyncio.create_task(notification_manager.fire_ephemeral(
+            spawn(notification_manager.fire_ephemeral(
                 chat["user_sub"],
                 title=f"{agent_label or chat.get('agent') or ''} finished",
                 body="Response ready",
                 chat_id=self.chat_id,
-            ))
+            ), name="fire_ephemeral", owner="stream_pump")
 
     @staticmethod
     def _live_append_text(live: dict, text: str):
@@ -1833,9 +1961,9 @@ class ChatStreamPump:
                 ) >= _TITLE_CHAR_THRESHOLD:
                     self._title_armed = False
                     from services import title_generator
-                    asyncio.create_task(title_generator.request_chat_title(
+                    spawn(title_generator.request_chat_title(
                         self.chat_id, assistant_excerpt="".join(self._pending_text),
-                    ))
+                    ), name="request_chat_title", owner="stream_pump")
 
         elif event.type == THINKING:
             await self._forward_delta(THINKING, ed)
@@ -1882,9 +2010,9 @@ class ChatStreamPump:
             if self._title_armed and self._tool_seen >= _TITLE_TOOL_THRESHOLD:
                 self._title_armed = False
                 from services import title_generator
-                asyncio.create_task(title_generator.request_chat_title(
+                spawn(title_generator.request_chat_title(
                     self.chat_id, assistant_excerpt="".join(self._pending_text),
-                ))
+                ), name="request_chat_title", owner="stream_pump")
             # A memory tool call resets this session's capture-nudge counter
             # (services/memory_nudge). Name shapes: mcp__memory-mcp__memory
             # (CLI/Codex) or bare "memory" (Direct LLM).
@@ -1956,6 +2084,15 @@ class ChatStreamPump:
             # BEFORE tool_end, and keep the body out of the tool_end frame.
             result_content = ed.pop("result_content", None)
             result_is_error = bool(ed.pop("is_error", False))
+            # A Codex MCP result's pictures and blobs: kept and shown for a
+            # tool its MCP opts in (``result_files``), never forwarded or
+            # recorded with the tool block.
+            result_blocks = ed.pop("result_blocks", None)
+            result_owner = ed.pop("result_session_id", None) or self.session_id
+            if result_blocks:
+                from services.mcp import result_files
+                await result_files.keep_blocks(result_owner, tool_name, result_blocks,
+                                               result_content or "", is_error=result_is_error)
             if result_content:
                 result_content = truncate_result(result_content)
                 summary = result_summary(tool_name, result_content)
@@ -2198,6 +2335,14 @@ class ChatStreamPump:
                 live["live_blocks"].append(evt)
 
         elif event.type == PERMISSION_REQUEST:
+            # The engine's own request (Claude's stdio channel): a prompt
+            # waiting on a person, answered through the raising session's
+            # layer (core/session/engine_prompts).
+            from core.session import engine_prompts
+            if engine_prompts.withdrawn_before_registered(str(ed.get("request_id") or "")):
+                return   # the engine withdrew it before the card could show
+            engine_prompts.watch(ed.get("session_id") or self.session_id, ed,
+                                 chat_id=self.chat_id)
             self._flush_pending_text()
             self._turn_blocks.append({"type": wire.PERMISSION_PROMPT, **ed})
             # Gate: use the same queue as perm_queue permissions

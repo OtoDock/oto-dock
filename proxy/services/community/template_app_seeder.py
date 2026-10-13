@@ -44,7 +44,7 @@ from storage.agents.community_agent_template_store import (
 from auth import roles
 from core import layout
 
-logger = logging.getLogger("claude-proxy.community-agent-installer")
+logger = logging.getLogger("otodock.community-agent-installer")
 
 SEED_SUBDIR = ("config", "community", "user-apps")
 HEAL_INTERVAL_S = 60.0

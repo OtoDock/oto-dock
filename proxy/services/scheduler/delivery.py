@@ -14,6 +14,7 @@ import functools
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING
 import config
 from storage import database as task_store
 from storage.automation import run_status
-from services.scheduler import interactive, lanes, shared
+from services.scheduler import interactive, lanes, shared, wake_fresh
 from core import placement
 from core.session import session_kind
 from core.session.visibility import (
@@ -29,10 +30,12 @@ from core.session.visibility import (
 )
 from auth import roles
 from ws import wire_events as wire
+from services.scheduler.lanes import _run_echo_turn_pumped  # noqa: F401
 from services.scheduler.delivery_identity import (  # noqa: F401
     _shared_chat_person, _standing_of, _wake_refused, _wake_visibility,
     resolve_delivery_person,
 )
+from core.background import spawn
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,7 +45,7 @@ if TYPE_CHECKING:
     from core.session.visibility import VisibilityResolution
     from storage.remote_store import BrowserTargetSettings
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 # Chats one wake sweep delivers at once: a wake that waits for a slot on a
 # full box holds up only its own chat.
@@ -129,10 +132,9 @@ def _wake_credential_env(agent: str, session_id: str, *, user_sub: str | None, r
     env["PROXY_API_KEY"] = create_session_token(session_id, agent, user_sub or "",
                                                 issued_at=minted_at)
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
-    if mcp_format == "toml" and mcp_config:
-        mcp_config = mcp_registry.inject_credential_env_into_toml(
-            mcp_config, env, exclude_keys=bash_env_keys,
-        )
+    mcp_config = mcp_registry.inject_toml_credentials(
+        mcp_config, env, mcp_format=mcp_format, exclude_keys=bash_env_keys,
+    )
     return mcp_config, env, multi_value_envs, minted_at
 
 
@@ -234,8 +236,10 @@ async def _wake_dynamic_contexts(
 def _wake_superseded(session_id: str, chat_id: str) -> bool:
     """Someone else is starting or using this chat's session: a live
     interactive session under the id, a live terminal or a warmup on the
-    chat, or a turn streaming on it. A background wake then spawns nothing
-    (its wake is stored for the chat's next turn instead)."""
+    chat, a turn streaming on it, or another turn starter holding it. A
+    background wake then spawns nothing (its wake is stored for the chat's
+    next turn instead, and that turn's end replays it)."""
+    from core.events import input_queue
     from core.events.stream_pump import _active_pumps
     from core.session import interactive_session, warmup_registry
 
@@ -249,6 +253,8 @@ def _wake_superseded(session_id: str, chat_id: str) -> bool:
             return True
         pump = _active_pumps.get(chat_id)
         if pump is not None and not pump.is_done:
+            return True
+        if input_queue.is_claimed(chat_id):
             return True
     return False
 
@@ -280,6 +286,8 @@ async def _store_undelivered_wakes(chat_id: str, wakes: list[str], *, person: st
             person=person, role=role, by=by))) or stored
     if not stored:
         return False
+    from core.events.stream_pump import note_stored_wake
+    note_stored_wake(chat_id)
     isess = interactive_session.find_live_for_chat(chat_id)
     if isess is not None and isess.alive:
         for rec in await run_db(task_store.claim_pending_wake_records, chat_id):
@@ -294,7 +302,7 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
                                *, worker_chat_id: str = "", output_cursor: int = 0,
                                prompt_row_id: int = 0, prompt_text: str = "",
                                run_started_at: str = "", ending=None,
-                               run_id: str = "") -> None:
+                               run_id: str = "", background_pending: int = 0) -> None:
     """Deliver completed task result to originating session/chat.
 
     The originating ``on_complete_session_id`` is the primary route key
@@ -315,6 +323,8 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
     ``run_id`` names the run whose attached files the result names
     (``services/delegation/result_files``): read after the lane settled,
     never copied here; a second delivery of the run names the same rows.
+    ``background_pending`` counts the background work still running when the
+    run ended: the callback says its results are not in the report.
     """
     row = await asyncio.to_thread(task_store.get_dynamic_task, task.id)
     on_complete_agent = (row.get("on_complete_agent") if row else None) or task.on_complete_agent
@@ -428,6 +438,12 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
             result_prompt += f"\n\n[{ending.callback_note(worker_chat_id)}]"
         if files_note:
             result_prompt += f"\n\n{files_note}"
+        if background_pending:
+            cont = (f'delegate(continue_id="{worker_chat_id}")' if worker_chat_id
+                    else "delegate(continue_id=…)")
+            result_prompt += (f"\n\n[The worker's run ended with {background_pending} "
+                              f"background job(s) still running; their results are not in "
+                              f"this report. Continue the worker with {cont} to collect them.]")
         await _do_deliver(
             on_complete_session_id, on_complete_agent, result_prompt, task,
             chat_id=on_complete_chat_id,
@@ -437,12 +453,13 @@ async def _deliver_task_result(task: shared.TaskDefinition, final_status: str, o
             ending=ending,
             files=files,
             files_skipped=files_skipped,
+            background_pending=background_pending,
         )
 
     # The worker chat owes this report until the collection above (taken
     # before the task exists, so no turn starts between them).
     lanes.hold_report(worker_chat_id)
-    asyncio.create_task(_finalize_and_deliver())
+    spawn(_finalize_and_deliver(), name="finalize_and_deliver", owner="delivery")
 
 
 def _ending_fields(ending) -> dict:
@@ -469,7 +486,8 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
                       *, chat_id: str | None = None, output_text: str = "",
                       status: str = run_status.COMPLETED, verdict: dict | None = None,
                       ending=None, files: list | None = None,
-                      files_skipped: list | None = None) -> None:
+                      files_skipped: list | None = None,
+                      background_pending: int = 0) -> None:
     """Deliver a delegate result via the session-delivery ladder.
 
     The routing itself (WS notify → pump → persistent → one-shot) lives in
@@ -506,6 +524,7 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
             "status": status,
             **_result_extras(verdict, files, files_skipped),
             **(_ending_fields(ending)),
+            **({"background_pending": background_pending} if background_pending else {}),
         }
         delegate_event_data = json.dumps({
             "task_id": task.id,
@@ -515,6 +534,7 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: sha
             "status": status,
             **_result_extras(verdict, files, files_skipped),
             **(_ending_fields(ending)),
+            **({"background_pending": background_pending} if background_pending else {}),
         }, default=str)
 
         from core.events import chat_writer
@@ -890,101 +910,6 @@ async def _redeliver_group(chat: dict, prompts: list[str], *, person: str, role:
     return True
 
 
-async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
-                                agent: str, result_prompt: str, *,
-                                person: str = "", only_as_chat_turn: bool = False) -> str | None:
-    """Run a delegate-echo turn through a headless ChatStreamPump on the
-    delegating chat.
-
-    The old direct collection (``layer.send_message`` → join TEXT parts) ran
-    the turn INVISIBLY: no ``chat_status`` streaming/ready broadcasts, no live
-    pump a viewer could attach to, no ``last_response_at`` stamp (so no unread
-    dot or Active-now row), and every non-text block dropped — a delivered
-    result nobody was told about (2026-07-13 incident, chat 75eab195). The
-    pump is the one turn pipeline that does all of that, and a viewer opening
-    the chat mid-turn attaches to it like any streaming chat.
-
-    Returns "" on success — the pump persisted the turn itself, so the caller
-    must NOT save an echo row — or None when a pump can't run here (the caller
-    falls through / logs the refusal). A stalled turn is reaped by the task
-    watchdog with its partial output persisted; that still counts as delivered
-    (the delegate_result event row is the source of truth either way).
-
-    A turn on a live process runs in the chat's own permission mode: when
-    its next step waits on a person while nobody views the chat, ``person``
-    (the delivery's, else the chat's owner when a person owns it) is told
-    once, so the card does not wait unseen.
-
-    The turn ends at the engine's result, as the chat's own turns do, and the
-    chat's monitors take what it leaves running (``lanes.takes_chat_contract``);
-    only inside a run's report window, or in a phone chat, does it wait on its
-    background work as a task turn.
-    """
-    from core.events.stream_pump import ChatStreamPump, _active_pumps
-    from core.events.task_producer import task_produce
-    from core.session import visibility as _vis
-    from core.session.session_state import get_permission_queue
-    from storage.pg import run_db
-
-    # Read before the pump check: nothing may await between it and the
-    # pump's registration.
-    chat_row = await run_db(task_store.get_chat, chat_id)
-    from core.events import input_queue
-    if _active_pumps.get(chat_id) is not None or input_queue.get(chat_id).claimed:
-        # A turn started on the chat between the ladder's pump check and now,
-        # or a send, a drain or a queued delivery holds the chat for the turn
-        # it is starting (its pump registers a few steps later): never
-        # dual-pump a chat. The caller keeps the prompt (a stored wake, a
-        # review's next round).
-        return None
-    chat_turn = lanes.takes_chat_contract(chat_row, session_id)
-    if only_as_chat_turn and not chat_turn:
-        return None   # a review never runs inside a run's report
-    echo_id = f"echo-{chat_id[:8]}"
-    event_queue: asyncio.Queue = asyncio.Queue()
-    producer = asyncio.create_task(
-        lanes._chat_turn_produce(layer, session_id, result_prompt, event_queue)
-        if chat_turn else task_produce(
-            layer, session_id, result_prompt, event_queue, echo_id, settle_timeout=30.0))
-    pump = ChatStreamPump(
-        chat_id=chat_id,
-        session_id=session_id,
-        producer=producer,
-        event_queue=event_queue,
-        perm_queue=get_permission_queue(session_id),
-        scope="agent" if _vis.is_shared_only(agent) else "user",
-    )
-    _active_pumps[chat_id] = pump
-    pump.start()
-    async def _tell_parked() -> None:
-        who = person
-        if not who:
-            owner = (chat_row or {}).get("user_sub") or ""
-            who = "" if is_synthetic_owner(owner) else owner
-        if not who:
-            return
-        from services.notifications import notification_manager
-        await notification_manager.fire_notification(
-            "A chat waits on your answer",
-            f"{agent} was woken in a chat (a delegated result, a scheduled wake or a "
-            f"finished background job) and its next step waits for your answer there. "
-            f"Open the chat to answer.",
-            severity="info", scope="user", target=who, source="delegation",
-            agent_slug=agent, chat_id=chat_id,
-        )
-
-    # A _TaskTurnStalled reap persisted the partial turn and closed the chat
-    # status — delivered as far as it went; never fall through to another rung
-    # (that would run a SECOND echo turn).
-    with contextlib.suppress(lanes._TaskTurnStalled):
-        await lanes._watch_task_pump(layer, pump, echo_id, chat_id, session_id,
-                                     on_parked=_tell_parked)
-    if chat_turn:
-        from core.events.pump_bg_monitors import arm_bg_monitors
-        arm_bg_monitors(layer, session_id, chat_id)
-    return ""
-
-
 async def _deliver_via_persistent(
     session_id: str, agent: str, result_prompt: str,
     *, user_sub: str | None = None, role: str = "manager", chat_id: str = "",
@@ -1094,13 +1019,19 @@ async def _deliver_via_oneshot(
     # the agent scope even when a person is on the delivery.
     from core.session.visibility import SCOPE_USER
     vis = await run_db(_wake_visibility, agent, username or "", role, user_sub)
-    if not await layer.can_resume_session(session_id, agent_name=agent,
-                                          username=vis.mount_username):
-        logger.info(
-            f"Delegate one-shot delivery skipped — session {session_id[:8]} has no "
-            f"resumable conversation (agent={agent})"
-        )
-        return None
+    fresh_from = ""
+    from core.session.session_manager import capabilities_for_path
+    if capabilities_for_path(exec_path).behaviour.rebuilds_history_from_db:
+        pass   # its history is the chat's rows: the start under the same id rebuilds it
+    elif not await layer.can_resume_session(session_id, agent_name=agent,
+                                            username=vis.mount_username):
+        if not (chat_id and wake_fresh.applies(session_id, target, _chat_row)):
+            logger.info(
+                f"Delegate one-shot delivery skipped — session {session_id[:8]} has no "
+                f"resumable conversation (agent={agent})"
+            )
+            return None
+        fresh_from, session_id = session_id, str(uuid.uuid4())
     # Reserve before anything is built for the spawn: on a full box the wake
     # waits here like a task (never taking the last slot a person needs) and
     # gives way to a person who opens the chat meanwhile. A wake that gives
@@ -1128,14 +1059,15 @@ async def _deliver_via_oneshot(
             started, response = await _spawn_wake_session(
                 layer, session_id, agent, result_prompt, user_sub=user_sub, role=spawn_role,
                 chat_id=chat_id, chat_row=_chat_row, exec_path=exec_path, target=target,
-                username=username or "",
+                username=username or "", fresh_from=fresh_from,
             )
     except BaseException:
         if reserved:
-            _release_wake_slot(session_id, chat_id)
+            _release_wake_slot(session_id, "" if fresh_from else chat_id)
         raise
     if not started and reserved:
-        _release_wake_slot(session_id, chat_id)
+        # A fresh id is this wake's alone: nobody else can have adopted it.
+        _release_wake_slot(session_id, "" if fresh_from else chat_id)
     return response
 
 
@@ -1173,11 +1105,14 @@ async def _role_after_wait(agent: str, user_sub: str, role: str, target: str,
 async def _spawn_wake_session(
     layer: "ExecutionLayer", session_id: str, agent: str, result_prompt: str, *,
     user_sub: str | None, role: str, chat_id: str, chat_row: dict | None,
-    exec_path: str, target: str, username: str,
+    exec_path: str, target: str, username: str, fresh_from: str = "",
 ) -> tuple[bool, str | None]:
     """Build the resumed session's config and start it (headless, or the
     chat's own terminal). Returns whether a session was started and the rung's
-    answer; after a start the session's lifecycle owns the slot."""
+    answer; after a start the session's lifecycle owns the slot. With
+    ``fresh_from`` (the chat's session that left no conversation) the session
+    starts fresh under ``session_id`` and runs the wake through the
+    fresh-spawn rung (``wake_fresh``)."""
     from core.events.common_events import TEXT
     from storage import remote_store
     from core.execution_layer import AgentConfig
@@ -1289,7 +1224,7 @@ async def _spawn_wake_session(
         multi_value_envs=multi_value_envs,
         permission_mode="auto",
         client_type="",
-        resume=True,
+        resume=not fresh_from,
         security_context=oneshot_security,
         execution_target=target,
         execution_path=exec_path,
@@ -1297,7 +1232,7 @@ async def _spawn_wake_session(
         model=_os_model,
         # The chat's own thread: without it a Codex resume starts a new one
         # (Claude resumes by the session id and stores none).
-        resume_handle=(chat_row or {}).get("codex_thread_id") or "",
+        resume_handle="" if fresh_from else (chat_row or {}).get("codex_thread_id") or "",
         token_minted_at=token_minted_at,
         extra_env=sub_env,
         subscription_id=subscription_id,
@@ -1321,9 +1256,12 @@ async def _spawn_wake_session(
                 f"chat={chat_id[:8] if chat_id else '-'}"
             )
             return False, None
-        if chat_row and await run_db(functools.partial(
+        interactive = bool(chat_row) and await run_db(functools.partial(
             _exec_mode.is_interactive, chat_override=chat_row.get("execution_mode") or None,
-        )):
+        ))
+        if interactive and fresh_from:
+            return False, None   # a terminal chat's fresh start is its next warmup's
+        if interactive:
             # The re-warm owns the seat from here: a failed one closes any
             # terminal it started (the close releases) and returns the seat
             # of one it never started.
@@ -1338,6 +1276,10 @@ async def _spawn_wake_session(
     finally:
         if not handed_over:
             release_config_seat(session_id, oneshot_cfg)
+    if fresh_from:
+        return True, await wake_fresh.run_echo(
+            layer, session_id, fresh_from, chat_id, agent, result_prompt,
+            person=user_sub or "")
     if chat_id:
         return True, await _run_echo_turn_pumped(
             layer, session_id, chat_id, agent, result_prompt, person=user_sub or "",
@@ -1350,6 +1292,12 @@ async def _spawn_wake_session(
                 if content:
                     parts.append(content)
     return True, "".join(parts) if parts else ""
+
+
+def _arm_chat_queue(chat_id: str) -> None:
+    from core.events import input_queue
+    if input_queue.peek(chat_id):
+        input_queue.arm(chat_id)
 
 
 # Turn-open verification window for interactive wakes: covers CLI spawn →
@@ -1441,9 +1389,11 @@ async def _rewarm_interactive_and_wake(
         )
         if registered:
             # Spawn is live — release the registry so the queued-prompt drain
-            # and dashboard attach gates stop deferring to it.
+            # and dashboard attach gates stop deferring to it, and what a
+            # person sent while it got ready goes out (input_queue).
             await warmup_registry.unregister(chat_id)
             registered = False
+            _arm_chat_queue(chat_id)
 
         # Verify the turn actually OPENED before counting the wake delivered.
         # turn_open is transcript-derived (both CLIs write the user line at
@@ -1527,3 +1477,4 @@ async def _rewarm_interactive_and_wake(
         if registered:
             with contextlib.suppress(Exception):
                 await warmup_registry.unregister(chat_id)
+            _arm_chat_queue(chat_id)

@@ -174,3 +174,142 @@ async def test_the_file_listing_asks_a_paging_satellite_for_pages(monkeypatch):
     assert [m for _mid, m in sent] == [rws.manifest_request(cm, "m1", "a")]
     assert all(mid == "m1" for mid, _m in sent)
     assert cm._pending_acks == {}
+
+
+@pytest.mark.asyncio
+async def test_the_listing_with_sizes_and_the_private_pull(monkeypatch, tmp_path):
+    """``list_remote_entries`` carries each file's listed size; ``pull_into``
+    pulls one file into a private path for the session's own agent, with
+    the caller's byte cap, and refuses a session held for another agent or
+    a path that is not canonical without asking the machine."""
+    from types import SimpleNamespace
+    from core.remote import remote_file_flow as rff
+    from core.remote.satellite_connection import SatelliteConnectionManager as _Mgr
+
+    cm = _cm_with("0.5.130")
+
+    async def send_command(machine_id, msg, *, timeout=30.0, command_id=None):
+        return {"type": "file_manifest", "files": [
+            {"path": "workspace/t/a.md", "mtime": 1.0, "size": 12},
+            {"path": "workspace/t/b.md.partial", "mtime": 1.0, "size": 3},
+            {"path": "workspace/other.md", "mtime": 1.0, "size": 1},
+        ]}
+
+    pulls: list[tuple] = []
+
+    async def pull_file_to_path(machine_id, ref, dest_path, *, agent_slug="",
+                                stall_s=None, max_bytes=None):
+        pulls.append((machine_id, ref.kind, ref.value, dest_path, agent_slug, max_bytes))
+        return True
+
+    # The fake keeps the real method's signature, so a call it would refuse
+    # (a missing keyword, a renamed one) fails here too.
+    import inspect
+    assert inspect.signature(pull_file_to_path).parameters.keys() == \
+        {k for k in inspect.signature(_Mgr.pull_file_to_path).parameters if k != "self"}
+    monkeypatch.setattr(cm, "send_command", send_command)
+    monkeypatch.setattr(cm, "pull_file_to_path", pull_file_to_path)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    monkeypatch.setattr(rff, "_get_remote_session_info",
+                        lambda sid: SimpleNamespace(machine_id="m1", agent_name="a"))
+
+    assert await rff.list_remote_entries("s1", "workspace/t", agent="a") == [
+        {"path": "workspace/t/a.md", "size": 12}]
+    assert await rff.list_remote_entries("s1", "workspace/t", agent="b") is None
+
+    dest = tmp_path / "snap" / "a.md"
+    assert await rff.pull_into("s1", "workspace/t/a.md", dest, agent="a", max_bytes=99)
+    assert pulls == [("m1", "agent_tree", "workspace/t/a.md", dest, "a", 99)]
+    assert not await rff.pull_into("s1", "workspace/t/a.md", dest, agent="b")
+    assert not await rff.pull_into("s1", "workspace/../config/x", dest, agent="a")
+    assert len(pulls) == 1
+
+
+def test_skips_are_asked_of_a_0_5_145_satellite_and_old_windows_absence_is_unknown():
+    def cm(version, os_name):
+        c = _cm_with(version)
+        c._connections["m1"].capabilities = {"os": os_name}
+        return c
+
+    assert cm("0.5.145", "linux").satellite_supports_skipped_manifest("m1")
+    assert not cm("0.5.144", "linux").satellite_supports_skipped_manifest("m1")
+    assert rws.manifest_request(cm("0.5.145", "linux"), "m1", "a",
+                                report_skipped=True)["report_skipped"] is True
+    assert "report_skipped" not in rws.manifest_request(cm("0.5.145", "linux"), "m1", "a")
+    blind = {v: cm(v, "windows").satellite_absence_unreliable("m1")
+             for v in ("0.5.129", "0.5.130", "0.5.138", "0.5.143", "0.5.144", "0.5.145")}
+    assert blind == {"0.5.129": False, "0.5.130": True, "0.5.138": True,
+                     "0.5.143": True, "0.5.144": False, "0.5.145": False}
+    assert not cm("0.5.138", "linux").satellite_absence_unreliable("m1")
+    assert cm("0.5.145", "windows").satellite_restores_holds("m1")
+    assert not cm("0.5.144", "windows").satellite_restores_holds("m1")
+    assert not cm("0.5.145", "linux").satellite_restores_holds("m1")
+    assert not _cm_with("0.5.145").satellite_absence_unreliable("m-offline")
+
+
+@pytest.mark.asyncio
+async def test_the_listing_asks_a_satellite_that_lists_what_it_skipped(monkeypatch):
+    """``report_skipped`` reaches only a satellite that lists what it could
+    not read (0.5.145); its skipped entries come back flagged, a folder's
+    with ``dir``, inside the prefix or covering it, and an older satellite
+    is asked for nothing and lists nothing of the kind."""
+    from types import SimpleNamespace
+    from core.remote import remote_file_flow as rff
+
+    sent: list[dict] = []
+    answer = {"type": "file_manifest", "files": [
+        {"path": "workspace/t/a.md", "mtime": 1.0, "size": 12},
+        {"path": "workspace/t/locked.md", "skipped": "unreadable", "size": 3, "mtime": 1.0},
+        {"path": "workspace/t/sub", "skipped": "unreadable_dir", "dir": True},
+        {"path": "workspace", "skipped": "link", "dir": True},
+        {"path": "workspace/other.md", "skipped": "unreadable", "size": 1, "mtime": 1.0},
+        {"path": "", "skipped": "unreadable_dir", "dir": True},
+    ]}
+
+    def _with(version: str):
+        cm = _cm_with(version)
+
+        async def send_command(machine_id, msg, *, timeout=30.0, command_id=None):
+            sent.append(dict(msg))
+            return answer
+        monkeypatch.setattr(cm, "send_command", send_command)
+        monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+        return cm
+
+    monkeypatch.setattr(rff, "_get_remote_session_info",
+                        lambda sid: SimpleNamespace(machine_id="m1", agent_name="a"))
+    monkeypatch.setattr("core.session.session_state._session_security", {})
+
+    _with("0.5.145")
+    out = await rff.list_remote_entries("s1", "workspace/t", report_skipped=True)
+    assert sent[-1].get("report_skipped") is True
+    assert out == [
+        {"path": "", "size": 0, "skipped": "unreadable_dir", "dir": True},
+        {"path": "workspace", "size": 0, "skipped": "link", "dir": True},
+        {"path": "workspace/t/a.md", "size": 12},
+        {"path": "workspace/t/locked.md", "size": 0, "skipped": "unreadable"},
+        {"path": "workspace/t/sub", "size": 0, "skipped": "unreadable_dir", "dir": True},
+    ]
+    # Not asked: the plain listing, whatever the satellite.
+    assert await rff.list_remote_files("s1", "workspace/t") == ["workspace/t/a.md"]
+    assert "report_skipped" not in sent[-1]
+
+    _with("0.5.144")
+    out = await rff.list_remote_entries("s1", "workspace/t", report_skipped=True)
+    assert "report_skipped" not in sent[-1]
+    assert out == [{"path": "workspace/t/a.md", "size": 12}]
+
+
+def test_absence_is_reliable_follows_the_satellite(monkeypatch):
+    from types import SimpleNamespace
+    from core.remote import remote_file_flow as rff
+
+    cm = _cm_with("0.5.145")
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    monkeypatch.setattr(rff, "_get_remote_session_info", lambda sid: None)
+    assert not rff.absence_is_reliable("s1")
+    monkeypatch.setattr(rff, "_get_remote_session_info",
+                        lambda sid: SimpleNamespace(machine_id="m1", agent_name="a"))
+    assert rff.absence_is_reliable("s1")
+    monkeypatch.setattr(cm, "satellite_absence_unreliable", lambda mid: True)
+    assert not rff.absence_is_reliable("s1")

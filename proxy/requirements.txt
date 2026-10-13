@@ -55,8 +55,8 @@ py-vapid==1.9.4
 pyasn1==0.6.4
 pyasn1-modules==0.4.2
 pycparser==3.0
-pydantic==2.11.3
-pydantic-core==2.33.1
+pydantic==2.12.5
+pydantic-core==2.41.5
 pydantic-settings==2.14.2
 pyjwt==2.15.1
 pyopenssl==26.4.0

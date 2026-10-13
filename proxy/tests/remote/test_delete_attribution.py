@@ -137,3 +137,174 @@ def test_knowledge_delete_attribution_unchanged():
                           target_role="manager", target_username="alice")
     a = _act(plan, "knowledge/old-doc.md")
     assert a is not None and a.op == "delete_platform"
+
+
+# --- What a 0.5.145 satellite could not read (``skipped`` entries) ---------
+
+def _skip(path, why="unreadable", **extra):
+    return {"path": path, "skipped": why, **extra}
+
+
+def test_a_file_the_satellite_could_not_read_is_left_alone():
+    # A locked .pst (B == P, write authority): without the skipped entry it
+    # would read as deleted; with it, nothing is done to it either way.
+    local = [FileEntry("workspace/mail.pst", "sha256:v1", 10, 1.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    base = {"workspace/mail.pst": ("sha256:v1", 1.0)}
+    plan = diff_manifests(local, [_ALIVE, _skip("workspace/mail.pst")], base=base,
+                          target_role="editor")
+    assert _act(plan, "workspace/mail.pst") is None
+    plan = diff_manifests(local, [_ALIVE, _skip("workspace/mail.pst", "too_large")],
+                          base=base, target_role="editor")
+    assert _act(plan, "workspace/mail.pst") is None
+
+
+def test_files_under_a_folder_the_satellite_could_not_list_are_left_alone():
+    local = [FileEntry("workspace/build/out.txt", "sha256:o", 10, 1.0),
+             FileEntry("workspace/build/deep/x.txt", "sha256:x", 10, 1.0),
+             FileEntry("workspace/buildings.txt", "sha256:b", 10, 1.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    base = {e.path: (e.hash, 1.0) for e in local}
+    remote = [_ALIVE, _skip("workspace/build", "unreadable_dir", dir=True)]
+    plan = diff_manifests(local, remote, base=base, target_role="editor")
+    assert _act(plan, "workspace/build/out.txt") is None
+    assert _act(plan, "workspace/build/deep/x.txt") is None
+    # A sibling sharing the prefix text is not under the folder.
+    a = _act(plan, "workspace/buildings.txt")
+    assert a is not None and a.op == "delete_platform"
+
+
+def test_a_tree_the_satellite_could_not_list_at_all_gets_no_action():
+    local = [FileEntry("workspace/a.txt", "sha256:a", 10, 1.0),
+             FileEntry("config/prompt.md", "sha256:p", 10, 1.0)]
+    base = {"workspace/a.txt": ("sha256:a", 1.0)}
+    plan = diff_manifests(local, [_skip("", "unreadable_dir", dir=True)], base=base,
+                          tombstones={"workspace/gone.txt": 5.0}, target_role="manager",
+                          target_username="alice")
+    assert plan.actions == [] and plan.to_scrub == []
+
+
+def test_skipped_entries_alone_do_not_make_the_tree_alive():
+    # Only unreadable files listed: still an "empty" tree for the wipe guard,
+    # so a converged file missing from it is pushed, never deleted.
+    local = [FileEntry("workspace/gone.md", "sha256:v1", 10, 1.0)]
+    base = {"workspace/gone.md": ("sha256:v1", 1.0)}
+    plan = diff_manifests(local, [_skip("workspace/locked.docx")], base=base,
+                          target_role="editor")
+    a = _act(plan, "workspace/gone.md")
+    assert a is not None and a.op == "push"
+
+
+def test_a_skipped_push_only_path_is_not_pushed_over():
+    local = [FileEntry(".claude/settings.json", "sha256:p", 10, 1.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    plan = diff_manifests(local, [_ALIVE, _skip(".claude/settings.json")],
+                          target_role="editor")
+    assert _act(plan, ".claude/settings.json") is None
+
+
+# --- An old Windows satellite (absence_unknown) ----------------------------
+
+def test_an_old_windows_satellite_never_loses_a_file_to_its_absence():
+    # B == P (a delete_platform before) and B None (the bug cleared the base
+    # of what it deleted, the machine still has it): no action on either.
+    local = [FileEntry("workspace/converged.md", "sha256:v1", 10, 1.0),
+             FileEntry("workspace/rebased.md", "sha256:v2", 10, 1.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    base = {"workspace/converged.md": ("sha256:v1", 1.0),
+            "workspace/keep.txt": ("sha256:keep", 1.0)}
+    plan = diff_manifests(local, [_ALIVE], base=base, target_role="editor",
+                          absence_unknown=True)
+    assert _act(plan, "workspace/converged.md") is None
+    assert _act(plan, "workspace/rebased.md") is None
+    # What it did list merges as usual.
+    new = _r("workspace/made-there.md", "sha256:n")
+    plan = diff_manifests(local, [_ALIVE, new], base=base, target_role="editor",
+                          absence_unknown=True)
+    a = _act(plan, "workspace/made-there.md")
+    assert a is not None and a.op == "pull"
+
+
+# --- Holds: the Windows hash bug's deletes ----------------------------------
+
+def test_a_held_file_is_restored_only_by_the_windows_machine():
+    remote = [_ALIVE, _r("workspace/report.docx", "sha256:win-edit", mtime=3.0)]
+    local = [FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    holds = {"workspace/report.docx": 2.0}
+    windows = diff_manifests(local, remote, holds=holds, restore_holds=True,
+                             target_role="editor")
+    a = _act(windows, "workspace/report.docx")
+    assert a is not None and a.op == "pull" and a.base_hash == "sha256:win-edit"
+    assert a.drop_tombstone is True
+    # The restored copy keeps the machine's own time (clock-adjusted), so a
+    # newer copy elsewhere still wins the next divergence.
+    timed = diff_manifests(local, remote, holds=holds, restore_holds=True,
+                           clock_offset=10.0, target_role="editor")
+    assert _act(timed, "workspace/report.docx").keep_mtime == 13.0
+    assert a.keep_mtime is None             # no clock offset known: nothing to keep
+    # Any other machine (an idle Linux one, or the Windows one before its
+    # update): neither a pull nor a delete, newer or older than the hold.
+    for mtime in (1.0, 9.0):
+        remote = [_ALIVE, _r("workspace/report.docx", "sha256:old", mtime=mtime)]
+        other = diff_manifests(local, remote, holds=holds, target_role="editor")
+        assert _act(other, "workspace/report.docx") is None
+
+
+def test_a_held_file_without_write_authority_is_not_restored():
+    remote = [_ALIVE, _r("workspace/report.docx", "sha256:win-edit")]
+    local = [FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    plan = diff_manifests(local, remote, holds={"workspace/report.docx": 2.0},
+                          restore_holds=True, target_role="viewer",
+                          target_username="alice")
+    assert _act(plan, "workspace/report.docx") is None
+
+
+def test_a_held_path_the_platform_has_again_merges_and_drops_the_hold():
+    local = [FileEntry("workspace/report.docx", "sha256:v2", 10, 5.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    plan = diff_manifests(local, [_ALIVE, _r("workspace/report.docx", "sha256:v2")],
+                          holds={"workspace/report.docx": 2.0}, target_role="editor")
+    a = _act(plan, "workspace/report.docx")
+    assert a is not None and a.op == "noop" and a.drop_tombstone is True
+
+
+def test_the_restore_race_keeps_the_windows_edit():
+    """The audit's race: an idle Linux machine still holds the old bytes
+    (B == S there). It merges first and does nothing; the updated Windows
+    machine restores its newer edit; the Linux machine then gets the
+    restored copy pushed, its old bytes never reaching the platform."""
+    path = "users/alice/workspace/notes.md"
+    holds = {path: 2.0}
+    keep = FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)
+    linux_remote = [_ALIVE, _r(path, "sha256:old", mtime=1.0)]
+    linux_base = {path: ("sha256:old", 1.0)}
+    first = diff_manifests([keep], linux_remote, base=linux_base, holds=holds,
+                           target_role="editor", target_username="alice")
+    assert _act(first, path) is None
+    win_remote = [_ALIVE, _r(path, "sha256:win-edit", mtime=1.5)]
+    restore = diff_manifests([keep], win_remote, holds=holds, restore_holds=True,
+                             target_role="editor", target_username="alice")
+    assert _act(restore, path).op == "pull"
+    after = [keep, FileEntry(path, "sha256:win-edit", 10, 9.0)]
+    later = diff_manifests(after, linux_remote, base=linux_base,
+                           target_role="editor", target_username="alice")
+    a = _act(later, path)
+    assert a is not None and a.op == "push" and a.base_hash == "sha256:win-edit"
+
+
+def test_a_restore_never_beats_a_newer_copy_on_another_windows_machine():
+    """Two Windows machines of one person: the desktop restores its older
+    copy (keeping its mtime), the laptop holds the newer edit and no base
+    (the bug's delete cleared it): the laptop's edit wins and is pulled."""
+    path = "users/alice/workspace/notes.md"
+    keep = FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)
+    desktop = diff_manifests([keep], [_ALIVE, _r(path, "sha256:old", mtime=100.0)],
+                             holds={path: 150.0}, restore_holds=True, clock_offset=0.0,
+                             target_role="editor", target_username="alice")
+    restored = _act(desktop, path)
+    assert restored.op == "pull" and restored.keep_mtime == 100.0
+    after = [keep, FileEntry(path, "sha256:old", 10, restored.keep_mtime)]
+    laptop = diff_manifests(after, [_ALIVE, _r(path, "sha256:newest", mtime=200.0)],
+                            clock_offset=0.0, target_role="editor", target_username="alice")
+    a = _act(laptop, path)
+    assert a is not None and a.op == "pull" and a.base_hash == "sha256:newest"

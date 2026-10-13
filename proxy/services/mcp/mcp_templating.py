@@ -70,7 +70,8 @@ def _resolve_template(
     intended for stdio MCP ``agent_env`` blocks; resolves to "" when no context
     is supplied, e.g. when admin UI renders MCP descriptors):
       ``${session.task_owner}``, ``${session.task_username}``,
-      ``${session.task_scope}``, ``${session.chat_id}``
+      ``${session.task_scope}``, ``${session.chat_id}``,
+      ``${session.call_ask_back}``
 
     **Cross-MCP config references**:
       ``${config:mcp_name:key}`` — reads config value from another MCP's DB config
@@ -121,6 +122,9 @@ def _resolve_template(
         "${session.task_username}":       sctx.get("task_username", ""),
         "${session.task_scope}":          sctx.get("task_scope", ""),
         "${session.chat_id}":             sctx.get("chat_id", ""),
+        # "1" on a phone call another agent placed (the call-control MCP
+        # then offers the ask tool), else "".
+        "${session.call_ask_back}":       sctx.get("call_ask_back", ""),
     }
     # NOTE: tokens in _SECRET_TEMPLATE_TOKENS resolve here as usual, but
     # build_session_mcp_config moves the resolved agent_env value into the
@@ -146,9 +150,15 @@ def _resolve_template(
     # Cross-MCP config references: ${config:mcp_name:key}. Possessive
     # quantifiers — an unclosed reference can't match by backtracking, so
     # giving characters back is pure ReDoS surface.
+    # The value in effect, as the env builds read it: saved, else the
+    # referenced MCP's manifest default.
+    from services.mcp import mcp_registry
     for match in re.finditer(r'\$\{config:([^:}]++):([^}]++)\}', result):
         ref_mcp, ref_key = match.group(1), match.group(2)
-        ref_val = mcp_store.get_mcp_config_values(ref_mcp).get(ref_key, "")
-        result = result.replace(match.group(0), ref_val)
+        saved = mcp_store.get_mcp_config_values(ref_mcp)
+        ref_manifest = mcp_registry.get_manifest(ref_mcp)
+        values = (mcp_registry.effective_config(ref_manifest, saved) if ref_manifest
+                  else {k: v for k, v in saved.items() if not k.startswith("_")})
+        result = result.replace(match.group(0), values.get(ref_key, ""))
 
     return result

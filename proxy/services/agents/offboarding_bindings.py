@@ -33,7 +33,7 @@ from storage.automation import webhook_subscription_store
 from storage.identity import credential_store
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 SUBSCRIBER = "service-bindings"
 

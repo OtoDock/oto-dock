@@ -35,6 +35,10 @@ _AUTH_LADDER = (2.0, 4.0, 8.0)
 # A decision that waits on a person is streamed with whitespace keepalives
 # every 30 s, so a few intervals of silence mean the stream is gone.
 _SOCKET_TIMEOUT_S = 150
+# The permission_mode values Codex reports for a turn whose approval requests
+# reach the platform's bridge ("default" for untrusted / on-request /
+# granular; "bypassPermissions" means never, where no request comes).
+_BRIDGE_ASKS = frozenset({"default", "acceptEdits", "plan"})
 
 
 def _request_decision(req):
@@ -113,6 +117,14 @@ def main():
     except (OSError, ValueError):
         inp = {}
 
+    # An attended Codex app-server chat (OTO_HOOK_BRIDGED): Codex's approval
+    # requests carry the person's cards, so the gate stands aside on a turn
+    # Codex says will raise them, and judges every other one (Don't Ask and
+    # auto run under never: "bypassPermissions"). An unknown or missing value
+    # is judged: a turn with no judge is the failure to avoid.
+    if os.environ.get("OTO_HOOK_BRIDGED") and inp.get("permission_mode") in _BRIDGE_ASKS:
+        return
+
     session_id = os.environ.get("OTO_SESSION_ID", "")
     proxy_url = os.environ.get("PROXY_URL", "")
     api_key = os.environ.get("PROXY_API_KEY", "")
@@ -131,6 +143,9 @@ def main():
         # LIVE mode from the CLI (reflects in-TUI Shift+Tab) — the proxy uses
         # it as the effective mode for interactive sessions.
         "permission_mode": inp.get("permission_mode", ""),
+        # This host's clock, the one the CLI's transcript lines carry: a
+        # terminal's turn parked on a dialog ignores lines journaled before.
+        "hook_sent_at": time.time(),
     }).encode()
 
     req = urllib.request.Request(
@@ -162,9 +177,10 @@ def main():
 
     # Codex's PreToolUse hook supports a DENY decision but REJECTS
     # permissionDecision:"allow" ("unsupported permissionDecision:allow"). Under
-    # Codex (OTO_HOOK_DENY_ONLY=1, set on the interactive spawn) emit JSON only to
+    # Codex (OTO_HOOK_DENY_ONLY=1, set on every Codex spawn) emit JSON only to
     # DENY; any non-deny (allow/ask) becomes "no opinion" (exit 0) → the CLI
-    # proceeds and Codex's own sandbox / -a on-request handles any prompt.
+    # proceeds and Codex's own sandbox / -a on-request handles any prompt. A
+    # platform card the decision waited on was answered before this point.
     # Claude supports "allow"/"ask" and needs them, so this gate is Codex-only.
     if decision != "deny" and os.environ.get("OTO_HOOK_DENY_ONLY"):
         return
@@ -197,11 +213,18 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # A hook crash enforces nothing: both CLIs treat a non-zero exit as a
-        # non-blocking error and run the tool anyway, so dying loudly only adds
-        # "hook exited with code 1" noise (seen on a Windows satellite) while
-        # silently dropping the deny floor for that call. Leave a breadcrumb
-        # and exit 0. The fail-closed properties live in the JSON path — proxy
-        # unreachable still emits a deny — and are unaffected.
+        # A hook crash enforces nothing on its own: both CLIs read a non-zero
+        # exit as a non-blocking error and run the tool, and Claude Code's
+        # onFailure block (the platform's settings, 2.1.295+) cannot see an
+        # exit 0 with no output. So the crash denies in the gate's own JSON,
+        # which both CLIs honour (Codex accepts a deny), after a breadcrumb.
+        # The proxy-unreachable deny stays in main.
         _log_failure()
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "OtoDock permission gate error — tool call denied (fail closed)"
+            ),
+        }}))
         sys.exit(0)

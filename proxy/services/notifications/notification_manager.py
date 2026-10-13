@@ -44,7 +44,7 @@ from ws import chat_phase
 from ws import wire_events as wire
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.notifications")
+logger = logging.getLogger("otodock.notifications")
 
 
 # --- Per-connection state ---
@@ -1075,7 +1075,7 @@ def _fan_out_slot() -> asyncio.Semaphore:
 
 async def fire_ephemeral(
     user_sub: str, title: str, body: str, chat_id: str | None = None,
-    *, interactive: bool = False, cli_attached: bool = False,
+    *, interactive: bool = False, cli_attached: bool = False, mid_turn: bool = False,
 ) -> None:
     """Fire an ephemeral turn-complete signal, routed to the device that
     STARTED the turn (recorded by ``set_chat_turn_origin`` at send time):
@@ -1112,6 +1112,11 @@ async def fire_ephemeral(
     and a stale origin left by a superseded dashboard viewer must never
     swallow the push. Without active dashboard presence the FCM always fires,
     even while the CLI terminal is open on the remote machine.
+
+    ``mid_turn=True`` (a prompt that waits on the person while the turn
+    runs) sends the origin browser's frame on its live queue: the socket
+    streaming the chat drains that one during the turn, its notification
+    queue only after it.
     """
     frame = {
         "type": wire.TURN_COMPLETE, "chat_id": chat_id,
@@ -1141,9 +1146,12 @@ async def fire_ephemeral(
             if not conn:
                 _route("dropped (origin browser connection gone)")
                 return
-            await _safe_put(conn.queue, frame)
+            if mid_turn and conn.live_queue is not None:
+                conn.live_queue.put(frame)
+            else:
+                await _safe_put(conn.queue, frame)
             if not conn.away:
-                _route("frame to the origin browser")
+                _route("frame to the origin browser" + (" mid-turn" if mid_turn else ""))
                 return
             # Origin dashboard visibly open but input-idle: the frame above
             # keeps the local toast/sound, and the alert ALSO falls through
@@ -1333,13 +1341,26 @@ async def flush_file_updates() -> None:
         await asyncio.gather(*list(_file_flushes), return_exceptions=True)
 
 
+async def _put_file_frame(conn: ConnectionInfo, msg: dict) -> None:
+    """A ``file_updated`` frame rides the connection's LIVE queue: the socket
+    drains it during the viewed chat's turn as well as between turns, and for
+    an idle or hidden tab too, so a file a machine syncs back mid-turn shows
+    in the tree when it lands, not at the turn's end. The notify queue takes
+    the frame only for a connection without a live queue or one holding
+    nothing but open frames."""
+    q = conn.live_queue
+    if q is not None and q.put(msg):
+        return
+    await _safe_put(conn.queue, msg)
+
+
 async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
-    """One batch's frames: the audience and each active user's role and
+    """One batch's frames: the audience and each connected user's role and
     username read in one job, then one ``file_updated`` per path to each
-    user's active sockets (a batch past ``_FILE_UPDATED_MAX_FRAMES`` sends
-    that many per path and one agent-level frame with an empty ``rel_path``,
-    which every tree view refreshes on and no per-path consumer matches),
-    and each path handed to the catalog once."""
+    user's sockets, active or not (a batch past ``_FILE_UPDATED_MAX_FRAMES``
+    sends that many per path and one agent-level frame with an empty
+    ``rel_path``, which every tree view refreshes on and no per-path consumer
+    matches), and each path handed to the catalog once."""
     try:
         import base64
 
@@ -1348,9 +1369,9 @@ async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
 
         def _audience() -> tuple[list[str], dict[str, tuple[str, str]]]:
             subs = resolve_targets("agent", agent_slug) or []
-            active = [u for u in subs if any(c.active for c in _user_connections.get(u, []))]
+            connected = [u for u in subs if _user_connections.get(u)]
             return subs, {u: (acting_role_of(u, agent_slug),
-                              task_store.get_username_by_sub(u) or "") for u in active}
+                              task_store.get_username_by_sub(u) or "") for u in connected}
 
         _, by_user = await run_db(_audience)
 
@@ -1391,8 +1412,7 @@ async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
                 told.append(user_sub)
                 if n < _FILE_UPDATED_MAX_FRAMES:
                     for c in _user_connections.get(user_sub, []):
-                        if c.active:
-                            await _safe_put(c.queue, msg)
+                        await _put_file_frame(c, msg)
                 else:
                     reached.add(user_sub)
             # The catalog's ``file_changes`` feed, ONE delta per change: frames to
@@ -1410,8 +1430,7 @@ async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
                        "rel_path": "", "file_id": "", "source": "disk"}
             for user_sub in reached:
                 for c in _user_connections.get(user_sub, []):
-                    if c.active:
-                        await _safe_put(c.queue, summary)
+                    await _put_file_frame(c, summary)
     except Exception:
         logger.debug("file_updated batch for %s failed", agent_slug, exc_info=True)
 

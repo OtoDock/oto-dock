@@ -16,7 +16,7 @@ import config
 from core.config import deployment
 from services.mcp import mcp_manifest_types as _mt
 
-logger = logging.getLogger("claude-proxy.docker-manager")
+logger = logging.getLogger("otodock.docker-manager")
 
 # The container status vocabulary, named once (core-seams phase 8; the
 # dashboard mirror is ``lib/status/docker.ts``): the six words
@@ -175,6 +175,38 @@ def get_container_status(manifest) -> str:
     wedged camoufox whose HTTP is up but `page.goto` hangs) so the dashboard shows
     it amber instead of green — the proxy never auto-restarts Docker MCPs.
     """
+    return container_state(manifest)[0]
+
+
+def normalize_image(ref: str) -> str:
+    """An image reference as Docker resolves it, for comparing two of them: an
+    implicit ``:latest`` added, the Docker Hub registry and ``library/``
+    prefixes dropped."""
+    ref = (ref or "").strip()
+    if "@" not in ref and ":" not in ref.rsplit("/", 1)[-1]:
+        ref += ":latest"
+    for prefix in ("docker.io/", "index.docker.io/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+            break
+    if ref.startswith("library/"):
+        ref = ref[len("library/"):]
+    return ref
+
+
+def image_stale(manifest, running_images: list[str]) -> bool:
+    """Whether the running container serves another image than the one the
+    manifest names (an update whose recreate did not happen): a restart
+    switches it. No image named, or nothing running: never stale."""
+    want = getattr(getattr(manifest, "server", None), "image", "") or ""
+    if not want or not running_images:
+        return False
+    return normalize_image(want) not in {normalize_image(i) for i in running_images}
+
+
+def container_state(manifest) -> tuple[str, list[str]]:
+    """``get_container_status``'s answer and the images of the project's
+    running containers (one ``compose ps`` call)."""
     try:
         result = subprocess.run(
             _compose_cmd(manifest, "ps", "--format", "json", "-a"),
@@ -186,41 +218,71 @@ def get_container_status(manifest) -> str:
                 _log_docker_perm_denied(
                     f"Docker status check for {manifest.name} failed"
                 )
-            return NOT_FOUND
+            return NOT_FOUND, []
 
         output = result.stdout.strip()
         if not output:
-            return NOT_FOUND
+            return NOT_FOUND, []
 
         # docker compose ps --format json outputs one JSON object per line
         # (the State / Health words are Docker's, not ours).
         import json
+        status = None
+        images: list[str] = []
         for line in output.splitlines():
             if not line.strip():
                 continue
             try:
                 container = json.loads(line)
-                state = container.get("State", "").lower()
-                if state == "running":
-                    # `Health` is "" when the image declares no healthcheck.
-                    health = (container.get("Health") or "").lower()
-                    if health == "unhealthy":
-                        return UNHEALTHY
-                    if health == "starting":
-                        return STARTING
-                    return RUNNING
-                elif state in ("exited", "dead", "created"):
-                    return STOPPED
             except json.JSONDecodeError:
                 continue
+            state = container.get("State", "").lower()
+            if state == "running":
+                if container.get("Image"):
+                    images.append(str(container["Image"]))
+                if status is None:
+                    # `Health` is "" when the image declares no healthcheck.
+                    health = (container.get("Health") or "").lower()
+                    status = (UNHEALTHY if health == "unhealthy"
+                              else STARTING if health == "starting" else RUNNING)
+            elif state in ("exited", "dead", "created") and status is None:
+                status = STOPPED
 
-        return NOT_FOUND
+        return status or NOT_FOUND, images
     except subprocess.TimeoutExpired:
         logger.warning("Timeout checking Docker status for %s", manifest.name)
-        return ERROR
+        return ERROR, []
     except Exception as e:
         logger.warning("Error checking Docker status for %s: %s", manifest.name, e)
-        return ERROR
+        return ERROR, []
+
+
+def _odd_backslash_run_before_quote(value: str) -> bool:
+    """Whether an odd run of backslashes ends ``value`` or precedes a ``'``
+    in it (one pass; a regex over a long run of backslashes backtracks)."""
+    run = 0
+    for ch in value:
+        if ch == "\\":
+            run += 1
+            continue
+        if ch == "'" and run % 2:
+            return True
+        run = 0
+    return bool(run % 2)
+
+
+def dotenv_quote(value: str) -> str | None:
+    """``value`` as a single-quoted ``.env`` value Compose's dotenv reader
+    hands the container literally: no ``$`` interpolation, backslashes kept,
+    each ``'`` written ``\\'``. ``None`` for a value that form cannot carry: a
+    control character (a newline ends the line), or an odd run of
+    backslashes right before a ``'`` or at the end (Compose reads the quote
+    after an odd run as escaped)."""
+    if any(ord(c) < 0x20 or c == "\x7f" for c in value):
+        return None
+    if _odd_backslash_run_before_quote(value):
+        return None
+    return "'" + value.replace("'", "\\'") + "'"
 
 
 def _inject_mcp_env(manifest) -> bool:
@@ -231,12 +293,14 @@ def _inject_mcp_env(manifest) -> bool:
     so it picks up the new env (compose otherwise leaves a running container
     untouched on `up -d` when only env values change).
 
-    Three sources merged in priority order (latest wins):
+    Four sources merged in priority order (latest wins):
       1. Existing non-declared keys in `.env` (escape hatch for compose-time
          one-offs — keys not declared anywhere else stay put).
       2. ``manifest.env`` + ``manifest.agent_env`` resolved via the shared
          template resolver (``${platform.*}`` tokens, etc.).
-      3. ``infra_credentials`` rows for this MCP — admin-set secrets like
+      3. The ``config`` rows (``mcp_registry.effective_config``: saved, else
+         the manifest's default), single-quoted.
+      4. ``infra_credentials`` rows for this MCP — admin-set secrets like
          ESPOCRM_API_KEY land here so Docker containers receive them at
          startup without hand-editing ``.env``.
 
@@ -299,29 +363,51 @@ def _inject_mcp_env(manifest) -> bool:
                 manifest.name, e,
             )
 
-    # Priority order: existing < manifest-declared < infra credentials.
-    # Admin secrets win over declarations (so an ESPOCRM_URL admin set in the
-    # dashboard overrides any default the manifest happens to ship).
-    final = {**existing, **declared, **infra_creds}
+    # The MCP's config rows (the admin's saved value, else the manifest's
+    # default), single-quoted for Compose's dotenv reader: an admin's text is
+    # handed over as typed. A value that form cannot carry is left out.
+    config_vals: dict[str, str] = {}
+    for key, value in mcp_registry.effective_config(manifest).items():
+        quoted = dotenv_quote(value) if value else ""
+        if quoted is None:
+            logger.warning(
+                "Config %s of %s holds a character its .env cannot carry; left out",
+                key, manifest.name,
+            )
+            existing.pop(key, None)  # never the value an earlier write left
+            continue
+        config_vals[key] = quoted
 
-    # Generic tool filter: for MCPs that declare
-    # `tool_filter` AND have an admin-set regex in `mcp_state`, write the
-    # composed flag (e.g. `--enabled-tools '^(mail|calendar)_.*'`) into
-    # the env var the manifest names (default ENABLED_TOOLS_FLAG). The
-    # MCP's Dockerfile ENTRYPOINT expands it into the binary's CLI args.
-    # Clear the env var when no filter — otherwise stale flags would
-    # outlive the regex being cleared.
-    tf = mcp_registry.get_tool_filter(manifest.name)
-    if tf is not None and manifest.tool_filter is not None:
-        arg_name, regex = tf
-        # Single-quote the regex so shell expansion in the ENTRYPOINT
-        # doesn't choke on special characters (^ $ | etc.).
-        final[manifest.tool_filter.env_var_name] = f"{arg_name} '{regex}'"
-    elif manifest.tool_filter is not None:
-        # Manifest supports filtering but admin hasn't set a regex — make
-        # sure the env var is empty (so the ENTRYPOINT's expansion is a
-        # no-op rather than stale flags from a previous run).
-        final[manifest.tool_filter.env_var_name] = ""
+    # Priority order: existing < manifest-declared < config < infra credentials.
+    # Admin secrets win over declarations (so an ESPOCRM_URL admin set in the
+    # dashboard overrides any default the manifest happens to ship), as an
+    # admin's config value wins over a manifest env default.
+    final = {**existing, **declared, **config_vals, **infra_creds}
+
+    # Generic tool filter: for MCPs that declare `tool_filter`, two variables.
+    # `regex_env_var_name` (default ENABLED_TOOLS_REGEX) holds the admin's
+    # regex bare, single-quoted for Compose's dotenv reader so the container
+    # sees it byte for byte: a server reads it from its env, or a shell
+    # entrypoint passes "$ENABLED_TOOLS_REGEX" quoted. `env_var_name`
+    # (default ENABLED_TOOLS_FLAG) keeps the composed flag
+    # (`--enabled-tools '<regex>'`) for an entrypoint that expands it; an
+    # unquoted expansion keeps those quotes, so a new compose reads the bare
+    # one. Both are emptied with no filter, so a cleared regex leaves no stale
+    # flag. A regex the dotenv form cannot carry (a control character, a
+    # trailing backslash; the save refuses both) empties both.
+    if manifest.tool_filter is not None:
+        tf = mcp_registry.get_tool_filter(manifest.name)
+        regex = tf[1] if tf is not None else ""
+        quoted = dotenv_quote(regex) if regex else ""
+        if quoted is None:
+            logger.warning(
+                "The tool filter of %s holds a character its .env cannot carry; "
+                "the MCP runs unfiltered until the regex is saved again", manifest.name,
+            )
+            regex, quoted = "", ""
+        final[manifest.tool_filter.env_var_name] = (
+            f"{tf[0]} '{regex}'" if regex and tf is not None else "")
+        final[manifest.tool_filter.regex_env_var_name] = quoted
 
     if not final:
         # No declarations + no preserved keys: don't litter the MCP folder with
@@ -725,22 +811,42 @@ def remove_container(manifest, *, prune_image: bool = True) -> bool:
         return False
 
 
-def restart_container(manifest) -> bool:
-    """Restart Docker container via docker compose restart."""
+def restart_container(manifest, *, start_exited: bool = False) -> bool:
+    """Recreate a Docker MCP's container from the current ``.env`` and the
+    image the manifest names.
+
+    ``compose restart`` keeps the environment a container was created with and
+    the image it runs, so neither a saved tool filter nor an update whose
+    recreate did not happen would ever reach it: the restart re-injects
+    ``.env`` and recreates. Only an enabled MCP's container that is up
+    (running, unhealthy, starting) is recreated, and an exited one too when
+    ``start_exited`` (the admin's Restart button): a disabled or stopped MCP is
+    never started here (its new ``.env`` applies at its next start). The image
+    must already be on this host (``--pull never``, ``--no-build``): an Update
+    fetches it."""
+    from storage.mcp import mcp_store
     try:
-        result = subprocess.run(
-            _compose_cmd(manifest, "restart"),
-            capture_output=True, text=True, timeout=120,
-            cwd=str(manifest.mcp_dir),
-            env=_compose_env(),
+        _inject_mcp_env(manifest)
+        state = mcp_store.get_mcp_state(manifest.name) or {}
+        status = get_container_status(manifest)
+        allowed = PRESENT | ({STOPPED} if start_exited else set())
+        if not state.get("enabled") or status not in allowed:
+            logger.info(
+                "%s: no container to recreate (%s%s); the current settings apply "
+                "at its next start", manifest.name, status,
+                "" if state.get("enabled") else ", disabled",
+            )
+            return False
+        from services.mcp import compose_rewrite
+        if deployment.in_docker_compose():
+            compose_rewrite.ensure_pull_compose(manifest)
+        else:
+            compose_rewrite.ensure_t1_override(manifest)
+        return _compose_up(
+            manifest,
+            ["up", "-d", "--force-recreate", "--no-build", "--pull", "never"],
+            timeout=120, t1_retry=True,
         )
-        if result.returncode == 0:
-            logger.info("Restarted Docker MCP: %s", manifest.name)
-            return True
-        logger.error(
-            "Failed to restart Docker MCP %s: %s", manifest.name, result.stderr[:500]
-        )
-        return False
     except Exception as e:
         logger.error("Error restarting Docker MCP %s: %s", manifest.name, e)
         return False

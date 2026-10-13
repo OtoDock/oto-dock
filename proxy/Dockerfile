@@ -28,8 +28,8 @@
 # fresh isolated /proc. NO cap_add (SYS_ADMIN dropped), NOT --privileged. Net a
 # privilege REDUCTION vs a root-run proxy.
 
-ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm
-ARG NODE_IMAGE=node:24.21.0-slim
+ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+ARG NODE_IMAGE=node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 
 # --- Node stage: source the pinned Node 24 (same bookworm/glibc base) ---
 FROM ${NODE_IMAGE} AS node
@@ -179,5 +179,18 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=300s --retries=6 \
 # Drop to the non-root runtime user for the proxy process (and thus the bwrap'd
 # agents, which inherit this uid → uid 1000, capability-less).
 USER 1000:1000
+
+# OCI image metadata. The version is a build arg the release workflow and
+# the build overlay pass from VERSIONS.md, declared after every RUN so a new
+# version never invalidates a cached layer.
+ARG OTODOCK_VERSION=dev
+LABEL org.opencontainers.image.title="OtoDock proxy" \
+      org.opencontainers.image.description="The OtoDock platform: the API, the dashboard and the agent sandbox." \
+      org.opencontainers.image.source="https://github.com/OtoDock/oto-dock" \
+      org.opencontainers.image.url="https://otodock.io" \
+      org.opencontainers.image.documentation="https://docs.otodock.io" \
+      org.opencontainers.image.vendor="OtoDock" \
+      org.opencontainers.image.licenses="FSL-1.1-ALv2" \
+      org.opencontainers.image.version="${OTODOCK_VERSION}"
 
 CMD ["/opt/otodock/proxy/venv/bin/python", "app.py"]

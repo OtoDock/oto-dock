@@ -44,7 +44,7 @@ from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE, RouteIdentity
 from core.execution_layer import DEFAULT_EXECUTION_PATH
 from core.session import session_kind
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 def resolve_phone_execution_target(
@@ -70,8 +70,17 @@ async def build_phone_agent_config(
     trigger_payload: dict | None = None,
     route_identity: RouteIdentity | None = None,
     session_id: str = "",
+    call_tools: bool = False,
+    transfer_targets: list[dict] | None = None,
 ) -> AgentConfig:
     """Build an ``AgentConfig`` for a phone (call) session.
+
+    ``call_tools`` is the daemon's word (its warmup says it understands
+    ``call_control`` frames): the call-control MCP rides the session
+    regardless of assignment (the Direct layer registers builtins instead),
+    the prompt names the tools and the route's ``transfer_targets`` by
+    label, and an outbound call gets the ask tool. Without it the session
+    keeps the text markers alone, as an older daemon expects.
 
     Args:
         agent_name: agent slug servicing this call.
@@ -93,26 +102,45 @@ async def build_phone_agent_config(
         session_id: the session being warmed — the dashboard builder bakes
             it into ``OTO_SESSION_ID`` / the session token for a user route.
     """
+    from adapters.phone import is_outbound
+    ask_back = bool(call_tools and is_outbound(call_type))
     if route_identity is not None and route_identity.mode == "user":
         return await _build_user_route_config(
             agent_name, route_identity, call_type=call_type,
             phone_context_override=phone_context_override,
             trigger_payload=trigger_payload, session_id=session_id,
+            call_tools=call_tools, ask_back=ask_back,
+            transfer_targets=transfer_targets,
         )
     return await _build_external_config(
         agent_name, route_identity, call_type=call_type,
         phone_context_override=phone_context_override, phone_mode=phone_mode,
         trigger_payload=trigger_payload, session_id=session_id,
+        call_tools=call_tools, ask_back=ask_back,
+        transfer_targets=transfer_targets,
     )
 
 
-def _phone_tail(prompt: str, *, call_type: str, phone_context_override: str) -> str:
-    """The call context (TTS-friendly rules) + the per-route override."""
+def _phone_tail(prompt: str, *, call_type: str, phone_context_override: str,
+                tools_block: str = "") -> str:
+    """The call context (TTS-friendly rules) + the per-route override + the
+    call tools block when the session carries the tools."""
     from adapters.phone import PhoneAdapter
     prompt = (prompt or "") + "\n\n" + PhoneAdapter.get_phone_context(call_type=call_type)
     if phone_context_override:
         prompt += "\n" + phone_context_override
+    if tools_block:
+        prompt += "\n\n" + tools_block
     return prompt
+
+
+def _tools_block(*, call_tools: bool, attached: bool, ask_back: bool,
+                 transfer_targets: list[dict] | None) -> str:
+    """The prompt block, only when the tools are really in the session."""
+    if not (call_tools and attached):
+        return ""
+    from adapters.phone import call_tools_block
+    return call_tools_block(ask_back=ask_back, transfer_targets=transfer_targets)
 
 
 async def _build_user_route_config(
@@ -123,10 +151,14 @@ async def _build_user_route_config(
     phone_context_override: str,
     trigger_payload: dict | None,
     session_id: str,
+    call_tools: bool = False,
+    ask_back: bool = False,
+    transfer_targets: list[dict] | None = None,
 ) -> AgentConfig:
     """A route tied to a platform user: their own session, built by the
     dashboard builder, plus the call context."""
     from core.config.config_builder import build_agent_config
+    from services.phone.call_control import ASK_BACK_ENV, CALL_CONTROL_MCP, CALL_TOOLS_ENV
     user = identity.user or {}
     cfg = await build_agent_config(
         agent_name, user, user.get("sub", ""), identity.user_role,
@@ -137,11 +169,20 @@ async def _build_user_route_config(
         trigger_payload=trigger_payload,
         subscription_pool_fallback=True,
         external_claim=identity.caller_claim,
+        extra_mcps=[CALL_CONTROL_MCP] if call_tools else None,
+        call_ask_back=ask_back,
     )
     cfg.system_prompt = _phone_tail(
         cfg.system_prompt, call_type=call_type,
         phone_context_override=phone_context_override,
+        tools_block=_tools_block(
+            call_tools=call_tools, attached=True, ask_back=ask_back,
+            transfer_targets=transfer_targets),
     )
+    if call_tools:
+        cfg.extra_env = {**(cfg.extra_env or {}), CALL_TOOLS_ENV: "1"}
+        if ask_back:
+            cfg.extra_env[ASK_BACK_ENV] = "1"
     return cfg
 
 
@@ -154,9 +195,13 @@ async def _build_external_config(
     phone_mode: bool,
     trigger_payload: dict | None,
     session_id: str = "",
+    call_tools: bool = False,
+    ask_back: bool = False,
+    transfer_targets: list[dict] | None = None,
 ) -> AgentConfig:
     """An EXTERNAL principal — the caller is not a platform user. Always a
     viewer of the shared space, whatever a legacy route row says."""
+    from services.phone.call_control import ASK_BACK_ENV, CALL_CONTROL_MCP, CALL_TOOLS_ENV
     ident = (
         identity.external if identity is not None and identity.external is not None
         else external_identity.resolve(external_identity.PHONE, "", session_id="", shared=True)
@@ -234,26 +279,32 @@ async def _build_external_config(
 
     # MCP config — phone mode filters out tools that don't apply mid-call;
     # the external rule drops the platform-management MCPs.
-    mcp_config_path, credential_env, excluded_mcps, secret_bundles, _ = await asyncio.to_thread(
-        mcp_registry.build_session_mcp_config,
-        agent_name, None, phone_mode=phone_mode, session_id=session_id,
-        placement=target,
-        target_browser=target_browser,
-        external=True,
-        # The caller's role: an MCP or skill whose audience is above it stays
-        # out, as in the prompt below.
-        user_role=role,
-        mcp_config_format=mcp_format,
-    )
-    if mcp_format == "toml" and mcp_config_path and credential_env:
-        # Codex spawns MCPs from the TOML env tables only (no daemon-env
-        # inheritance): bake the resolved credential env in, as the dashboard
-        # builder does (bash-only env_injection keys never reach the file).
-        mcp_config_path = await asyncio.to_thread(
-            mcp_registry.inject_credential_env_into_toml,
-            mcp_config_path, credential_env,
-            exclude_keys=mcp_registry.bash_only_env_keys(agent_name),
+    mcp_config_path, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
+        await asyncio.to_thread(
+            mcp_registry.build_session_mcp_config,
+            agent_name, None, phone_mode=phone_mode, session_id=session_id,
+            placement=target,
+            target_browser=target_browser,
+            external=True,
+            # The caller's role: an MCP or skill whose audience is above it
+            # stays out, as in the prompt below.
+            user_role=role,
+            mcp_config_format=mcp_format,
+            extra_mcps=[CALL_CONTROL_MCP] if call_tools else None,
+            call_ask_back=ask_back,
         )
+    )
+    # The CLI engines carry the call tools through the MCP (absent when the
+    # placement excluded it); an engine that runs its tools in-process (no
+    # MCP config file) registers them as builtins.
+    tools_attached = (mcp_format is None
+                      or CALL_CONTROL_MCP not in (excluded_mcps or {}))
+    # A Codex config gets the credential environment written in, as the
+    # dashboard builder does; the bash-only git entries stay out of the file.
+    mcp_config_path = await asyncio.to_thread(
+        mcp_registry.inject_toml_credentials, mcp_config_path, credential_env,
+        mcp_format=mcp_format, exclude_keys=bash_env_keys,
+    )
 
     # Dynamic context blocks — including builder blocks that read
     # ${trigger.*} tokens. A call is agent-scope so ``user_sub`` stays empty
@@ -306,6 +357,9 @@ async def _build_external_config(
     agent_prompt = _phone_tail(
         agent_prompt, call_type=call_type,
         phone_context_override=phone_context_override,
+        tools_block=_tools_block(
+            call_tools=call_tools, attached=tools_attached, ask_back=ask_back,
+            transfer_targets=transfer_targets),
     )
 
     # Persistent CLI config dir: the caller's tree when there is one, else
@@ -327,6 +381,10 @@ async def _build_external_config(
     # platform pool answers. Surfaced via extra_env; provider-switching key
     # (``_USER_SUB``) left empty for Direct LLM (no per-user routing on calls).
     extra_env: dict[str, str] = {}
+    if call_tools and tools_attached:
+        extra_env[CALL_TOOLS_ENV] = "1"
+        if ask_back:
+            extra_env[ASK_BACK_ENV] = "1"
     subscription_id = ""
     try:
         subscription_id, sub_env = await asyncio.to_thread(

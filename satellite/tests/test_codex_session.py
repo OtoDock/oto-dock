@@ -130,6 +130,33 @@ class TestCodexSessionStart:
         assert "task-mcp" in (codex_dir / "config.toml").read_text()
 
     @pytest.mark.asyncio
+    async def test_writes_the_command_wrappers_and_names_them_in_the_daemon_env(
+        self, tmp_agent_dir, codex_config, sat_config,
+    ):
+        """The payload's ``command_wrappers`` land under CODEX_HOME/bin and
+        the daemon env carries the helper's variables with that bin first on
+        PATH (the attended PTY session builds the same env)."""
+        import os
+        import sys
+        codex_config["command_wrappers"] = {"bin/gh": "#!/bin/sh\nexec x \"$@\"\n"}
+        session = CodexSession("sess-1", tmp_agent_dir, codex_config, sat_config)
+        seen: dict = {}
+
+        async def _connect(env):
+            seen.update(env)
+            session._client = _thread_client()
+        with patch.object(session, "_connect_with_retry", new=AsyncMock(side_effect=_connect)), \
+                patch.object(session, "_warm_mcps", new=AsyncMock()), \
+                patch.object(session, "_run_forwarder", new=AsyncMock()):
+            await session.start()
+            await session.close()
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        gh = codex_dir / "bin" / "gh"
+        assert gh.is_file() and gh.stat().st_mode & 0o111
+        assert seen["OTO_HOOKS_DIR"] == str(codex_dir) and seen["OTO_HOOK_PY"] == sys.executable
+        assert seen["PATH"].startswith(str(codex_dir / "bin") + os.pathsep)
+
+    @pytest.mark.asyncio
     async def test_writes_auth_json(self, tmp_agent_dir, sat_config):
         config = {
             "cwd_relative": "users/alice",
@@ -190,6 +217,8 @@ class TestCodexSessionThread:
         assert "thread/start" not in methods
         resume_params = next(p for m, p in calls if m == "thread/resume")
         assert resume_params.get("threadId") == "thread-existing"
+        # The history stays in the rollout: Codex deprecates hydrating it.
+        assert resume_params.get("excludeTurns") is True
         assert session.thread_id == "thread-existing"
 
     @pytest.mark.asyncio
@@ -460,6 +489,25 @@ def test_pty_config_toml_header_keys():
     # No local endpoint in the payload → no selector and no provider table.
     assert "model_provider" not in cfg
     assert "model_providers" not in cfg
+    # Without a codex_dir no worktree root either.
+    assert "desktop" not in cfg
+
+
+def test_pty_config_toml_puts_codex_worktrees_beside_the_codex_dir():
+    # Twin of the proxy writer: Codex 0.162's managed worktrees (TUI tools)
+    # default to $CODEX_HOME/worktrees, the protected .codex dir; the root is
+    # the hidden sibling at the scope root, satellite-absolute as Codex needs.
+    from pathlib import Path
+    from satellite.tests._toml import toml_loads
+    from satellite.terminal.codex_pty_session import _build_codex_config_toml
+    text = _build_codex_config_toml(
+        "/home/u/work", "", codex_dir=Path("/home/u/.oto-dock/agents/pa/users/u/.codex"),
+    )
+    cfg = toml_loads(text)
+    assert cfg["desktop"]["git-worktree-root"] == "/home/u/.oto-dock/agents/pa/users/u/.codex-worktrees"
+    # A table, after the trust table and before any MCP section.
+    assert text.index("[desktop]") > text.index("[projects.")
+    assert cfg["projects"]["/home/u/work"]["trust_level"] == "trusted"
 
 
 # ---------------------------------------------------------------------------
@@ -817,7 +865,67 @@ class TestHooksFloor:
         assert env["OTO_SESSION_ID"] == "sess-hf"
 
     @pytest.mark.asyncio
+    async def test_an_attended_chat_runs_the_bridged_floor(self, tmp_agent_dir, sat_config):
+        """0.5.143: ``codex_attended_floor`` trusts the hook on the thread with
+        the bridged env; under Don't Ask the policy is never (the hook judges)."""
+        from satellite.tests._toml import toml_loads
+        text, calls, env = await self._start(tmp_agent_dir, sat_config, self._config(
+            codex_attended_floor=True, permission_mode="dontAsk",
+            sandbox_mode="danger-full-access"))
+        assert toml_loads(text)["features"] == {"plugins": False, "hooks": True}
+        start = next(p for m, p in calls if m == "thread/start")
+        assert start["config"] == {"bypass_hook_trust": True}
+        assert start["approvalPolicy"] == "never"
+        assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
+        assert env["OTO_HOOK_BRIDGED"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_a_full_access_default_chat_asks_through_the_bridge(self, tmp_agent_dir, sat_config):
+        _, calls, _ = await self._start(tmp_agent_dir, sat_config, self._config(
+            codex_attended_floor=True, permission_mode="default",
+            sandbox_mode="danger-full-access"))
+        start = next(p for m, p in calls if m == "thread/start")
+        assert start["approvalPolicy"] == "untrusted" and start["sandbox"] == "danger-full-access"
+
+    @pytest.mark.asyncio
+    async def test_a_floored_session_never_runs_bridged(self, tmp_agent_dir, sat_config, monkeypatch):
+        monkeypatch.setenv("OTO_HOOK_BRIDGED", "1")
+        _, _, env = await self._start(tmp_agent_dir, sat_config, self._config(
+            codex_hooks_floor=True, codex_attended_floor=False))
+        assert "OTO_HOOK_BRIDGED" not in env
+
+    @pytest.mark.asyncio
+    async def test_a_mode_change_moves_the_policy_and_plan(self, tmp_agent_dir, codex_config, sat_config):
+        session = CodexSession("sess-m", tmp_agent_dir, {
+            **codex_config, "codex_attended_floor": True, "permission_mode": "default",
+            "sandbox_mode": "danger-full-access"}, sat_config)
+        assert session._approval_policy() == "untrusted"
+        await session.send_control_request(
+            "set_permission_mode", sandbox_mode="danger-full-access", permission_mode="dontAsk")
+        assert session._approval_policy() == "never"
+        await session.send_control_request(
+            "set_permission_mode", sandbox_mode="read-only", permission_mode="plan")
+        assert session._approval_policy() == "untrusted" and session._plan_mode("read-only")
+        # A daemon that refuses untrusted: on-request in a workspace sandbox,
+        # never under danger-full-access (the hook judges every call there).
+        session._untrusted_rejected = True
+        await session.send_control_request(
+            "set_permission_mode", sandbox_mode="danger-full-access", permission_mode="default")
+        assert session._approval_policy() == "never"
+        await session.send_control_request(
+            "set_permission_mode", sandbox_mode="workspace-write", permission_mode="default")
+        assert session._approval_policy() == "on-request"
+        # An older proxy ships no mode: the sandbox decides, as before.
+        old = CodexSession("sess-o", tmp_agent_dir, {
+            **codex_config, "permission_mode": "", "sandbox_mode": "danger-full-access"}, sat_config)
+        assert old._approval_policy() == "never"
+        await old.send_control_request("set_permission_mode", sandbox_mode="workspace-write")
+        assert old._approval_policy() == "untrusted"
+
+    @pytest.mark.asyncio
     async def test_attended_session_gets_none_of_it(self, tmp_agent_dir, sat_config):
+        # A proxy that ships no codex_attended_floor (older): the chat runs as
+        # before, its hook dormant.
         from satellite.tests._toml import toml_loads
         text, calls, env = await self._start(tmp_agent_dir, sat_config, self._config())
         cfg = toml_loads(text)
@@ -826,14 +934,16 @@ class TestHooksFloor:
         start = next(p for m, p in calls if m == "thread/start")
         assert "config" not in start
         assert "OTO_HOOK_DENY_ONLY" not in env and "OTO_HOOK_NO_FORWARD" not in env
+        assert "OTO_HOOK_BRIDGED" not in env
         # hooks.json is still written (dormant without trust).
         assert (tmp_agent_dir / "users" / "alice" / ".codex" / "hooks.json").exists()
 
     @pytest.mark.asyncio
-    async def test_resume_carries_the_trust_too(self, tmp_agent_dir, sat_config):
+    @pytest.mark.parametrize("floor_key", ["codex_hooks_floor", "codex_attended_floor"])
+    async def test_resume_carries_the_trust_too(self, tmp_agent_dir, sat_config, floor_key):
         _, calls, _ = await self._start(
             tmp_agent_dir, sat_config,
-            self._config(codex_hooks_floor=True, thread_id="thread-existing"),
+            self._config(**{floor_key: True}, thread_id="thread-existing"),
         )
         resume = next(p for m, p in calls if m == "thread/resume")
         assert resume["threadId"] == "thread-existing"

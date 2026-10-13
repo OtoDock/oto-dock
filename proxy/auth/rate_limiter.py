@@ -34,7 +34,7 @@ import config
 from storage import database as db
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 class _Attempts(dict):
@@ -122,8 +122,8 @@ def check_rate_limit(bucket: str, key: str) -> tuple[bool, int]:
         return False, int(blocked_until - now)
 
     if now - entry["first_at"] > rule["window"]:
-        # Window lapsed and no active block → reset the COUNTING window but
-        # KEEP block_count. Deleting the entry here (the old behaviour) wiped
+        # Window lapsed and no active block → reset the COUNTING window (and
+        # its tags) but KEEP block_count. Deleting the entry here (the old behaviour) wiped
         # the escalation history every window, so a patient attacker who
         # spaced attempts one window apart always faced the base block and
         # the documented exponential backoff never materialized. _cleanup
@@ -131,6 +131,7 @@ def check_rate_limit(bucket: str, key: str) -> tuple[bool, int]:
         entry["count"] = 0
         entry["first_at"] = now
         entry["blocked_until"] = 0
+        entry.pop("tags", None)
         return True, 0
 
     if entry["count"] < rule["max"]:
@@ -169,8 +170,9 @@ def _make_room(bucket: str, now: float) -> bool:
     return False
 
 
-def record_attempt(bucket: str, key: str) -> None:
-    """Count one attempt against ``(bucket, key)`` (starts/rolls the window)."""
+def record_attempt(bucket: str, key: str, tag: str = "") -> None:
+    """Count one attempt against ``(bucket, key)`` (starts/rolls the window).
+    A ``tag`` also counts it under that tag, for ``release_tag``."""
     now = time.time()
     entry = _attempts.get((bucket, key))
     if entry is None and _attempts.per_bucket[bucket] >= config.RATE_LIMIT_MAX_KEYS:
@@ -180,14 +182,17 @@ def record_attempt(bucket: str, key: str) -> None:
     # Never roll the window (which would zero blocked_until) while a block is
     # still being served — a single probe during the block would otherwise
     # lift it. While blocked, just keep counting on the existing entry.
-    blocked = bool(entry) and entry.get("blocked_until", 0) > now
+    blocked = entry is not None and entry.get("blocked_until", 0) > now
     if not entry or (now - entry["first_at"] > rule["window"] and not blocked):
-        _attempts[(bucket, key)] = {
+        entry = _attempts[(bucket, key)] = {
             "count": 1, "first_at": now, "blocked_until": 0,
             "block_count": entry.get("block_count", 0) if entry else 0,
         }
     else:
         entry["count"] += 1
+    if tag:
+        tags = entry.setdefault("tags", {})
+        tags[tag] = tags.get(tag, 0) + 1
 
 
 def hit(bucket: str, key: str) -> tuple[bool, int]:
@@ -209,9 +214,20 @@ def release_attempt(bucket: str, key: str) -> None:
         entry["count"] -= 1
 
 
+def release_tag(bucket: str, key: str, tag: str) -> None:
+    """Give back the attempts of the live window counted under ``tag`` (a
+    share link's own wrong passwords once its right one came), never below
+    zero; a block in force stays."""
+    entry = _attempts.get((bucket, key))
+    if not entry:
+        return
+    n = (entry.get("tags") or {}).pop(tag, 0)
+    if n:
+        entry["count"] = max(0, entry["count"] - n)
+
+
 def clear_rate_limit(bucket: str, key: str) -> None:
-    """Drop tracking for ``(bucket, key)`` (e.g. a link unlocked by its
-    password)."""
+    """Drop tracking for ``(bucket, key)``."""
     _attempts.pop((bucket, key), None)
 
 

@@ -11,7 +11,6 @@ agents (the session token's own agent, never a header a cookie caller
 sends). A caller who may neither read nor act gets 404, so ids never leak.
 """
 
-import asyncio
 import json
 import uuid
 
@@ -24,6 +23,7 @@ from storage import database as task_store
 from storage.agents import agent_store
 from storage.chat import meeting_status
 from storage.pg import run_db
+from core.background import spawn
 
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -374,7 +374,7 @@ async def start_meeting_endpoint(
         raise HTTPException(400, f"Meeting status is '{meeting['status']}', expected 'pending'")
 
     from services.meetings import meeting_orchestrator
-    asyncio.create_task(meeting_orchestrator.start_meeting(meeting_id))
+    spawn(meeting_orchestrator.start_meeting(meeting_id), name="start_meeting", owner="meetings")
     return {"status": ANSWER_STARTING, "meeting_id": meeting_id}
 
 

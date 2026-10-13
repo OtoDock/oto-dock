@@ -29,7 +29,7 @@ from services.mcp import mcp_manifest_parse as _mmp
 from services.mcp import mcp_manifest_types as _mt
 from storage.mcp import mcp_update_state_store as state_store
 
-logger = logging.getLogger("claude-proxy.mcp-source-swap")
+logger = logging.getLogger("otodock.mcp-source-swap")
 
 INTERRUPTED = "interrupted by a restart"
 

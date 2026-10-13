@@ -45,7 +45,7 @@ from storage.prefs.audio_provider_store import (
 )
 from services.phone.phone_config import notify_phone_config_changed, groq_classifier_configured
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -132,12 +132,16 @@ def _provider_class(provider_type: str, provider_name: str):
 
 def _decorate(provider: dict) -> dict:
     """Attach the credential-configured flag + the engine's advanced-settings
-    defaults (single source of truth: the provider class) for the pill UI."""
+    defaults, the model ids that run when the row stores none and the
+    shipped per-language voices (single source of truth: the provider
+    class) for the pill UI's fields and placeholders."""
     cls = _provider_class(provider.get("provider_type", ""), provider.get("provider_name", ""))
     return {
         **provider,
         "credential_configured": _credential_configured(provider.get("credential_key")),
         "advanced_defaults": cls.default_advanced_settings() if cls else {},
+        "model_defaults": cls.default_model_ids() if cls else {},
+        "voice_defaults": dict(getattr(cls, "default_voices", {}) or {}) if cls else {},
     }
 
 

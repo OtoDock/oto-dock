@@ -18,16 +18,30 @@ export const PHONE_INBOUND = 'inbound'
 export const PHONE_OUTBOUND = 'outbound'
 export type PhoneDirection = typeof PHONE_INBOUND | typeof PHONE_OUTBOUND
 
+// Where the agent may hand the caller (transfer_call): the only numbers
+// it ever dials, named by label in its instructions.
+export interface PhoneTransferTarget {
+  label: string
+  number: string
+}
+
 export interface PhoneRoute {
   id: string
   direction: PhoneDirection
   name: string
   agent: string
   language: string
+  // Identify the caller's language on the first utterance and lock the
+  // call to it; `language` stays the greeting's and the fallback.
+  language_detect: boolean
   llm_mode: string
+  transfer_targets: PhoneTransferTarget[]
   phone_server_id: number | null
   stt_provider_id: number | null
   tts_provider_id: number | null
+  // A voice for this route only (the TTS provider's own id); '' keeps the
+  // provider's voice for the call's language.
+  voice_id: string
   greeting: string
   phone_context_override: string
   backchannel_mode: RouteMode
@@ -537,5 +551,20 @@ export function useSavePhoneSettings() {
       return res.json()
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-settings'] }) },
+  })
+}
+
+/** The shipped call prompts (the seed's texts): what Restore Default writes. */
+export type PhonePromptDefaults = { context_inbound: string; context_outbound: string }
+
+export function usePhonePromptDefaults() {
+  return useQuery({
+    queryKey: ['phone-prompt-defaults'],
+    queryFn: async (): Promise<PhonePromptDefaults> => {
+      const res = await apiFetch('/v1/admin/phone/settings/defaults')
+      if (!res.ok) throw new Error('Failed to fetch the call prompt defaults')
+      return res.json()
+    },
+    staleTime: Infinity,
   })
 }

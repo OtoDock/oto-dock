@@ -21,9 +21,10 @@
  * three EMPTY_* constants below stay module-level here and are passed where
  * needed (a second copy breaks zustand's Object.is selector guard).
  */
-import React, { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
+import { useFlag } from '../../hooks/useFlag'
 import { SearchProvider } from '../../contexts/SearchContext'
 import { useAgents, useExecutionLayers, useAgentTargetStatus } from '../../api/agents'
 import { engineLabels, runsInteractive, supportsCompact } from '../../lib/engines'
@@ -33,12 +34,14 @@ import ChatMessages from '../../components/chat/ChatMessages'
 import { ChatFileProvider } from '../../components/chat/ChatFileContext'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
 import type { PendingImage, PendingFile } from '../../components/chat/ChatInput'
-import type { QueuedMessage } from '../../store/types'
+import type { AttachedFileMeta, QueuedMessage } from '../../store/types'
 import type { WireImage } from '../../hooks/useDashboardWs'
 import TopBar from '../../components/chat/TopBar'
 import AppSettingsModal from '../../components/chat/AppSettingsModal'
 import { SetupBanner } from '../../components/PlatformSetupGuard'
 import { ForwardingBanner } from '../../components/admin/ForwardingBanner'
+import { ReleaseBanner } from '../../components/admin/ReleaseBanner'
+import { ReleaseDialog } from '../../components/ReleaseDialog'
 import FindBar from '../../components/chat/FindBar'
 import { useChatNotifications } from '../../hooks/useChatNotifications'
 import { useSwipeGesture } from '../../hooks/useSwipeGesture'
@@ -95,6 +98,7 @@ export default function AgentChat() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const { user, logout } = useAuth()
+  const interactiveTerminalEnabled = useFlag('interactive_terminal_enabled')
   const { data: agents, isError: agentsLoadFailed } = useAgents()
   // Roam the server-side ui-prefs bag (per-agent interactive pick) into
   // agentPrefsStore — once per session load (the guard lives in the store), so
@@ -204,14 +208,15 @@ export default function AgentChat() {
     setMeetingRound,
     meetingLeftParticipants,
     editText, setEditText,
-    currentMsgRef, thinkingBufRef, abortedRef, discardingRef, sentWithBubbleRef, erroredRef,
+    currentMsgRef, thinkingBufRef, abortedRef, discardingRef, sentWithBubbleRef, sentWithBubbleIdRef,
+    erroredRef,
     meetingSpeakerRef,
     handlePermissionRespond, handleQuestionAnswer, handleQuestionAnswerStructured, handleSendMessage,
     sendArtifactInteraction, sendAppAction,
     handleImplementPlan, handlePlanFetched, resolvePlanReview, finalizeAbortedTurn,
     latest,
-    preWarmedRef, lastResumedChatIdRef, pendingFilesRef,
-    pendingMessageRef, pendingImagesRef, serverKickPendingRef, keepAppsOnChatEntryRef,
+    preWarmedRef, lastResumedChatIdRef,
+    warmupSends, serverKickPendingRef, keepAppsOnChatEntryRef, phoneCallActive,
   } = useAgentChatStream({
     agents, urlChatId, agentDefaultModel, agentExecutionPath, agentName, navigate, isFavoriteAgent, preWarmPath,
     warmingUp, setWarmingUp, chatNotif, sessionInteractiveRef, duplexActiveRef,
@@ -260,7 +265,7 @@ export default function AgentChat() {
   // (sessions always spawn headless then).
   const interactiveAvailable =
     agentExecutionPaths.some(p => runsInteractive(layers?.[p]))
-    && user?.feature_flags?.interactive_terminal_enabled !== false
+    && interactiveTerminalEnabled
   // The toggle is free to flip any time EXCEPT while a cold-start is warming or a
   // live switch (kill+rewarm) is in flight — both would race a second
   // toggle. A live session is switchable (via confirm).
@@ -316,7 +321,7 @@ export default function AgentChat() {
   const { modelGroups } = useModelEngineReconcile({
     layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model,
     setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError, chatId, agentName, sessionId, setProcessAlive,
-    urlChatId, agentDefaultModel, setModel, setMode, selectedLayer, setSelectedLayer, currentAgent, parseModelValue,
+    urlChatId, agentDefaultModel, setModel, setMode, selectedLayer, setSelectedLayer, currentAgent,
   })
 
   // Read tracking for the sidebar unread dot: the viewer has SEEN this chat
@@ -480,7 +485,7 @@ export default function AgentChat() {
     discardingRef.current = true
     setMessages([])
     currentMsgRef.current = null
-    pendingMessageRef.current = null
+    warmupSends.discard()
     heldForAgentsRef.current = null  // a held first send must not flush into the opened chat
     thinkingBufRef.current = ''
     setChatId(urlChatId)
@@ -526,7 +531,7 @@ export default function AgentChat() {
   // --- Handlers ---
 
   // Eager file uploads — the composer's attachment chips (chat/useChatAttachments.ts).
-  const { handleAddFiles, handleRemoveFile, handleRetryFile } = useChatAttachments({ agentName, draftKey })
+  const { handleAddFiles, handleAddFolder, handleRemoveFile, handleRetryFile } = useChatAttachments({ agentName, draftKey })
 
   const handleSend = useCallback(
     (text: string, again?: { images?: PendingImage[]; files?: PendingFile[] }) => {
@@ -576,9 +581,9 @@ export default function AgentChat() {
         if (files) useChatStore.getState().setPendingFiles(draftKey, [])
       }
 
-      const uploadedFiles: Array<{ path: string; name: string }> | undefined = files
+      const uploadedFiles: AttachedFileMeta[] | undefined = files
         ?.filter(f => f.uploadedPath)
-        .map(f => ({ path: f.uploadedPath!, name: f.name }))
+        .map(f => ({ path: f.uploadedPath!, name: f.name, ...(f.folder ? { folder: true } : {}) }))
 
       // Helper: add user bubble + empty assistant placeholder (shows typing dots)
       const addUserAndPlaceholder = (text: string) => {
@@ -586,7 +591,7 @@ export default function AgentChat() {
         // Build blocks: file badges + image thumbnails + text
         const blocks: MessageBlock[] = []
         if (uploadedFiles?.length) {
-          blocks.push({ type: 'file_attachments', files: uploadedFiles.map(f => ({ name: f.name, path: f.path })) })
+          blocks.push({ type: 'file_attachments', files: uploadedFiles })
         }
         if (images) {
           // A fresh photo renders from its data URL; one handed back from a
@@ -630,6 +635,7 @@ export default function AgentChat() {
       if (!sessionId && !warmingUp && agents === undefined && !agentsLoadFailed && !interactive.chatExecMode) {
         addUserAndPlaceholder(text)
         sentWithBubbleRef.current = text
+        sentWithBubbleIdRef.current = null
         setWarmingUp(true)
         serverKickPendingRef.current = { chatId: chatId || null }
         heldForAgentsRef.current = { text, images: wsImages, files: wsFiles }
@@ -650,6 +656,7 @@ export default function AgentChat() {
         onColdStart: () => {
           addUserAndPlaceholder(text)
           sentWithBubbleRef.current = text
+          sentWithBubbleIdRef.current = null
           setWarmingUp(true)
           // A cold interactive send carries its text with the warmup (Codex
           // argv / Claude server submit) — if the backend DECLINES interactive
@@ -672,7 +679,7 @@ export default function AgentChat() {
         } else {
           addUserAndPlaceholder(text)
           sentWithBubbleRef.current = text
-          ws.sendMessage(text, chatId, wsImages, wsFiles)
+          sentWithBubbleIdRef.current = ws.sendMessage(text, chatId, wsImages, wsFiles)
         }
       } else if (!warmingUp) {
         addUserAndPlaceholder(text)
@@ -697,9 +704,9 @@ export default function AgentChat() {
         // for -p spawns.
         ws.warmup(agentName, chatId || undefined, mode, model, chatActiveLayer ?? selectedLayer ?? undefined, { text, images: wsImages, files: wsFiles }, interactive.chatExecMode || undefined, currentDashboardTheme())
       } else {
-        pendingMessageRef.current = text
-        pendingImagesRef.current = wsImages || null
-        pendingFilesRef.current = wsFiles || null
+        // A send while the chat gets ready: kept, in order, behind its
+        // first message (chat/useWarmupSends.ts).
+        warmupSends.send(text, wsImages, wsFiles)
       }
     },
     [agentName, sessionId, chatId, mode, model, chatActiveLayer, selectedLayer, ws, warmingUp, agents, agentsLoadFailed, interactive.routeSend, interactive.setShowRichView, interactive.chatExecMode, pendingImages, pendingFiles, workspace, draftKey, duplexVoice.sendTyped],
@@ -730,8 +737,14 @@ export default function AgentChat() {
   // A chip is its author's to cancel (an admin's: any); a chip a 1.7.0
   // proxy minted names no author.
   const mayCancelQueued = useCallback(
-    (item: QueuedMessage) => !item.authorSub || item.authorSub === user?.sub || isAdmin(user),
-    [user],
+    (item: QueuedMessage) => !warmupSends.chips.some((c) => c.queueId === item.queueId)
+      && (!item.authorSub || item.authorSub === user?.sub || isAdmin(user)),
+    [user, warmupSends.chips],
+  )
+  // The chips a warmup still holds (no chat id yet) show after the queue's.
+  const shownQueued = useMemo(
+    () => (warmupSends.chips.length ? [...queuedMessages, ...warmupSends.chips] : queuedMessages),
+    [queuedMessages, warmupSends.chips],
   )
 
   // The turn-ended card's Send again: the person's messages of the turn
@@ -744,10 +757,9 @@ export default function AgentChat() {
 
   const handleAbort = useCallback(() => {
     if (warmingUp) {
-      // Cancel before warmup completes — don't send the pending message
-      pendingMessageRef.current = null
-      pendingImagesRef.current = null
-      pendingFilesRef.current = null
+      // Cancel before warmup completes: what was typed meanwhile goes back
+      // to the composer (the proxy returns what it already queued).
+      warmupSends.handBack()
       heldForAgentsRef.current = null  // a send held on the agents query is cancelled too
       setWarmingUp(false)
       // Remove the user message bubble that was added on send
@@ -802,7 +814,7 @@ export default function AgentChat() {
     // reset+seed; the navigate below must not trigger a duplicate reset.
     newChatModeSeededRef.current = agentName
     currentMsgRef.current = null
-    pendingMessageRef.current = null
+    warmupSends.discard()
     heldForAgentsRef.current = null  // a held first send belongs to the abandoned chat view
     setTotalCost(0)
     setLimitReached(false)
@@ -893,7 +905,7 @@ export default function AgentChat() {
       // Reset ALL state to prevent cross-chat leakage
       setMessages([])
       currentMsgRef.current = null
-      pendingMessageRef.current = null
+      warmupSends.discard()
       heldForAgentsRef.current = null  // a held first send must not flush into the selected chat
       thinkingBufRef.current = ''
       setChatId(selectedChatId)
@@ -1007,7 +1019,7 @@ export default function AgentChat() {
         onArtifactInteraction={sendArtifactInteraction}
         onPlanFetched={handlePlanFetched}
         streaming={viewedStreaming}
-        queuedMessages={queuedMessages}
+        queuedMessages={shownQueued}
         pendingSteers={pendingSteers}
         onCancelQueued={handleCancelQueued}
         mayCancelQueued={mayCancelQueued}
@@ -1050,6 +1062,8 @@ export default function AgentChat() {
           used to bury the z-20 TopBar and swallow its clicks). */}
       <SetupBanner />
       <ForwardingBanner />
+      <ReleaseBanner />
+      <ReleaseDialog />
       {/* min-h-0 is load-bearing: as a COLUMN flex item this div's
           min-height:auto tracks its content, so a long chat blows the
           100dvh root open and the DOCUMENT becomes the scroller (input +
@@ -1169,6 +1183,7 @@ export default function AgentChat() {
           sessionExecutionTarget={sessionExecutionTarget} sessionFallbackReason={sessionFallbackReason}
           offlineMachineName={offlineMachineName} zeroAccessible={zeroAccessible} chatId={chatId}
           pendingEngineSwitch={pendingEngineSwitch} targetMismatch={targetMismatch}
+          phoneCallActive={phoneCallActive}
           viewedStreaming={viewedStreaming} warming={warming} ws={ws} agentName={agentName} mode={mode}
           model={model} chatActiveLayer={chatActiveLayer} selectedLayer={selectedLayer}
           interactive={interactive} preWarmedRef={preWarmedRef} preWarmPath={preWarmPath} layers={layers}
@@ -1198,7 +1213,8 @@ export default function AgentChat() {
           handleEditQueued={handleEditQueued} handleEngage={handleEngage} permissionPending={permissionPending}
           warmingUp={warmingUp} aborting={aborting} queuedMessages={queuedMessages} editText={editText}
           setEditText={setEditText} pendingImages={pendingImages} draftKey={draftKey}
-          pendingFiles={pendingFiles} handleAddFiles={handleAddFiles} handleRemoveFile={handleRemoveFile}
+          pendingFiles={pendingFiles} handleAddFiles={handleAddFiles} handleAddFolder={handleAddFolder}
+          handleRemoveFile={handleRemoveFile}
           handleRetryFile={handleRetryFile} workspace={workspace} appsActive={appsActive}
           toggleApps={toggleApps} setAppsOpen={setAppsOpen}
           projectsActive={projectsActive} isProjectChat={isProjectChat} dockAvailable={dockAvailable}

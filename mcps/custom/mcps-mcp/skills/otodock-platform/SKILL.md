@@ -125,7 +125,11 @@ exact page, tab, and role from `references/settings-map.md`.
   interactive terminals, chat audio, user-paired machines) — if a user can't see what
   you describe, the feature may be disabled or their role too low; say which.
 - **Voice, phone, and live voice conversations** need the phone service add-on; plain
-  dictation and read-aloud don't.
+  dictation and read-aloud don't. On a call the agent can hang up when the conversation
+  is done, hand the caller to one of the route's **transfer targets** and, on a call
+  another agent placed, ask that agent.
+- **A tool's pictures and files** reach the chat on their own only when its package opts
+  in; when in doubt, show them yourself with the display tools.
 - **Never ask users for secrets** (API keys, tokens, passwords) in chat — point them at
   the settings page that stores credentials encrypted.
 - The public docs live at **https://docs.otodock.io** — link a page when the user wants

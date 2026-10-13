@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from core.layers.cli.remote import ClaudeRemoteState
 from core.layers.cli.settle import SettleController
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.remote import remote_abort
@@ -157,6 +158,59 @@ async def test_soft_abort_requires_live_turn():
     assert info.cli_dead is True
 
 
+def _claude_turn_state(info: RemoteSessionInfo, *, settle_after_result: int) -> ClaudeRemoteState:
+    translator = ClaudeCLIEventTranslator(info.session_id)
+    state = ClaudeRemoteState(
+        translator=translator,
+        settle=SettleController(info.session_id, settle_after_result, translator),
+    )
+    info.engine_state = state
+    return state
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_settle_takes_the_hard_path_at_once():
+    """The task turn's result was read and the stream only waits for
+    background work: the soft frame would find nothing to interrupt (the
+    2026-10-13 finding: a 30 s detour, then the watchdog's kill flushed the
+    commands as done and the producer nudged a dead CLI). The abort kills
+    at once, so the caller cancels the producer."""
+    layer = _make_layer(soft_supported=True)
+    info = _make_info()
+    layer._sessions[info.session_id] = info
+    state = _claude_turn_state(info, settle_after_result=30)
+    state.result_seen = True
+    state.settle.enter_settle()
+
+    result = await layer.abort(info.session_id)
+
+    assert result is False
+    assert _sent_frame_types(layer) == ["abort"]
+    assert info.proxy_killed is True and info.cli_dead is True
+    layer._cm.arm_abort_acked.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_result_read_but_not_settling_keeps_the_graceful_path():
+    """An interactive turn keeps the stream open for the stop_turn drain
+    after its result (and a steer's turn may follow it): that is not a
+    settle, so a Stop there stays graceful."""
+    layer = _make_layer(soft_supported=True)
+    info = _make_info()
+    layer._sessions[info.session_id] = info
+    state = _claude_turn_state(info, settle_after_result=0)
+    state.result_seen = True
+
+    result = await layer.abort(info.session_id)
+
+    assert result is True
+    assert _sent_frame_types(layer) == ["interrupt_turn"]
+    assert info.proxy_killed is False and info.cli_dead is False
+    assert state.translator.interrupted is True
+    info.turn_active = False
+    await asyncio.sleep(0.3)
+
+
 @pytest.mark.asyncio
 async def test_watchdog_escalates_when_turn_never_closes(monkeypatch):
     monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
@@ -276,6 +330,21 @@ async def test_interrupt_for_queued_fires_graceful_only(monkeypatch):
     assert info.cli_dead is False
     layer._cm.arm_abort_acked.assert_not_called()
     layer._cm.drop_grace_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_for_queued_marks_the_turns_translator(monkeypatch):
+    # The turn the interrupt closes may end in the CLI's "[ede_diagnostic]"
+    # error result: the translator reads it as the interrupt landing.
+    layer = _make_layer(soft_supported=True)
+    layer._cm.is_connected = MagicMock(return_value=True)
+    info = _make_info()
+    layer._sessions[info.session_id] = info
+    _released(monkeypatch)
+    await layer._adapter(info).begin_turn(info, 0)
+    assert info.engine_state.translator.interrupted is False
+    assert await layer.interrupt_for_queued(info.session_id) is True
+    assert info.engine_state.translator.interrupted is True
 
 
 @pytest.mark.asyncio

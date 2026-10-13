@@ -38,7 +38,7 @@ from .base import (
     RouteHandle,
 )
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # The AstDB tree OtoDock owns. Asterisk's DB() splits on the FIRST '/', so
 # DB(otodock/route_uuid/<n>) ⇒ Family="otodock", Key="route_uuid/<n>" — i.e. the

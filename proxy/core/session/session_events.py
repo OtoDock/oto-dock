@@ -148,6 +148,10 @@ _last_hook_eval: dict[str, float] = {}
 # turn, a Stop): a check round started before it is cancelled, and a
 # proxy-driven turn it cut is neither judged nor continued.
 _user_message_at: dict[str, float] = {}
+# When the person last STOPPED the session's turn (the dashboard's Stop):
+# a task turn's settle ends on it instead of waiting for background work,
+# and the task producer reviews no background work after it.
+_stopped_at: dict[str, float] = {}
 # Coalesce concurrent evaluations per session: a hook and a loop racing, or
 # an agent curling its own Stop endpoint, never evaluate twice at once.
 _turn_end_locks: dict[str, asyncio.Lock] = {}
@@ -172,6 +176,7 @@ def cleanup_session(session_id: str) -> None:
     _last_turn_end.pop(session_id, None)
     _last_hook_eval.pop(session_id, None)
     _user_message_at.pop(session_id, None)
+    _stopped_at.pop(session_id, None)
     _turn_end_locks.pop(session_id, None)
 
 
@@ -187,6 +192,19 @@ def note_user_message(session_id: str) -> None:
 def user_message_since(session_id: str, since: float) -> bool:
     """Whether a person's message landed after the monotonic instant."""
     return _user_message_at.get(session_id, 0.0) > since
+
+
+def note_stop(session_id: str) -> None:
+    """The person stopped the session's turn (a Stop, not a queued message):
+    a cut-in like any other, and the mark the settle and the task producer
+    read so nothing waits for or reviews background work after it."""
+    note_user_message(session_id)
+    _stopped_at[session_id] = time.monotonic()
+
+
+def stopped_since(session_id: str, since: float) -> bool:
+    """Whether a person's Stop landed after the monotonic instant."""
+    return _stopped_at.get(session_id, 0.0) > since
 
 
 # ---------------------------------------------------------------------------

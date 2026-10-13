@@ -28,7 +28,7 @@ from storage.agents import agent_store
 from storage import database as user_store
 from services.community import community_agent_installer
 
-logger = logging.getLogger("claude-proxy.default-agent-assigner")
+logger = logging.getLogger("otodock.default-agent-assigner")
 
 
 def assign_default_agents(user_sub: str) -> dict[str, str]:

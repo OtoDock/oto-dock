@@ -13,15 +13,23 @@ FILES = (
     "telephony/twilio_media.py",
     "telephony/dtmf_detect.py",
     "telephony/ami_events.py",
+    "telephony/transfer.py",
     "pipeline/pin_gate.py",
+    "pipeline/call_control.py",
     "calls/pin_failures.py",
+    "calls/twilio_http.py",
 )
 
-# Any f-string / format interpolation of these identifiers is a leak.
+# Any f-string / format interpolation of these identifiers is a leak. A
+# channel name carries the dialled number, a transfer target's number is
+# the colleague's, and an unlabelled target's label IS its number
+# (``transfer.loggable_label`` is what a log line may name).
 BANNED = (
     "{digit", "{new", "{entered", "{candidate", "{expected",
     "{ch", "{pin}", "{pin!", "{pin:", "{self.route.pin",
     "{route.pin", "digits)", "% digit", "% pin",
+    "{self._channel", "{dialable(", "{number", "{entry.label",
+    "{target.get('number')", "{target.get(\"number\")",
 )
 
 

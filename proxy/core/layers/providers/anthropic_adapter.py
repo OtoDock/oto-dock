@@ -92,6 +92,8 @@ def _server_tool_result_preview(block) -> str:
 class AnthropicAdapter(ProviderAdapter):
     """Anthropic Claude API adapter."""
 
+    tool_result_images = True
+
     # The provider's own server-run tools, appended to session.tools for
     # models with server_tools=True. The BASIC tool versions on purpose
     # (decided 2026-09-07): the 2026 versions add "dynamic filtering" — the
@@ -318,13 +320,22 @@ class AnthropicAdapter(ProviderAdapter):
             await client.close()
 
     def format_tool_results(self, results: list[dict]) -> list[dict]:
-        """Anthropic format: single user message with tool_result content blocks."""
+        """Anthropic format: single user message with tool_result content
+        blocks. A result's ``images`` (an MCP tool's kept pictures) ride
+        inside its tool_result, after its text."""
         tool_results = []
         for r in results:
+            content = r["content"]
+            if r.get("images"):
+                content = [{"type": "text", "text": content}] + [
+                    self.format_image_content_block(
+                        media_type=img["media_type"], base64_data=img["base64"])
+                    for img in r["images"]
+                ]
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": r["tool_use_id"],
-                "content": r["content"],
+                "content": content,
             })
         return [{"role": "user", "content": tool_results}]
 

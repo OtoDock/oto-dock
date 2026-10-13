@@ -504,3 +504,38 @@ def test_the_user_row_and_the_title_ride_the_chat_writer(phone_ws_env, monkeypat
     asyncio.run(run())
     assert labels[:2] == ["phone_user_row", "phone_title"]
     assert [a for a in layer.persisted if a[1] == "user"][-1][2] == "hello there"
+
+
+def test_a_turn_waits_for_another_starter_and_says_when_the_chat_stays_busy(
+        phone_ws_env, monkeypatch):
+    """The chat's turn starters take turns: a caller's turn waits a moment
+    for another starter bringing the chat a turn (a stored wake's replay),
+    then answers busy, with no row and no dispatch."""
+    from core.events import input_queue
+    ws, layer = phone_ws_env
+    monkeypatch.setattr(ws_phone, "_CLAIM_WAIT_S", 0.2)
+
+    async def run():
+        handler = await _run_handler(ws)
+        await _warmup(ws)
+        ws.push({"type": "chat", "prompt": "first", "turn": 1})
+        await ws.wait_for_frame(lambda f: f["type"] == "done" and f.get("turn") == 1)
+        chat_id = layer.persisted[0][0]
+        q = input_queue.get(chat_id)
+        held = q.try_claim()
+        assert held is not None
+        ws.push({"type": "chat", "prompt": "second", "turn": 2})
+        err = await ws.wait_for_frame(lambda f: f["type"] == "error" and f.get("turn") == 2)
+        assert "busy" in err["data"]["message"]
+        assert layer.prompts == ["first"]
+        assert [r[2] for r in layer.persisted] == ["first"]
+        q.release(held)
+        ws.push({"type": "chat", "prompt": "third", "turn": 3})
+        await ws.wait_for_frame(lambda f: f["type"] == "done" and f.get("turn") == 3)
+        assert layer.prompts == ["first", "third"]
+        assert not q.claimed
+        ws.disconnect()
+        await handler
+        input_queue._registry.pop(chat_id, None)
+
+    asyncio.run(run())

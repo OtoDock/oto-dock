@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel
 
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 
 _running_tasks: dict[str, asyncio.Task] = {}

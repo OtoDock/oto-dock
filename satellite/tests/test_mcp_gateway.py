@@ -101,9 +101,12 @@ def test_the_table_keys_by_token_hash_and_mcp_leases_and_wipes():
     assert t.wipe({"token_hash": "h1"}) == 1 and t.get("h1", "vendor") is None
     assert t.wipe({"token_hash": "h1"}) == 0  # idempotent
     assert t.wipe({"session_id": "s-2"}) == 1 and len(t) == 0
-    t.push({**msg, "expires_in": 0})
+    # a lease of zero is the proxy's revoke: the entry goes at once (an
+    # older satellite stored it as already over), nothing left to sweep
+    t.push(msg)
+    assert t.push({**msg, "expires_in": 0, "value": "-"})
     assert t.get("h1", "vendor") is None
-    assert t.sweep() == 1 and len(t) == 0
+    assert t.sweep() == 0 and len(t) == 0
 
 
 @pytest.mark.asyncio
@@ -210,8 +213,51 @@ async def test_a_redirect_a_vendor_401_and_an_expired_lease(rig):
         _push(tunnel.gateway.table, vendor, expires_in=0)
         vendor.status, vendor.headers = 200, {"Content-Type": "application/json"}
         async with s.post(f"http://127.0.0.1:{port}/v1/mcp-gateway/vendor/mcp", json=RPC, headers=auth) as r:
-            assert r.status == 200 and "No credential" in (await r.json())["error"]["message"]
+            assert r.status == 200 and "withdrew" in (await r.json())["error"]["message"]
     assert len(vendor.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_token_is_refused_at_once_with_why(rig):
+    """A revoke leaves a tombstone: the session's next request is refused
+    without the push wait, saying the account was disconnected (or the
+    proxy's own reason for another kind); a push of the key clears it, a
+    wipe of the session too."""
+    ws, tunnel, port, vendor = rig
+    auth = {"Authorization": f"Bearer {BEARER}"}
+    table = tunnel.gateway.table
+    url = f"http://127.0.0.1:{port}/v1/mcp-gateway/vendor/mcp"
+    _push(table, vendor)
+    _push(table, vendor, expires_in=0, value="-", kind="no_value",
+          reason="The credential has no value; reconnect the account.")
+    async with aiohttp.ClientSession() as s:
+        t0 = time.monotonic()
+        async with s.post(url, json=RPC, headers=auth) as r:
+            message = (await r.json())["error"]["message"]
+        assert time.monotonic() - t0 < 1.5
+        assert "disconnected on the platform" in message and "Settings > Integrations" in message
+        # another kind: the proxy's own reason
+        _push(table, vendor, expires_in=0, value="-", kind="host_not_allowed",
+              reason="The host mcp.example.com is not approved for vendor.")
+        async with s.post(url, json=RPC, headers=auth) as r:
+            assert (await r.json())["error"]["message"] == "The host mcp.example.com is not approved for vendor."
+        # reconnected: the next push serves again
+        _push(table, vendor)
+        async with s.post(url, json=RPC, headers=auth) as r:
+            assert r.status == 200 and "error" not in await r.json()
+        # a wipe by session id clears a tombstone too
+        _push(table, vendor, expires_in=0, value="-", kind="no_value")
+        table.wipe({"session_id": "s-1"})
+        assert table.revoked(gw.token_hash_of(BEARER), "vendor") is None
+    assert len(vendor.requests) == 1
+
+
+def test_the_tombstones_are_bounded():
+    t = gw.GatewayTable()
+    for i in range(gw._TOMBSTONES_MAX + 5):
+        t.push({"session_id": "s", "token_hash": f"h{i}", "mcp": "m", "header": "A", "value": "-",
+                "expires_in": 0, "upstream": "https://x.example/mcp"})
+    assert t.revoked("h0", "m") is None and t.revoked(f"h{gw._TOMBSTONES_MAX + 4}", "m")
 
 
 @pytest.mark.asyncio

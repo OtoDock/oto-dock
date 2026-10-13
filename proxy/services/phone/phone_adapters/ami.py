@@ -30,7 +30,7 @@ import uuid
 
 from .base import PhoneAdapterError
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _CONNECT_TIMEOUT = 10.0
 _READ_TIMEOUT = 10.0

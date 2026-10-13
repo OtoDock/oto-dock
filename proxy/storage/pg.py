@@ -31,13 +31,15 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import FrameType
+from typing import cast
 
 import psycopg
 import psycopg_pool
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
-logger = logging.getLogger("claude-proxy.db")
+logger = logging.getLogger("otodock.db")
 
 _pool: psycopg_pool.ConnectionPool | None = None
 _lane_pool: psycopg_pool.ConnectionPool | None = None
@@ -97,7 +99,7 @@ def connection_kwargs(conninfo: str, *, loop: bool = False) -> dict:
         if loop:
             flags.append(f"-c lock_timeout={_LOOP_LOCK_TIMEOUT_MS}")
         if params.get("options"):
-            flags.append(params["options"])
+            flags.append(str(params["options"]))
         kwargs["options"] = " ".join(flags)
     if "connect_timeout" not in params:
         kwargs["connect_timeout"] = _CONNECT_TIMEOUT_S
@@ -269,7 +271,10 @@ class _Liveness:
         self._kwargs = {**kwargs, "autocommit": True}
         self._kwargs.pop("row_factory", None)
         self._kwargs["connect_timeout"] = max(2, int(deadline_s + 0.999))
-        self._conn_class = type("_Sentinel", (_SentinelConnection,), {"deadline_s": deadline_s})
+        self._conn_class = cast(
+            type[_SentinelConnection],
+            type("_Sentinel", (_SentinelConnection,), {"deadline_s": deadline_s}),
+        )
         self._conn: psycopg.Connection | None = None
         self._lock = threading.Lock()
         self._conn_lock = threading.Lock()
@@ -480,7 +485,8 @@ class LoopPool:
         and the next is tried, before the caller's work has run."""
         while True:
             try:
-                conn = pool.getconn(timeout=max(0.0, deadline - time.monotonic()))
+                conn = cast(_LoopConnection,
+                            pool.getconn(timeout=max(0.0, deadline - time.monotonic())))
             except (psycopg_pool.PoolTimeout, psycopg_pool.PoolClosed) as e:
                 self._trip(f"no connection within {self.acquire_timeout:.1f}s", slow=True)
                 raise DatabaseUnavailable(f"database unavailable ({e})") from e
@@ -821,7 +827,7 @@ def loop_guard_hits() -> dict[tuple[str, int, str], int]:
 
 
 def _caller_outside_storage() -> tuple[str, int, str]:
-    frame = sys._getframe(2)
+    frame: FrameType | None = sys._getframe(2)
     while frame is not None:
         fname = frame.f_code.co_filename
         if (os.sep + "storage" + os.sep not in fname and "storage/pg.py" not in fname

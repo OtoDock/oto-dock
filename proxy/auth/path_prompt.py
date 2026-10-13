@@ -1121,10 +1121,14 @@ def build_permission_context(
         perm_lines.append(
             "- Always blocked (every role, every environment): only "
             "catastrophic, irreversible commands — `rm -rf /` or `~`, fork "
-            "bombs, writes to raw devices / `/proc` / `/sys`, kernel-module "
-            "ops, reading `/etc/shadow` (and the PowerShell "
+            "bombs, writes to raw devices, a write to `/proc/sysrq-trigger` "
+            "or `/sys/power/state`, reading `/etc/shadow` (and the PowerShell "
             "equivalents: `Format-Volume`, `Clear-Disk`, recursive-force "
-            "delete of a drive root). Nothing else is hard-blocked.\n"
+            "delete of a drive root). Other writes to `/proc` / `/sys` and "
+            "kernel-module ops are blocked too, except over `ssh` and, for "
+            "editors and up, on a machine paired with full filesystem "
+            "access, where they ask for approval instead. Nothing else is "
+            "hard-blocked.\n"
         )
         perm_lines.append(
             "- Other commands run by tier: common read-only commands run "

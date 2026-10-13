@@ -385,6 +385,18 @@ class TestAgentScopedTask:
         path = _resolve("personal-assistant/users/alice/workspace/file.txt")
         assert not _check_write_path(path, self.ctx).allowed
 
+    @pytest.mark.parametrize("role,allowed", [
+        ("viewer", False), ("contributor", True), ("editor", True),
+        ("manager", True), ("not-a-role", False),
+    ])
+    def test_workspace_writes_follow_the_mount(self, role, allowed):
+        """A person's own task on a Shared-only agent runs agent-scoped with
+        that person's role: below the workspace tier the sandbox mounts the
+        workspace read-only, and a Docker MCP write or an MCP result file
+        is refused the same way."""
+        path = _resolve("personal-assistant/workspace/out.md")
+        assert _check_write_path(path, _ctx(role, "")).allowed is allowed
+
 
 # ===== Agent-scoped task on admin agent =====
 

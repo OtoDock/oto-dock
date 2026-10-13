@@ -42,7 +42,7 @@ from storage.agents import agent_store
 from storage import database as task_store
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.media")
+logger = logging.getLogger("otodock.media")
 router = APIRouter()
 
 # Workspace-minted tokens self-expire (reaped by the TTL sweep). Chat-display

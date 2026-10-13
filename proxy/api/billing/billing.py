@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends
 
 from auth.providers import get_current_user, require_auth, UserContext, require_user
 
-logger = logging.getLogger("claude-proxy.billing")
+logger = logging.getLogger("otodock.billing")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 

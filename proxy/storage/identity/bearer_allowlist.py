@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 from storage.pg import get_conn
 
-logger = logging.getLogger("claude-proxy.bearer-allowlist")
+logger = logging.getLogger("otodock.bearer-allowlist")
 
 
 def _now() -> str:

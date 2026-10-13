@@ -44,13 +44,16 @@ import config
 from auth.lan_check import auth_bucket_key, check_local_auth_allowed
 from auth.providers import UserContext, get_current_user, mask_email, require_auth
 from auth.rate_limiter import hit as rate_limit_hit
-from auth.totp import consume_2fa_session_token, validate_2fa_session_token
+from auth.totp import (
+    StepTokenBusy, release_2fa_session_token, reserve_2fa_session_token,
+    spend_2fa_session_token, validate_2fa_session_token,
+)
 from storage import database as task_store
 from storage.identity import webauthn_store
 
 from api.auth._router import router
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _RP_NAME = "OtoDock"
 
@@ -496,77 +499,90 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
         # the handoff binding): nothing to bind the sign-in to.
         raise HTTPException(400, "Go back to the app and start the sign-in again")
 
-    # 2FA-step flow: validate (not yet consume) the step token; in
+    # 2FA-step flow: the step token is this request's until it is spent (the
+    # assertion verified) or given back (any other exit), so two requests
+    # carrying it cannot both sign in; taken before the challenge is popped,
+    # so a refused second request leaves the ceremony intact. In
     # second_factor mode a bare passwordless verify is refused server-side —
     # the mode must not be merely cosmetic.
-    step_sub = ""
+    step = None
     if req.totp_session_token:
-        step_sub = validate_2fa_session_token(req.totp_session_token) or ""
-        if not step_sub:
+        try:
+            step = reserve_2fa_session_token(req.totp_session_token)
+        except StepTokenBusy:
+            raise HTTPException(409, "This sign-in is already being completed")
+        if step is None:
             raise HTTPException(401, "2FA session expired. Please log in again.")
-    mode = await asyncio.to_thread(passkey_login_mode)
-    if mode == "second_factor" and not step_sub:
-        raise HTTPException(400, "Passkey sign-in requires your password first")
-
-    popped = _pop_challenge(req.state)
-    if not popped:
-        raise HTTPException(401, "Sign-in challenge expired — try again")
-
-    credential_id = req.credential.get("id") or ""
-    cred = await asyncio.to_thread(webauthn_store.get_credential, credential_id)
-    if not cred:
-        raise HTTPException(401, "Unknown passkey")
-    # Challenge- and token-bound identity: a step-scoped ceremony may only
-    # complete with a credential of that same user.
-    if popped[1] and cred["user_sub"] != popped[1]:
-        raise HTTPException(401, "Unknown passkey")
-    if step_sub and cred["user_sub"] != step_sub:
-        raise HTTPException(401, "Unknown passkey")
-
-    user_row = await asyncio.to_thread(task_store.get_user, cred["user_sub"])
-    if not user_row:
-        raise HTTPException(401, "Unknown passkey")
-
+    step_sub = step.sub if step is not None else ""
+    spent = False
     try:
-        verification = verify_authentication_response(
-            credential=req.credential,
-            expected_challenge=popped[0],
-            expected_rp_id=_rp_id(),
-            expected_origin=_expected_origin(),
-            credential_public_key=base64url_to_bytes(cred["public_key"]),
-            credential_current_sign_count=cred["sign_count"],
-            # Passwordless login must always be ≥2 factors: possession + the
-            # on-device biometric/PIN. Enforced for the 2FA step too.
-            require_user_verification=True,
+        mode = await asyncio.to_thread(passkey_login_mode)
+        if mode == "second_factor" and not step_sub:
+            raise HTTPException(400, "Passkey sign-in requires your password first")
+
+        popped = _pop_challenge(req.state)
+        if not popped:
+            raise HTTPException(401, "Sign-in challenge expired — try again")
+
+        credential_id = req.credential.get("id") or ""
+        cred = await asyncio.to_thread(webauthn_store.get_credential, credential_id)
+        if not cred:
+            raise HTTPException(401, "Unknown passkey")
+        # Challenge- and token-bound identity: a step-scoped ceremony may only
+        # complete with a credential of that same user.
+        if popped[1] and cred["user_sub"] != popped[1]:
+            raise HTTPException(401, "Unknown passkey")
+        if step_sub and cred["user_sub"] != step_sub:
+            raise HTTPException(401, "Unknown passkey")
+
+        user_row = await asyncio.to_thread(task_store.get_user, cred["user_sub"])
+        if not user_row:
+            raise HTTPException(401, "Unknown passkey")
+
+        try:
+            verification = verify_authentication_response(
+                credential=req.credential,
+                expected_challenge=popped[0],
+                expected_rp_id=_rp_id(),
+                expected_origin=_expected_origin(),
+                credential_public_key=base64url_to_bytes(cred["public_key"]),
+                credential_current_sign_count=cred["sign_count"],
+                # Passwordless login must always be ≥2 factors: possession + the
+                # on-device biometric/PIN. Enforced for the 2FA step too.
+                require_user_verification=True,
+            )
+        except WebAuthnException as e:
+            logger.info(f"Passkey login rejected for credential {credential_id[:12]}…: {e}")
+            raise HTTPException(401, "Passkey could not be verified")
+        # The LAN restriction is judged only after the assertion verifies, as the
+        # password login judges it after the password: before, a caller holding
+        # a credential id alone would learn which accounts are local_only.
+        if not check_local_auth_allowed(request, user_row):
+            raise HTTPException(403, "This account can only be accessed from the local network")
+
+        await asyncio.to_thread(
+            webauthn_store.record_use, credential_id, verification.new_sign_count,
         )
-    except WebAuthnException as e:
-        logger.info(f"Passkey login rejected for credential {credential_id[:12]}…: {e}")
-        raise HTTPException(401, "Passkey could not be verified")
-    # The LAN restriction is judged only after the assertion verifies, as the
-    # password login judges it after the password: before, a caller holding
-    # a credential id alone would learn which accounts are local_only.
-    if not check_local_auth_allowed(request, user_row):
-        raise HTTPException(403, "This account can only be accessed from the local network")
+        if step is not None:
+            # The factor is accepted: the step token never opens another session.
+            spend_2fa_session_token(step)
+            spent = True
 
-    await asyncio.to_thread(
-        webauthn_store.record_use, credential_id, verification.new_sign_count,
-    )
-    if req.totp_session_token:
-        # Spend the step token only on SUCCESS (typos stay retryable).
-        consume_2fa_session_token(req.totp_session_token)
+        # Native app: the SYSTEM browser ran this ceremony — don't log the browser
+        # in; hand back a one-time token the app's webview exchanges for ITS cookie.
+        if req.native:
+            token = _mint_native_token(user_row["sub"], req.handoff)
+            logger.info(f"Passkey native handoff minted for {mask_email(user_row['email'])}")
+            return {"status": "ok", "native_token": token}
 
-    # Native app: the SYSTEM browser ran this ceremony — don't log the browser
-    # in; hand back a one-time token the app's webview exchanges for ITS cookie.
-    if req.native:
-        token = _mint_native_token(user_row["sub"], req.handoff)
-        logger.info(f"Passkey native handoff minted for {mask_email(user_row['email'])}")
-        return {"status": "ok", "native_token": token}
-
-    # A verified passkey is multi-factor by construction — no TOTP step.
-    from api.auth.identity import _login_response
-    response = await _login_response(user_row, "local")
-    logger.info(f"Passkey login: {mask_email(user_row['email'])} role={user_row['role']}")
-    return response
+        # A verified passkey is multi-factor by construction — no TOTP step.
+        from api.auth.identity import _login_response
+        response = await _login_response(user_row, "local")
+        logger.info(f"Passkey login: {mask_email(user_row['email'])} role={user_row['role']}")
+        return response
+    finally:
+        if step is not None and not spent:
+            release_2fa_session_token(step)
 
 
 _HANDOFF_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")

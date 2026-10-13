@@ -34,11 +34,12 @@ from fastapi import HTTPException
 
 import config
 from services.infra import path_confinement
+from services.mcp import manifest_floor
 from services.mcp import mcp_manifest_parse as _mmp
 from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_registry, mcp_installer
 
-logger = logging.getLogger("claude-proxy.community-installer")
+logger = logging.getLogger("otodock.community-installer")
 
 # GitHub tarball endpoint. Follows a 302 to a codeload CDN URL — httpx
 # follows redirects by default. The whole repo is ~50KB right now; even at
@@ -246,6 +247,19 @@ def _git_identity(source: str) -> str | None:
         return None
     subdir = subdirs[0].strip("/") if subdirs else ""
     return f"{parts.scheme.lower()}://{host}{path}#{subdir}"
+
+
+_GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def git_ref_is_commit(source) -> bool:
+    """Whether a ``git+`` source pins a full commit (the ref after the last
+    ``@`` before ``#``, 40 lowercase hex). A tag or a branch can be moved
+    upstream without any change in the catalog; a commit cannot."""
+    if not isinstance(source, str) or not source.startswith("git+"):
+        return False
+    parsed = mcp_installer.parse_source(source)
+    return parsed is not None and bool(_GIT_COMMIT_RE.fullmatch(parsed.version))
 
 
 def source_identity(*, runtime, source, image, url_template) -> tuple[str, str]:
@@ -663,6 +677,12 @@ def check_package(mcp_root: Path, *, skipped: list[str] | tuple[str, ...] = ()) 
             errors.append("version must be set for a docker MCP (the image tag)")
     if source.startswith("git+") and not str(data.get("version") or ""):
         errors.append("version must be set for a git+ source (the pinned ref)")
+    if source.startswith("git+") and not git_ref_is_commit(source):
+        warnings.append(
+            "server.source pins a tag or a branch: the community catalog takes a git+ "
+            "source only at a full 40-character commit (a tag can move upstream), "
+            "while an admin may still install this package from a ZIP",
+        )
     if rt is not None and rt.installed and source and not source.startswith("git+"):
         parsed = mcp_installer.parse_source(source)
         if parsed is not None and parsed.version:
@@ -711,6 +731,22 @@ def check_package(mcp_root: Path, *, skipped: list[str] | tuple[str, ...] = ()) 
         except HTTPException as exc:
             errors.append(str(exc.detail))
 
+    floor, floor_reasons = "", []
+    try:
+        schema = manifest_floor.load_schema()
+        floor, floor_reasons = manifest_floor.platform_floor(data, schema)
+        for problem in manifest_floor.schema_errors(data, schema):
+            # The git+ ref has its own, plainer warning above.
+            if not (problem.startswith("/server/source:") and source.startswith("git+")):
+                warnings.append(f"catalog schema: {problem}")
+    except (OSError, ValueError, ImportError) as exc:
+        warnings.append(f"the catalog schema could not be read ({exc}): fields not checked against it")
+    if floor and manifest_floor.version_key(manifest_floor.declared_floor(data)) < manifest_floor.version_key(floor):
+        warnings.append(
+            f"platform_min_version should be at least {floor}: older platforms refuse or "
+            f"ignore {', '.join(floor_reasons)}",
+        )
+
     skills = [sk.get("id") for sk in skills if isinstance(sk, dict)]
     creds = data.get("credentials") if isinstance(data.get("credentials"), dict) else {}
     summary = {
@@ -723,6 +759,7 @@ def check_package(mcp_root: Path, *, skipped: list[str] | tuple[str, ...] = ()) 
         "skills": [s for s in skills if isinstance(s, str)],
         "host": urlsplit(str(server.get("url_template") or "")).hostname or "" if remote else "",
         "files": sum(1 for p in mcp_root.rglob("*") if p.is_file()),
+        "platform_floor": floor,
     }
     return {"ok": not errors, "errors": errors, "warnings": warnings, "summary": summary}
 
@@ -734,6 +771,7 @@ def check_package(mcp_root: Path, *, skipped: list[str] | tuple[str, ...] = ()) 
 async def install_from_extracted_folder(
     mcp_root: Path, *, progress_cb: ProgressCb = None, install_version: str | None = None,
     accepted_source: tuple[str, str] | None = None, accepted_manifest_hash: str = "",
+    from_catalog: bool = False,
 ) -> dict:
     """Install or update an MCP from an already-extracted folder.
 
@@ -762,6 +800,10 @@ async def install_from_extracted_folder(
     any file moves. A switch drops ``node_modules`` and ``venv`` after the
     backup and stops a container the incoming runtime no longer has.
 
+    ``from_catalog`` (the catalog install, ``install_from_catalog``) adds the
+    catalog's rule: a ``git+`` source pins a full commit (an admin's own ZIP
+    may pin a tag or a branch; it is their code by their choice).
+
     Raises ``HTTPException`` on validation or install failure. Returns a
     dict matching the existing zip-upload endpoint's response shape so the
     frontend can reuse its install-result UI, plus ``container_started``
@@ -770,6 +812,14 @@ async def install_from_extracted_folder(
     manifest_data = await asyncio.to_thread(_check_incoming_tree, mcp_root)
 
     errors = _validate_manifest(manifest_data)
+    incoming_source = (manifest_data.get("server") or {}).get("source") \
+        if isinstance(manifest_data.get("server"), dict) else ""
+    if from_catalog and isinstance(incoming_source, str) and incoming_source.startswith("git+") \
+            and not git_ref_is_commit(incoming_source):
+        errors.append(
+            "a catalog git+ source must pin a full 40-character commit (a tag or a "
+            "branch can move upstream without the catalog changing)",
+        )
     if errors:
         raise HTTPException(400, f"Invalid manifest: {'; '.join(errors)}")
     # The lexical rule passed above; the file must also exist inside THIS
@@ -927,7 +977,7 @@ async def install_from_extracted_folder(
             effective_source = source
             if parsed and parsed.registry in ("npm", "pypi"):
                 if install_version:
-                    effective_source = f"{parsed.registry}:{parsed.package}@{install_version}"
+                    effective_source = parsed.pinned(install_version)
                 elif not parsed.version:
                     constraint = manifest_data["server"].get("version_constraint", "") or ""
                     if constraint:
@@ -946,7 +996,7 @@ async def install_from_extracted_folder(
                                 f"'{parsed.package}' satisfies the catalog version "
                                 f"constraint {constraint!r}.",
                             )
-                        effective_source = f"{parsed.registry}:{parsed.package}@{target}"
+                        effective_source = parsed.pinned(target)
 
             # Map mcp_installer's intra-step pct (npm/venv/pip, 0-100) into the job's
             # 20-80 "installing dependencies" band. A no-op for docker — install_mcp
@@ -959,12 +1009,17 @@ async def install_from_extracted_folder(
                     ev.get("message") or ev.get("phase") or "Installing dependencies",
                 )
             try:
+                # The venv runs on the proxy's own minor, on an interpreter
+                # the session sandbox binds.
+                from services.mcp import mcp_venv_bootstrap
                 result = await mcp_installer.install_mcp(
                     target_dir, runtime, effective_source,
                     progress_cb=_install_progress,
-                    uv_bin=_uv_bin_if_present(),
+                    uv_bin=mcp_venv_bootstrap.find_uv(),
                     timeout=_INSTALL_TIMEOUT_SECONDS,
                     source_build=list(manifest_data["server"].get("source_build") or []),
+                    python_spec=mcp_venv_bootstrap.proxy_python_spec(),
+                    sandbox_roots=mcp_venv_bootstrap.sandbox_interpreter_roots(target_dir),
                 )
                 install_ok, install_log = result.ok, result.log
                 resolved_version = result.resolved_version
@@ -1004,6 +1059,7 @@ async def install_from_extracted_folder(
             await asyncio.to_thread(
                 mcp_updater.pin_local_manifest,
                 target_dir, parsed.registry, parsed.package, resolved_version,
+                extras=parsed.extras,
             )
             version = resolved_version
         except Exception as exc:
@@ -1118,13 +1174,6 @@ async def install_from_extracted_folder(
     }
 
 
-def _uv_bin_if_present() -> str | None:
-    """Return path to ``uv`` if present, else ``None``."""
-    import os
-    uv = os.path.expanduser("~/.local/bin/uv")
-    return uv if os.path.isfile(uv) else None
-
-
 def _existing_enabled_state(mcp_name: str) -> bool | None:
     """Return the current ``mcp_state.enabled`` for an MCP, or ``None`` if no row exists."""
     from storage.mcp import mcp_store
@@ -1196,6 +1245,7 @@ async def install_from_catalog(
             mcp_root, progress_cb=progress_cb, install_version=install_version,
             accepted_source=accepted_source,
             accepted_manifest_hash=accepted_manifest_hash,
+            from_catalog=True,
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -25,7 +25,8 @@ improvising.
 3. **Write the folder** somewhere you can write: `/workspace/<something>/` for
    a shared agent, or your own `/users/<you>/workspace/<something>/`. On a
    remote machine it must be inside the synced workspace, otherwise the
-   platform cannot read it. The platform copies the folder before reading
+   platform cannot read it; the check reads it from the machine, so you can
+   validate in the same turn you wrote it. The platform copies the folder before reading
    it: at most 300 files, 1 MB a file, 20 MB in all; dotfiles,
    `node_modules` and an app's `data/` are left out, a symlink is refused.
 4. **`validate_agent_template`** — fix what it reports, repeat until clean.

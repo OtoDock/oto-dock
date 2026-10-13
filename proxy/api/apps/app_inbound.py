@@ -34,7 +34,7 @@ from storage import db_app_deliveries as deliveries
 from storage import db_app_secrets
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 

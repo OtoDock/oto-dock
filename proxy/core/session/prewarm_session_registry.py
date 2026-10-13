@@ -20,7 +20,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-logger = logging.getLogger("claude-proxy.prewarm")
+logger = logging.getLogger("otodock.prewarm")
 
 # How long an unclaimed pre-warm may live before the reaper closes it. Short — the
 # whole point is to release the slot quickly when a user pre-warms then doesn't send.
@@ -41,13 +41,18 @@ _entries: dict[str, _Entry] = {}
 _lock = asyncio.Lock()
 
 
-async def register(session_id: str, *, agent: str, user_sub: str = "",
-                   role: str = "manager", exec_path: str = "",
-                   model: str = "") -> None:
-    """Record a freshly pre-warmed (not-yet-claimed) session as reapable."""
+async def register(session_id: str, *, agent: str, role: str, user_sub: str = "",
+                   exec_path: str = "", model: str = "") -> None:
+    """Record a freshly pre-warmed (not-yet-claimed) session as reapable.
+
+    ``role`` is the per-agent role the session was built with: a claim key
+    and the offboarding closer's demotion test, so a missing one is refused
+    rather than guessed (no guess is safe for both)."""
+    if not role:
+        raise ValueError("a pre-warm is registered with the role it was built with")
     async with _lock:
         _entries[session_id] = _Entry(
-            agent=agent, user_sub=user_sub, role=role or "manager",
+            agent=agent, user_sub=user_sub, role=role,
             exec_path=exec_path, ts=time.monotonic(), model=model,
         )
 
@@ -66,11 +71,14 @@ async def claim_by_key(*, user_sub: str, agent: str, model: str,
     for DETACHED pre-warms (wake-word detection fires an HTTP pre-warm with no
     WS connection to remember the sid on). Returns ``(session_id, age_s)`` or
     None. Model is part of the key because CLI sessions spawn with ``--model``
-    and can't swap; role because the SecurityContext is baked at start."""
+    and can't swap; role because the SecurityContext is baked at start. An
+    empty role matches nothing."""
+    if not role:
+        return None
     async with _lock:
         for sid, e in _entries.items():
             if (e.user_sub == user_sub and e.agent == agent
-                    and e.model == model and e.role == (role or "manager")
+                    and e.model == model and e.role == role
                     and e.exec_path == exec_path):
                 _entries.pop(sid, None)
                 return sid, time.monotonic() - e.ts
@@ -96,21 +104,17 @@ async def reap_stale(ttl: float = PREWARM_TTL_S) -> int:
     reaped = 0
     for sid, e in stale:  # close OUTSIDE the lock (async, and these are ours alone)
         try:
-            from core.session.session_manager import find_layer_for_session
+            from core.session.session_manager import layer_for_prewarm
             # The entry is already popped under the lock above, so the only
-            # thing left is the close — and the registry knows which layer
-            # holds the session. No agent row, no machine row, no platform
-            # settings: the old path resolved all three off the event loop
-            # just to arrive at the layer that was already holding it, and
-            # would strand the slot + subscription seat if that resolution
-            # ever failed (a deleted agent, a retired engine id).
-            layer = find_layer_for_session(sid)
+            # thing left is the close, on the layer holding the session or
+            # the pre-warm's own engine. No agent row, no machine row, no
+            # platform settings: resolving those would strand the slot and
+            # the subscription seat whenever it failed (a deleted agent).
+            layer = layer_for_prewarm(sid, e.exec_path)
             if layer is None:
-                # Spawn failed or something already closed it — nothing to
-                # release, and the entry is gone either way.
                 logger.info(
-                    "prewarm: %s (agent=%s) is in no layer registry — "
-                    "nothing to close", sid[:8], e.agent,
+                    "prewarm: %s (agent=%s) has no layer to close on",
+                    sid[:8], e.agent,
                 )
                 continue
             await layer.close_session(sid)

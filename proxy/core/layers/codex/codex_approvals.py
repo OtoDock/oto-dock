@@ -227,7 +227,7 @@ def build_response(method: str, params: dict, allow: bool) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 # Sandbox / approval policy — shared by the local layer and the satellite
 # (both must build the structured per-turn sandboxPolicy + derive the approval
-# policy from the resolved SandboxMode).
+# policy from the platform mode and the resolved SandboxMode).
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -237,31 +237,51 @@ def build_response(method: str, params: dict, allow: bool) -> dict:
 # ``thread/resume`` and ``turn/start`` (its integration tests send it at
 # 0.153.4 and 0.154.0) but retired from config files and the CLI flag in
 # 0.149 — so a session that sends it must be ready for a rejection and fall
-# back (``UNTRUSTED_FALLBACK``); the bump checklist probes it.
+# back (``untrusted_fallback``); the bump checklist probes it.
 UNTRUSTED_POLICY = "untrusted"
 UNTRUSTED_FALLBACK = "on-request"
 
+#: The platform modes in which nothing asks a person. An attended chat runs
+#: them under ``never``: the bridge never fires and its PreToolUse hook judges
+#: every call (HOOKS.md "Attended Codex chats").
+NO_PROMPT_MODES = frozenset({"dontAsk", "auto"})
 
-def approval_for_sandbox(sandbox_mode: str, attended: bool = False) -> str:
-    """Derive the Codex ``approvalPolicy`` from the resolved ``SandboxMode``.
 
-    ``danger-full-access`` (dontAsk/auto) → ``"never"``: nothing asks.
-    ``read-only`` and ``workspace-write`` → ``"on-request"`` by default, so a
+def approval_for_sandbox(sandbox_mode: str) -> str:
+    """The ``approvalPolicy`` of a session nobody answers through the bridge
+    (an unattended app-server session, the interactive TUI), from the
+    resolved ``SandboxMode``.
+
+    ``danger-full-access`` → ``"never"``: nothing asks, the PreToolUse hook is
+    the gate. ``read-only`` and ``workspace-write`` → ``"on-request"``, so a
     sandbox escape, an MCP call and Codex's own dangerous-command heuristics
     fire an approval we route through ``decide_tool_permission``.
-
-    ``attended=True`` (a dashboard app-server chat — a person can answer) →
-    ``"untrusted"``: every shell command Codex's trusted list does not cover
-    and every patch become an approval request, so the bridge decides each
-    one exactly as Claude's PreToolUse hook is decided — the read tier runs,
-    edits run in acceptEdits and ask in default, destructive commands ask in
-    both (HOOKS.md "Attended Codex chats"). Under ``on-request`` Codex ran an
-    in-workspace ``rm`` without asking anyone. The interactive TUI keeps
-    ``on-request`` (its native prompt is the person's).
     """
-    if sandbox_mode == "danger-full-access":
-        return "never"
-    return UNTRUSTED_POLICY if attended else "on-request"
+    return "never" if sandbox_mode == "danger-full-access" else "on-request"
+
+
+def approval_policy(permission_mode: str, sandbox_mode: str, *, attended: bool) -> str:
+    """The ``approvalPolicy`` of an app-server session.
+
+    Attended (a dashboard chat — a person answers the bridge): the platform
+    MODE decides, not the sandbox. ``dontAsk`` / ``auto`` → ``"never"``: the
+    bridge never fires and the hook judges every call. Every other mode →
+    ``"untrusted"``: every shell command Codex's trusted list does not cover
+    and every patch become an approval request, so the bridge decides each one
+    exactly as Claude's PreToolUse hook is decided — the read tier runs, edits
+    run in acceptEdits and ask in default, destructive commands ask in both.
+    A machine paired with full access runs default and acceptEdits under
+    ``danger-full-access`` and still asks. An empty ``permission_mode`` (a
+    proxy that ships none) reads the sandbox as before: ``never`` under
+    ``danger-full-access``.
+
+    Unattended: ``approval_for_sandbox``.
+    """
+    if not attended:
+        return approval_for_sandbox(sandbox_mode)
+    if permission_mode:
+        return "never" if permission_mode in NO_PROMPT_MODES else UNTRUSTED_POLICY
+    return "never" if sandbox_mode == "danger-full-access" else UNTRUSTED_POLICY
 
 
 def is_untrusted_policy_rejection(error: Exception | str) -> bool:
@@ -270,6 +290,19 @@ def is_untrusted_policy_rejection(error: Exception | str) -> bool:
     wire value as it retired the config key.)"""
     text = str(error).lower()
     return "untrusted" in text or "unlesstrusted" in text or "approvalpolicy" in text
+
+
+def untrusted_fallback(sandbox_mode: str) -> str:
+    """The policy an attended chat runs once the daemon refused ``untrusted``.
+
+    ``on-request`` (a sandbox escape, an MCP call and Codex's own heuristics
+    still reach the bridge), except under ``danger-full-access`` (a machine
+    paired with full access, default or acceptEdits), where no command leaves
+    a sandbox and ``on-request`` would let every one run with no judge:
+    ``never`` there, so the PreToolUse hook judges every call with the
+    session's stored mode and raises the person's cards itself.
+    """
+    return "never" if sandbox_mode == "danger-full-access" else UNTRUSTED_FALLBACK
 
 
 def build_sandbox_policy(sandbox_mode: str, writable_root: str = "") -> dict:

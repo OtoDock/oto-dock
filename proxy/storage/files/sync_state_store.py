@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 from storage.pg import get_conn
 
-logger = logging.getLogger("claude-proxy.sync-state")
+logger = logging.getLogger("otodock.sync-state")
 
 
 def _now_iso() -> str:

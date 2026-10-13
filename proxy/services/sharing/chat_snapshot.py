@@ -32,7 +32,7 @@ from storage import database as task_store
 from ws import wire_events as wire
 from core import layout
 
-logger = logging.getLogger("claude-proxy.shares")
+logger = logging.getLogger("otodock.shares")
 
 SNAPSHOT_DIRNAME = "shares"
 MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024

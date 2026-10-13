@@ -77,7 +77,7 @@ from core.config import deployment
 from services.mcp import mcp_manifest_parse as _mmp
 from services.mcp import mcp_manifest_types as _mt
 
-logger = logging.getLogger("claude-proxy.compose-rewrite")
+logger = logging.getLogger("otodock.compose-rewrite")
 
 # The in-compose key for the platform's shared network. Mapped to the real
 # (external) network name via ``{external: true, name: <OTODOCK_NETWORK>}``.
@@ -191,13 +191,13 @@ def _reject_reserved_name(kind: str, value: object, mcp_name: str) -> None:
 
 # Named volumes the platform compose owns that no community MCP may mount:
 # attaching one hands the sidecar the Postgres unix socket (which the image
-# trusts: an instant superuser), the raw heap files, the SSH keys or the session
-# state. The agents volume is the one legitimate reach (the ``${HOST_AGENTS_DIR}``
+# trusts: an instant superuser), the raw heap files, the SSH keys, the session
+# state or the recover bin (every person's deleted files). The agents volume is the one legitimate reach (the ``${HOST_AGENTS_DIR}``
 # contract maps onto it, and a healed pull-form file names it directly), so it
 # is not listed. Case-insensitive, like the service names.
 _PLATFORM_VOLUMES = frozenset({
     "otodock-pgdata", "otodock-pgsock", "otodock-mcps", "otodock-skills",
-    "otodock-ssh-keys", "otodock-sessions",
+    "otodock-ssh-keys", "otodock-sessions", "otodock-recover-bin",
 })
 
 

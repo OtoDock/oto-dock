@@ -79,8 +79,10 @@ def test_ollama_inherits_openai_format():
 
 # --- reasoning-effort gating (adaptive thinking only on reasoning models) -----
 # Regression: the Anthropic adapter must NOT send `thinking`/`output_config` for a
-# non-reasoning model (e.g. Haiku 4.5), or the API 400s with "adaptive thinking is
-# not supported on this model". Mirrors the OpenAI adapter's supports_reasoning gate.
+# non-reasoning model (Haiku 4.5, a custom row without the flag), or the API 400s
+# with "adaptive thinking is not supported on this model". Mirrors the OpenAI
+# adapter's supports_reasoning gate. Every current Anthropic builtin thinks, so
+# the non-reasoning case is a registry-less id the flag lookup answers False for.
 
 from core.layers.providers import anthropic_adapter
 from core.layers.providers.anthropic_adapter import AnthropicAdapter, _with_history_breakpoint
@@ -145,6 +147,8 @@ def _capture_stream_kwargs(monkeypatch, model, effort):
 
 
 def test_anthropic_non_reasoning_model_drops_thinking(monkeypatch):
+    monkeypatch.setattr(anthropic_adapter.app_config, "model_supports_reasoning",
+                        lambda model: model != "claude-haiku-4-5")
     kw = _capture_stream_kwargs(monkeypatch, "claude-haiku-4-5", "high")
     assert "thinking" not in kw
     assert "output_config" not in kw
@@ -198,10 +202,17 @@ def test_openai_usage_cost_matches_openai_bill_gpt56():
     # 2.50 write = 1.25x, 0.20 read = 0.1x — the 2026-07-30 cut) — the
     # decomposed row must price to exactly what OpenAI bills.
     u = OpenAIAdapter._decompose_usage(
+        _usage(100_000, 10_000, cached=60_000, written=30_000))
+    cost = OpenAIAdapter().calculate_cost("gpt-5.6-terra", u)
+    #   10k plain * 2.00 + 30k written * 2.50 + 60k read * 0.20 + 10k out * 12
+    assert abs(cost - (0.02 + 0.075 + 0.012 + 0.12)) < 1e-9
+    # A 1M-token prompt is past OpenAI's 272K line: the whole request bills at
+    # 2x input (cache reads and writes with it) and 1.5x output.
+    u = OpenAIAdapter._decompose_usage(
         _usage(1_000_000, 100_000, cached=600_000, written=300_000))
     cost = OpenAIAdapter().calculate_cost("gpt-5.6-terra", u)
-    #   100k plain * 2.00 + 300k written * 2.50 + 600k read * 0.20 + 100k out * 12
-    assert abs(cost - (0.20 + 0.75 + 0.12 + 1.2)) < 1e-9
+    #   100k plain * 4.00 + 300k written * 5.00 + 600k read * 0.40 + 100k out * 18
+    assert abs(cost - (0.40 + 1.50 + 0.24 + 1.80)) < 1e-9
 
 
 # ---------------------------------------------------------------------------

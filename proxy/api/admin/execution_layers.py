@@ -489,6 +489,29 @@ def _local_group_view(group: str, user: UserContext) -> dict:
     return _annotate_local_group(_local_group(group), user)
 
 
+def _own_endpoint_conflict(groups: list[dict], owner_sub: str, provider: str,
+                           layers: list[str], *, other_than: str = "") -> str:
+    """The refusal when the caller already holds an endpoint of ``provider``
+    on one of ``layers``: the credential key is one row per (engine,
+    provider, auth type, owner), so a second server of one provider on one
+    engine needs the first removed. Only the caller's own rows can collide
+    (the owner is part of the key), so the message names nobody else's."""
+    for g in groups:
+        if g["provider"] != provider or g["group"] == other_than:
+            continue
+        for layer in layers:
+            eng = g["engines"].get(layer)
+            if eng is not None and eng.get("owner_sub") == owner_sub:
+                return (
+                    f"You already connected {g['endpoint_url']} for this provider on "
+                    f"{layer}: one endpoint per provider and engine, remove that one first"
+                )
+    return ""
+
+
+_RACED_MSG = "An endpoint for this provider was just connected on that engine: reload the list"
+
+
 async def _local_endpoint_changed(layers) -> None:
     subscription_pool.schedule_rebind("local endpoint change")
     await _subscriptions_changed(*layers)
@@ -531,19 +554,30 @@ async def admin_add_local_endpoint(
     if req.api_key:
         cred_data["api_key"] = req.api_key
 
-    def _job() -> bool:
-        if any(g["group"] == key for g in subscription_store.list_local_endpoint_groups()):
-            return False
-        for layer in layers:
-            subscription_store.add_subscription(
-                layer=layer, provider=req.provider, auth_type="local_endpoint",
-                owner_sub=user.sub, use_personal=True, contribute_platform=True,
-                label=req.label, credential_data=cred_data,
-            )
-        return True
+    def _job() -> str:
+        groups = subscription_store.list_local_endpoint_groups()
+        if any(g["group"] == key for g in groups):
+            return "This endpoint is already connected — use its engine checkboxes"
+        conflict = _own_endpoint_conflict(groups, user.sub, req.provider, layers)
+        if conflict:
+            return conflict
+        created: list[str] = []
+        try:
+            for layer in layers:
+                created.append(subscription_store.add_subscription(
+                    layer=layer, provider=req.provider, auth_type="local_endpoint",
+                    owner_sub=user.sub, use_personal=True, contribute_platform=True,
+                    label=req.label, credential_data=cred_data,
+                )["id"])
+        except subscription_store.SubscriptionExists:
+            for sub_id in created:
+                subscription_store.delete_subscription(sub_id)
+            return _RACED_MSG
+        return ""
 
-    if not await run_db(_job):
-        raise HTTPException(409, "This endpoint is already connected — use its engine checkboxes")
+    refusal = await run_db(_job)
+    if refusal:
+        raise HTTPException(409, refusal)
     await _local_endpoint_changed(layers)
     return await run_db(_local_group_view, key, user)
 
@@ -562,25 +596,37 @@ async def admin_set_local_endpoint_engine(
     if req.layer not in _layers_with_auth_type("local_endpoint"):
         raise HTTPException(400, f"Local endpoints cannot serve: {req.layer}")
 
-    def _job() -> None:
+    def _job() -> str:
         g = _local_group(group)
         _require_group_owner(g, user)
         eng = g["engines"].get(req.layer)
         if req.enabled:
             if eng is None:
+                conflict = _own_endpoint_conflict(
+                    subscription_store.list_local_endpoint_groups(), user.sub,
+                    g["provider"], [req.layer], other_than=group,
+                )
+                if conflict:
+                    return conflict
                 sibling = next(iter(g["engines"].values()))
                 cred_data = subscription_store.get_credential_data(sibling["id"])
-                subscription_store.add_subscription(
-                    layer=req.layer, provider=g["provider"], auth_type="local_endpoint",
-                    owner_sub=user.sub, use_personal=True, contribute_platform=True,
-                    label=g["label"], credential_data=cred_data,
-                )
+                try:
+                    subscription_store.add_subscription(
+                        layer=req.layer, provider=g["provider"], auth_type="local_endpoint",
+                        owner_sub=user.sub, use_personal=True, contribute_platform=True,
+                        label=g["label"], credential_data=cred_data,
+                    )
+                except subscription_store.SubscriptionExists:
+                    return _RACED_MSG
             elif eng["status"] != subscription_status.ACTIVE:
                 subscription_store.update_subscription(eng["id"], status=subscription_status.ACTIVE)
         elif eng is not None and eng["status"] == subscription_status.ACTIVE:
             subscription_store.update_subscription(eng["id"], status=subscription_status.DISABLED)
+        return ""
 
-    await run_db(_job)
+    refusal = await run_db(_job)
+    if refusal:
+        raise HTTPException(409, refusal)
     await _local_endpoint_changed([req.layer])
     return await run_db(_local_group_view, group, user)
 

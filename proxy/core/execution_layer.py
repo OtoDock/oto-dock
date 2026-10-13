@@ -34,6 +34,25 @@ DEFAULT_EXECUTION_PATH = "claude-code-cli"
 PERMISSION_MODES: tuple[str, ...] = ("default", "acceptEdits", "plan", "dontAsk")
 PLAN_MODE = "plan"
 
+#: The platform's effort levels, lowest first — what ``agents.default_effort``
+#: may hold and the order every engine's ``effort_levels`` and every
+#: provider's ``effort_scale`` follow (each is a sub-sequence of it).
+EFFORT_LADDER: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def fold_effort(level: str, scale: list[str] | tuple[str, ...]) -> str:
+    """``level`` on a provider's declared ``scale``: itself when the scale
+    has it (or declares nothing), else the highest scale level below it on
+    the ladder, else the scale's lowest. A level off the ladder passes
+    through (the adapter's own map decides)."""
+    if not scale or level in scale or level not in EFFORT_LADDER:
+        return level
+    rank = EFFORT_LADDER.index(level)
+    below = [s for s in scale if s in EFFORT_LADDER and EFFORT_LADDER.index(s) < rank]
+    if below:
+        return max(below, key=EFFORT_LADDER.index)
+    return min(scale, key=lambda s: EFFORT_LADDER.index(s) if s in EFFORT_LADDER else len(EFFORT_LADDER))
+
 
 # ---------------------------------------------------------------------------
 # AgentConfig — bundles what each execution layer needs to start a session
@@ -300,6 +319,13 @@ class BehaviourProfile:
     (Codex: ``request_user_input`` → ``ask_user_question``); False when the
     platform must deny the call, surface the card and let the answer arrive
     as the next message (Claude headless).
+
+    ``repository_instruction_files``: the instruction files of the
+    repositories in a person's workspace that the platform lifts into the
+    session's prompt, in the engine's own order (its own file first, the
+    other only when a repository lacks it); ``()`` when the engine needs
+    none. An engine sets it because it does not load a nested repository's
+    files where the platform runs it (``services/agents/repository_instructions``).
     """
     rebuilds_history_from_db: bool = False
     attach_images_inline: bool = False
@@ -315,6 +341,7 @@ class BehaviourProfile:
     supports_interrupt_for_queued: bool = False
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
     question_tool_holds_turn: bool = False
+    repository_instruction_files: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -332,6 +359,7 @@ class BehaviourProfile:
             "supports_interrupt_for_queued": self.supports_interrupt_for_queued,
             "tools": {role: list(names) for role, names in self.tools.items()},
             "question_tool_holds_turn": self.question_tool_holds_turn,
+            "repository_instruction_files": list(self.repository_instruction_files),
         }
 
 
@@ -749,6 +777,18 @@ class RemoteEngineAdapter(ABC):
     def soft_interrupt_frame(self) -> str:
         """The satellite frame that closes this engine's live turn gracefully
         (the process survives for the next prompt)."""
+
+    def note_interrupt(self, info) -> None:
+        """That frame went out for the live turn: an engine whose turn then
+        ends in an error result marks the result as the interrupt's.
+        Default: nothing."""
+
+    def turn_settled(self, info) -> bool:
+        """The engine's turn is over (its result was read) and only the wait
+        for background work holds the stream open: a soft interrupt would
+        find nothing to interrupt, so a Stop takes the hard path at once.
+        Default: the engine's stream has no such wait."""
+        return False
 
     @abstractmethod
     async def control_request(self, info, cm, subtype: str, **kwargs) -> bool:
@@ -1226,6 +1266,13 @@ class ExecutionLayer(ABC):
         self, session_id: str, request_id: str, approved: bool,
     ) -> None:
         """Answer a permission prompt."""
+
+    async def answer_engine_prompt(
+        self, session_id: str, request_id: str, approved: bool, tool_input: dict,
+    ) -> None:
+        """Answer a permission request the engine raised on its own stdio
+        channel (``core/session/engine_prompts``). Only the Claude CLI raises
+        them; every other layer has nothing to write."""
 
     @abstractmethod
     async def change_model(

@@ -23,7 +23,7 @@ from adapters.phone import INBOUND
 from services.phone import daemon_url
 from services.phone.phone_adapters.twilio import normalize_did
 
-logger = logging.getLogger("claude-proxy.phone-health-worker")
+logger = logging.getLogger("otodock.phone-health-worker")
 
 _INTERVAL_SECONDS = 300
 _MAX_CONCURRENCY = 5

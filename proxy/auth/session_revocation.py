@@ -22,7 +22,7 @@ import logging
 import threading
 import time
 
-logger = logging.getLogger("claude-proxy.auth")
+logger = logging.getLogger("otodock.auth")
 
 _revoked: dict[str, float] = {}    # sign-in id -> expiry (epoch seconds)
 _lock = threading.Lock()           # read on the loop and on executor threads

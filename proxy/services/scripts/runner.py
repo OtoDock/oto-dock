@@ -33,7 +33,7 @@ from typing import Awaitable, Callable
 import config
 from core import layout
 
-logger = logging.getLogger("claude-proxy.scripts")
+logger = logging.getLogger("otodock.scripts")
 
 OUTPUT_KEEP_BYTES = 32 * 1024
 TAIL_KEEP_BYTES = 4096

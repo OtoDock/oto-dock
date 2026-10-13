@@ -19,7 +19,7 @@ from core.session.session_state import (
     mark_meeting_turn_routed,
 )
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 

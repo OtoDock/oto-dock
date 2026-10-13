@@ -39,6 +39,8 @@ export interface TransferItem {
   uploadSent: number
   uploadTotal: number
   uploadFailed: boolean
+  uploadError?: string             // why the upload failed, when known
+  batchId?: string                 // the workspace upload batch it belongs to
   machines: Record<string, TransferMachineRow>
   startedAt: number
   lastEventAt: number
@@ -49,6 +51,24 @@ export interface TransferItem {
 // before the icon auto-hides. Slightly shorter than the server registry's
 // 6s DONE_LINGER_S so a replayed item never outlives its server record.
 const DONE_LINGER_MS = 5000
+
+// The abort of each running workspace upload batch, by batch id: outside
+// the store state (a controller is no render input).
+const batchAborts = new Map<string, AbortController>()
+
+/** Make `cancelBatch(batchId)` abort `abort`; the returned function ends it
+ * (the batch's loop calls it when the batch is over). */
+export function registerBatch(batchId: string, abort: AbortController): () => void {
+  batchAborts.set(batchId, abort)
+  return () => {
+    if (batchAborts.get(batchId) === abort) batchAborts.delete(batchId)
+  }
+}
+
+/** A batch row still uploading: what the popup's Cancel stops. */
+export function isBatchRunning(t: TransferItem): boolean {
+  return !!t.batchId && t.phase === 1 && !t.uploadFailed && batchAborts.has(t.batchId)
+}
 
 /** Map an agent-relative path to the workspace section it belongs to.
  * Foreign users' personal paths return null (the server never emits those to
@@ -106,7 +126,7 @@ interface TransferStoreState {
 
   beginLocalUpload: (d: {
     clientId: string; agent: string; targetDir: string
-    filename: string; bytesTotal: number
+    filename: string; bytesTotal: number; batchId?: string
   }) => void
   updateLocalUpload: (clientId: string, sent: number) => void
   failLocalUpload: (clientId: string, error?: string) => void
@@ -120,6 +140,8 @@ interface TransferStoreState {
   applyDone: (msg: any) => void
   applySnapshot: (msg: any) => void
 
+  /** Stop a workspace upload batch: its loop sees the abort and ends it. */
+  cancelBatch: (batchId: string) => void
   prune: () => void
   clearInFlight: () => void
 }
@@ -127,7 +149,7 @@ interface TransferStoreState {
 export const useTransferStore = create<TransferStoreState>((set, get) => ({
   byId: {},
 
-  beginLocalUpload: ({ clientId, agent, targetDir, filename, bytesTotal }) =>
+  beginLocalUpload: ({ clientId, agent, targetDir, filename, bytesTotal, batchId }) =>
     set((s) => ({
       byId: {
         ...s.byId,
@@ -141,6 +163,7 @@ export const useTransferStore = create<TransferStoreState>((set, get) => ({
           uploadSent: 0,
           uploadTotal: bytesTotal,
           uploadFailed: false,
+          ...(batchId ? { batchId } : {}),
           machines: {},
           startedAt: Date.now(),
           lastEventAt: Date.now(),
@@ -161,7 +184,7 @@ export const useTransferStore = create<TransferStoreState>((set, get) => ({
       }
     }),
 
-  failLocalUpload: (clientId) =>
+  failLocalUpload: (clientId, error) =>
     set((s) => {
       const t = s.byId[clientId]
       if (!t) return s
@@ -171,6 +194,7 @@ export const useTransferStore = create<TransferStoreState>((set, get) => ({
           [clientId]: {
             ...t, uploadFailed: true, doneAt: Date.now(),
             lastEventAt: Date.now(),
+            ...(error ? { uploadError: error } : {}),
           },
         },
       }
@@ -321,6 +345,10 @@ export const useTransferStore = create<TransferStoreState>((set, get) => ({
         },
       }
     }),
+
+  cancelBatch: (batchId) => {
+    batchAborts.get(batchId)?.abort()
+  },
 
   prune: () =>
     set((s) => {

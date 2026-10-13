@@ -31,7 +31,7 @@ from storage.phone import phone_route_store
 from storage import database as task_store
 from auth import roles
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 #: The role of every external principal on a phone line (a caller who is not
 #: a platform user): viewer of the agent's shared space, writer only of its
@@ -122,6 +122,16 @@ def route_identity_mode(route: dict) -> str:
     everywhere else."""
     mode = route.get("identity_mode") or IDENTITY_MODE_CALLER
     return IDENTITY_MODE_USER if mode == IDENTITY_MODE_USER else IDENTITY_MODE_CALLER
+
+
+def pin_allowed(route: dict) -> bool:
+    """Whether a route may carry a PIN: every inbound route, and an outbound
+    route tied to a platform user (the person who answers enters it before
+    the agent speaks). An outbound route in caller identity gates nobody:
+    the API refuses a PIN there and the config push carries none."""
+    from adapters.phone import is_outbound
+    return (not is_outbound(route.get("direction"))
+            or route_identity_mode(route) == IDENTITY_MODE_USER)
 
 
 def resolve_route_identity(

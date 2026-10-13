@@ -79,6 +79,9 @@ workspace the files are named where they are. A delegating chat on a
 Shared-only agent receives the files in that agent's shared workspace. Caps:
 the send_files per-call count after expansion and a per-run total (60 by
 default); a call over a cap is refused whole: split it or send an archive.
+Stop your own background wait loops (a polling shell you backgrounded) before
+the final message: the run waits for background work up to its ceiling, so a
+loop you no longer need holds the result back for that long.
 
 ## Choosing a model for a lane
 

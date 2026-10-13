@@ -3,6 +3,10 @@
 Every field of `manifest.json` the platform reads. The full reference with
 the platform-side details is on docs.otodock.io (the MCP framework pages)
 and in the catalog's CONTRIBUTING.md at github.com/OtoDock/community-mcps.
+The machine-readable contract is the JSON Schema `mcps/manifest.schema.json`
+in github.com/OtoDock/oto-dock (its `$id` names the release it belongs to);
+`validate_mcp_package` checks a package against it and reports the platform
+floor the fields imply.
 
 ## Top level
 
@@ -11,15 +15,15 @@ and in the catalog's CONTRIBUTING.md at github.com/OtoDock/community-mcps.
 | `name` | yes | The canonical slug: lowercase letters, digits, dashes, underscores. The key for assignments, config and tools; keep it equal to the folder name; never rename a shipped package. |
 | `label` | yes | The display name. |
 | `description` | yes | One line for the catalog card and the agent's tool list. |
-| `version` | yes | `""` for an npm or PyPI package (the platform pins the installed release); a version for a container (equal to the image tag) and for a git source (the pinned ref). |
+| `version` | yes | `""` for an npm or PyPI package (the platform pins the installed release); a version for a container (equal to the image tag) and for a git source (the release the pinned commit is; it moves with every new commit). |
 | `category` | yes | `"community"`. |
 | `author` | catalog | Who maintains the server code the package wraps, written as the project shows it. |
 | `author_url` | catalog | That code's repository (`https://…`), or the vendor's page for a hosted MCP. |
 | `server` | yes | The runtime block below. |
 | `server_name` | no | The tool namespace prefix when it must differ from `name`. |
-| `credentials` | no | `type`: `none`, `per_user` (each person enters their own, in Settings) or `infra` (an admin enters them once); `fields` for the inputs; `oauth` for an OAuth provider; `service_account: true` lets a manager lend an account to agent-scope sessions. |
+| `credentials` | no | `type`: `none`, `per_user` (each person enters their own, in Settings) or `infra` (an admin enters them once); `fields` for the inputs (`{key, label, input_type, required}`: a field is required unless it says `"required": false`, and an account without a required one keeps the MCP out of its sessions, so add a new field as optional); `oauth` for an OAuth provider; `service_account: true` lets a manager lend an account to agent-scope sessions. |
 | `instances` | no | Admin-managed instances (a server URL, a token) delivered as env (`delivery: "env"`); pair with `assignment_mode: "explicit"`. |
-| `config` | no | Admin-managed key/value settings shown on the MCP's page; `user_overridable: true` lets each person override one. |
+| `config` | no | Admin-managed key/value settings shown on the MCP's page; `user_overridable: true` lets each person override one. A row's `default` applies until an admin saves another value (an empty default sets nothing), so a safe default belongs here, not only in the description. |
 | `env` | no | Static variables for every launch. |
 | `agent_env` | no | Per-session variables with `${session.*}` tokens. |
 | `path_env` | no | Path-bearing variables by role (`workspace`, `user_root`, `shared_workspace`, `config`, `knowledge_dir`, `credentials_dir`). The platform fills them with the right sandbox path per session. |
@@ -27,6 +31,7 @@ and in the catalog's CONTRIBUTING.md at github.com/OtoDock/community-mcps.
 | `skills` | no | Skills bundled with the MCP: `{id, file, description, loading, default_exclude_from, audience}`. `loading` is `on_demand` (default) or `always`; `audience` (`owner`, `editor`, `workspace`) limits a skill to a tier. |
 | `agent_context` | no | Prompt blocks with `${account.*}`, `${agent.*}`, `${trigger.*}` tokens. |
 | `outputs` | no | Files the server writes into a shared folder that the platform moves into the session's workspace. |
+| `result_files` | no | Tools whose results the person should keep: `{"tools": ["maps_static_map"], "subdir": "maps"}`. Each picture (an MCP `image` block: png, jpeg, webp or gif) and each embedded `resource` blob such a tool returns is saved in the session's workspace under `subdir` and shown in the chat with the result's text as the caption (its first link opens from the picture). Exact tool names (up to 64, none that `outputs` already moves), one plain folder name; 15 MB a file, 8 files and 30 MB a result. Never a tool that returns a picture on every call for the model's own use (a browser screenshot). Set `platform_min_version: "1.8.0"`. On Claude only pictures are kept (the CLI saves other blobs itself). |
 | `costs` | no | Per-tool prices (`currency`, `provider`, ordered `rules`). |
 | `permissions` | no | Per-tool permission tiers (`open`, `standard`, `sensitive`, `critical`). |
 | `assignment_mode` | no | `auto` (managers enable it per agent) or `explicit` (an admin must configure an instance first). |
@@ -35,9 +40,9 @@ and in the catalog's CONTRIBUTING.md at github.com/OtoDock/community-mcps.
 | `network_targets` | no | The internal hosts a homelab MCP dials, read from a config key, an instance field or a credential; the admin's toggle opens the sandbox to exactly those. |
 | `system_requirements` | no | OS packages and a `node_min` the installer checks before installing. |
 | `replaces` | no | Sources this entry supersedes, with credential key renames: `[{"source": "<previous source>", "credentials": {"OLD": "NEW"}}]`. Information for the admin's switch, never an authorization. |
-| `tool_filter` | no | For a container whose binary takes a tool-filter flag: `{arg_name, env_var_name}`. |
+| `tool_filter` | no | For a container whose server takes a tool-filter regex: `{arg_name, env_var_name, regex_env_var_name}`. The platform writes the admin's regex bare to `regex_env_var_name` (default `ENABLED_TOOLS_REGEX`) and the flag `arg_name '<regex>'` to `env_var_name` (default `ENABLED_TOOLS_FLAG`); read the bare one (`env_file: .env`, then `"$$ENABLED_TOOLS_REGEX"` quoted in a `sh -c` entrypoint, or the server's own env). |
 | `patched`, `patch_note` | no | `true` plus one line when `patches/*.patch` are shipped and applied after `npm install`. |
-| `deprecated`, `platform_min_version` | no | Catalog metadata. |
+| `deprecated`, `platform_min_version` | no | Catalog metadata. `platform_min_version` is the oldest platform the entry works on: 1.7.1 when it uses `audience`, a skill's `audience`, `replaces`, `credentials.api_key_header` or `oauth.authorization_server`; 1.8.0 for `result_files`, `tool_filter.regex_env_var_name` or a PyPI source with extras. `validate_mcp_package` computes it from the fields and warns when the declared one is lower. |
 
 Fields a community package never sets: `requires_capability`, `hosted`,
 `server.proxy_callbacks`, `placement`, `device_capability`,
@@ -50,7 +55,7 @@ Fields a community package never sets: `requires_capability`, `hosted`,
 | `runtime` | all but remote | `python`, `node` or `docker`. A remote (vendor-hosted) MCP declares none. |
 | `transport` | yes | `stdio` for python and node; `http` for a container (streamable HTTP at `/mcp/`); `streamable_http` for a remote MCP. |
 | `command`, `args` | stdio | What to launch, relative to the folder, `${mcp_dir}` allowed in args (`node`, `["${mcp_dir}/node_modules/<pkg>/dist/index.js"]`; `venv/bin/python`, `["-m", "<module>"]`). |
-| `source` | yes | `npm:<package>`, `pypi:<package>`, `git+<url>@<ref>#subdirectory=<dir>`, `docker:<label>` or `remote:<host>`. |
+| `source` | yes | `npm:<package>`, `pypi:<package>` (with extras: `pypi:<package>[<extra>,<extra>]`, platform 1.8.0 and later), `git+<url>@<commit>#subdirectory=<dir>`, `docker:<label>` or `remote:<host>`. A catalog git source pins the full 40-character commit, never a tag or a branch (they can move upstream); from 1.8.0 the weekly update builds a new commit the catalog pins. An admin's own ZIP may pin a tag. |
 | `version_constraint` | no | A PEP 440 range (`">=2,<3"`) that bounds the automatic updates of an npm or PyPI package. |
 | `source_build` | no | For a PyPI package: the distributions the installer may build from source when the machine has no wheel for them (every package installs from wheels first; a listed one is built only when that resolve fails on it). |
 | `port`, `url_template`, `health_endpoint`, `docker_compose`, `image`, `service_name` | docker | The port, `http://${docker_mcp_host}:${port}`, an optional health path, the compose file in the folder, the prebuilt image (required for the containerised deployment), an optional service-DNS name. |

@@ -27,7 +27,7 @@ from auth.path_policy import SecurityContext, build_permission_context
 from core.execution_layer import DEFAULT_EXECUTION_PATH
 from core.session import session_kind
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +183,12 @@ async def build_meeting_agent_config(
         )
     )
 
-    # For TOML (Codex): inject the resolved credential env INTO the config.toml
-    # env sections (Codex doesn't inherit parent env for MCP servers).
-    if mcp_format == "toml" and mcp_config and credential_env:
-        mcp_config = await asyncio.to_thread(
-            mcp_registry.inject_credential_env_into_toml,
-            mcp_config, credential_env,
-            exclude_keys=bash_env_keys,
-        )
+    # A Codex config gets the credential environment written in; the
+    # bash-only git entries stay out of the file.
+    mcp_config = await asyncio.to_thread(
+        mcp_registry.inject_toml_credentials, mcp_config, credential_env,
+        mcp_format=mcp_format, exclude_keys=bash_env_keys,
+    )
 
     task_security = SecurityContext(
         role=task_role,

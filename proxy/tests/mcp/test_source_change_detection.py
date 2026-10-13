@@ -102,6 +102,10 @@ def fake_catalog(monkeypatch):
     monkeypatch.setattr(community_catalog, "fetch_manifest", _manifest)
     monkeypatch.setattr(community_catalog, "fetch_skills_registry", _skills)
     monkeypatch.setattr(mcp_updater, "resolve_latest_in_bound", _latest)
+
+    async def _no_doc(registry, package):
+        return None
+    monkeypatch.setattr(mcp_updater, "_registry_doc", _no_doc)
     return state
 
 

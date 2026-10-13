@@ -923,3 +923,40 @@ async def test_release_queues_draft_behind_busy_typed_turn_without_abort():
         sess._typed_turn.cancel()
         with pytest.raises(asyncio.CancelledError):
             await sess._typed_turn
+
+
+def test_duplex_session_detects_the_language_when_the_pick_is_automatic(monkeypatch):
+    """The Automatic dictation pick reaches the session as ``language_detect``:
+    the session starts in English and locks on the first utterance, as a
+    route that detects does; a picked language is locked from the start."""
+    from config_manager import ConfigManager
+    from duplex import session as dsession
+    from pipeline import providers as plproviders
+    from pipeline_fakes import FakeSTT, FakeTTS, FakeVAD
+
+    monkeypatch.setattr(dsession, "SileroVad", FakeVAD)
+    monkeypatch.setattr(
+        plproviders, "get_provider_class",
+        lambda kind, name: FakeSTT if kind == "stt" else FakeTTS,
+    )
+
+    class FakeDuplexConn:
+        call_uuid = "dx-lang-test"
+        peer_addr = "duplex:lang"
+        sample_rate_in = 16000
+        sample_rate_out = 24000
+        frame_bytes_out = 960
+        is_closed = False
+        on_barge_in = None
+
+        def send_event(self, payload):
+            pass
+
+    base = {"stt": {"provider_name": "deepgram"}, "tts": {"provider_name": "cartesia"},
+            "chat_endpointing_ms": 1500}
+    auto = dsession.DuplexSession(FakeDuplexConn(), ConfigManager(),
+                                  {**base, "language": "", "language_detect": True})
+    assert auto._locked_language == "en" and auto.state._language_locked is False
+    picked = dsession.DuplexSession(FakeDuplexConn(), ConfigManager(),
+                                    {**base, "language": "el", "language_detect": False})
+    assert picked._locked_language == "el" and picked.state._language_locked is True

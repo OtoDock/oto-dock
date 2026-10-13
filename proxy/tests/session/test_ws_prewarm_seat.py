@@ -331,3 +331,146 @@ async def test_a_refusal_below_the_editor_tier_is_left_to_the_send(monkeypatch, 
     assert conn.errors == [] and conn.sent == []
     assert conn._pre_warmed_sid is None
     assert not any(r.levelname == "ERROR" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_prewarm_closes_on_its_own_engine(monkeypatch):
+    """The pre-warm a new frame replaces is closed on the layer holding it,
+    else on its own engine: never on a layer picked from a role (a context
+    with no role used to read as manager) or from the agent's default
+    engine. The close runs before the new build, which refuses here."""
+    from core.sandbox.session_config_dir import AgentStateRefused
+    from core.session import session_manager
+    from ws import dashboard_warmup as dw
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+    conn._pre_warmed_sid = "old-sid"
+    conn._pre_warmed_agent = "alpha"
+    conn._pre_warmed_exec_path = "codex-cli"
+    conn._pre_warmed_model = "other-model"
+    conn._pre_warmed_role = ""
+    closed, asked = [], []
+
+    class _Layer:
+        async def close_session(self, sid):
+            closed.append(sid)
+
+    def _layer_for(sid, path):
+        asked.append((sid, path))
+        return _Layer()
+
+    async def _refused(**kwargs):
+        raise AgentStateRefused("no")
+    from core.session import prewarm_session_registry as reg
+    monkeypatch.setattr(session_manager, "layer_for_prewarm", _layer_for)
+    monkeypatch.setattr(dw, "get_execution_layer",
+                        lambda *a, **k: pytest.fail("the close picked a layer by role"))
+    monkeypatch.setattr(dw, "build_agent_config", _refused)
+    await reg.register("old-sid", agent="alpha", user_sub="user-pw", role="viewer",
+                       exec_path="codex-cli", model="other-model")
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                   "execution_path": "codex-cli"})
+    assert asked == [("old-sid", "codex-cli")] and closed == ["old-sid"]
+    assert conn._pre_warmed_sid is None and conn._pre_warmed_exec_path == ""
+
+
+@pytest.mark.asyncio
+async def test_a_prewarm_another_tab_claimed_is_left_running(monkeypatch):
+    """Another tab's warmup claimed this socket's pre-warm by its key and runs
+    its chat on it: replacing ours must not close that session or free its
+    slot."""
+    from core import concurrency
+    from core.sandbox.session_config_dir import AgentStateRefused
+    from core.session import prewarm_session_registry as reg
+    from core.session import session_manager
+    from ws import dashboard_warmup as dw
+    conn = _controller()
+    _stub_seams(monkeypatch, built_cfg=_cfg())
+    conn._pre_warmed_sid = "taken-sid"
+    conn._pre_warmed_agent = "alpha"
+    conn._pre_warmed_exec_path = "codex-cli"
+    conn._pre_warmed_model = "other-model"
+    conn._pre_warmed_role = "viewer"
+    await reg.register("taken-sid", agent="alpha", user_sub="user-pw", role="viewer",
+                       exec_path="codex-cli", model="other-model")
+    assert await reg.claim_by_key(user_sub="user-pw", agent="alpha", model="other-model",
+                                  role="viewer", exec_path="codex-cli") is not None
+    released = []
+
+    async def _refused(**kwargs):
+        raise AgentStateRefused("no")
+    monkeypatch.setattr(session_manager, "layer_for_prewarm",
+                        lambda *a: pytest.fail("closed a session another tab runs"))
+    monkeypatch.setattr(concurrency, "release_chat_slot", released.append)
+    monkeypatch.setattr(dw, "build_agent_config", _refused)
+    await conn._handle_pre_warmup({"agent": "alpha", "model": "some-model",
+                                   "execution_path": "codex-cli"})
+    assert "taken-sid" not in released and conn._pre_warmed_sid is None
+
+
+def test_the_layer_for_a_prewarm_falls_back_to_its_engine(monkeypatch):
+    """A pool drops a dead entry on any lookup, so "nobody holds it" still
+    closes on the pre-warm's own engine (the close frees the seat and the
+    slot); a holder wins; an unknown engine gives nothing to close on."""
+    from core.session import session_manager as sm
+    engine, holder = object(), object()
+    monkeypatch.setitem(sm._LAYERS, "codex-cli", engine)
+    monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: None)
+    assert sm.layer_for_prewarm("s1", "codex-cli") is engine
+    assert sm.layer_for_prewarm("s1", "no-such-engine") is None
+    monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: holder)
+    assert sm.layer_for_prewarm("s1", "codex-cli") is holder
+
+
+def test_the_prewarm_registry_takes_no_unknown_role():
+    """The stored role is a claim key and the offboarding closer's demotion
+    test: a pre-warm without one is refused, and a claim without one
+    matches nothing (no default reads as manager)."""
+    from core.session import prewarm_session_registry as reg
+
+    async def run():
+        with pytest.raises(ValueError):
+            await reg.register("sid-norole", agent="alpha", user_sub="u1", role="",
+                               exec_path="codex-cli", model="m")
+        await reg.register("sid-v", agent="alpha", user_sub="u1", role="viewer",
+                           exec_path="codex-cli", model="m")
+        assert await reg.claim_by_key(user_sub="u1", agent="alpha", model="m",
+                                      role="", exec_path="codex-cli") is None
+        assert await reg.claim_by_key(user_sub="u1", agent="alpha", model="m",
+                                      role="manager", exec_path="codex-cli") is None
+        hit = await reg.claim_by_key(user_sub="u1", agent="alpha", model="m",
+                                     role="viewer", exec_path="codex-cli")
+        assert hit is not None and hit[0] == "sid-v"
+    asyncio.run(run())
+
+
+def test_the_reaper_closes_a_dead_prewarm_on_its_engine(monkeypatch):
+    from core.session import prewarm_session_registry as reg
+    from core.session import session_manager as sm
+    closed = []
+
+    class _Layer:
+        async def close_session(self, sid):
+            closed.append(sid)
+    monkeypatch.setattr(sm, "find_layer_for_session", lambda sid: None)
+    monkeypatch.setitem(sm._LAYERS, "codex-cli", _Layer())
+
+    async def run():
+        await reg.register("sid-dead", agent="alpha", user_sub="u1", role="editor",
+                           exec_path="codex-cli", model="m")
+        return await reg.reap_stale(ttl=0)
+    assert asyncio.run(run()) == 1 and closed == ["sid-dead"]
+
+
+def test_no_prewarm_close_reads_a_role_default():
+    """The four sites that read ``role or "manager"`` for a context built
+    without a role: none is left (the socket-close block sits inside the
+    connection loop, so its fence is this pin beside the helper's tests)."""
+    from tests._paths import PROXY_DIR
+    for rel in ("core/session/prewarm_session_registry.py", "ws/dashboard_warmup.py",
+                "ws/dashboard.py"):
+        text = (PROXY_DIR / rel).read_text()
+        assert 'or "manager"' not in text, rel
+    socket_close = (PROXY_DIR / "ws/dashboard.py").read_text()
+    assert "layer_for_prewarm(orphan_sid" in socket_close
+    assert "if await _prewarm.claim(orphan_sid):" in socket_close

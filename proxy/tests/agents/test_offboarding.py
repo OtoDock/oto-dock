@@ -113,7 +113,7 @@ async def test_subscribers_run_in_order_and_one_failure_does_not_stop_the_next(r
     offboarding.subscribe("first", first)
     offboarding.subscribe("second", second)
     offboarding.subscribe("record", offboarding._subscribers["record"][1], priority=200)
-    with caplog.at_level(logging.INFO, logger="claude-proxy.offboarding"):
+    with caplog.at_level(logging.INFO, logger="otodock.offboarding"):
         await offboarding.on_user_offboarded(offboarding.OffboardEvent(
             PERSON, offboarding.REMOVED, (AgentLoss("a", "editor", ""),), ADMIN))
     assert order == ["first", ("second", False)]

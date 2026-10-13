@@ -19,7 +19,7 @@ import logging
 from api.apps import manifest as _mf
 from storage import db_app_secrets
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 
 def declared(row: dict) -> list[dict]:

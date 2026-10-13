@@ -199,6 +199,9 @@ _config.AGENTS_DIR = _test_agents_root
 # age-gated startup sweep above reaps it too.
 _config.SESSIONS_DIR = Path(tempfile.gettempdir()) / f"{_agents_dir_name}-sessions"
 _config.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+# The recover bin likewise: the live install's bin sits beside its agents
+# root, and a capture during a test would land there.
+_config.RECOVER_BIN_DIR = Path(tempfile.gettempdir()) / f"{_agents_dir_name}-recover-bin"
 if "core.session.session_state" in sys.modules:
     _ss = sys.modules["core.session.session_state"]
     _ss._SESSION_INDEX = _config.SESSIONS_DIR / "index.json"
@@ -213,8 +216,8 @@ def pytest_sessionfinish(session, exitstatus):
     """
     # Loop-guard inventory (OTODOCK_DB_LOOP_GUARD=count): every store call
     # issued from an event-loop thread during the run, as file:line — the
-    # explicit backlog of loop-side DB calls still to convert (see
-    # docs/TESTING.md). Written per worker so xdist runs merge.
+    # explicit backlog of loop-side DB calls still to convert (the testing
+    # page, "Event-loop DB guard"). Written per worker so xdist runs merge.
     try:
         from storage import pg as _pg
         _hits = _pg.loop_guard_hits()
@@ -430,7 +433,7 @@ class _LoopDbGuard:
 @pytest.fixture
 def loop_db_guard():
     """Opt-in, function-scoped, never autouse: the regression fence for the
-    paths converted to off-loop DB access (docs/TESTING.md, "Event-loop DB
+    paths converted to off-loop DB access (the testing page, "Event-loop DB
     guard"). Disarmed on teardown no matter how the test exits."""
     from storage import pg
     yield _LoopDbGuard()

@@ -29,12 +29,14 @@ from auth.providers import UserContext, get_current_user  # noqa: E402
 from services.scheduler import scheduler  # noqa: E402
 from storage.agents import agent_store  # noqa: E402
 from storage import database as task_store  # noqa: E402
+import config  # noqa: E402
+from storage.pg import get_conn  # noqa: E402
 
 
 AGENT = "briefer"
 # Enabled on the agent's layer in the stubbed registry below; the agent's own
 # default stays MODEL_DEFAULT so "pinned" and "inherited" are distinguishable.
-MODEL_DEFAULT = "claude-sonnet-5"
+MODEL_DEFAULT = "claude-sonnet-5-5"
 MODEL_STRONG = "claude-opus-5-5"
 
 
@@ -284,6 +286,27 @@ class TestConsumption:
         chat = task_store.get_chat(chat_id)
         assert chat["model"] == MODEL_DEFAULT
         assert chat["execution_path"] == ""
+
+
+    def test_a_pin_written_after_the_boot_walk_runs_on_its_successor(self, client):
+        """The walk rewrites pins at boot only; a retired id stored later (an
+        old MCP call, a restore) runs on its successor, and the chat row and
+        the session name the same model (one rule, so billing agrees)."""
+        tid = _create_scheduled(client, model=MODEL_STRONG).json()["task_id"]
+        with get_conn() as conn:
+            conn.execute("UPDATE dynamic_tasks SET override_model = 'claude-opus-5' WHERE id = %s",
+                         (tid,))
+            conn.commit()
+        task = scheduler._row_to_task(task_store.get_dynamic_task(tid))
+        assert task.override_model == "claude-opus-5"
+        task_store.create_run("run-ov3", tid, AGENT, "scheduled", None, "x")
+        chat_id = f"task-run-ov3-{uuid.uuid4().hex[:6]}"
+        scheduler._create_task_chat_row(chat_id, "run-ov3", task)
+        assert task_store.get_chat(chat_id)["model"] == MODEL_STRONG
+        assert config.resolve_run_model(AGENT, task.override_model,
+                                        layer="claude-code-cli") == MODEL_STRONG
+        listed = client.get("/v1/tasks").json()["tasks"][0]
+        assert listed["effective_model"] == MODEL_STRONG and not listed["pin_warnings"]
 
 
 # ───────────────────────────────────────────────────────────────────────────

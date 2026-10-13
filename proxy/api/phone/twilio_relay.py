@@ -32,7 +32,7 @@ from fastapi import APIRouter, Request, Response, WebSocket
 import config
 from services.phone import daemon_url
 
-logger = logging.getLogger("claude-proxy.twilio-relay")
+logger = logging.getLogger("otodock.twilio-relay")
 
 router = APIRouter()
 
@@ -106,6 +106,15 @@ async def relay_twilio_status(server_id: str, request: Request) -> Response:
     if not _SERVER_ID_OK(server_id):
         return Response(status_code=404)
     return await _forward_post(request, f"/v1/twilio/status/{server_id}")
+
+
+@router.post("/v1/twilio/transfer/{server_id}")
+async def relay_twilio_transfer(server_id: str, request: Request) -> Response:
+    """The action callback of a transfer's ``<Dial>``: how it ended, answered
+    with the TwiML the caller hears next."""
+    if not _SERVER_ID_OK(server_id):
+        return Response(status_code=404)
+    return await _forward_post(request, f"/v1/twilio/transfer/{server_id}")
 
 
 async def ws_twilio_media_relay(websocket: WebSocket) -> None:

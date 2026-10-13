@@ -52,7 +52,7 @@ from storage import db_apps
 if TYPE_CHECKING:
     from core.config.task_config_builder import TaskIdentity
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 RESULT_MAX_CHARS = 32 * 1024
 POOL_MAX = 8            # LRU-evicted; each entry is a set of MCP subprocesses

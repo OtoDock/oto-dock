@@ -43,10 +43,18 @@ class TestMatches:
         assert _limit_notice("You're out of usage credits. Switch to another model, "
                              "or manage usage credits at claude.ai/settings/usage, to continue.") is not None
 
+    def test_org_wording(self):
+        # A Team or Enterprise login's notice (Claude Code 2.1.289 and later).
+        assert _limit_notice("Done.\n\nYour org is out of usage · add funds to continue") is not None
+        assert _limit_notice("Your org is out of usage · contact your admin") is not None
+
 
 class TestNonMatches:
     def test_empty(self):
         assert _limit_notice("") is None
+
+    def test_a_plan_fact_is_not_a_limit(self):
+        assert _limit_notice("Your seat type doesn't include usage credits") is None
 
     def test_ordinary_output(self):
         assert _limit_notice("Deployed the fix and verified the logs.") is None

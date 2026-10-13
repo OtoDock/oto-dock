@@ -7,6 +7,7 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import re as _re
@@ -39,7 +40,7 @@ from api.hooks import routing
 from core.session import session_kind
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 #: The tool ROLES auto-approved in every mode (read-only / safe / internal):
@@ -67,6 +68,17 @@ class HookPermissionRequest(BaseModel):
     # callers that don't carry it (Codex bridge, old gate scripts in
     # already-running sessions).
     permission_mode: str = ""
+    # When the gate sent this call, by the clock of the host the CLI runs on
+    # (a satellite's own): a terminal parked on a dialog compares the
+    # transcript lines' times against it. None from the Codex bridge.
+    hook_sent_at: float | None = None
+
+
+# The ``hook_sent_at`` of the gate call being decided, for the park below
+# (``decide_tool_permission`` runs in the receiver's task).
+_hook_sent_at: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "hook_sent_at", default=None,
+)
 
 
 # A decision that waits on a person streams a whitespace keepalive this
@@ -164,6 +176,7 @@ async def hook_permission(req: HookPermissionRequest, authorization: str | None 
     person is streamed with keepalives (``_answer_with_keepalive``).
     """
     await verify_session_match_async(authorization, req.session_id)
+    _hook_sent_at.set(req.hook_sent_at)
     return await _answer_with_keepalive(
         decide_tool_permission(
             req.session_id, req.tool_name, req.tool_input,
@@ -235,6 +248,45 @@ async def hook_mcp_credentials(authorization: str | None = Header(None)):
     return {"env": bundle.env}
 
 
+class HookCliCredentialRequest(BaseModel):
+    session_id: str
+    host: str
+
+
+@router.post("/v1/hooks/cli-credential")
+async def hook_cli_credential(
+    req: HookCliCredentialRequest, authorization: str | None = Header(None),
+):
+    """The credential a session's command-line tools get for ``host`` right
+    now: the git credential helper and the ``gh`` wrapper
+    (``proxy/hooks/credential_helper.py``) ask here at each command, so the
+    token is in no environment and no file and the current token file is
+    read every time. Auth is the SESSION TOKEN (the holder judged, its
+    session against the body's): the helper runs inside the session, with
+    nothing but the session's own credentials. The master key is refused
+    outright (it names no session). Answers: the username git presents, the
+    token and the names the wrapper sets; 404 when the session holds no
+    credential for the host (not connected, or the store emptied by a
+    restart and not re-provisioned); 409 when the account needs a
+    reconnect. Reachable directly and over the satellite tunnel.
+    """
+    from api.sessions.sessions import _bearer_payload
+    from core.credentials import mcp_broker, mcp_gateway
+    if _bearer_payload(authorization) is None:
+        raise HTTPException(status_code=403, detail="A session token is required")
+    await verify_session_match_async(authorization, req.session_id)
+    cred = mcp_broker.cli_credential(req.session_id, req.host)
+    if cred is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {req.host.strip().lower()[:253]} account is connected for this session",
+        )
+    res = await asyncio.to_thread(mcp_gateway.resolve_cli_credential, cred)
+    if isinstance(res, mcp_gateway.Refusal):
+        raise HTTPException(status_code=409, detail=res.detail)
+    return {"username": res.username, "password": res.secret, "env": list(res.env_names)}
+
+
 @router.post("/v1/hooks/session-files")
 async def hook_session_files(authorization: str | None = Header(None)):
     """Session-file broker: return a remote session's secret FILES at start.
@@ -288,7 +340,7 @@ def _park_interactive_on_dialog(session_id: str, tool_name: str) -> None:
     from core.session import interactive_session
     sess = interactive_session.get(session_id)
     if sess is not None:
-        sess.park_on_native_dialog(tool_name)
+        sess.park_on_native_dialog(tool_name, sent_at=_hook_sent_at.get())
 
 
 async def decide_tool_permission(

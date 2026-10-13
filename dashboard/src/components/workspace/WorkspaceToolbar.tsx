@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect } from 'react'
+import { useRef } from 'react'
 import { createPortal } from 'react-dom'
+import { usePortalMenu } from '../../hooks/usePortalMenu'
 import type { WorkspaceView } from '../../hooks/useWorkspaceState'
-import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '../ui/popoverPosition'
+import { canPickFolder, FOLDER_PICKER_ATTRS } from '../../lib/droppedItems'
 
 interface NewFileOption {
   ext: string
@@ -27,6 +28,9 @@ interface Props {
   onNewFile: (ext: string) => void
   onNewFolder: () => void
   onUpload: (files: FileList) => void
+  /** Upload a whole folder; offered where the browser has a folder picker
+   * (`canPickFolder`). */
+  onUploadFolder?: (files: FileList) => void
   targetDisplay?: string  // e.g. "Saving to: research/2026"
   /** Count of recoverable (removed/replaced) files the caller may restore; the
    * Recover button + badge shows only when > 0 (independent of canWrite — the
@@ -54,6 +58,7 @@ export default function WorkspaceToolbar({
   onNewFile,
   onNewFolder,
   onUpload,
+  onUploadFolder: onUploadFolderProp,
   targetDisplay,
   recoverCount = 0,
   onOpenRecover,
@@ -63,40 +68,33 @@ export default function WorkspaceToolbar({
   searchOpen = false,
   onToggleSearch,
 }: Props) {
-  // Anchor coords for the New File dropdown. We render the dropdown via
-  // `createPortal` to `document.body` (instead of inline-absolute under the
-  // button) because the toolbar uses `overflow-x: auto`, which per CSS spec
-  // computes `overflow-y` to `auto` as well — so an absolute-positioned
-  // child would get clipped by the toolbar's scroll viewport.
-  // Left-aligned to the button and clamped to the viewport on both axes
-  // (`usePopoverPlacement`, shared with the app tab menu).
-  const [newFileAnchor, setNewFileAnchor] = useState<AnchorBox | null>(null)
-  const newFileButtonRef = useRef<HTMLButtonElement>(null)
-  const menuRef = useRef<HTMLDivElement>(null)
-  const newFilePlacement = usePopoverPlacement(newFileAnchor, menuRef, { align: 'left' })
+  // The New File and Upload dropdowns are portaled to `document.body`
+  // (instead of inline-absolute under the button) because the toolbar uses
+  // `overflow-x: auto`, which per CSS spec computes `overflow-y` to `auto` as
+  // well — so an absolute-positioned child would get clipped by the
+  // toolbar's scroll viewport. Left-aligned to the button and clamped to
+  // the viewport on both axes; keyboard-usable (`usePortalMenu`).
+  const {
+    open: newFileOpen, buttonRef: newFileButtonRef, panelRef: newFileMenuRef, style: newFileStyle,
+    toggle: toggleNewFileMenu, close: closeNewFileMenu, onKeyDown: onNewFileMenuKey,
+  } = usePortalMenu()
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  // Upload ▾ (Files / Folder): a browser's file dialog picks files or a
+  // folder, never both, so one button offers the two pickers.
+  const {
+    open: uploadOpen, buttonRef: uploadButtonRef, panelRef: uploadMenuRef, style: uploadStyle,
+    toggle: toggleUploadMenu, close: closeUploadMenu, onKeyDown: onUploadMenuKey,
+  } = usePortalMenu()
+  const onUploadFolder = canPickFolder() ? onUploadFolderProp : undefined
 
-  const openNewFileMenu = () => {
-    const rect = newFileButtonRef.current?.getBoundingClientRect()
-    if (!rect) return
-    setNewFileAnchor(anchorBoxOf(rect))
-  }
-  const closeNewFileMenu = () => setNewFileAnchor(null)
-
-  useEffect(() => {
-    if (!newFileAnchor) return
-    const handler = (e: MouseEvent) => {
-      const target = e.target as Node
-      if (
-        menuRef.current && !menuRef.current.contains(target)
-        && newFileButtonRef.current && !newFileButtonRef.current.contains(target)
-      ) {
-        closeNewFileMenu()
-      }
+  const onUploadClick = () => {
+    if (!onUploadFolder) {
+      fileInputRef.current?.click()
+      return
     }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [newFileAnchor])
+    toggleUploadMenu()
+  }
 
   const btnBase =
     'flex items-center gap-1 px-2 py-1 text-xs rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text hover:bg-p-surface-hover transition-colors shrink-0'
@@ -110,9 +108,11 @@ export default function WorkspaceToolbar({
               (see openNewFileMenu) to escape the toolbar's overflow clip. */}
           <button
             ref={newFileButtonRef}
-            onClick={() => (newFileAnchor ? closeNewFileMenu() : openNewFileMenu())}
+            onClick={toggleNewFileMenu}
             className={btnBase}
             title="New file"
+            aria-haspopup="menu"
+            aria-expanded={newFileOpen}
           >
             <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
@@ -129,14 +129,22 @@ export default function WorkspaceToolbar({
             Folder
           </button>
           <button
-            onClick={() => fileInputRef.current?.click()}
+            ref={uploadButtonRef}
+            onClick={onUploadClick}
             className={btnBase}
             title="Upload"
             aria-label="Upload"
+            aria-haspopup={onUploadFolder ? 'menu' : undefined}
+            aria-expanded={onUploadFolder ? uploadOpen : undefined}
           >
             <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0l-4 4m4-4v12" />
             </svg>
+            {onUploadFolder && (
+              <svg width={10} height={10} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            )}
           </button>
           <input
             ref={fileInputRef}
@@ -148,6 +156,18 @@ export default function WorkspaceToolbar({
               e.target.value = ''
             }}
           />
+          {onUploadFolder && (
+            <input
+              ref={folderInputRef}
+              type="file"
+              className="hidden"
+              {...FOLDER_PICKER_ATTRS}
+              onChange={(e) => {
+                if (e.target.files?.length) onUploadFolder(e.target.files)
+                e.target.value = ''
+              }}
+            />
+          )}
         </>
       )}
 
@@ -258,31 +278,59 @@ export default function WorkspaceToolbar({
         </button>
       </div>
 
-      {newFileAnchor && createPortal(
+      {newFileOpen && createPortal(
         <div
-          ref={menuRef}
-          style={{
-            position: 'fixed',
-            left: newFilePlacement?.left ?? newFileAnchor.left,
-            top: newFilePlacement?.top ?? newFileAnchor.bottom,
-            visibility: newFilePlacement ? 'visible' : 'hidden',
-            zIndex: 60,
-          }}
+          ref={newFileMenuRef}
+          role="menu"
+          aria-label="New file"
+          onKeyDown={onNewFileMenuKey}
+          style={newFileStyle}
           className="min-w-[160px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
         >
           {NEW_FILE_OPTIONS.map((opt) => (
             <button
               key={opt.ext}
+              type="button"
+              role="menuitem"
               onClick={() => {
-                closeNewFileMenu()
+                closeNewFileMenu(false)
                 onNewFile(opt.ext)
               }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-text hover:bg-p-surface-hover"
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-text hover:bg-p-surface-hover focus:bg-p-surface-hover focus:outline-none"
             >
               <span className={`w-4 h-4 flex items-center justify-center text-[9px] font-bold ${opt.color}`}>
                 {opt.icon}
               </span>
               <span>{opt.label}</span>
+            </button>
+          ))}
+        </div>,
+        document.body,
+      )}
+      {uploadOpen && createPortal(
+        <div
+          ref={uploadMenuRef}
+          role="menu"
+          aria-label="Upload"
+          onKeyDown={onUploadMenuKey}
+          style={uploadStyle}
+          className="min-w-[140px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
+        >
+          {([
+            ['Files', fileInputRef],
+            ['Folder', folderInputRef],
+          ] as const).map(([label, ref]) => (
+            <button
+              key={label}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                closeUploadMenu()
+                ref.current?.click()
+              }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-text hover:bg-p-surface-hover focus:bg-p-surface-hover focus:outline-none"
+            >
+              {label}
             </button>
           ))}
         </div>,

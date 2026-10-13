@@ -42,6 +42,27 @@ def test_provision_get_purge():
     assert mcp_broker.get("s1", "github") is None
 
 
+def test_the_command_line_half_rides_the_bundle_and_is_found_by_host():
+    from core.credentials.mcp_gateway import CliCredential, TokenRef
+    cred = CliCredential(host="github.com", token_ref=TokenRef("/tokens", "acct"),
+                         env_names=("GH_TOKEN",), manifest="github-mcp")
+    mcp_broker.provision("s1", {"github-mcp": SecretBundle(cli=cred),
+                                "slack": SecretBundle(env={"SLACK_TOKEN": "sk"})})
+    assert mcp_broker.cli_credential("s1", "github.com") is cred
+    assert mcp_broker.cli_credential("s1", " GITHUB.COM ") is cred   # a host, case-free
+    assert mcp_broker.cli_credential("s1", "gitlab.com") is None
+    assert mcp_broker.cli_credential("s2", "github.com") is None
+    assert mcp_broker.cli_credential("s1", "") is None
+    # the mcp-credentials endpoint never answers it (the env half is empty)
+    assert mcp_broker.get("s1", "github-mcp").env == {}
+    mcp_broker.purge_session("s1")
+    assert mcp_broker.cli_credential("s1", "github.com") is None
+    # the descriptor round trip is secret-free and loses nothing
+    back = CliCredential.from_descriptor(cred.descriptor())
+    assert back == cred and "GH_TOKEN" in cred.descriptor()["env_names"]
+    assert CliCredential.from_descriptor({"host": "x"}) is None
+
+
 def test_provision_replaces_and_empty_clears():
     mcp_broker.provision("s1", {"a": SecretBundle(env={"K": "1"})})
     mcp_broker.provision("s1", {"b": SecretBundle(env={"K": "2"})})  # whole-session replace

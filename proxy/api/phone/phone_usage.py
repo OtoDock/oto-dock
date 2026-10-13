@@ -21,7 +21,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import config
-from adapters.phone import DIRECTIONS, INBOUND, is_outbound
+from adapters.phone import DIRECTIONS, INBOUND, OUTBOUND, is_outbound
 from core.layers.providers import ProviderUsage, get_adapter
 from services.billing import usage_service
 from services.infra import external_retention
@@ -32,7 +32,7 @@ from storage.phone import phone_route_store
 from core.session import session_kind
 from core.session.visibility import PHONE_CHAT_OWNER
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 router = APIRouter()
 
 
@@ -181,14 +181,16 @@ _PIN_WINDOW_MAX_S = 3600
 
 @router.get("/v1/phone/pin-failures")
 async def list_pin_failures(window_s: int = 900, authorization: str | None = Header(None)):
-    """The inbound calls of the last ``window_s`` seconds that entered the
-    PIN gate (caller, route, outcome, attempts, start and end), so the
-    daemon rebuilds its lockout windows after a restart
-    (``calls/pin_failures.py``). Master key only."""
+    """The calls of the last ``window_s`` seconds that entered the PIN gate
+    (the number the gate keyed on: the caller's, or the callee's of an
+    outbound call; route, outcome, attempts, start and end), so the daemon
+    rebuilds its lockout windows after a restart (``calls/pin_failures.py``).
+    Master key only."""
     _require_master_key(authorization)
     window = min(max(int(window_s), 60), _PIN_WINDOW_MAX_S)
     since = (datetime.now(timezone.utc) - timedelta(seconds=window)).isoformat()
-    calls = await asyncio.to_thread(phone_call_log_store.list_pin_attempts, since)
+    calls = await asyncio.to_thread(
+        phone_call_log_store.list_pin_attempts, since, outbound=OUTBOUND)
     return {"calls": calls}
 
 
@@ -201,3 +203,28 @@ async def report_phone_call(
     rejected). Entered digits never travel here — only attempt counts."""
     _require_master_key(authorization)
     return await asyncio.to_thread(_record_call, req.model_dump())
+
+
+class TransferOutcome(BaseModel):
+    """The daemon's word on a transfer's Dial that ended without the
+    colleague, for a row already reported as ``transferred``."""
+    call_uuid: str
+    outcome: str
+
+
+@router.post("/v1/phone/calls/transfer-outcome")
+async def report_transfer_outcome(
+    req: TransferOutcome, authorization: str | None = Header(None),
+):
+    """Twilio's action callback can land after the call's row was written
+    (the Dial rings while the daemon reports): the newest ``transferred``
+    row of the call takes ``transfer_failed``. Master key only; a repeated
+    callback updates nothing."""
+    _require_master_key(authorization)
+    if req.outcome != "transfer_failed" or not req.call_uuid:
+        raise HTTPException(status_code=400, detail="outcome must be transfer_failed")
+    updated = await asyncio.to_thread(
+        phone_call_log_store.update_outcome, req.call_uuid,
+        outcome=req.outcome, only_from="transferred",
+    )
+    return {"updated": updated}

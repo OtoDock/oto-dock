@@ -52,15 +52,16 @@ def test_codex_capabilities_expose_plan_mode():
 
 
 class TestCollaborationMode:
-    """Plan collaboration mode is DERIVED from the platform mode (`plan_mode`),
-    not from the sandbox: plan mode runs a read-only sandbox, but so does a
-    judge session (CHECKS.md), which must stay in the default collaboration
-    mode. The per-turn override uses the MINIMAL {mode:...} (not the full
-    preset, whose reasoning_effort would clobber the user's effort)."""
+    """Plan collaboration mode is DERIVED from the platform mode
+    (`permission_mode`), not from the sandbox: plan mode runs a read-only
+    sandbox, but so does a judge session (CHECKS.md), which must stay in the
+    default collaboration mode. The per-turn override uses the MINIMAL
+    {mode:...} (not the full preset, whose reasoning_effort would clobber the
+    user's effort)."""
 
     def test_plan_mode_is_plan(self):
         s = _mk(sandbox_mode="read-only")
-        s.plan_mode = True
+        s.set_mode("plan", "read-only")
         assert s._collaboration_mode() == {"mode": "plan"}
 
     def test_read_only_without_plan_is_default(self):

@@ -9,7 +9,7 @@ import {
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
   useDeleteRoutePin,
   usePhoneServers, useCreatePhoneServer,
-  usePhoneSettings, useSavePhoneSettings, useRouteMcpPreview,
+  usePhoneSettings, useSavePhoneSettings, usePhonePromptDefaults, useRouteMcpPreview,
   useExternalData, useSaveExternalData, useForgetExternalData,
   type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
   PIN_DIGITS, isRoutePin, PHONE_INBOUND, PHONE_OUTBOUND,
@@ -135,8 +135,9 @@ function ServersSection() {
 // ---------------------------------------------------------------------------
 
 const EMPTY_ROUTE: PhoneRouteCreate = {
-  direction: PHONE_INBOUND, name: '', agent: '', language: 'en', llm_mode: 'proxy',
-  phone_server_id: null, stt_provider_id: null, tts_provider_id: null,
+  direction: PHONE_INBOUND, name: '', agent: '', language: 'en', language_detect: true, llm_mode: 'proxy',
+  transfer_targets: [],
+  phone_server_id: null, stt_provider_id: null, tts_provider_id: null, voice_id: '',
   greeting: '', phone_context_override: '',
   backchannel_mode: 'on', thinking_filler_mode: 'on',
   background_sound: 'off',
@@ -161,6 +162,13 @@ export type PinIntent = { dirty: boolean; enabled: boolean; value: string }
 function endsWithoutPin(form: { identity_mode: string; direction: string }, pin: PinIntent, hasPin: boolean) {
   return form.identity_mode === 'user' && form.direction === PHONE_INBOUND
     && !(pin.enabled && (pin.value !== '' || hasPin))
+}
+
+// Where a PIN belongs (the server's rule): every inbound route, and an
+// outbound route tied to a platform user (the person who answers enters it
+// before the agent speaks).
+function pinAllowed(form: { identity_mode: string; direction: string }) {
+  return form.direction === PHONE_INBOUND || form.identity_mode === 'user'
 }
 
 // Who the caller IS on a route (docs/PHONE-CONFIG.md "Route identity and
@@ -233,8 +241,9 @@ function RouteModal({
   const [pinEnabled, setPinEnabled] = useState(hasPin)
   const [pinValue, setPinValue] = useState('')
   const pinDirty = pinEnabled !== hasPin || pinValue !== ''
+  const pinFits = pinAllowed(form)
   const pinValid =
-    form.direction !== PHONE_INBOUND || !pinEnabled
+    !pinFits || !pinEnabled
     || isRoutePin(pinValue) || (hasPin && pinValue === '')
   const { data: agentTriggers } = useTriggers({ agent: form.agent, scope: 'agent' })
   const createTrigger = useCreateTrigger()
@@ -330,6 +339,11 @@ function RouteModal({
             </div>
           </div>
 
+          <SettingRow label="Detect the caller's language"
+            description="The greeting plays in the language above; the caller's first words pick the language of the rest of the call when the line has a voice for it. Off: every call runs in the language above.">
+            <Toggle checked={form.language_detect ?? false} onChange={v => set('language_detect', v)} />
+          </SettingRow>
+
           <div>
             <label className="block text-xs font-medium text-p-text mb-1">Phone Server</label>
             <select value={form.phone_server_id ?? ''} onChange={e => set('phone_server_id', e.target.value ? Number(e.target.value) : null)}
@@ -369,7 +383,7 @@ function RouteModal({
                 <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
                   {form.direction === PHONE_INBOUND
                     ? 'Require a PIN below — without one, anyone who dials this number acts as that user.'
-                    : 'Whoever answers an outbound call on this route acts as that user.'}
+                    : 'Whoever answers a call on this route acts as that user. Require a PIN below so they enter it first; use the route for calls to your own phone.'}
                 </p>
               </div>
             ) : (
@@ -380,24 +394,47 @@ function RouteModal({
             <McpPreview agent={form.agent} identityMode={form.identity_mode} />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-p-text mb-1">STT Provider</label>
-              <select value={form.stt_provider_id ?? ''} onChange={e => set('stt_provider_id', e.target.value ? Number(e.target.value) : null)}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                <option value="">(use default)</option>
-                {sttProviders.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-              </select>
+          {/* The PIN: every inbound route, and an outbound route tied to a
+              user (the person who answers enters it before the agent
+              speaks). A stored PIN on a form that no longer allows one stays
+              visible in its removal state, and the save removes it first. */}
+          {(pinFits || hasPin) && (
+            <div className="border border-p-border-light rounded-lg p-3 space-y-2">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <span className="text-sm font-medium text-p-text">
+                    Require a PIN
+                    {hasPin && <span className="text-xs text-green-600 ml-1.5">(set)</span>}
+                  </span>
+                  <p className="text-xs text-p-text-light mt-0.5">
+                    {form.direction === PHONE_INBOUND
+                      ? 'Anyone who calls this number must enter this code on the keypad before the agent answers — even people you know.'
+                      : 'The person who answers must enter this code on the keypad before the agent speaks. A Twilio line receives every keypress; an Asterisk line needs its AMI event listener connected (else only in-band tones are heard).'}
+                  </p>
+                </div>
+                {pinFits && <Toggle checked={pinEnabled} onChange={setPinEnabled} />}
+              </div>
+              {pinFits && pinEnabled && (
+                <div>
+                  <input
+                    type="password" inputMode="numeric" autoComplete="off" maxLength={PIN_DIGITS}
+                    value={pinValue}
+                    onChange={e => setPinValue(e.target.value.replace(/\D/g, ''))}
+                    className="w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono tracking-widest"
+                    placeholder={hasPin ? '••••••' : `${PIN_DIGITS} digits`}
+                  />
+                  <p className="text-xs text-p-text-light mt-1">
+                    {hasPin
+                      ? 'Leave empty to keep the current PIN, or type a new one to replace it.'
+                      : `Enter ${PIN_DIGITS} digits. The person presses pound (#) after the code.`}
+                  </p>
+                </div>
+              )}
+              {hasPin && (!pinFits || !pinEnabled) && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">The PIN will be removed when you save.</p>
+              )}
             </div>
-            <div>
-              <label className="block text-xs font-medium text-p-text mb-1">TTS Provider</label>
-              <select value={form.tts_provider_id ?? ''} onChange={e => set('tts_provider_id', e.target.value ? Number(e.target.value) : null)}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                <option value="">(use default)</option>
-                {ttsProviders.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-              </select>
-            </div>
-          </div>
+          )}
 
           {form.direction === PHONE_INBOUND && (
             <>
@@ -414,83 +451,44 @@ function RouteModal({
                   className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text resize-y"
                   placeholder="TTS greeting text (leave empty for default)" />
               </div>
-              <div className="border border-p-border-light rounded-lg p-3 space-y-2">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <span className="text-sm font-medium text-p-text">
-                      Require a PIN
-                      {hasPin && <span className="text-xs text-green-600 ml-1.5">(set)</span>}
-                    </span>
-                    <p className="text-xs text-p-text-light mt-0.5">
-                      Anyone who calls this number must enter this code on the
-                      keypad before the agent answers — even people you know.
-                    </p>
-                  </div>
-                  <Toggle checked={pinEnabled} onChange={setPinEnabled} />
-                </div>
-                {pinEnabled && (
-                  <div>
-                    <input
-                      type="password" inputMode="numeric" autoComplete="off" maxLength={PIN_DIGITS}
-                      value={pinValue}
-                      onChange={e => setPinValue(e.target.value.replace(/\D/g, ''))}
-                      className="w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono tracking-widest"
-                      placeholder={hasPin ? '••••••' : `${PIN_DIGITS} digits`}
-                    />
-                    <p className="text-xs text-p-text-light mt-1">
-                      {hasPin
-                        ? 'Leave empty to keep the current PIN, or type a new one to replace it.'
-                        : `Enter ${PIN_DIGITS} digits. Callers press pound (#) after the code.`}
-                    </p>
-                  </div>
-                )}
-                {!pinEnabled && hasPin && (
-                  <p className="text-xs text-amber-600 dark:text-amber-400">The PIN will be removed when you save.</p>
-                )}
-              </div>
-              {/* AudioSocket UUID is Asterisk-family plumbing: the PBX
-                  dialplan/AstDB pins it, so reusing one keeps an existing
-                  PBX config working when a route is recreated. Twilio
-                  matches by server+DID — the field is noise there, hidden
-                  entirely; for Asterisk it lives behind Advanced. */}
-              {selectedServerAdapter !== 'twilio' && (
-                <details className="group">
-                  <summary className="text-xs text-p-text-light cursor-pointer select-none hover:text-p-text">
-                    Advanced
-                  </summary>
-                  <div className="mt-2">
-                    <label className="block text-xs font-medium text-p-text mb-1">AudioSocket UUID</label>
-                    <input value={form.audiosocket_uuid || ''} onChange={e => set('audiosocket_uuid', e.target.value || null)}
-                      className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
-                      placeholder="(auto-allocated on save)" />
-                    <p className="text-xs text-p-text-light mt-1">Auto-allocated when you save — set it only to reuse a UUID your Asterisk dialplan/AstDB already carries (recreating a route without touching the PBX).</p>
-                  </div>
-                </details>
-              )}
             </>
           )}
 
           {form.direction === PHONE_OUTBOUND && (
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Caller ID</label>
-                <input value={form.ami_caller_id} onChange={e => set('ami_caller_id', e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder='"Company" <+1234567890>' />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Outbound Dial Prefix</label>
-                <input value={form.dial_prefix} onChange={e => set('dial_prefix', e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="(optional, e.g. 81)" />
-                <p className="mt-1 text-xs text-p-text-light">Prepended to the dialed number to pick which SIP line/trunk this route uses. Create a matching FreePBX Outbound Route (pattern <span className="font-mono">{'<prefix>|.'}</span>) with that trunk + its Caller ID. Blank = your default outbound routing.</p>
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Dialplan Context</label>
-                <input value={form.ami_outbound_context} onChange={e => set('ami_outbound_context', e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="oto-audiosocket-outbound" />
-                <p className="mt-1 text-xs text-p-text-light">Blank = <span className="font-mono">oto-audiosocket-outbound</span> (installed by the bootstrap snippet).</p>
-              </div>
+            <div>
+              <label className="block text-xs font-medium text-p-text mb-1">Caller ID</label>
+              <input value={form.ami_caller_id} onChange={e => set('ami_caller_id', e.target.value)}
+                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder='"Company" <+1234567890>' />
             </div>
           )}
+
+          <div>
+            <label className="block text-xs font-medium text-p-text mb-1">Transfer targets</label>
+            <p className="text-xs text-p-text-light mb-1">
+              The colleagues the agent may hand the caller to with its transfer tool, by name. These are the only numbers it ever dials: a FreePBX extension or a number your outbound routes understand (Asterisk lines transfer inbound calls; Twilio lines both ways).
+            </p>
+            <div className="space-y-2" data-testid="transfer-targets">
+              {/* Wraps on a phone: the number takes its own row below 640 px. */}
+              {(form.transfer_targets ?? []).map((t, i) => (
+                <div key={i} className="flex flex-wrap gap-2">
+                  <input value={t.label} aria-label={`Transfer target ${i + 1} name`}
+                    onChange={e => set('transfer_targets', (form.transfer_targets ?? []).map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
+                    className="flex-1 min-w-[10rem] px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="Name, e.g. Reception" />
+                  <input value={t.number} aria-label={`Transfer target ${i + 1} number`}
+                    onChange={e => set('transfer_targets', (form.transfer_targets ?? []).map((x, j) => j === i ? { ...x, number: e.target.value } : x))}
+                    className="w-full sm:w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono" placeholder="200 or +30210…" />
+                  <button type="button" aria-label={`Remove transfer target ${i + 1}`}
+                    onClick={() => set('transfer_targets', (form.transfer_targets ?? []).filter((_, j) => j !== i))}
+                    className="px-2 text-xs text-p-text-secondary hover:text-red-500">Remove</button>
+                </div>
+              ))}
+              <button type="button" onClick={() => set('transfer_targets', [...(form.transfer_targets ?? []), { label: '', number: '' }])}
+                disabled={(form.transfer_targets ?? []).length >= 20}
+                className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-40">
+                + Add target
+              </button>
+            </div>
+          </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <SettingRow label="Backchannel" description="Active-listening sounds while the caller talks">
@@ -553,6 +551,69 @@ function RouteModal({
               </div>
             )}
           </div>
+
+          {/* Blank by default: the provider overrides, a voice for this
+              route alone, and the Asterisk plumbing (a Twilio server
+              matches by DID and dials by REST, so its lines never show
+              the three Asterisk fields). */}
+          <details className="group" data-testid="route-advanced">
+            <summary className="text-xs text-p-text-light cursor-pointer select-none hover:text-p-text">
+              Advanced
+            </summary>
+            <div className="mt-2 space-y-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-p-text mb-1">STT Provider</label>
+                  <select value={form.stt_provider_id ?? ''} onChange={e => set('stt_provider_id', e.target.value ? Number(e.target.value) : null)}
+                    className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+                    <option value="">(use default)</option>
+                    {sttProviders.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-p-text mb-1">TTS Provider</label>
+                  <select value={form.tts_provider_id ?? ''} onChange={e => set('tts_provider_id', e.target.value ? Number(e.target.value) : null)}
+                    className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+                    <option value="">(use default)</option>
+                    {ttsProviders.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-p-text mb-1">Voice</label>
+                <input value={form.voice_id ?? ''} aria-label="Voice id"
+                  onChange={e => set('voice_id', e.target.value.replace(/\s+/g, ''))}
+                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                  placeholder="(the provider's voice for the language)" />
+                <p className="mt-1 text-xs text-p-text-light">A voice id from the TTS provider's library, for this route only. Needs the phone server of 1.8.0 or later.</p>
+              </div>
+              {form.direction === PHONE_OUTBOUND && selectedServerAdapter !== 'twilio' && (
+                <>
+                  <div>
+                    <label className="block text-xs font-medium text-p-text mb-1">Outbound Dial Prefix</label>
+                    <input value={form.dial_prefix} onChange={e => set('dial_prefix', e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="(e.g. 81)" />
+                    <p className="mt-1 text-xs text-p-text-light">Digits dialled before the number to pick a trunk, with a matching FreePBX outbound route. Blank: your default routing.</p>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-p-text mb-1">Dialplan Context</label>
+                    <input value={form.ami_outbound_context} onChange={e => set('ami_outbound_context', e.target.value)}
+                      className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="oto-audiosocket-outbound" />
+                    <p className="mt-1 text-xs text-p-text-light">Blank unless you changed the installed dialplan.</p>
+                  </div>
+                </>
+              )}
+              {form.direction === PHONE_INBOUND && selectedServerAdapter !== 'twilio' && (
+                <div>
+                  <label className="block text-xs font-medium text-p-text mb-1">AudioSocket UUID</label>
+                  <input value={form.audiosocket_uuid || ''} onChange={e => set('audiosocket_uuid', e.target.value || null)}
+                    className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                    placeholder="(auto-allocated on save)" />
+                  <p className="mt-1 text-xs text-p-text-light">Auto-allocated on save. Set it only to reuse the UUID your dialplan already carries.</p>
+                </div>
+              )}
+            </div>
+          </details>
 
           <div className="flex items-center gap-2">
             <Toggle checked={form.enabled} onChange={v => set('enabled', v)} />
@@ -625,21 +686,38 @@ function RoutesSection() {
     const { id, pin_configured, ...rest } = data
     delete (rest as { warnings?: string[] }).warnings
     const hadPin = !!pin_configured
-    // The PIN card hides on an outbound form but keeps its state: a value
-    // rides the save only for an inbound route, and only a valid one.
-    const settingPin = rest.direction === PHONE_INBOUND && pin.dirty && pin.enabled && isRoutePin(pin.value)
+    // A value rides the save only where a PIN belongs (every inbound route,
+    // an outbound route tied to a user), and only a valid one.
+    const fits = pinAllowed(rest)
+    const settingPin = fits && pin.dirty && pin.enabled && isRoutePin(pin.value)
     if (settingPin) rest.pin = pin.value
     if (acknowledged) rest.acknowledge_no_pin = true
-    const removingPin = pin.dirty && !pin.enabled && hadPin
+    // A removal the admin asked for goes after the save; a stored PIN the
+    // edited route may no longer carry goes BEFORE it (the card said so),
+    // since the server refuses the save while the PIN would be stranded.
+    const removingPin = hadPin && pin.dirty && !pin.enabled
+    const strandedPin = hadPin && !fits
     if (id) {
-      updateMut.mutate({ id, data: rest }, {
+      const save = () => updateMut.mutate({ id, data: rest }, {
         onSuccess: (res) => {
-          if (removingPin) removePin(id, acknowledged)
+          if (removingPin && !strandedPin) removePin(id, acknowledged)
           setEditRoute(null)
           showWarnings(res, 'Route saved. Please note:', acknowledged)
         },
         onError: (e) => alert((e as Error).message),
       })
+      if (strandedPin) {
+        // The card said the PIN goes with this save; the stored row may still
+        // be an inbound user route, whose PIN removal the server lets through
+        // only acknowledged.
+        delPinMut.mutate({ id, acknowledgeNoPin: true }, {
+          onSuccess: save,
+          onError: (e) => showWarnings(
+            { warnings: [(e as Error).message] }, 'The PIN could not be removed, so the route was not saved:', true),
+        })
+      } else {
+        save()
+      }
     } else {
       createMut.mutate(rest as PhoneRouteCreate, {
         onSuccess: (created) => {
@@ -657,7 +735,7 @@ function RoutesSection() {
   return (
     <>
       <div className="flex items-center justify-between mb-3">
-        <p className="text-xs text-p-text-light">Map AudioSocket UUIDs to agent configurations for inbound/outbound calls.</p>
+        <p className="text-xs text-p-text-light">Set up your inbound and outbound call routes.</p>
         <button onClick={openNew} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover">Add Route</button>
       </div>
 
@@ -819,37 +897,11 @@ function CallerDataSection() {
 // Call prompts (inbound / outbound context — phone_*)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_INBOUND_CONTEXT =
-  'You are on a live phone call. This is voice — not chat.\n' +
-  'RULES:\n' +
-  '- ALWAYS respond in the SAME LANGUAGE the user speaks. Greek → Greek. English → English.\n' +
-  '- Keep responses SHORT: 1-3 sentences maximum. Summarize instead of listing details.\n' +
-  '- Talk naturally like a real person on the phone — use casual, conversational language.\n' +
-  '- Avoid stiff/formal phrasing. Say things the way you\'d say them out loud.\n' +
-  '- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n' +
-  '- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n' +
-  '- Don\'t spell out URLs, paths, or IPs unless asked.\n' +
-  '- When using tools: say \'One moment\' before, then summarize the result in 1-2 short sentences.\n' +
-  '- To end the call (e.g. user says goodbye or the conversation is clearly over), append [CALL_COMPLETE] at the end of your final message. The system will strip it before speaking.\n'
-
-const DEFAULT_OUTBOUND_CONTEXT =
-  'You are on a live phone call that YOU placed to complete a task. This is voice — not chat.\n' +
-  'RULES:\n' +
-  '- ALWAYS respond in the SAME LANGUAGE the other person speaks. Greek → Greek. English → English.\n' +
-  '- Keep responses SHORT: 1-3 sentences maximum. Summarize instead of listing details.\n' +
-  '- Talk naturally like a real person on the phone — use casual, conversational language.\n' +
-  '- Avoid stiff/formal phrasing. Say things the way you\'d say them out loud.\n' +
-  '- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n' +
-  '- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n' +
-  '- Don\'t spell out URLs, paths, or IPs unless asked.\n' +
-  '- When using tools: say \'One moment\' before, then summarize the result in 1-2 short sentences.\n' +
-  '- Complete the task you were given, politely and professionally.\n' +
-  '- If you need information from your manager during the call, emit [QUESTION: your question here] in your response. The system will relay the question while the call stays active.\n' +
-  '- When the task is complete or clearly cannot be completed, end your final message with [CALL_COMPLETE].\n' +
-  '- The [CALL_COMPLETE] and [QUESTION:] markers are stripped before speaking — they\'re signals for the system.\n'
-
 function CallPromptsSection() {
   const { data: settings } = usePhoneSettings()
+  // The shipped texts come from the server (the seed's source), so Restore
+  // Default writes what a fresh install gets.
+  const { data: defaults } = usePhonePromptDefaults()
   const saveMut = useSavePhoneSettings()
   const [savedField, setSavedField] = useState('')
 
@@ -857,14 +909,18 @@ function CallPromptsSection() {
     saveMut.mutate({ [key]: value }, { onSuccess: () => { setSavedField(key); setTimeout(() => setSavedField(''), 2000) } })
   }
 
-  const prompt = (key: 'context_inbound' | 'context_outbound', label: string, fallback: string, rows: number) => (
+  const prompt = (key: 'context_inbound' | 'context_outbound', label: string, rows: number) => (
     <div>
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-2">
           <label className="text-sm font-medium text-p-text">{label}</label>
           <SavedBadge show={savedField === key} />
         </div>
-        <button onClick={() => save(key, fallback)} className="text-xs text-p-text-secondary hover:text-p-text">Restore Default</button>
+        <button
+          onClick={() => { if (defaults) save(key, defaults[key]) }}
+          disabled={!defaults}
+          className="text-xs text-p-text-secondary hover:text-p-text disabled:opacity-50"
+        >Restore Default</button>
       </div>
       <textarea
         defaultValue={settings?.[key] || ''}
@@ -878,8 +934,8 @@ function CallPromptsSection() {
   return (
     <div className="space-y-4">
       <p className="text-xs text-p-text-light">System prompt instructions injected into all call sessions. Edit to customize, or restore defaults.</p>
-      {prompt('context_inbound', 'Inbound Context', DEFAULT_INBOUND_CONTEXT, 10)}
-      {prompt('context_outbound', 'Outbound Context', DEFAULT_OUTBOUND_CONTEXT, 10)}
+      {prompt('context_inbound', 'Inbound Context', 10)}
+      {prompt('context_outbound', 'Outbound Context', 10)}
     </div>
   )
 }
@@ -1130,6 +1186,12 @@ function InfrastructureSection() {
             {['DEBUG', 'INFO', 'WARNING', 'ERROR'].map(l => <option key={l} value={l}>{l}</option>)}
           </select>
           <SavedBadge show={savedField === 'log_level'} />
+        </SettingRow>
+        <SettingRow label="Save outgoing audio"
+          description="Save the agent's outgoing audio of every call as a WAV file next to the phone log until you turn it off. For checking playback artifacts; the caller's audio is never saved. Needs the phone server of 1.8.0 or later.">
+          <Toggle checked={settings?.debug_outgoing_audio === 'on'}
+            onChange={v => save('debug_outgoing_audio', v ? 'on' : 'off')} />
+          <SavedBadge show={savedField === 'debug_outgoing_audio'} />
         </SettingRow>
       </div>
     </div>

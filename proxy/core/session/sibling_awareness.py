@@ -5,7 +5,9 @@ RIGHT NOW: live sibling chats (title + generating/awaiting user) and running
 background task runs (name + dyn-<task_id>, so the agent can look one up via
 list_tasks / get_task_result ONLY when its work depends on it). Injected:
 
-- per turn at the three layer prepend sites (after the [Current time] line),
+- per turn at the three layer prepend sites (ahead of the [Current time]
+  line), and on a task run's first prompt (the runner: headless through
+  those sites, interactive after the time line),
 - at session start via the delegation-mcp dynamic-context block,
 - piggybacked on server-delivered prompts (the PTY rung writes raw bytes and
   never passes the layer sites).
@@ -25,11 +27,15 @@ import time
 from storage import database as task_store
 from core.session import session_kind
 
-logger = logging.getLogger("claude-proxy.siblings")
+logger = logging.getLogger("otodock.siblings")
 
 _SNAP_TTL = 2.0    # live-lane + running-task snapshot
 _ROW_TTL = 30.0    # chat-row / session→chat lookups
 _MAX_LISTED = 5    # per kind; the rest collapses to "+N more"
+# The caches are keyed by chat and session, and every task run has its own:
+# past this many entries the expired ones go, and then all of them (a lost
+# hash re-injects an unchanged line once, nothing more).
+_CACHE_CAP = 2048
 
 _snapshot: dict = {"ts": 0.0, "lanes": {}, "tasks": []}
 _chat_rows: dict[str, tuple[float, dict | None]] = {}
@@ -69,11 +75,25 @@ def _get_snapshot_sync() -> dict:
     return _snapshot
 
 
+def _bound(cache: dict, ttl: float | None) -> None:
+    """Keep a cache under ``_CACHE_CAP``: drop the expired timed entries,
+    then everything if it is still full."""
+    if len(cache) < _CACHE_CAP:
+        return
+    if ttl is not None:
+        now = time.monotonic()
+        for key in [k for k, v in list(cache.items()) if now - v[0] >= ttl]:
+            cache.pop(key, None)
+    if len(cache) >= _CACHE_CAP:
+        cache.clear()
+
+
 def _chat_row_sync(chat_id: str) -> dict | None:
     cached = _chat_rows.get(chat_id)
     if cached and time.monotonic() - cached[0] < _ROW_TTL:
         return cached[1]
     row = task_store.get_chat(chat_id)
+    _bound(_chat_rows, _ROW_TTL)
     _chat_rows[chat_id] = (time.monotonic(), row)
     return row
 
@@ -85,7 +105,9 @@ def _chat_id_for_session_sync(session_id: str) -> str:
     row = task_store.get_chat_by_session(session_id)
     chat_id = row["id"] if row else ""
     if row:
+        _bound(_chat_rows, _ROW_TTL)
         _chat_rows[chat_id] = (time.monotonic(), row)
+    _bound(_session_chats, _ROW_TTL)
     _session_chats[session_id] = (time.monotonic(), chat_id)
     return chat_id
 
@@ -117,7 +139,20 @@ def _gather_sync(agent: str, owner: str, own_chat_id: str) -> tuple[list, list]:
     return siblings, tasks
 
 
+_NAME_MAX = 80     # per listed title or task name
+
+
+def _one_line(text: str) -> str:
+    """A title or task name folded onto one line and bounded: the matchers
+    that strip the line from titles and bubbles read it as one line of at
+    most 2000 characters (ten names and the frame stay well under)."""
+    name = " ".join(str(text).split())
+    return name if len(name) <= _NAME_MAX else name[:_NAME_MAX - 1].rstrip() + "…"
+
+
 def _render_line(siblings: list, tasks: list) -> str:
+    siblings = [(_one_line(title), status) for title, status in siblings]
+    tasks = [(_one_line(name), task_id) for name, task_id in tasks]
     parts = []
     if siblings:
         listed = ", ".join(
@@ -150,6 +185,7 @@ def _line_for_chat_sync(chat_id: str) -> str:
     h = hash(line)
     if _last_hash.get(chat_id) == h:
         return ""
+    _bound(_last_hash, None)
     _last_hash[chat_id] = h
     return line
 

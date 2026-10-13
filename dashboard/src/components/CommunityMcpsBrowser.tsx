@@ -15,6 +15,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   useCommunityMcps,
   useInstallCommunityMcp,
+  MCP_TRUST_TIERS,
   useCatalogInstallJobs,
   useCreateMcpRequest,
   useCancelMcpRequest,
@@ -329,6 +330,16 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
                 by {mcp.author}
               </a>
             )}
+            {mcp.trust && (
+              <span
+                className={`text-[10px] px-1 py-0.5 rounded-sm ${mcp.trust === 'third-party'
+                  ? 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary'
+                  : 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-400'}`}
+                title={MCP_TRUST_TIERS[mcp.trust]?.title}
+              >
+                {MCP_TRUST_TIERS[mcp.trust]?.label ?? mcp.trust}
+              </span>
+            )}
             {mcp.patched && (
               <span
                 className="text-[10px] px-1 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
@@ -390,6 +401,14 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
               title="The catalog entry moved to another source. Run Check Updates on the MCP Servers page and switch it there."
             >
               source changed
+            </span>
+          )}
+          {showAdminInstall && !installing && mcp.catalog_unpinned && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
+              title="The catalog pins this entry to a tag or a branch, not a commit. It can be updated once the catalog pins a commit."
+            >
+              catalog pins no commit
             </span>
           )}
           {showAdminInstall && !installing && mcp.update_available && (

@@ -148,7 +148,7 @@ class TestOverflow:
         warnings = [ln for ln in lines if "log queue overflow" in ln]
         assert len(warnings) == 1
         assert "dropped 3 records" in warnings[0]
-        assert "WARNING claude-proxy.log-queue" in warnings[0]
+        assert "WARNING otodock.log-queue" in warnings[0]
         idx = lines.index(warnings[0])
         assert lines[idx - 1].endswith("fill 7")
         assert lines[idx + 1].endswith("after")
@@ -222,6 +222,19 @@ class TestSecretsStayOutOfTheLog:
         assert lq.drain(5.0)
         text = path.read_text()
         assert "JWT.x.y" not in text and "%3Faccess_token%3D[redacted]%26permission" in text
+
+    def test_the_editors_access_header_is_redacted_in_every_encoding(self):
+        token = "eyJhbGciOi.payload_part.sig-part"
+        for line in (
+            "WebSocket /collabora/cool/http%3A//p/wopi/files/f%3Faccess_header%3DAuthorization"
+            f"%253A%2520Bearer%2520{token}%26x%3D1/ws",
+            f"/collabora/cool/http://p/wopi/files/f?access_header=Authorization%3A%20Bearer%20{token}&x=1",
+            f"/collabora/cool/http://p/wopi/files/f?access_header=Authorization: Bearer {token}&x=1",
+            f"uri [http://p/wopi/files/f?access_header=Authorization:+Bearer+{token}]",
+        ):
+            out = log_queue.redact(line)
+            assert token not in out and "payload_part" not in out, out
+            assert "[redacted]" in out
 
     def test_other_query_parameters_are_kept(self):
         assert log_queue.redact("GET /x?a=1&_t=99&path=/y") == "GET /x?a=1&_t=99&path=/y"

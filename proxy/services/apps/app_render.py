@@ -41,7 +41,7 @@ from storage import database as task_store
 if TYPE_CHECKING:
     from services.apps.app_deploy import Manifest
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 WIDTHS = [390, 820, 1280]
 IMAGE_NAMES = {390: "phone", 820: "tablet", 1280: "desktop"}

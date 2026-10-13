@@ -40,8 +40,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from core.execution_layer import Scoped, Window, WindowSpec, Windows
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.subscription-windows")
+logger = logging.getLogger("otodock.subscription-windows")
 
 SETTING_KEY = "subscription_windows_enabled"
 _SETTING_CACHE_S = 60
@@ -478,7 +479,7 @@ def record_for_session_async(session_id: str, w: Windows) -> None:
     """``record_for_session`` off the event loop, fire-and-forget; called from
     the stream consumers, which must never wait on the store."""
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         record_for_session(session_id, w)
         return
@@ -489,7 +490,7 @@ def record_for_session_async(session_id: str, w: Windows) -> None:
         except Exception:
             logger.debug("windows: async record failed", exc_info=True)
 
-    loop.create_task(_run())
+    spawn(_run(), name="record_for_session", owner="subscription_windows")
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +692,7 @@ def schedule_poll(sub_id: str) -> None:
     if not sub_id or not is_enabled() or _air_gapped():
         return
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
 
@@ -709,4 +710,4 @@ def schedule_poll(sub_id: str) -> None:
         except Exception:
             logger.debug("windows: connect-time poll failed", exc_info=True)
 
-    loop.create_task(_run())
+    spawn(_run(), name="connect_time_poll", owner="subscription_windows")

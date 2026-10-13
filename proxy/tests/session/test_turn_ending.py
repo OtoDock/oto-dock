@@ -19,8 +19,8 @@ def test_every_reason_round_trips_through_its_payload(reason):
 
 def test_the_sets_the_owners_read():
     assert te.KILLS_PROCESS == {te.DECLINED, te.LIMIT, te.SILENT}
-    assert te.RESEND == {te.ERROR, te.EXITED, te.SILENT, te.LOST}
-    assert te.STOPPED not in te.RESEND and te.ERROR not in te.KILLS_PROCESS
+    assert te.RESEND == {te.ERROR, te.EXITED, te.SILENT, te.LOST, te.STOPPED}
+    assert te.STOPPED not in te.KILLS_PROCESS and te.ERROR not in te.KILLS_PROCESS
 
 
 def test_a_payload_without_the_new_fields_reads_as_before():
@@ -35,6 +35,7 @@ def test_a_payload_without_the_new_fields_reads_as_before():
     (te.EXITED, ("exited before it answered", "exit code 137", "Send the message again")),
     (te.SILENT, ("went silent", "Send the message again")),
     (te.LOST, ("connection to the machine", "lost mid-turn", "Send the message again")),
+    (te.STOPPED, ("stopped before this message ran", "Send it again")),
     (te.DECLINED, ("safety classifier declined", "another model")),
     (te.LIMIT, ("Usage limit reached",)),
 ])
@@ -64,5 +65,15 @@ def test_the_summary_and_the_callback_name_the_reason_not_the_limit(reason):
 
 def test_stopped_is_the_persons_own_word():
     ending = te.TurnEnding(te.STOPPED)
-    assert ending.line() == "Stopped."
     assert ending.summary() == "Stopped by the person."
+    assert ending.callback_note("chat-1").startswith("The worker's turn was stopped by a person.")
+
+
+def test_a_stopped_message_stamps_the_flags_the_send_consumed():
+    """The message that met the stopped process consumed the Stop's own
+    abort flags while it built its batch: the ending stamps them again, as a
+    lost machine does, so the next turn re-injects the cancelled context."""
+    stamps = {"last_turn_aborted": True, "last_abort_graceful": False}
+    assert te.TurnEnding(te.STOPPED).abort_stamps() == stamps
+    assert te.TurnEnding(te.LOST).abort_stamps() == stamps
+    assert te.TurnEnding(te.ERROR).abort_stamps() is None

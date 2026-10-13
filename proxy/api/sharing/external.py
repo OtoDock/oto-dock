@@ -45,7 +45,7 @@ from storage import database as task_store
 from storage.sharing import share_store
 from storage import db_apps
 
-logger = logging.getLogger("claude-proxy.shares")
+logger = logging.getLogger("otodock.shares")
 router = APIRouter()
 
 UNLOCK_TTL_S = 24 * 3600
@@ -289,8 +289,11 @@ def _host_page(share: dict, row: dict, unlocked: bool, site_key: str) -> str:
     # The config rides a JSON script block: no `<` may reach the parser
     # (`</script>` ends the block, `<!--` puts it in escape mode).
     cfg_json = json.dumps(cfg).replace("<", "\\u003c")
+    # maximum-scale=1 stops iOS zooming into a framed app's field; the
+    # host script drops it on every other device, where it would only
+    # take pinch zoom away (dashboard lib/device/viewport.ts).
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta name="robots" content="noindex"><title>{html.escape(title)}</title>
 <style>html,body{{margin:0;height:100%;font:15px system-ui,sans-serif;background:#f6f7f9;color:#223}}
 @media (prefers-color-scheme:dark){{html,body{{background:#111318;color:#dde3ea}}}}
@@ -348,9 +351,10 @@ class UnlockRequest(BaseModel):
 async def share_unlock(token: str, req: UnlockRequest, request: Request):
     """Password mode: a right password sets the link's own cookie. Wrong
     passwords count against the client address (``auth_bucket_key``) and
-    the link (ten in five minutes each); a right one clears the client's
-    count. Attempts on one link run one at a time, so a burst cannot all
-    pass the check before the first wrong one is counted."""
+    the link (ten in five minutes each); a right one gives back the client's
+    wrong attempts on THIS link only, so its count for the other links it
+    tried stands. Attempts on one link run one at a time, so a burst cannot
+    all pass the check before the first wrong one is counted."""
     _json_only(request)
     ip = get_client_ip(request)
     ip_key = auth_bucket_key(request)
@@ -377,10 +381,10 @@ async def share_unlock(token: str, req: UnlockRequest, request: Request):
         except HashBusy:
             raise _confirm.hash_busy()
         if not ok:
-            rate_limiter.record_attempt("share_unlock_ip", ip_key)
+            rate_limiter.record_attempt("share_unlock_ip", ip_key, tag=share["id"])
             rate_limiter.record_attempt("share_unlock_share", share["id"])
             raise HTTPException(status_code=403, detail="Wrong password")
-    rate_limiter.clear_rate_limit("share_unlock_ip", ip_key)
+    rate_limiter.release_tag("share_unlock_ip", ip_key, share["id"])
     response = JSONResponse({"status": "ok", "release_sha": _release_sha(share, row)})
     response.set_cookie(
         key=_cookie_name(share), value=_mint_unlock(share), httponly=True,

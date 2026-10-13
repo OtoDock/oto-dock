@@ -19,7 +19,7 @@ from auth import roles
 # pairing scope) and the descriptor this store builds from a machine row.
 from core import placement
 
-logger = logging.getLogger("claude-proxy.remote-store")
+logger = logging.getLogger("otodock.remote-store")
 
 # The persisted ``remote_machines.status`` column's three words, named once
 # (core-seams phase 8): ``offline`` (the row a pairing mints), ``online``

@@ -8,11 +8,13 @@ is provisioned via the admin UI + adapter. The platform ships with zero
 routes until then.
 """
 
+import hashlib
 import json
 import logging
 import os
 from datetime import datetime, timezone
 
+from adapters.phone import PHONE_CONTEXT, PHONE_OUTBOUND
 from storage import database as task_store
 from storage.pg import get_conn
 
@@ -149,37 +151,10 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "phone_audiosocket_port": "9092",
     "phone_http_api_port": "9093",
     "phone_log_level": "INFO",
-    # Call context prompts (seeded with the defaults from the phone adapter)
-    "phone_context_inbound": (
-        "You are on a live phone call. This is voice — not chat.\n"
-        "RULES:\n"
-        "- ALWAYS respond in the SAME LANGUAGE the user speaks. Greek → Greek. English → English. Never switch language mid-call.\n"
-        "- Keep responses SHORT: 1-3 sentences maximum. Summarize instead of listing details.\n"
-        "- Talk naturally like a real person on the phone — use casual, conversational language.\n"
-        "- Avoid stiff/formal phrasing. Say things the way you'd say them out loud.\n"
-        "- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n"
-        "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
-        "- Don't spell out URLs, paths, or IPs unless asked.\n"
-        "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you' — in the SAME language as the call). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
-        "- To end the call (e.g. user says goodbye or the conversation is clearly over), append [CALL_COMPLETE] at the end of your final message. The system will strip it before speaking.\n"
-    ),
-    "phone_context_outbound": (
-        "You are on a live phone call that YOU placed to complete a task. This is voice — not chat.\n"
-        "RULES:\n"
-        "- ALWAYS respond in the SAME LANGUAGE the other person speaks. Greek → Greek. English → English. Never switch language mid-call.\n"
-        "- Keep responses SHORT: 1-3 sentences maximum. Summarize instead of listing details.\n"
-        "- Talk naturally like a real person on the phone — use casual, conversational language.\n"
-        "- Avoid stiff/formal phrasing. Say things the way you'd say them out loud.\n"
-        "- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n"
-        "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
-        "- Don't spell out URLs, paths, or IPs unless asked.\n"
-        "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you' — in the SAME language as the call). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
-        "- Complete the task you were given, politely and professionally.\n"
-        "- If you need information from your manager during the call, emit [QUESTION: your question here] in your response. "
-        "The system will relay the question while the call stays active.\n"
-        "- When the task is complete or clearly cannot be completed, end your final message with [CALL_COMPLETE].\n"
-        "- The [CALL_COMPLETE] and [QUESTION:] markers are stripped before speaking — they're signals for the system.\n"
-    ),
+    # Call context prompts: the adapter's texts, one source for the seed, the
+    # empty-setting fallback and the dashboard's Restore Default.
+    "phone_context_inbound": PHONE_CONTEXT,
+    "phone_context_outbound": PHONE_OUTBOUND,
     # Duplex-mode context (dashboard full-duplex voice): the spoken-reply
     # rules, adapted from the call contexts — same language + brevity + never
     # read structured output aloud, but the user HAS a screen, so rich content
@@ -265,18 +240,132 @@ _DEFAULT_SETTINGS: dict[str, str] = {
 # separately via the admin UI (infra_credentials keyed by ``credential_key``,
 # inner key ``API_KEY``). ``voices`` (per-language TTS voice IDs) and
 # ``advanced`` (endpointing) live on the row — the source of truth the phone
-# config push reads. Fields: (type, name, label, credential_key, advanced, voices).
+# config push reads. Neither a model id nor a voice is seeded: the provider
+# classes ship both, and a row that stores none follows a later default.
+# Fields: (type, name, label, credential_key, advanced, voices).
 _DEFAULT_PROVIDERS = [
     ("stt", "deepgram", "Deepgram", "audio-deepgram",
      json.dumps({"call_endpointing_ms": 500, "chat_endpointing_ms": 1500}),
      json.dumps({})),
     ("tts", "cartesia", "Cartesia", "audio-cartesia",
      json.dumps({}),
-     json.dumps({
-         "en": "79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e",
-         "el": "50849023-76e9-46c7-af52-9ec39888a165",
-     })),
+     json.dumps({})),
 ]
+
+#: The former default model ids the boot walk has already cleared from the
+#: rows (a JSON list): a later explicit pick of the same id stays.
+FORMER_DEFAULTS_WALKED = "audio_former_defaults_walked"
+
+# Every call prompt an earlier release seeded (the dashboard's Restore Default
+# wrote the oldest), as ``_prompt_digest`` of the text: a stored prompt that
+# still reads as one of them was never edited and follows the adapter's
+# current text at boot; any other text is an admin's and stays. A release that
+# changes PHONE_CONTEXT or PHONE_OUTBOUND adds the digest of the text it
+# replaces here, never the current one.
+SHIPPED_CALL_PROMPTS: dict[str, frozenset[str]] = {
+    "phone_context_inbound": frozenset({
+        "8420e63f15387681a5fdb370ee4c57a42af7df01932b8959d7d88651af94c5fc",
+        "10cc48190da79daa4b90c43ccb4320522a045c5c1b6804219a621c083236b7be",
+        "a96225005990342b27929c7efebea0da05469bbcf25c2180a9258bc50f35f185",
+    }),
+    "phone_context_outbound": frozenset({
+        "d33b8ae69333070854e54ff2bd3c833b5eb2232dbe882f4d50a8dcb7735b9119",
+        "d2fa303c1ae2ac9d23b68c2eaa28c57182886169d7fb140e51717b5025196a1c",
+        "bc92d4d08e110701011979c079f3674e09364c039ad90beafaf28252b4e345bb",
+    }),
+}
+
+
+def _prompt_digest(text: str) -> str:
+    """The identity of a call prompt's text: surrounding and trailing
+    whitespace do not count (a textarea save drops a trailing newline)."""
+    lines = "\n".join(line.rstrip() for line in text.strip().splitlines())
+    return hashlib.sha256(lines.encode("utf-8")).hexdigest()
+
+
+def remap_shipped_call_prompts() -> list[str]:
+    """The boot walk over the two call prompts: a stored prompt that still
+    reads as a text an earlier release seeded (``SHIPPED_CALL_PROMPTS``)
+    takes the adapter's current text; an edited prompt stays. Idempotent (the
+    current text is in no release's set). Returns the keys changed."""
+    stored = task_store.get_all_platform_settings()
+    changed: list[str] = []
+    for key, digests in SHIPPED_CALL_PROMPTS.items():
+        value = stored.get(key)
+        if value is None or _prompt_digest(value) not in digests:
+            continue
+        task_store.set_platform_setting(key, _DEFAULT_SETTINGS[key])
+        logger.info("%s read as an earlier release's default; it follows the current text", key)
+        changed.append(key)
+    return changed
+
+
+def remap_retired_audio_models() -> dict[str, int]:
+    """The boot walk over the audio providers' model ids
+    (``audio.providers.model_succession``, the LLM registry's rule applied to
+    audio): a RETIRED id stored on a row moves to its successor's chain end
+    on every boot (the provider builds resolve it too, so a row written
+    after the walk runs the successor as well); a FORMER DEFAULT is cleared
+    from the rows once, so the live default applies, and the setting
+    remembers it so an admin's later pick of that id stays. Returns
+    ``{old id: rows changed}``; never raises past one row."""
+    from audio.providers.model_succession import (
+        DEFAULT_MODELS,
+        FORMER_DEFAULTS,
+        MODEL_ID_KEYS,
+        MODEL_SUCCESSORS,
+        successor_of,
+    )
+
+    from storage.prefs import audio_provider_store
+
+    try:
+        walked = set(json.loads(task_store.get_all_platform_settings().get(FORMER_DEFAULTS_WALKED) or "[]"))
+    except (TypeError, ValueError):
+        walked = set()
+    changed: dict[str, int] = {}
+    failed = False
+    for row in audio_provider_store.get_all_providers():
+        kind = (row["provider_type"], row["provider_name"])
+        successors = MODEL_SUCCESSORS.get(kind, {})
+        former = set(FORMER_DEFAULTS.get(kind, ())) - walked
+        defaults = DEFAULT_MODELS.get(kind, {})
+        advanced = dict(row.get("advanced") or {})
+        moved = False
+        for key in MODEL_ID_KEYS:
+            stored = advanced.get(key)
+            if not stored:
+                continue
+            if stored in successors:
+                successor = successor_of(successors, stored)
+                if successor == defaults.get(key):
+                    # The successor is the live default: the row follows
+                    # it unpinned, so a later default moves it too.
+                    del advanced[key]
+                else:
+                    advanced[key] = successor
+                logger.info("audio model %s on %s/%s row %s -> %s (retired)",
+                            stored, *kind, row["id"], successor)
+            elif stored in former:
+                del advanced[key]
+                logger.info("audio model %s on %s/%s row %s cleared (a former default; the live one applies)",
+                            stored, *kind, row["id"])
+            else:
+                continue
+            changed[stored] = changed.get(stored, 0) + 1
+            moved = True
+        if moved:
+            try:
+                audio_provider_store.update_provider(row["id"], {"advanced": advanced})
+            except Exception:
+                failed = True
+                logger.exception("audio model remap on row %s failed (non-fatal)", row["id"])
+    every_former = {m for members in FORMER_DEFAULTS.values() for m in members}
+    # A row the walk could not write keeps its former default; the marker
+    # waits for a boot that clears it, or that row would read as a pick.
+    if not failed and not every_former <= walked:
+        task_store.set_platform_setting(FORMER_DEFAULTS_WALKED, json.dumps(sorted(walked | every_former)))
+    return changed
 
 
 def _seed_audio_providers() -> None:

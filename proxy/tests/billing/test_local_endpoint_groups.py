@@ -138,6 +138,88 @@ class TestLocalEndpointApi:
                     user=self._admin()))
             assert ei.value.status_code == 400
 
+    def test_a_second_server_of_one_provider_on_one_engine_answers_409(self):
+        # The credential key is one row per (engine, provider, auth type,
+        # owner): a second URL of the same provider used to reach the INSERT
+        # and answer 500.
+        import api.admin.execution_layers as api_mod
+        from fastapi import HTTPException
+        first = self._group({"direct-llm": "active"}, url="http://first:8080/v1")
+        req = api_mod.AddLocalEndpointRequest(
+            provider="openai_compatible", endpoint_url="http://second:8080/v1",
+            layers=["codex-cli", "direct-llm"],
+        )
+        with patch.object(api_mod, "subscription_store") as store, \
+             patch.object(api_mod.config, "OTODOCK_CLOUD", False):
+            store.normalize_endpoint_url.side_effect = store_mod.normalize_endpoint_url
+            store.local_endpoint_group_key.side_effect = store_mod.local_endpoint_group_key
+            store.list_local_endpoint_groups.return_value = [first]
+            with pytest.raises(HTTPException) as ei:
+                self._run(api_mod.admin_add_local_endpoint(req, user=self._admin()))
+            store.add_subscription.assert_not_called()
+        assert ei.value.status_code == 409
+        assert "http://first:8080/v1" in ei.value.detail and "direct-llm" in ei.value.detail
+
+    def test_another_admins_server_of_the_provider_is_no_conflict(self):
+        import api.admin.execution_layers as api_mod
+        theirs = self._group({"direct-llm": "active"}, url="http://theirs:8080/v1", owner="admin-2")
+        req = api_mod.AddLocalEndpointRequest(
+            provider="openai_compatible", endpoint_url="http://mine:8080/v1", layers=["direct-llm"],
+        )
+        mine = self._group({"direct-llm": "active"}, url="http://mine:8080/v1")
+        groups = [[theirs], [theirs, mine]]
+        with patch.object(api_mod, "subscription_store") as store, \
+             patch.object(api_mod, "subscription_pool"), \
+             patch.object(api_mod, "_subscriptions_changed", new_callable=AsyncMock), \
+             patch.object(api_mod.config, "OTODOCK_CLOUD", False):
+            store.normalize_endpoint_url.side_effect = store_mod.normalize_endpoint_url
+            store.local_endpoint_group_key.side_effect = store_mod.local_endpoint_group_key
+            store.list_local_endpoint_groups.side_effect = lambda: groups.pop(0)
+            out = self._run(api_mod.admin_add_local_endpoint(req, user=self._admin()))
+        assert store.add_subscription.call_count == 1
+        assert out["endpoint_url"] == "http://mine:8080/v1"
+
+    def test_a_race_on_the_key_answers_409_and_removes_what_it_added(self):
+        import api.admin.execution_layers as api_mod
+        from fastapi import HTTPException
+        req = api_mod.AddLocalEndpointRequest(
+            provider="openai_compatible", endpoint_url="http://h:8080/v1",
+            layers=["direct-llm", "codex-cli"],
+        )
+        added = iter([{"id": "row-1"}])
+
+        def _add(**kw):
+            row = next(added, None)
+            if row is None:
+                raise store_mod.SubscriptionExists("raced")
+            return row
+
+        with patch.object(api_mod, "subscription_store") as store, \
+             patch.object(api_mod.config, "OTODOCK_CLOUD", False):
+            store.SubscriptionExists = store_mod.SubscriptionExists
+            store.normalize_endpoint_url.side_effect = store_mod.normalize_endpoint_url
+            store.local_endpoint_group_key.side_effect = store_mod.local_endpoint_group_key
+            store.list_local_endpoint_groups.return_value = []
+            store.add_subscription.side_effect = _add
+            with pytest.raises(HTTPException) as ei:
+                self._run(api_mod.admin_add_local_endpoint(req, user=self._admin()))
+            store.delete_subscription.assert_called_once_with("row-1")
+        assert ei.value.status_code == 409
+
+    def test_enabling_an_engine_held_by_another_of_ones_servers_answers_409(self):
+        import api.admin.execution_layers as api_mod
+        from fastapi import HTTPException
+        first = self._group({"codex-cli": "active"}, url="http://first:8080/v1")
+        second = self._group({"direct-llm": "active"}, url="http://second:8080/v1")
+        with patch.object(api_mod, "subscription_store") as store:
+            store.list_local_endpoint_groups.return_value = [first, second]
+            with pytest.raises(HTTPException) as ei:
+                self._run(api_mod.admin_set_local_endpoint_engine(
+                    second["group"], api_mod.SetLocalEndpointEngineRequest(layer="codex-cli", enabled=True),
+                    user=self._admin()))
+            store.add_subscription.assert_not_called()
+        assert ei.value.status_code == 409 and "http://first:8080/v1" in ei.value.detail
+
     def test_enable_missing_engine_copies_the_credential(self):
         import api.admin.execution_layers as api_mod
         g = self._group({"direct-llm": "active"}, has_key=True)

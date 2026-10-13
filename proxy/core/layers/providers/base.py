@@ -76,6 +76,13 @@ class ProviderError(Exception):
 class ProviderAdapter(ABC):
     """Abstract interface for LLM provider backends in the Direct LLM path."""
 
+    #: Whether ``format_tool_results`` places a result's ``images`` (an MCP
+    #: tool's kept pictures, ``services/mcp/result_files.py``) where every
+    #: model of the provider reads them. False where vision depends on the
+    #: model behind the endpoint (a text-only model fails the whole request)
+    #: or the API has no image inside a tool result.
+    tool_result_images: bool = False
+
     @property
     @abstractmethod
     def provider_name(self) -> str:
@@ -186,13 +193,14 @@ class ProviderAdapter(ABC):
 
     def calculate_cost(self, model: str, usage: ProviderUsage) -> float:
         """Calculate USD cost from usage using centralized model pricing (the
-        tokens at the model's rates plus the per-call fee of every provider-run
+        tokens at the model's rates, ``config.price_usage``, which applies a
+        model's long-context tier, plus the per-call fee of every provider-run
         web search, ``config.WEB_SEARCH_USD_PER_REQUEST``)."""
-        p_in, p_out, p_cw, p_cr = app_config.get_model_pricing(model, self.provider_name)
         return (
-            usage.input_tokens * p_in / 1_000_000
-            + usage.output_tokens * p_out / 1_000_000
-            + usage.cache_write_tokens * p_cw / 1_000_000
-            + usage.cache_read_tokens * p_cr / 1_000_000
+            app_config.price_usage(
+                model, self.provider_name,
+                input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                cache_read_tokens=usage.cache_read_tokens)
             + usage.web_search_requests * app_config.WEB_SEARCH_USD_PER_REQUEST
         )

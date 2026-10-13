@@ -40,7 +40,7 @@ from storage import database as task_store
 from storage.mcp import mcp_store
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.delegation-api")
+logger = logging.getLogger("otodock.delegation-api")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -400,14 +400,14 @@ async def spawn_delegate(
                     "project_id": project_id or None}
     elif req.surface == "chat":
         worker_chat_id = str(uuid.uuid4())
-        # Best-effort: the run resolves its real model itself (override
-        # included); the chat row's model/layer/mode only seed the
-        # dashboard header and the continue re-derivation above.
+        # The run's own rule (config.resolve_run_model), so the row the
+        # header and billing read names the model the run spawns on; the
+        # row's layer/mode seed the continue re-derivation above.
         # Layer-aware: with a per-lane layer override, the agent-default
         # model may be foreign to that engine.
         try:
-            worker_model = ov_model or config.get_cli_model(
-                effective_agent, layer=ov_layer)
+            worker_model = await asyncio.to_thread(
+                config.resolve_run_model, effective_agent, ov_model, layer=ov_layer)
         except Exception:
             worker_model = ov_model or ""
         worker_row = await asyncio.to_thread(
@@ -591,9 +591,10 @@ async def send_files(
         )
     )
     unavailable: list[str] = []
+    held: list[str] = []
     if u.session_id:
         unavailable = await file_transfer.prefetch_remote_sources(
-            u.session_id, authz, req.paths,
+            u.session_id, authz, req.paths, held=held,
         )
     try:
         result = await asyncio.to_thread(
@@ -604,6 +605,13 @@ async def send_files(
     except file_transfer.MissingSourcePath as e:
         if e.raw not in unavailable:
             raise
+        if e.raw in held:
+            raise HTTPException(
+                status_code=404,
+                detail=f"'{e.raw}' is not in the platform copy of your workspace, and "
+                       "this session may not copy files from its machine into that "
+                       "folder (its role cannot write there), so it cannot be sent",
+            ) from None
         machine = await file_transfer.remote_source_label(u.session_id)
         raise HTTPException(
             status_code=404,
@@ -798,8 +806,9 @@ def _caller_visibility(u: UserContext, x_agent_name: str | None) -> tuple[str, s
     ``owner`` is the chat-history pool the caller's identity owns (real sub,
     or the synthetic ``agent::<slug>`` for shared-only agents / no-user
     service callers). ``caller_chat_id`` resolves from the caller's OWN
-    session token — lineage authority for its spawned workers."""
-    source_agent = u.agent or x_agent_name or ""
+    session token — lineage authority for its spawned workers. Only the
+    master key names its agent by ``X-Agent-Name``."""
+    source_agent = u.agent or (x_agent_name if u.is_service else None) or ""
     acting = u.acting_sub
     if acting is not None:
         owner = chat_history_owner(source_agent, acting) if source_agent else acting

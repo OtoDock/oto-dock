@@ -7,6 +7,7 @@ run in parallel. All responses go to a shared transcript visible to everyone.
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 from core.events import input_queue, tool_roles
@@ -49,8 +50,9 @@ from services.meetings.meeting_context import (
 from core.session import session_kind
 from auth import roles
 from ws import wire_events as wire
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _active_meetings: dict[str, asyncio.Task] = {}
 
@@ -254,13 +256,11 @@ def _start_participant_bg_monitors(
     bgreg.chat_id = chat_id
     layer = _meeting_session_layers.get(session_id) or get_execution_layer(agent_slug)
     if reg.has_pending and not bg_monitor_running(session_id):
-        asyncio.create_task(
-            _bg_agent_monitor(layer, session_id, chat_id, reg.pending_count)
-        )
+        spawn(_bg_agent_monitor(layer, session_id, chat_id, reg.pending_count),
+              name="bg_agent_monitor", owner="meeting_orchestrator")
     if bgreg.has_pending and not bg_command_monitor_running(session_id):
-        asyncio.create_task(
-            _bg_command_monitor(layer, session_id, chat_id, bgreg.pending_count)
-        )
+        spawn(_bg_command_monitor(layer, session_id, chat_id, bgreg.pending_count),
+              name="bg_command_monitor", owner="meeting_orchestrator")
 
 
 def _drain_system_notes(
@@ -914,6 +914,10 @@ async def meeting_produce(
 # pump, re-sends chat history — which carries the persisted meeting_failed
 # banner and the cleared restore.meeting (status is already failed).
 _FAIL_PUMP_LINGER_S = 10.0
+# The chat's claim: a meeting waits for the turn that called it (and any
+# other starter) this long, its failure's pump this long.
+_START_CLAIM_WAIT_S = 600.0
+_FAIL_CLAIM_WAIT_S = 120.0
 
 
 async def fail_meeting(meeting_id: str, reason: str) -> None:
@@ -922,7 +926,8 @@ async def fail_meeting(meeting_id: str, reason: str) -> None:
     await _notify_meeting_failed(meeting_id, reason)
 
 
-async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
+async def _notify_meeting_failed(meeting_id: str, reason: str, *,
+                                 claim: object | None = None, wait: bool = True) -> None:
     """Surface a pre-pump meeting failure into the requesting chat.
 
     Every early-exit path in start_meeting() (usage pre-check, config build,
@@ -933,28 +938,30 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
     meeting pump so an open chat attaches and shows the reason, and mark the
     row failed (summary = reason, shown on the Meetings tabs). Best-effort:
     surfacing must never mask the original failure path.
+
+    The pump takes the chat's claim: ``claim`` is the one ``start_meeting``
+    already holds, else it is waited for (``wait``). A chat that stays busy
+    gets the line on its lane and its viewers without a pump.
     """
     try:
         await run_db(task_store.update_meeting, meeting_id, status=meeting_status.FAILED,
                      summary=(reason or "")[:5000])
     except Exception:
         logger.exception(f"Meeting {meeting_id}: failed-status update failed")
+    parent_chat_id = ""
     try:
         meeting = await run_db(task_store.get_meeting, meeting_id)
         if not meeting:
             return
         parent_chat_id = meeting["parent_chat_id"]
-        # The usage pre-check fires while the moderator's ack turn may still
-        # be streaming — same bounded wait as the normal path before taking
-        # the chat's pump registration.
-        existing_pump = _active_pumps.get(parent_chat_id)
-        if existing_pump and not existing_pump.is_done:
-            # Keep TimeoutError + Exception (a doomed prior pump must not block
-            # the failure path) but let CancelledError propagate — swallowing it
-            # would keep a superseded/aborted meeting running.
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(existing_pump._task, timeout=120.0)
-            await asyncio.sleep(0.5)
+        if claim is None and wait:
+            # The usage pre-check fires while the moderator's ack turn may
+            # still be streaming.
+            claim = await input_queue.claim_when_free(parent_chat_id,
+                                                      timeout=_FAIL_CLAIM_WAIT_S)
+        if claim is None:
+            _write_failed_line(parent_chat_id, meeting_id, reason)
+            return
 
         pump_session_id = "meeting-" + meeting_id
         event_queue: asyncio.Queue = asyncio.Queue()
@@ -979,6 +986,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
         )
         pump.producer = asyncio.create_task(_produce_failure())
         _active_pumps[parent_chat_id] = pump
+        input_queue.get(parent_chat_id).release(claim)
         try:
             pump.start()
             await pump._task
@@ -986,6 +994,23 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
             cleanup_session_permission_state(pump_session_id)
     except Exception:
         logger.exception(f"Meeting {meeting_id}: failure surfacing failed")
+    finally:
+        if parent_chat_id:
+            input_queue.get(parent_chat_id).release(claim)
+
+
+def _write_failed_line(chat_id: str, meeting_id: str, reason: str) -> None:
+    """The failure's line with no pump (the chat stayed busy): written on
+    the chat's lane, in the row shape a reload renders, and sent to the
+    chat's viewers."""
+    from core.events import chat_writer
+    from core.session.session_state import broadcast_chat_frame
+    block = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_MEETING_FAILED,
+             "meeting_id": meeting_id, "message": reason}
+    chat_writer.submit(chat_id, functools.partial(
+        task_store.add_chat_message, chat_id, "event", "",
+        event_type=wire.SYSTEM, event_data=json.dumps(block)), label="meeting_failed")
+    broadcast_chat_frame(chat_id, {**block, "chat_id": chat_id})
 
 
 # ---------------------------------------------------------------------------
@@ -1067,22 +1092,34 @@ async def start_meeting(meeting_id: str) -> None:
     # inherit the chat's permission mode (default/acceptEdits/dontAsk).
     parent_session_id = meeting.get("parent_session_id") or ""
 
-    # Wait for any existing pump on this chat to finish (e.g., the agent that
-    # called start_meeting is still generating its response). We must not
-    # register the meeting pump until the old pump is gone.
     existing_pump = _active_pumps.get(parent_chat_id)
     if not parent_session_id and existing_pump:
         parent_session_id = existing_pump.session_id or ""
-    if existing_pump and not existing_pump.is_done:
-        logger.info(f"Meeting {meeting_id}: waiting for existing pump on {parent_chat_id[:8]} to finish")
-        # Keep TimeoutError + Exception (a doomed prior pump must not block
-        # meeting setup) but let CancelledError propagate — swallowing it would
-        # keep a superseded/aborted meeting running.
-        with contextlib.suppress(asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(existing_pump._task, timeout=120.0)
-        # Brief pause for WS to process pump_ended
-        await asyncio.sleep(0.5)
+    # The chat's turn starters take turns: the meeting waits for the turn
+    # that called it (the moderator's ack may still stream) and for any other
+    # starter, then holds the chat through the participants' setup until its
+    # own pump is registered.
+    if (existing_pump and not existing_pump.is_done) or input_queue.is_claimed(parent_chat_id):
+        logger.info(f"Meeting {meeting_id}: waiting for the turn on {parent_chat_id[:8]} to end")
+    claim = await input_queue.claim_when_free(parent_chat_id, timeout=_START_CLAIM_WAIT_S)
+    if claim is None:
+        await _notify_meeting_failed(
+            meeting_id, "The meeting could not start: the chat stayed busy with another turn.",
+            wait=False)
+        return
+    try:
+        await _start_meeting_claimed(meeting_id, meeting, parent_chat_id,
+                                     parent_session_id, participants, claim)
+    finally:
+        input_queue.get(parent_chat_id).release(claim)
 
+
+async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id: str,
+                                 parent_session_id: str, participants: list,
+                                 claim: object) -> None:
+    """``start_meeting`` past the chat's claim: the participants' sessions,
+    then the meeting's pump. A failure hands the claim to the failure's own
+    pump; the pump's registration releases it."""
     # Create sessions for each participant (parallel for speed)
     agent_sessions: dict[str, str] = {}
 
@@ -1124,16 +1161,19 @@ async def start_meeting(meeting_id: str) -> None:
             # refusal is the reason, named with its participant.
             who = next(slug for slug, r in zip(participants, _built) if r is _build_err)
             await _notify_meeting_failed(
-                meeting_id, f"The meeting could not start: {who}: {_build_err}")
+                meeting_id, f"The meeting could not start: {who}: {_build_err}",
+                claim=claim)
         elif isinstance(_build_err, NoSubscriptionError):
             # The pool refused a participant (its subscription cap, or a
             # user-scope block): the reason is the message, not a crash.
             await _notify_meeting_failed(
-                meeting_id, f"The meeting could not start: {_build_err}")
+                meeting_id, f"The meeting could not start: {_build_err}",
+                claim=claim)
         else:
             await _notify_meeting_failed(
                 meeting_id,
                 f"The meeting could not start: failed to prepare participant sessions ({str(_build_err)[:200]}).",
+                claim=claim,
             )
         return
     agent_cfgs = dict(zip(participants, _built))
@@ -1156,6 +1196,7 @@ async def start_meeting(meeting_id: str) -> None:
         await _notify_meeting_failed(
             meeting_id,
             adm.user_message or "The platform cannot start the meeting right now.",
+            claim=claim,
         )
         return
 
@@ -1245,6 +1286,7 @@ async def start_meeting(meeting_id: str) -> None:
         await _notify_meeting_failed(
             meeting_id,
             f"The meeting could not start: participant sessions failed to start ({str(e)[:200]}).",
+            claim=claim,
         )
         return
 
@@ -1283,6 +1325,7 @@ async def start_meeting(meeting_id: str) -> None:
     pump.queue_closed = False  # meeting_produce reads the user messages each round
 
     _active_pumps[parent_chat_id] = pump
+    input_queue.get(parent_chat_id).release(claim)
     _active_meetings[meeting_id] = asyncio.current_task()
 
     try:

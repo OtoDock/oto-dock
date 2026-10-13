@@ -40,3 +40,20 @@ async def test_smart_turn_offline_uses_vendored_config(monkeypatch, tmp_path):
     # End-to-end: mel extraction (vendored config) → ONNX inference.
     res = await clf.classify_audio(np.zeros(16000, dtype=np.float32))
     assert isinstance(res, bool)
+
+
+def test_one_loaded_model_per_key_shared_by_every_classifier():
+    """The session and the extractor load once per (path, threads) and every
+    classifier on that key wraps the same object: the daemon warms it at
+    start, and a call pays no load (the first call after a daemon start
+    lost two seconds of audio to it)."""
+    model = smart_turn.load_model(None, 1)
+    assert smart_turn.load_model(smart_turn.default_model_path(), 1) is model
+    smart_turn.prewarm_smart_turn(None, 1)
+    assert smart_turn.load_model(None, 1) is model
+    a = smart_turn.SmartTurnClassifier(
+        model_path=smart_turn.default_model_path(), threshold=0.5, num_threads=1, audio_window_s=8.0)
+    b = smart_turn.SmartTurnClassifier(
+        model_path=smart_turn.default_model_path(), threshold=0.9, num_threads=1, audio_window_s=4.0)
+    assert a._model is model and b._model is model
+    assert a._threshold == 0.5 and b._threshold == 0.9

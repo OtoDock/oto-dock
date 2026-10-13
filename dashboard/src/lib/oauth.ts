@@ -8,7 +8,10 @@
  */
 
 import { Capacitor } from '@capacitor/core'
+import { exchangeOAuthCode } from '../api/oauth'
+import { emitAppToast } from './appToasts'
 import { hasNativeBridge, openNativeBrowser } from './nativeBridge'
+import { queryClient } from './queryClient'
 
 // ---------------------------------------------------------------------------
 // Deep link callback system (native only)
@@ -39,7 +42,54 @@ export function deepLinkPending(): boolean {
 
 /** Called from Android native via evaluateJavascript when an otodock://oauth/* deep link fires. */
 ;(window as any)._handleDeepLink = (url: string) => {
-  pendingDeepLink?.resolve(url)
+  if (pendingDeepLink) {
+    pendingDeepLink.resolve(url)
+    return
+  }
+  return completeUnawaitedConnect(url)
+}
+
+/**
+ * The link arrived with no waiter: the page was recreated while the person
+ * consented (Android dropped the activity, or the link named another
+ * installation and the shell switched to it), so the form that started the
+ * connect is gone and the code the link carries would be lost with it. The
+ * exchange runs here, under this login, the accounts refresh, and a toast
+ * says how it went. A link without a code (an older server exchanged on the
+ * callback) or of another flow is left alone.
+ */
+export async function completeUnawaitedConnect(url: string): Promise<boolean> {
+  const provider = connectProviderOf(url)
+  if (!provider) return false
+  try {
+    await exchangeOAuthCode(provider, url)
+  } catch (e: unknown) {
+    emitAppToast({
+      severity: 'warning', title: 'Account not connected',
+      body: e instanceof Error ? e.message : 'The connect could not be completed. Start it again.',
+    })
+    return false
+  }
+  void queryClient.invalidateQueries({ queryKey: ['my-integrations'] })
+  void queryClient.invalidateQueries({ queryKey: ['admin-integrations'] })
+  const label = provider.charAt(0).toUpperCase() + provider.slice(1)
+  emitAppToast({ severity: 'success', title: 'Account connected', body: `Your ${label} account is connected.` })
+  return true
+}
+
+/** The provider of an `otodock://oauth/<provider>/complete` link carrying a code and a state, else null. */
+function connectProviderOf(url: string): string | null {
+  let u: URL
+  try {
+    u = new URL(url)
+  } catch {
+    return null
+  }
+  if (u.protocol !== 'otodock:' || u.host !== 'oauth') return null
+  const seg = u.pathname.split('/').filter(Boolean)
+  if (seg.length !== 2 || seg[1] !== 'complete') return null
+  if (!u.searchParams.get('code') || !u.searchParams.get('state')) return null
+  return seg[0]
 }
 
 /** A waiter for the next link; untimed until armed when `timeoutMs` is null

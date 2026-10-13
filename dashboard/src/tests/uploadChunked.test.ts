@@ -98,6 +98,23 @@ describe('uploadWithProgress — chunked path', () => {
     expect(fetchCalls).toHaveLength(0)
   })
 
+  it('a folder-picked file goes by its own name, never its folder path', async () => {
+    FakeXHR.autoRespond = (x) => x.respond(200, {
+      path: 'p/notes.md', filename: 'notes.md', size: 3, transfer_id: 't', remote_push: false,
+    })
+    const appended: unknown[][] = []
+    const real = FormData.prototype.append
+    const spy = vi.spyOn(FormData.prototype, 'append').mockImplementation(function (this: FormData, ...a: unknown[]) {
+      appended.push(a)
+      return (real as (...x: unknown[]) => void).apply(this, a)
+    })
+    const f = new File(['abc'], 'notes.md')
+    Object.defineProperty(f, 'webkitRelativePath', { value: 'rf/context/notes.md' })
+    await uploadWithProgress(f, 'ag', 'users/u/workspace/rf/context', () => {})
+    spy.mockRestore()
+    expect(appended.find((a) => a[0] === 'file')).toEqual(['file', f, 'notes.md'])
+  })
+
   it('slices by the server-returned chunk size, sequentially, with aggregate progress', async () => {
     FakeXHR.autoRespond = (x) => {
       // Mid-chunk progress before the 2xx — aggregate must be monotonic.

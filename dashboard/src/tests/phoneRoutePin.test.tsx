@@ -75,14 +75,57 @@ describe('route PIN option', () => {
   beforeEach(() => { vi.stubGlobal('alert', vi.fn()); vi.stubGlobal('confirm', vi.fn(() => true)) })
   afterEach(() => { fetchSpy.mockReset(); vi.unstubAllGlobals() })
 
-  it('renders only for inbound routes', async () => {
+  it('renders for inbound routes and for outbound routes tied to a user', async () => {
     mockApi([makeRoute()])
     renderTab()
     await openEdit()
     expect(screen.getByText('Require a PIN')).toBeInTheDocument()
-    // Flip the modal to outbound — the PIN section must disappear live.
+    // Flip the modal to outbound — the PIN section disappears live for a
+    // per-caller route, and returns once the route is tied to a user (the
+    // person who answers enters the code before the agent speaks).
     fireEvent.click(screen.getByRole('button', { name: 'outbound' }))
     expect(screen.queryByText('Require a PIN')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText(/A platform user/))
+    expect(screen.getByText('Require a PIN')).toBeInTheDocument()
+    expect(screen.getByText(/The person who answers must enter this code/)).toBeInTheDocument()
+    expect(screen.getByText(/Require a PIN below so they enter it first/)).toBeInTheDocument()
+  })
+
+  it('an outbound route tied to a user sends the PIN with the save', async () => {
+    mockApi([makeRoute({ direction: 'outbound', identity_mode: 'user', identity_user_sub: 'u-alice' })])
+    renderTab()
+    await openEdit()
+    fireEvent.click(pinCard().querySelector('[role="switch"]')!)
+    fireEvent.change(screen.getByPlaceholderText('6 digits'), { target: { value: '471125' } })
+    fireEvent.click(screen.getByText('Save'))
+    await waitFor(() => {
+      const put = routeSave('PUT')
+      expect(put).toBeTruthy()
+      const body = JSON.parse(String(put![1]!.body))
+      expect(body.pin).toBe('471125')
+      expect(body.direction).toBe('outbound')
+      expect(body).not.toHaveProperty('acknowledge_no_pin')
+    })
+    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+  })
+
+  it('a stored PIN on a route that no longer takes one is removed before the save', async () => {
+    mockApi([makeRoute({ pin_configured: true })])
+    renderTab()
+    await openEdit()
+    fireEvent.click(screen.getByRole('button', { name: 'outbound' }))
+    // The card stays, in its removal state, so the admin sees what the save does.
+    expect(screen.getByText('The PIN will be removed when you save.')).toBeInTheDocument()
+    expect(pinCard().querySelector('[role="switch"]')).toBeNull()
+    fireEvent.click(screen.getByText('Save'))
+    await waitFor(() => expect(routeSave('PUT')).toBeTruthy())
+    const calls = fetchSpy.mock.calls.map(([p, i]) => `${i?.method} ${p}`)
+    // The stored row may still be an inbound user route: the removal goes
+    // out acknowledged, since the card said the PIN leaves with the save.
+    const del = calls.indexOf('DELETE /v1/admin/phone/routes/r1/pin?acknowledge_no_pin=true')
+    const put = calls.indexOf('PUT /v1/admin/phone/routes/r1')
+    expect(del).toBeGreaterThan(-1)
+    expect(del).toBeLessThan(put)
   })
 
   it('never echoes a stored PIN — mask flag + placeholder only', async () => {

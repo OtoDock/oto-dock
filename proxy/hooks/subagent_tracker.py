@@ -26,8 +26,15 @@ import urllib.request
 
 
 def main():
+    raw = sys.stdin.read()
+    # Codex app-server sessions (OTO_HOOK_NO_FORWARD): the thread router
+    # registers and resolves the sub-agents from the JSON-RPC stream. A
+    # SubagentStop fires at every child turn end, so a post here would park
+    # a reused child as finished before it runs again.
+    if os.environ.get("OTO_HOOK_NO_FORWARD"):
+        return
     try:
-        inp = json.loads(sys.stdin.read())
+        inp = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return
 

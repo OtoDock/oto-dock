@@ -15,10 +15,14 @@ once instead of within the minute.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 HOLDER_TTL_S = 60.0
 ANSWERS_MAX = 4096
 _answers: dict[tuple[str, int], tuple[bool, float]] = {}
+# Bumped by ``forget``: a store read that began before it must not cache its
+# answer after it (the read may predate the change that caused the forget).
+_generation: dict[str, int] = {}
 
 
 def _key(payload: dict) -> tuple[str, int] | None:
@@ -55,16 +59,35 @@ async def holder_ok(payload: dict) -> bool:
         return hit[0]
     from auth.providers import session_token_holder_ok
     from storage.pg import run_db_fast
+    generation = _generation.get(key[0], 0)
     ok = bool(await run_db_fast(session_token_holder_ok, payload))
-    _remember(key, ok, payload, time.monotonic())
+    if _generation.get(key[0], 0) == generation:
+        _remember(key, ok, payload, time.monotonic())
     return ok
 
 
 def forget(sub: str) -> None:
-    """Drop every answer of ``sub``: their next token use reads the store."""
+    """Drop every answer of ``sub``: their next token use reads the store,
+    and a read already in flight caches nothing. Every other cache of a
+    person's standing (``on_forget``) is told in the same call."""
+    _generation[sub] = _generation.get(sub, 0) + 1
     for key in [k for k in _answers if k[0] == sub]:
         _answers.pop(key, None)
+    for listener in _listeners:
+        listener(sub)
+
+
+# The caches that judge a person on the same timeline (the WOPI routes and
+# the editor relay keep their own, in api/media/wopi.py) register here, so
+# the sites that bump an epoch call ``forget`` once and nothing is missed.
+_listeners: list[Callable[[str], None]] = []
+
+
+def on_forget(listener: Callable[[str], None]) -> None:
+    if listener not in _listeners:
+        _listeners.append(listener)
 
 
 def reset_for_tests() -> None:
     _answers.clear()
+    _generation.clear()

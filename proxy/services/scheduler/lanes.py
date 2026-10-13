@@ -1,7 +1,8 @@
 """Lane helpers for task runs: output collection, the limit notice, lane
 quiescence and settling, warm-session reuse, the close before a round that
 changed the worker's model, the post-run session action, the prior-pump
-reaper, and the pump stall watchdog.
+reaper, the pump stall watchdog, the report window, and the turns the
+platform drives into a chat (``_chat_turn_produce``, ``_run_echo_turn_pumped``).
 
 One piece of the task scheduler; ``services/scheduler/scheduler.py`` is the
 facade that assembles them and holds the registry API. Every ``core.*`` and
@@ -10,6 +11,7 @@ this package without the platform.
 """
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -20,7 +22,7 @@ import config
 from storage import database as task_store
 from storage.automation import run_status
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 
 def _collect_task_output(chat_id: str, after_id: int = 0) -> str:
@@ -63,11 +65,11 @@ def _limit_notice(final_output: str) -> str | None:
 
     The CLIs stream the limit notice as NORMAL result text ("You've hit your
     session limit · resets 3pm", "You've reached your Fable limit. …",
-    "You're out of usage credits. …", "Claude AI usage limit reached|<ts>"), so the
-    turn ends cleanly and the run would be stamped `completed` with the notice
-    as its output. Only the LAST non-empty line is eligible and it must START
-    with a known notice shape — a run whose real output merely discusses usage
-    limits doesn't match.
+    "You're out of usage credits. …", "Your org is out of usage · …", "Claude AI
+    usage limit reached|<ts>"), so the turn ends cleanly and the run would be
+    stamped `completed` with the notice as its output. Only the LAST non-empty
+    line is eligible and it must START with a known notice shape — a run whose
+    real output merely discusses usage limits doesn't match.
     """
     if not final_output:
         return None
@@ -78,7 +80,7 @@ def _limit_notice(final_output: str) -> str | None:
             continue
         low = line.lower()
         if ((low.startswith(("you've hit your", "you've reached your")) and "limit" in low)
-                or low.startswith("you're out of usage credits")
+                or low.startswith(("you're out of usage", "your org is out of usage"))
                 or low.startswith("claude ai usage limit reached")
                 or low.startswith("usage limit reached")):
             return line
@@ -92,8 +94,12 @@ _PASTED_CONTENT_TAG_RE = re.compile(r"</?pasted_content\b[^>]*>")
 def _prompt_key(text: str) -> str:
     """A user row and the prompt that produced it, made comparable: the
     Claude TUI journals a multi-line paste wrapped in ``<pasted_content>``
-    tags, and every terminal re-flows whitespace."""
-    return " ".join(_PASTED_CONTENT_TAG_RE.sub("", text or "").split())
+    tags, an interactive run's first prompt carries the time and
+    parallel-activity lines ahead of the run's own text (the transcript
+    keeps them; the caller holds the raw prompt), and every terminal
+    re-flows whitespace."""
+    from core.session.codex_rollout_tailer import _user_row_key
+    return _user_row_key(_PASTED_CONTENT_TAG_RE.sub("", text or "").strip())
 
 
 def _collect_lane_output_since(chat_id: str, after_id: int = 0,
@@ -440,6 +446,33 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
 _report_holds: dict[str, int] = {}
 
 
+async def tell_run_parked(task, chat_id: str) -> None:
+    """A run's turn waits on a person's answer while nobody views its chat:
+    the people the drive gate lets answer it are told once (the creator of a
+    user-scope task, else the agent's editors and managers)."""
+    from auth import roles
+    from auth.providers import acting_role_of
+    from core.session.visibility import SCOPE_USER
+    from services.notifications import notification_manager
+    from storage.pg import run_db
+
+    def _people() -> list[str]:
+        if task.scope == SCOPE_USER and task.created_by:
+            return [task.created_by]
+        return [r["sub"] for r in task_store.get_agent_users(task.agent)
+                if roles.can_edit(acting_role_of(r["sub"], task.agent))]
+
+    who = "A delegated worker" if task.on_complete_agent else "A task run"
+    for sub in await run_db(_people):
+        await notification_manager.fire_notification(
+            f"{who} waits on your answer",
+            f"{task.agent} asked for permission in \"{task.name}\" and waits for an "
+            f"answer in its chat. Open the chat to answer.",
+            severity="info", scope="user", target=sub, source="task",
+            source_id=task.id, agent_slug=task.agent, chat_id=chat_id,
+        )
+
+
 def hold_report(*keys: str) -> None:
     for key in keys:
         if key:
@@ -504,3 +537,107 @@ async def _chat_turn_produce(layer, session_id: str, prompt: str,
         await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
     finally:
         await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
+
+
+async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
+                                agent: str, result_prompt: str, *,
+                                person: str = "", only_as_chat_turn: bool = False,
+                                claim: object | None = None) -> str | None:
+    """Run a delegate-echo turn through a headless ChatStreamPump on the
+    delegating chat.
+
+    The old direct collection (``layer.send_message`` → join TEXT parts) ran
+    the turn INVISIBLY: no ``chat_status`` streaming/ready broadcasts, no live
+    pump a viewer could attach to, no ``last_response_at`` stamp (so no unread
+    dot or Active-now row), and every non-text block dropped — a delivered
+    result nobody was told about. The
+    pump is the one turn pipeline that does all of that, and a viewer opening
+    the chat mid-turn attaches to it like any streaming chat.
+
+    Returns "" on success — the pump persisted the turn itself, so the caller
+    must NOT save an echo row — or None when a pump can't run here (the caller
+    falls through / logs the refusal). A stalled turn is reaped by the task
+    watchdog with its partial output persisted; that still counts as delivered
+    (the delegate_result event row is the source of truth either way).
+
+    A turn on a live process runs in the chat's own permission mode: when
+    its next step waits on a person while nobody views the chat, ``person``
+    (the delivery's, else the chat's owner when a person owns it) is told
+    once, so the card does not wait unseen.
+
+    The turn ends at the engine's result, as the chat's own turns do, and the
+    chat's monitors take what it leaves running (``takes_chat_contract``);
+    only inside a run's report window, or in a phone chat, does it wait on its
+    background work as a task turn.
+
+    ``claim``: the chat's claim the caller already holds (the fresh-spawn
+    rung prepares the chat under it); released once the pump registers.
+    """
+    from core.events.stream_pump import ChatStreamPump, _active_pumps
+    from core.events.task_producer import task_produce
+    from core.session import visibility as _vis
+    from core.session.session_state import get_permission_queue
+    from core.session.visibility import is_synthetic_owner
+    from storage.pg import run_db
+
+    # Read before the pump check: nothing may await between it and the
+    # pump's registration.
+    chat_row = await run_db(task_store.get_chat, chat_id)
+    from core.events import input_queue
+    q = input_queue.get(chat_id)
+    if _active_pumps.get(chat_id) is not None or (q.claimed and not q.holds(claim)):
+        # A turn started on the chat between the ladder's pump check and now,
+        # or a send, a drain or a queued delivery holds the chat for the turn
+        # it is starting (its pump registers a few steps later): never
+        # dual-pump a chat. The caller keeps the prompt (a stored wake, a
+        # review's next round).
+        return None
+    chat_turn = takes_chat_contract(chat_row, session_id)
+    if only_as_chat_turn and not chat_turn:
+        return None   # a review never runs inside a run's report
+    echo_id = f"echo-{chat_id[:8]}"
+    event_queue: asyncio.Queue = asyncio.Queue()
+    producer = asyncio.create_task(
+        _chat_turn_produce(layer, session_id, result_prompt, event_queue)
+        if chat_turn else task_produce(
+            layer, session_id, result_prompt, event_queue, echo_id, settle_timeout=30.0))
+    pump = ChatStreamPump(
+        chat_id=chat_id,
+        session_id=session_id,
+        producer=producer,
+        event_queue=event_queue,
+        perm_queue=get_permission_queue(session_id),
+        scope="agent" if _vis.is_shared_only(agent) else "user",
+        driver_tells_parked=True,   # _tell_parked below
+    )
+    _active_pumps[chat_id] = pump
+    q.release(claim)
+    pump.start()
+
+    async def _tell_parked() -> None:
+        who = person
+        if not who:
+            owner = (chat_row or {}).get("user_sub") or ""
+            who = "" if is_synthetic_owner(owner) else owner
+        if not who:
+            return
+        from services.notifications import notification_manager
+        await notification_manager.fire_notification(
+            "A chat waits on your answer",
+            f"{agent} was woken in a chat (a delegated result, a scheduled wake or a "
+            f"finished background job) and its next step waits for your answer there. "
+            f"Open the chat to answer.",
+            severity="info", scope="user", target=who, source="delegation",
+            agent_slug=agent, chat_id=chat_id,
+        )
+
+    # A _TaskTurnStalled reap persisted the partial turn and closed the chat
+    # status — delivered as far as it went; never fall through to another rung
+    # (that would run a SECOND echo turn).
+    with contextlib.suppress(_TaskTurnStalled):
+        await _watch_task_pump(layer, pump, echo_id, chat_id, session_id,
+                                     on_parked=_tell_parked)
+    if chat_turn:
+        from core.events.pump_bg_monitors import arm_bg_monitors
+        arm_bg_monitors(layer, session_id, chat_id)
+    return ""

@@ -37,7 +37,7 @@ def _clean_infra():
 class TestStartupKeyCanary:
     def test_silent_when_all_rows_decrypt(self, _clean_infra, caplog):
         credential_store.set_infra_credentials("canary-test", {"k": "v"})
-        with caplog.at_level(logging.ERROR, logger="claude-proxy"):
+        with caplog.at_level(logging.ERROR, logger="otodock"):
             startup_key_canary()
         assert "CREDENTIAL KEY MISMATCH" not in caplog.text
 
@@ -247,3 +247,44 @@ class TestSecretFloor:
             raise RuntimeError("db is gone")
         monkeypatch.setattr(credential_store, "get_conn", _boom)
         credential_store.judge_secret_floor()  # must not raise
+
+
+class TestKeyFingerprintRecord:
+    """The decrypting set, recorded by fingerprint at boot for restore.sh
+    (``record_key_fingerprints``): every comma entry, the whole value when it
+    differs, JWT_SECRET; labels name config.env lines, never values."""
+
+    def _record(self):
+        with get_conn() as conn:
+            row = conn.execute("SELECT value FROM platform_settings WHERE key=%s",
+                               (credential_store.KEY_FINGERPRINTS_SETTING,)).fetchone()
+        import json
+        return json.loads(row["value"]) if row else None
+
+    def test_every_decrypting_key_is_recorded_with_its_label(self, _floor):
+        _floor("J" * 64, key="K1" * 20 + "," + "K2" * 20)
+        credential_store.record_key_fingerprints()
+        rec = self._record()
+        fp = credential_store._fingerprint
+        assert rec[fp("J" * 64)] == "JWT_SECRET"
+        assert rec[fp("K1" * 20)] == "CREDENTIAL_ENCRYPTION_KEY entry 1"
+        assert rec[fp("K2" * 20)] == "CREDENTIAL_ENCRYPTION_KEY entry 2"
+        assert rec[fp("K1" * 20 + "," + "K2" * 20)] == "CREDENTIAL_ENCRYPTION_KEY as one value"
+        assert all(len(k) == 32 for k in rec)
+        for secret in ("J" * 64, "K1" * 20, "K2" * 20):
+            assert secret not in json_dumps(rec)
+
+    def test_the_canary_writes_the_record_and_a_new_boot_replaces_it(self, _floor, _clean_infra):
+        _floor("A" * 64)
+        credential_store.startup_key_canary()
+        first = self._record()
+        assert set(first.values()) == {"JWT_SECRET"}
+        _floor("B" * 64)
+        credential_store.startup_key_canary()
+        second = self._record()
+        assert set(second) != set(first) and set(second.values()) == {"JWT_SECRET"}
+
+
+def json_dumps(value) -> str:
+    import json
+    return json.dumps(value)

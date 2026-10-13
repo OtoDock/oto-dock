@@ -11,6 +11,8 @@
 #   2. Installs into the directory it is run from (give it a folder of its
 #      own) — and refuses to touch a directory that already holds an install.
 #      $OTODOCK_DIR is still honored as an override for older one-liners.
+#      On Linux it then checks the free disk where Docker keeps its images
+#      (OTODOCK_MIN_FREE_GB, 13 by default, moves the floor; 0 skips it).
 #   3. Writes a minimal .env with a generated PostgreSQL password (kept as-is
 #      if one already exists; the server appends its own generated secrets to
 #      the same file on first boot).
@@ -73,6 +75,52 @@ trusted_proxy_hint() {
 fetch() { # fetch <url> <dest>
     curl -fsSL "$1" -o "$2.tmp" || fail "could not download $1 — check your network and retry."
     mv "$2.tmp" "$2"
+}
+
+# Free disk where Docker keeps its images, before a pull of about 11 GB: a
+# first start adds about 1.5 GB more, and the server refuses uploads while
+# less than the larger of 5 GB and 5 % of the disk is free. Linux with a local
+# daemon only (a remote daemon, or Docker Desktop's VM, keeps the images
+# elsewhere); an answer that cannot be read skips the check.
+disk_preflight() {
+    local floor_gb="${OTODOCK_MIN_FREE_GB:-13}" endpoint root line total_k free_k
+    local free_gb upload_k upload_gb
+    [ "$(uname -s 2>/dev/null || true)" = Linux ] || return 0
+    if ! [[ "$floor_gb" =~ ^[0-9]+$ ]]; then
+        say "OTODOCK_MIN_FREE_GB='$floor_gb' is not a whole number of GB: using 13."
+        floor_gb=13
+    fi
+    [ "$floor_gb" -gt 0 ] || return 0
+    endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+    case "$endpoint" in unix://*) ;; *) return 0 ;; esac
+    case "$(docker info -f '{{.OperatingSystem}}' 2>/dev/null || true)" in
+        *"Docker Desktop"*) return 0 ;;
+    esac
+    root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)"
+    [ -n "$root" ] || return 0
+    line="$(df -Pk "$root" 2>/dev/null | awk 'NR == 2 { print $2, $4 }')" || return 0
+    read -r total_k free_k <<< "$line"
+    [[ "${total_k:-}" =~ ^[0-9]+$ && "${free_k:-}" =~ ^[0-9]+$ ]] || return 0
+    free_gb=$((free_k / 1024 / 1024))
+    if [ "$free_k" -lt $((floor_gb * 1024 * 1024)) ]; then
+        if [ -n "$(docker image ls -q ghcr.io/otodock/otodock-proxy 2>/dev/null || true)" ]; then
+            say "only ${free_gb} GB free where Docker keeps its images ($root); the release
+  images are already on this host, so going on."
+            return 0
+        fi
+        fail "only ${free_gb} GB free where Docker keeps its images ($root). The install
+  needs about ${floor_gb} GB: about 11 GB of release images and 1.5 GB for the
+  first start. Free some space (docker system prune removes unused images and
+  build cache), or run with OTODOCK_MIN_FREE_GB=0 to install anyway."
+    fi
+    upload_k=$((total_k / 20))
+    [ "$upload_k" -ge $((5 * 1024 * 1024)) ] || upload_k=$((5 * 1024 * 1024))
+    if [ "$free_k" -lt $((13 * 1024 * 1024 + upload_k)) ]; then
+        upload_gb=$((upload_k / 1024 / 1024))
+        say "${free_gb} GB free where Docker keeps its images ($root): after the install,
+  less than ${upload_gb} GB stays free, and the server refuses uploads until it is
+  (it keeps the larger of 5 GB and 5 % of the disk free). Going on."
+    fi
 }
 
 # --- 1. Preflight ------------------------------------------------------------
@@ -138,6 +186,7 @@ if [ -f docker-compose.yml ]; then
     To install fresh:         create a new, empty folder (mkdir otodock && cd otodock)
                               and re-run this script from there."
 fi
+disk_preflight
 say "installing into $(pwd)"
 
 # --- 3. Configuration (.env) -------------------------------------------------

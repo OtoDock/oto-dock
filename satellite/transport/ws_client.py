@@ -353,6 +353,20 @@ class SatelliteWSClient:
             with contextlib.suppress(Exception):
                 await ws.close(code=1000, reason="paused")
 
+    async def _acknowledge_update(self, msg: dict) -> None:
+        """``update_received`` straight on the socket, as ``pause`` is sent:
+        the writer's lanes may not drain before the update task takes the
+        loop. Best effort: a push the proxy hears nothing about counts by
+        its socket's state instead."""
+        ws = self._ws
+        if ws is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(ws.send(json.dumps({
+                "type": "update_received",
+                "target_version": str(msg.get("target_version") or ""),
+            })), timeout=5.0)
+
     async def resume(self) -> None:
         """Resume connecting after a pause (tray Resume). Idempotent."""
         if not self._paused:
@@ -1078,6 +1092,10 @@ class SatelliteWSClient:
                         msg.get("previous_version", "?"),
                         msg.get("target_version", "?"),
                     )
+                    # Say the push arrived before applying it (the update
+                    # task blocks this loop while it unpacks, then exits):
+                    # the proxy counts a rollback only for a delivered push.
+                    await self._acknowledge_update(msg)
                     asyncio.create_task(_self_update_and_restart(msg))
                 elif msg_type in ("local_session_opened", "local_session_error",
                                   "local_session_listed"):

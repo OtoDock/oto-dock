@@ -40,7 +40,7 @@ import logging
 import time
 from typing import Coroutine
 
-logger = logging.getLogger("claude-proxy.upload-inflight")
+logger = logging.getLogger("otodock.upload-inflight")
 
 # Hard ceiling on how long a turn waits for in-flight uploads. Generous
 # enough for a multi-MB file on a slow WAN link (every chunk is acked, a
@@ -50,21 +50,36 @@ logger = logging.getLogger("claude-proxy.upload-inflight")
 BARRIER_TIMEOUT_S = 60.0
 
 _inflight: dict[str, set[asyncio.Task]] = {}
+# The machines a tracked push is bound for, when the caller knows them (a
+# Collabora save's fan-out: the machines it marked, a set that grows while
+# later saves fold into it). A task with none holds every machine's turn.
+_bound_for: dict[asyncio.Task, set[str]] = {}
 
 
-def track(agent_slug: str, coro: Coroutine) -> asyncio.Task:
+def track(agent_slug: str, coro: Coroutine, *, machines: set[str] | None = None) -> asyncio.Task:
     """Run ``coro`` (an upload push) as a background task, registered so
     ``wait_settled`` can barrier on it. The registry holds a strong ref
     until completion (a bare ``create_task`` is GC-collectable mid-flight).
     The caller is responsible for the coroutine never raising — push
-    helpers are best-effort by contract and swallow their own errors."""
+    helpers are best-effort by contract and swallow their own errors.
+    ``machines``: the machines the push is bound for (read at each wait,
+    so the caller may add to the set), None when unknown."""
     task = asyncio.create_task(coro)
     _inflight.setdefault(agent_slug, set()).add(task)
+    if machines is not None:
+        _bound_for[task] = machines
     task.add_done_callback(lambda t: _discard(agent_slug, t))
     return task
 
 
+def unbind(task: asyncio.Task) -> None:
+    """The push is bound for no known machine any more: it holds every
+    machine's turn from now on."""
+    _bound_for.pop(task, None)
+
+
 def _discard(agent_slug: str, task: asyncio.Task) -> None:
+    _bound_for.pop(task, None)
     tasks = _inflight.get(agent_slug)
     if tasks is not None:
         tasks.discard(task)
@@ -78,19 +93,23 @@ def pending_count(agent_slug: str) -> int:
 
 
 async def wait_settled(
-    agent_slug: str, *, timeout: float = BARRIER_TIMEOUT_S,
+    agent_slug: str, *, machine_id: str = "", timeout: float = BARRIER_TIMEOUT_S,
 ) -> bool:
     """Wait (bounded) until every upload push in flight for ``agent_slug``
     AT CALL TIME has finished. Pushes that start DURING the wait are not
     awaited — the barrier protects the prompt that was just submitted, not
     future ones — so a steady stream of uploads can't extend the wait
-    unboundedly.
+    unboundedly. ``machine_id``: the machine the turn runs on; a push bound
+    for other machines only is not awaited.
 
     Returns True when everything settled, False on cap. Callers proceed
     either way — the barrier is best-effort, like the pushes themselves.
     Never raises.
     """
-    tasks = {t for t in _inflight.get(agent_slug, ()) if not t.done()}
+    tasks = {
+        t for t in _inflight.get(agent_slug, ())
+        if not t.done() and (not machine_id or t not in _bound_for or machine_id in _bound_for[t])
+    }
     if not tasks:
         return True
     started = time.monotonic()

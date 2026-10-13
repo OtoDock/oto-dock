@@ -20,6 +20,7 @@ import TerminalControlBar from '../../../components/chat/terminal/TerminalContro
 import { describeLimitReached, describeLimitWarning } from '../../../components/usage/poolCap'
 import { usePrimaryPointerCoarse } from '../../../hooks/usePrimaryPointerCoarse'
 import { withSendHint } from '../../../lib/composerKeys'
+import type { CollectedItems } from '../../../lib/droppedItems'
 
 type Stream = ReturnType<typeof useChatStream>
 
@@ -88,6 +89,7 @@ interface Props {
   draftKey: string
   pendingFiles: PendingFile[]
   handleAddFiles: (files: PendingFile[]) => void
+  handleAddFolder: (name: string, items: CollectedItems | Promise<CollectedItems>) => void
   handleRemoveFile: (id: string) => void
   handleRetryFile: (id: string) => void
   workspace: ReturnType<typeof useWorkspaceState>
@@ -114,7 +116,7 @@ export default function ChatComposerBar({
   limitReached, limitReachedInfo, limitWarning, setLimitWarning, engineLabels,
   draftInput, setDraftInput, handleSend, handleAbort, handleEditQueued, handleEngage,
   permissionPending, warmingUp, aborting, queuedMessages, editText, setEditText,
-  pendingImages, draftKey, pendingFiles, handleAddFiles, handleRemoveFile, handleRetryFile,
+  pendingImages, draftKey, pendingFiles, handleAddFiles, handleAddFolder, handleRemoveFile, handleRetryFile,
   workspace, appsActive, toggleApps, setAppsOpen,
   projectsActive, isProjectChat, dockAvailable, setProjectsOpen,
   voice, composerAnimates,
@@ -243,6 +245,7 @@ export default function ChatComposerBar({
         onRemoveImage={(id) => draftKey && useChatStore.getState().removePendingImage(draftKey, id)}
         pendingFiles={pendingFiles}
         onAddFiles={handleAddFiles}
+        onAddFolder={handleAddFolder}
         onRemoveFile={handleRemoveFile}
         onRetryFile={handleRetryFile}
         workspaceOpen={workspace.state.open}

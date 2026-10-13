@@ -6,7 +6,7 @@
  * the end-of-turn pings), followed by the four WS-lifecycle effects that
  * only read the stream and the refs owned here: connect on mount, the
  * favorite agent's eager pre-warm, the preWarmedRef reset on WS disconnect,
- * the pending-message flush after warmup. Called where the page called
+ * and the sends typed during a warmup (useWarmupSends). Called where the page called
  * useChatStream, so the React hook order is unchanged.
  *
  * Cross-module ref plumbing is what makes a split of this page fragile, so
@@ -16,15 +16,14 @@
  * after those values exist). useDashboardWs refreshes its callbacks every
  * render, so a callback always ran with the newest render's closure;
  * `latest.current` makes that same "read the latest state" guarantee
- * explicit across the module boundary. The eight stable refs the callbacks
+ * explicit across the module boundary. The stable refs the callbacks
  * share with the page's handlers are created here, before the call, and
  * returned — one instance each.
  */
-import { useRef, useEffect } from 'react'
+import { useRef, useEffect, useState } from 'react'
 import type { RefObject } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 import { useChatStream } from '../../../hooks/useChatStream'
-import type { WireImage } from '../../../hooks/useDashboardWs'
 import { WIRE } from '../../../api/wireEvents'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import type { useChatNotifications } from '../../../hooks/useChatNotifications'
@@ -36,6 +35,8 @@ import { useChatStore } from '../../../store/chatStore'
 import type { useModelEngineSelection } from './useModelEngineSelection'
 import type { useFindBar } from './useFindBar'
 import { isTaskChatId } from '../../../lib/session/kind'
+import { withWorkspaceParams } from '../../../lib/workspaceParams'
+import { useWarmupSends, type HeldSend } from './useWarmupSends'
 
 type Selection = ReturnType<typeof useModelEngineSelection>
 type FindBar = ReturnType<typeof useFindBar>
@@ -82,19 +83,20 @@ export function useAgentChatStream({
   // Assigned by the page every render (see the header); never read before
   // the first render completes, so the placeholder is never observed.
   const latest = useRef<AgentChatLatest>(null as unknown as AgentChatLatest)
+  // A phone call drives the viewed chat (chat_view_only): the banner shows
+  // until the socket re-resumes the chat at the call's end.
+  const [phoneCallActive, setPhoneCallActive] = useState(false)
 
-  // The eight refs the callbacks share with the page's handlers.
+  // The refs the callbacks share with the page's handlers.
   const chatRowsTimerRef = useRef<number | null>(null)
   const preWarmedRef = useRef<string | null>(null)
   // Tracks which chatId was last loaded so the URL-change effect doesn't double-resume
   // when in-component handlers (handleSelectChat) have already triggered the load.
   // Idempotent across StrictMode double-effects.
   const lastResumedChatIdRef = useRef<string | null>(null)
-  const pendingFilesRef = useRef<Array<{ path: string; name: string }> | null>(null)
-  // Warmup-pending message + attachments (held while the session spins up;
-  // sent by the post-warmup effect once sessionId + chatId land).
-  const pendingMessageRef = useRef<string | null>(null)
-  const pendingImagesRef = useRef<WireImage[] | null>(null)
+  // A failed or reset warmup hands the sends it held back to the composer
+  // (useWarmupSends, created after the stream; the resets fire later).
+  const warmupHandBackRef = useRef<() => void>(() => {})
   // Set when we send a prompt WITH warmup (server-kicked first turn). On
   // warmup_ready we adopt the server-driven turn into the streaming UI so the
   // stop button + timer + live generation engage (the client sent `warmup`,
@@ -151,6 +153,7 @@ export function useAgentChatStream({
         if (files.length) {
           st.addPendingFiles(key, files.map(f => ({
             id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path,
+            ...(f.folder ? { folder: true } : {}),
           })))
         }
       },
@@ -193,7 +196,7 @@ export function useAgentChatStream({
       // useChatStream already suppresses the rest of this handler in that case).
       if (data.chat_id && !urlChatId && lastResumedChatIdRef.current !== data.chat_id) {
         lastResumedChatIdRef.current = data.chat_id
-        navigate(`/chat/${agentName}/${data.chat_id}`, { replace: true })
+        navigate(withWorkspaceParams(`/chat/${agentName}/${data.chat_id}`), { replace: true })
       }
     },
     onWarmupStartedExtra: (data) => {
@@ -208,29 +211,31 @@ export function useAgentChatStream({
       // send-time from the NEW-chat screen; this just hardens against reorders).
       if (data?.chat_id && !urlChatId && lastResumedChatIdRef.current !== data.chat_id) {
         lastResumedChatIdRef.current = data.chat_id
-        navigate(`/chat/${agentName}/${data.chat_id}`, { replace: true })
+        navigate(withWorkspaceParams(`/chat/${agentName}/${data.chat_id}`), { replace: true })
       }
     },
     onPreWarmupReady: (data) => { preWarmedRef.current = data.session_id },
     isWarmingUp: warmingUp,
     onWarmupReset: () => {
       setWarmingUp(false)
-      pendingMessageRef.current = null
-      pendingImagesRef.current = null
-      pendingFilesRef.current = null
+      warmupHandBackRef.current()
     },
     onWarmupFailedReset: () => {
       // Clear warmup state so input re-enables and the user can retry
       // (e.g. once the admin brings the satellite back online).
       setWarmingUp(false)
-      pendingMessageRef.current = null
-      pendingImagesRef.current = null
-      pendingFilesRef.current = null
+      warmupHandBackRef.current()
       // A failed phone-mode mint must not leave the apps keep-open armed —
       // the NEXT ordinary chat entry would re-open a panel the user closed.
       keepAppsOnChatEntryRef.current = false
     },
     onTitleUpdated: () => latest.current.refetchChats(),
+    onChatViewOnly: (data) => {
+      // A phone call drives the viewed chat: the banner shows while the
+      // history is read-only; the socket re-resumes the chat when the call
+      // ends and clears this with null.
+      setPhoneCallActive(data !== null)
+    },
     onChatMoved: () => {
       // move_chat ack for the open chat: the backend rebound the pin and
       // dropped this connection's session binding — re-resume so the fresh
@@ -296,7 +301,7 @@ export function useAgentChatStream({
       // shell. Same-chatId navigate only swaps the slug: the URL-change
       // effect's lastResumedChatIdRef guard skips a redundant resume.
       if (data.agent && agentName && data.agent !== agentName && data.chat_id === urlChatId) {
-        navigate(`/chat/${data.agent}/${data.chat_id}`, { replace: true })
+        navigate(withWorkspaceParams(`/chat/${data.agent}/${data.chat_id}`), { replace: true })
       }
       // Restore execution layer + model from chat data (for resumed chats).
       if (data.execution_path) setChatActiveLayer(data.execution_path)
@@ -390,8 +395,31 @@ export function useAgentChatStream({
   // initialised right after the call, before any WS event can fire them.
   const {
     ws, setTurnStartTime, chatIdRef, setSessionId, setModel, setContextMax, chatId, seedDbHistory, setMode,
-    sessionId, model, mode,
+    sessionId, model, mode, setEditText,
   } = stream
+
+  // Sends typed during "Getting ready": kept in order; what is still held
+  // when the warmup fails goes back to the composer, attachments included.
+  const warmupSends = useWarmupSends(ws, chatId, (held: HeldSend[]) => {
+    setEditText(held.map((h) => h.text).filter(Boolean).join('\n\n'))
+    const key = latest.current.draftKey
+    if (!key) return
+    const st = useChatStore.getState()
+    const images = held.flatMap((h) => h.images ?? [])
+    if (images.length) {
+      st.addPendingImages(key, images.map((i, n) => ({
+        id: `img-held-${n}-${i.name}`, name: i.name, base64: i.base64, path: i.path,
+      })))
+    }
+    const files = held.flatMap((h) => h.files ?? [])
+    if (files.length) {
+      st.addPendingFiles(key, files.map((f) => ({
+        id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path,
+        ...(f.folder ? { folder: true } : {}),
+      })))
+    }
+  })
+  warmupHandBackRef.current = warmupSends.handBack
 
   // --- Connect on mount ---
 
@@ -437,24 +465,11 @@ export function useAgentChatStream({
     return () => window.removeEventListener('otodock:ws-disconnect', onDisconnect)
   }, [])
 
-  // After warmup completes, send any pending message (with images if any)
-  useEffect(() => {
-    if (sessionId && chatId && pendingMessageRef.current) {
-      const text = pendingMessageRef.current
-      const images = pendingImagesRef.current
-      const files = pendingFilesRef.current
-      pendingMessageRef.current = null
-      pendingImagesRef.current = null
-      pendingFilesRef.current = null
-      ws.sendMessage(text, chatId, images || undefined, files || undefined)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, chatId])
-
   return {
     ...stream,
     latest,
-    chatRowsTimerRef, preWarmedRef, lastResumedChatIdRef, pendingFilesRef,
-    pendingMessageRef, pendingImagesRef, serverKickPendingRef, keepAppsOnChatEntryRef,
+    chatRowsTimerRef, preWarmedRef, lastResumedChatIdRef,
+    warmupSends, serverKickPendingRef, keepAppsOnChatEntryRef,
+    phoneCallActive,
   }
 }

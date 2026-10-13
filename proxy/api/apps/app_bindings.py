@@ -61,7 +61,7 @@ from storage.pg import run_db
 from auth.providers import effective_role_of
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 BIND_RATE = 10.0

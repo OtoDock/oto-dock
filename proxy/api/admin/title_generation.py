@@ -1,8 +1,11 @@
 """Admin API — LLM chat-title generation settings.
 
 GET returns the enable flag, the pinned model (''=Auto), whether the feature is
-currently active (a Direct-LLM provider resolves), the effective provider/model,
-and the dropdown options. PUT sets the enable toggle and/or the pinned model.
+currently active (a Direct-LLM provider is configured), the effective
+provider/model, the dropdown options and the last attempt's outcome (a
+configured provider can still resolve no credential or answer an error). POST
+.../check resolves the credentials now. PUT sets the enable toggle and/or the
+pinned model.
 Provider + credentials come from the Direct-LLM execution layer (no separate API
 key) — see services/title_generator.py.
 """
@@ -17,7 +20,7 @@ from auth.providers import UserContext, get_current_user, require_admin, require
 from services import title_generator
 from storage import database as task_store
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -27,6 +30,14 @@ async def get_title_generation(user: UserContext | None = Depends(get_current_us
     """Title-generation status for the admin Setup card (read-only — never mints)."""
     require_admin(user)
     return await asyncio.to_thread(title_generator.title_generation_status)
+
+
+@router.post("/v1/admin/title-generation/check")
+async def check_title_generation(user: UserContext | None = Depends(get_current_user)):
+    """Resolve the title provider's credentials now (it may mint a relay
+    token) and answer the status with the outcome as ``last_attempt``."""
+    require_admin(user)
+    return await asyncio.to_thread(title_generator.check_title_generation)
 
 
 class TitleGenerationUpdate(BaseModel):

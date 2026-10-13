@@ -25,6 +25,7 @@ services:
       args:
         - PYTHON_IMAGE
         - NODE_IMAGE
+        - OTODOCK_VERSION
 
   # Reuses the proxy image. The base file gives this one-shot no build
   # config, so without this block Compose tries to PULL the GHCR proxy tag
@@ -39,6 +40,7 @@ services:
       args:
         - PYTHON_IMAGE
         - NODE_IMAGE
+        - OTODOCK_VERSION
 
   file-tools:
     pull_policy: build
@@ -46,3 +48,4 @@ services:
       context: ./mcps/custom/file-tools-mcp
       args:
         - PYTHON_IMAGE
+        - OTODOCK_VERSION

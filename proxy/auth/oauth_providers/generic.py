@@ -29,7 +29,7 @@ import httpx
 
 from auth.oauth_providers.base import OAuthProvider, OAuthTokenError, TokenSet, UserInfo
 
-logger = logging.getLogger("claude-proxy.oauth-providers.generic")
+logger = logging.getLogger("otodock.oauth-providers.generic")
 
 
 def _json_object(resp: httpx.Response) -> dict:

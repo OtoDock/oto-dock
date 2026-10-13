@@ -29,7 +29,7 @@ from storage import database as task_store
 from storage.agents import agent_store
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 def is_shared_only_row(agent: Mapping) -> bool:

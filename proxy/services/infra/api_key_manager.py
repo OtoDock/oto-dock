@@ -27,8 +27,9 @@ import bcrypt
 import config
 from storage.identity import api_key_store
 from storage.automation import notification_store
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.api-keys")
+logger = logging.getLogger("otodock.api-keys")
 
 
 # Public prefix on raw keys — makes them grep-able in code dumps and
@@ -350,7 +351,7 @@ def _schedule_last_used_update(kind: str, key_id: str) -> None:
         except Exception as e:
             logger.warning(f"Failed to update last_used_at for {kind} key {key_id[:8]}: {e}")
 
-    loop.create_task(_do())
+    spawn(_do(), name="touch_last_used", owner="api_key_manager")
 
 
 # =====================================================================

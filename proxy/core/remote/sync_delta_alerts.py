@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 
-logger = logging.getLogger("claude-proxy.satellite")
+logger = logging.getLogger("otodock.satellite")
 
 _ALERT_INTERVAL_S = 6 * 3600
 

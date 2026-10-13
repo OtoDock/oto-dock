@@ -1,6 +1,6 @@
 # The base pin follows VERSIONS.md (PYTHON_IMAGE); the build overlay passes
 # it as a build arg and a bare `docker build` falls back to the default.
-ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm
+ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
 FROM ${PYTHON_IMAGE}
 
 # LibreOffice (Writer/Calc/Impress only — not the full metapackage)
@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     tesseract-ocr tesseract-ocr-eng tesseract-ocr-ell \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+# PyMuPDF's OCR finds the language data here; unset, it runs `tesseract
+# --list-langs` to look for it on every OCR call. The path is the Debian
+# package's for tesseract 5.
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
 RUN useradd -m -s /bin/bash mcp
 
@@ -41,4 +45,17 @@ COPY *.py .
 
 USER mcp
 EXPOSE 8932
+# OCI image metadata. The version is a build arg the release workflow and
+# the build overlay pass from VERSIONS.md, declared after every RUN so a new
+# version never invalidates a cached layer.
+ARG OTODOCK_VERSION=dev
+LABEL org.opencontainers.image.title="OtoDock file tools" \
+      org.opencontainers.image.description="The OtoDock file tools: documents, PDFs, images and conversions for the agents." \
+      org.opencontainers.image.source="https://github.com/OtoDock/oto-dock" \
+      org.opencontainers.image.url="https://otodock.io" \
+      org.opencontainers.image.documentation="https://docs.otodock.io" \
+      org.opencontainers.image.vendor="OtoDock" \
+      org.opencontainers.image.licenses="FSL-1.1-ALv2" \
+      org.opencontainers.image.version="${OTODOCK_VERSION}"
+
 CMD ["python", "server.py"]

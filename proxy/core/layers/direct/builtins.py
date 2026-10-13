@@ -81,6 +81,11 @@ FILE_TOOL_NAMES: tuple[str, ...] = ("Read", "Glob", "Write", "Edit", "Delete")
 # Every client-side tool a direct session always carries (tool_search is
 # added by the deferred-tools catalog only when deferral is active).
 CLIENT_TOOL_NAMES: tuple[str, ...] = FILE_TOOL_NAMES + ("Skill",)
+# The call tools: a phone session carries the first two (the CLI engines
+# get them from the call-control MCP instead); the ask tool only on an
+# outbound call another agent placed.
+CALL_TOOL_NAMES: tuple[str, ...] = ("end_call", "transfer_call")
+CALL_ASK_TOOL = "ask_initiating_agent"
 
 
 def file_tool_defs() -> list[dict]:
@@ -89,6 +94,10 @@ def file_tool_defs() -> list[dict]:
 
 def client_tool_defs() -> list[dict]:
     return tool_defs(CLIENT_TOOL_NAMES)
+
+
+def call_tool_defs(*, ask_back: bool) -> list[dict]:
+    return tool_defs(CALL_TOOL_NAMES + ((CALL_ASK_TOOL,) if ask_back else ()))
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +446,101 @@ def _register_tool_search() -> None:
 
 
 _register_tool_search()
+
+
+# ---------------------------------------------------------------------------
+# Call tools — the phone session's end / transfer / ask, in-process
+# ---------------------------------------------------------------------------
+
+async def _call_action(session, action: str, args: dict) -> str:
+    """One call action through the call-control registry; the daemon's
+    verdict is the tool's text whether it accepted or refused. An accepted
+    end or transfer marks the session so the tool loop ends the turn without
+    another model call (the line closes as the farewell drains)."""
+    from services.phone import call_control
+    result = await call_control.request(session.session_id, action, args)
+    message = result.get("message") or ""
+    if result.get("ok"):
+        if action in (call_control.ACTION_END, call_control.ACTION_TRANSFER):
+            session.line_closing = True
+        return message
+    return f"Not done: {message}" if message else "Not done."
+
+
+async def _end_call(session, args: dict) -> str:
+    return await _call_action(session, "end", {"reason": str(args.get("reason") or "")[:200]})
+
+
+async def _transfer_call(session, args: dict) -> str:
+    target = str(args.get("target") or "").strip()
+    if not target:
+        raise FileToolError("target is required: a transfer target's name from your instructions")
+    return await _call_action(session, "transfer", {"target": target[:80]})
+
+
+async def _ask_initiating_agent(session, args: dict) -> str:
+    question = str(args.get("question") or "").strip()
+    if not question:
+        raise FileToolError("question is required")
+    return await _call_action(session, "ask", {"question": question[:1000]})
+
+
+register(Builtin(
+    name="end_call",
+    description=(
+        "End the phone call you are on. Say your goodbye in one short sentence "
+        "BEFORE calling this; the line closes right after and nothing you write "
+        "afterwards is heard. Only during a live call."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "description": "Why the call ends, in a few words (for the log)"},
+        },
+    },
+    tier=TIER_OPEN,
+    handler=_end_call,
+    file_path_tool=False,
+))
+
+register(Builtin(
+    name="transfer_call",
+    description=(
+        "Hand the caller to one of the transfer targets named in your instructions. "
+        "Tell the caller in one short sentence FIRST, then call this with the target's "
+        "name; you leave the call. Only during a live call."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "description": "The target's name (or number) from your instructions"},
+        },
+        "required": ["target"],
+    },
+    tier=TIER_OPEN,
+    handler=_transfer_call,
+    file_path_tool=False,
+))
+
+register(Builtin(
+    name=CALL_ASK_TOOL,
+    description=(
+        "Ask the agent that placed this call a question it can answer (a "
+        "preference, a fact you lack). Say that you are checking (one short "
+        "sentence) and stop: the answer arrives as your next message within "
+        "about 40 seconds."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The question, in one or two sentences"},
+        },
+        "required": ["question"],
+    },
+    tier=TIER_OPEN,
+    handler=_ask_initiating_agent,
+    file_path_tool=False,
+))
 
 
 # ---------------------------------------------------------------------------

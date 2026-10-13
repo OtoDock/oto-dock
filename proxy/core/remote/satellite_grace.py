@@ -10,7 +10,7 @@ with deregister + monkeypatched by tests) and is imported lazily where needed.
 import asyncio
 import logging
 
-logger = logging.getLogger("claude-proxy.satellite")
+logger = logging.getLogger("otodock.satellite")
 
 _GRACE_EXPIRED_MSG = (
     "⚠ stream interrupted — the remote machine disconnected and did not "

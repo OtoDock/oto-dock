@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 
-import { computeModelGroups, visibleAgentPaths } from '@/lib/modelGroups'
+import { computeModelGroups, pickSeedModel, visibleAgentPaths } from '@/lib/modelGroups'
 
 // ─── Model-dropdown layer visibility (the chat page's engine rules) ─────────
 // Locked to the chat's engine while its session process is alive; a DEAD
@@ -152,5 +152,61 @@ describe('computeModelGroups', () => {
     })!
     expect(served[0].models.filter(m => m.value.endsWith('claude-sonnet-5')))
       .toHaveLength(1)
+  })
+})
+
+// ─── The model a new chat opens on when its seed is not offered ────────────
+// A sticky pick or an agent default can name a retired id (the browser keeps
+// its own choice outside any boot walk): it opens on the model that id runs
+// as today, else the agent's default, else the engine's own default — never
+// the first row, which is the tier-ordered list's most expensive model.
+
+describe('pickSeedModel', () => {
+  const catalog = {
+    'engine-a': {
+      display_name: 'Engine A',
+      models: [
+        { value: 'frontier-2', label: 'Frontier', tier: 1 },
+        { value: 'strong-2', label: 'Strong', tier: 2 },
+        { value: 'balanced-2', label: 'Balanced', tier: 3 },
+      ],
+      auto_model: 'strong-2',
+      model_successors: { 'strong-1': 'strong-2', 'gone-1': 'not-offered' },
+    },
+    'engine-b': {
+      display_name: 'Engine B',
+      models: [{ value: 'b-1', label: 'B one' }],
+      auto_model: 'b-1',
+    },
+  }
+  const groups = computeModelGroups({
+    layers: catalog, agentPaths: ['engine-a', 'engine-b'], chatActiveLayer: null,
+    processAlive: true, canRun: {}, streaming: false, warming: false,
+  })!
+
+  it('keeps an offered pick on its own engine', () => {
+    expect(pickSeedModel(groups, catalog, ['b-1', 'strong-2'])).toEqual({ layer: 'engine-b', model: 'b-1' })
+  })
+
+  it('maps a retired sticky pick to the model it runs as today', () => {
+    expect(pickSeedModel(groups, catalog, ['strong-1', 'balanced-2'])).toEqual({ layer: 'engine-a', model: 'strong-2' })
+  })
+
+  it('falls to the agent default when the pick is not offered at all', () => {
+    expect(pickSeedModel(groups, catalog, ['someone-elses', 'balanced-2'])).toEqual({ layer: 'engine-a', model: 'balanced-2' })
+  })
+
+  it('falls to the engine default, never the first (most expensive) row', () => {
+    expect(pickSeedModel(groups, catalog, ['gone-1', ''])).toEqual({ layer: 'engine-a', model: 'strong-2' })
+  })
+
+  it('takes the first row only when no engine offers its own default', () => {
+    const bare = { 'engine-a': { ...catalog['engine-a'], auto_model: 'not-offered' } }
+    const g = computeModelGroups({
+      layers: bare, agentPaths: ['engine-a'], chatActiveLayer: null,
+      processAlive: true, canRun: {}, streaming: false, warming: false,
+    })!
+    expect(pickSeedModel(g, bare, [''])).toEqual({ layer: 'engine-a', model: 'frontier-2' })
+    expect(pickSeedModel([], bare, ['x'])).toBeNull()
   })
 })

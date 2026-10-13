@@ -21,9 +21,36 @@ from deepgram import (
 
 from audio.capabilities import STTCapabilities
 from audio.providers.credential_resolver import CredentialResolver
-from audio.providers.stt.base import STTProvider, TranscriptResult, Word
+from audio.providers.model_succession import DEFAULT_MODELS
+from audio.providers.stt.base import LanguageGuess, STTProvider, TranscriptResult, Word
 
 logger = logging.getLogger(__name__)
+
+
+class _SdkFinishNoise(logging.Filter):
+    """The SDK's ``finish()`` gathers the listen task it has just cancelled
+    and logs the ``CancelledError`` at ERROR on every close; the SDK swallows
+    the error either way (a cancellation of the caller's own task lands in
+    the same branch)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.msg).startswith("tasks cancelled error")
+
+
+def _route_sdk_logger(connection) -> None:
+    """The SDK builds each connection's logger outside the logging registry
+    (so ``logging.getLogger(name)`` never reaches it) with its own bare
+    stderr handler and the root as parent: every record printed twice. Its
+    handlers go, so a record reaches the process's own handlers once, with
+    the logger's name; the finish noise is dropped and every other record
+    (a failed send, a refused close) stays."""
+    sdk_logger = getattr(connection, "_logger", None)
+    if not isinstance(sdk_logger, logging.Logger):
+        return
+    for handler in list(sdk_logger.handlers):
+        sdk_logger.removeHandler(handler)
+    if not any(isinstance(f, _SdkFinishNoise) for f in sdk_logger.filters):
+        sdk_logger.addFilter(_SdkFinishNoise())
 
 # Minimum interval between KeepAlive messages (seconds). Deepgram's docs suggest
 # sending KeepAlive to prevent idle timeout; once every 5s is plenty.
@@ -34,11 +61,12 @@ _KEEPALIVE_INTERVAL_S = 5.0
 # instance via advanced.rate_override_per_unit.
 _COST_PER_SECOND = 0.0000717
 
-# Default Deepgram model (streaming + prerecorded). nova-3 is the current
-# flagship general model; admin-overridable per provider via ``advanced.model_id``
-# (set a newer/specialised one — nova-3-medical, nova-2-phonecall, … — without a
-# code change). Applies to both the live socket and file transcription.
-_DEFAULT_MODEL = "nova-3"
+# Default Deepgram model (streaming + prerecorded; ``audio.providers.model_succession``).
+# nova-3 is the current flagship general model; admin-overridable per provider
+# via ``advanced.model_id`` (set a newer/specialised one — nova-3-medical,
+# nova-2-phonecall, … — without a code change). Applies to both the live
+# socket and file transcription.
+_DEFAULT_MODEL = DEFAULT_MODELS[("stt", "deepgram")]["model_id"]
 
 # Deepgram uses base language codes, except for a few regional variants it accepts
 # natively. The dictation dropdown / native recognizer speak BCP-47 (e.g. el-GR,
@@ -57,10 +85,28 @@ _DG_REGIONAL = {
 
 def _to_deepgram_lang(tag: str) -> str:
     """BCP-47 tag → Deepgram language code: keep the regional variants Deepgram
-    supports, else strip to the base subtag. Empty → ``multi`` (auto-detect)."""
-    if not tag or tag in _DG_REGIONAL or "-" not in tag:
-        return tag or "multi"
+    supports, else strip to the base subtag. Empty or ``auto`` → ``multi``
+    (the code-switching stream: ten languages, Greek not among them)."""
+    if not tag or tag == "auto":
+        return "multi"
+    if tag in _DG_REGIONAL or "-" not in tag:
+        return tag
     return tag.split("-", 1)[0]
+
+
+# The languages the code-switching stream (``language=multi``) transcribes
+# (the vendor's documented set): Greek is not among them, so the dictation
+# relay identifies a Greek speaker through the prerecorded endpoint and
+# reopens the stream in Greek.
+_MULTI_LANGUAGES = frozenset({"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"})
+
+# The languages Deepgram's identification can name (its documented set); a
+# streaming model transcribes each of them once the stream is opened in it.
+_IDENTIFIABLE = frozenset({
+    "bg", "ca", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hi", "hu",
+    "id", "it", "ja", "ko", "lt", "lv", "ms", "nl", "no", "pl", "pt", "ro", "ru",
+    "sk", "sv", "th", "tr", "uk", "vi", "zh",
+})
 
 
 # Punctuation smart_format may add/alter between an interim and its final —
@@ -124,6 +170,8 @@ class DeepgramSTT(STTProvider):
         self._channels = channels
         self._vad_silence_offset_ms = vad_silence_offset_ms
         self._connection = None
+        # The connections a restart replaced, closing off the caller's path.
+        self._closing: set[asyncio.Task] = set()
         self._transcript_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._is_open = False
         self._connection_gen: int = 0  # generation counter to guard _on_close race
@@ -157,7 +205,7 @@ class DeepgramSTT(STTProvider):
             api_key=resolver(row.get("credential_key", "")),
             endpointing_ms=int(advanced.get("call_endpointing_ms", 200)),
             vad_silence_offset_ms=int(advanced.get("vad_silence_offset_ms", 50)),
-            model=advanced.get("model_id") or _DEFAULT_MODEL,
+            model=cls.live_model_id(advanced.get("model_id")) or _DEFAULT_MODEL,
         )
 
     @classmethod
@@ -169,6 +217,10 @@ class DeepgramSTT(STTProvider):
         # vad_silence_offset_ms is deliberately NOT here: the live knob is the
         # global Audio-tab setting; from_row still reads a per-row override.
         return {"call_endpointing_ms": 500, "chat_endpointing_ms": 1500}
+
+    @classmethod
+    def default_model_ids(cls) -> dict[str, str]:
+        return dict(DEFAULT_MODELS[("stt", "deepgram")])
 
     @classmethod
     def validate_advanced(cls, settings: dict) -> dict[str, str]:
@@ -207,6 +259,7 @@ class DeepgramSTT(STTProvider):
         text = ""
         words: list[Word] = []
         lang = language or "en"
+        confidence = 0.0
         duration = 0.0
         try:
             channel = resp.results.channels[0]
@@ -221,6 +274,10 @@ class DeepgramSTT(STTProvider):
             detected = getattr(channel, "detected_language", None)
             if detected:
                 lang = detected
+                try:
+                    confidence = float(getattr(channel, "language_confidence", None) or 0.0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
             duration = float(getattr(resp.metadata, "duration", 0.0) or 0.0)
             # Surface Deepgram's metadata warnings. An unsupported model+language
             # combo (e.g. Greek on nova-3 *prerecorded*) doesn't error — Deepgram
@@ -240,7 +297,62 @@ class DeepgramSTT(STTProvider):
         self._log_transcript("Deepgram file", text)
         return TranscriptResult(
             text=text, language=lang, audio_seconds=duration, words=words, provider_used="deepgram",
+            language_confidence=confidence,
         )
+
+    async def identify_language(self, audio_wav: bytes) -> LanguageGuess | None:
+        """One utterance through the prerecorded endpoint with
+        ``detect_language`` (Deepgram identifies on pre-recorded audio only;
+        its code-switching stream covers ten languages without Greek)."""
+        result = await self.transcribe_file(audio_wav, language=None)
+        lang = (result.language or "").split("-", 1)[0].lower()
+        if not lang:
+            return None
+        return LanguageGuess(language=lang, confidence=result.language_confidence, text=result.text)
+
+    def streams_language(self, language: str) -> bool:
+        return (language or "").split("-", 1)[0].lower() in _IDENTIFIABLE
+
+    @property
+    def multi_languages(self) -> frozenset[str]:
+        return _MULTI_LANGUAGES
+
+    async def restart(self, language: str) -> bool:
+        """Reopen the stream in ``language`` with the stored rate, interims
+        and endpointing (the language lock mid-call). The new stream opens
+        BEFORE the old one closes: the vendor's close handshake takes about
+        half a second, nothing of the old stream is wanted (its callbacks
+        are bound to their generation and ignored once ``start`` bumps it),
+        and the audio the lock replays should reach the new stream at once."""
+        old, self._connection = self._connection, None
+        try:
+            await self.start(
+                language=language, sample_rate=self._active_rate,
+                interim_results=self._interim_results,
+                endpointing_ms=self._endpointing_override,
+            )
+        except Exception as e:
+            logger.warning(f"Deepgram STT restart in {language} failed: {e}")
+            self._is_open = False
+            self._finish_quietly(old)
+            return False
+        self._finish_quietly(old)
+        logger.info(f"Deepgram STT restarted in {language}")
+        return True
+
+    def _finish_quietly(self, connection) -> None:
+        """A replaced connection's close handshake, off the caller's path;
+        its outcome is nobody's (the task is held until it ends)."""
+        if connection is None:
+            return
+
+        async def _finish() -> None:
+            with contextlib.suppress(Exception):
+                await connection.finish()
+
+        task = asyncio.create_task(_finish())
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
 
     # ── Streaming surface ──────────────────────────────────────────
 
@@ -280,11 +392,18 @@ class DeepgramSTT(STTProvider):
         self._connection_gen += 1
         gen = self._connection_gen
         self._connection = self._client.listen.asyncwebsocket.v("1")
+        _route_sdk_logger(self._connection)
 
-        self._connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
         # Bind the current generation so stale callbacks are ignored — a
         # replaced socket's dying gasp (net0001 after a mid-call reconnect)
-        # must not surface as a pipeline "STT fatal" for the LIVE connection.
+        # must not surface as a pipeline "STT fatal" for the LIVE connection,
+        # and a late result of the old stream must not land in the new queue
+        # (a dictation restart replays audio the old stream was still
+        # transcribing).
+        self._connection.on(
+            LiveTranscriptionEvents.Transcript,
+            lambda _conn, result, _gen=gen, **kw: self._on_transcript(_conn, result, _gen=_gen, **kw),
+        )
         self._connection.on(
             LiveTranscriptionEvents.Error,
             lambda _conn, error, _gen=gen, **kw: self._on_error(_conn, error, _gen=_gen, **kw),
@@ -657,8 +776,11 @@ class DeepgramSTT(STTProvider):
         if partial_final:
             self._emit_partial_final(partial_final)
 
-    async def _on_transcript(self, _conn, result, **kwargs) -> None:
+    async def _on_transcript(self, _conn, result, _gen: int | None = None, **kwargs) -> None:
         """Handle transcript events from Deepgram."""
+        if _gen is not None and _gen != self._connection_gen:
+            logger.debug(f"Deepgram transcript on stale gen={_gen} (current={self._connection_gen}) — ignoring")
+            return
         try:
             alt = result.channel.alternatives[0]
             transcript = alt.transcript
@@ -694,6 +816,13 @@ class DeepgramSTT(STTProvider):
                             "%d left for the next window", len(extra), len(rest),
                         )
                     self._set_interim(" ".join(w.word for w in rest), rest)
+                else:
+                    # The final covers the partial's audio: a drain that finds
+                    # the queue empty falls back to ``latest_interim``, and a
+                    # partial left here was appended once per drain (the
+                    # repeated words of every call). Cleared before the
+                    # commit, whose push starts the duplex sweep.
+                    self._latest_interim, self._latest_interim_words = "", []
                 await self._commit("Deepgram final", committed, partial_final=transcript)
             elif transcript and not is_final:
                 self._last_result_at = time.monotonic()

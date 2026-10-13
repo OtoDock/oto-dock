@@ -9,11 +9,15 @@ import re
 
 import config
 
-# Injected prelude line(s): the `[Current time: ...]` stamp and the viewer
-# focus line — twin of ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored
-# exact shapes only).
+# Injected prelude line(s): the `[Current time: ...]` stamp, the viewer
+# focus line and the parallel-activity line (``sibling_awareness``) — twin
+# of ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored exact shapes
+# only; a satellite single-lines a launch-argument prompt, so a prelude may
+# end in spaces instead of a line break).
 _TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
 
@@ -29,6 +33,27 @@ def interactive_prelude(text: str, *, user_tz: str | None, focus_line: str = "")
     the browser's own stamp (``withInteractiveTime``), the same shape."""
     focus = f"{focus_line}\n\n" if focus_line else ""
     return f"[Current time: {config.format_current_time(user_tz)}]\n\n{focus}{text}"
+
+
+
+def task_prelude(text: str, *, user_tz: str | None, parallel_line: str = "") -> str:
+    """A task run's first prompt into a terminal: the time stamp and the
+    parallel-activity line ahead of the text on the SAME line (the matchers
+    above end a prelude at spaces too). The Claude TUI journals a multi-line
+    prompt, which reaches it as a bracketed paste, wrapped as pasted
+    content; a single-line task prompt stays a typed line."""
+    head = f"[Current time: {config.format_current_time(user_tz)}]"
+    return " ".join(part for part in (head, parallel_line, text) if part)
+
+
+async def live_model(model: str) -> str:
+    """The model a socket frame names, as it runs today
+    (``config.live_model_id``): a retired builtin a stale page or a sticky
+    pick still sends is read as its successor, off the loop."""
+    if model in config.MODEL_SUCCESSORS:
+        from storage.pg import run_db
+        return await run_db(config.live_model_id, model)
+    return model
 
 # Bounded wait on an in-flight warmup during the dead-session re-check
 # (single-flight revival). Covers a normal respawn (~2-10s) with slack for a
@@ -101,12 +126,18 @@ def _queued_outgoing(stop_flags: dict, combined: str) -> str:
 
 
 # What ``_heal_viewed_session`` answers: the session is ready for the turn; the
-# send was answered there (typed into a live terminal, refused read-only); or
-# the session's machine is still reconnecting after the wait (nothing was
-# touched, the send waits).
+# send was answered there (typed into a live terminal); a teammate's live
+# terminal refused it (read-only: nothing was typed, the send may wait for it
+# to close); or the session's machine is still reconnecting after the wait
+# (nothing was touched, the send waits).
 HEAL_READY = "ready"
 HEAL_ANSWERED = "answered"
+HEAL_REFUSED = "refused"
 HEAL_RECONNECTING = "reconnecting"
+# What ``_deliver_chat_to_live_interactive`` did with a send ("" when no live
+# terminal took it up).
+LIVE_TERMINAL_TYPED = "typed"
+LIVE_TERMINAL_REFUSED = "refused"
 
 # The line a turn gets that could not wait in the queue (its row is already
 # written) while its chat's machine reconnects.

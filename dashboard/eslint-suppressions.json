@@ -1,0 +1,1210 @@
+{
+  "src/api/agents.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/api/apps.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/api/auth.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    }
+  },
+  "src/api/communityAgents.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    }
+  },
+  "src/api/executionLayers.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 8
+    }
+  },
+  "src/api/webauthn.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
+    }
+  },
+  "src/api/wireEvents.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 25
+    }
+  },
+  "src/audio/cleanText.ts": {
+    "no-misleading-character-class": {
+      "count": 1
+    }
+  },
+  "src/audio/micPermission.ts": {
+    "preserve-caught-error": {
+      "count": 2
+    }
+  },
+  "src/audio/webaudioPlayer.ts": {
+    "no-console": {
+      "count": 2
+    }
+  },
+  "src/components/AgentInstallModal.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/BrowserModeControls.tsx": {
+    "no-alert": {
+      "count": 2
+    },
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/CommunityMcpsBrowser.tsx": {
+    "no-extra-boolean-cast": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/CommunitySkillsBrowser.tsx": {
+    "no-extra-boolean-cast": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/ErrorBoundary.tsx": {
+    "no-console": {
+      "count": 1
+    },
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/FileEditor.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/components/McpCategoryFilter.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/McpIcon.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/ReleaseDialog.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 3
+    }
+  },
+  "src/components/TurnstileWidget.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 5
+    }
+  },
+  "src/components/accounts/OAuthAccountForm.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/components/accounts/PlainCredsAccountForm.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/components/accounts/SubscriptionRow.tsx": {
+    "no-alert": {
+      "count": 2
+    },
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/admin/McpInstanceManager.tsx": {
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/components/admin/OtodockConnectionCard.tsx": {
+    "no-alert": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/agents-map/AgentsMap3D.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    },
+    "react-hooks/immutability": {
+      "count": 4
+    },
+    "react-hooks/refs": {
+      "count": 19
+    }
+  },
+  "src/components/agents-map/layout.ts": {
+    "prefer-const": {
+      "count": 1
+    }
+  },
+  "src/components/agents-map/sceneBag.ts": {
+    "no-useless-assignment": {
+      "count": 2
+    }
+  },
+  "src/components/agents-map/useMapPointers.ts": {
+    "prefer-const": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 12
+    }
+  },
+  "src/components/agents-map/useMapRenderer.ts": {
+    "no-console": {
+      "count": 1
+    }
+  },
+  "src/components/agents-map/useStageMachine.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 5
+    }
+  },
+  "src/components/apps/AppApprovalCard.tsx": {
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 6
+    }
+  },
+  "src/components/apps/AppFrame.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    },
+    "react-hooks/immutability": {
+      "count": 2
+    },
+    "react-hooks/purity": {
+      "count": 2
+    },
+    "react-hooks/refs": {
+      "count": 13
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/apps/AppLogsPanel.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/apps/AppSettingsPanel.tsx": {
+    "no-alert": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 3
+    }
+  },
+  "src/components/audio/AdvancedTuning.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/components/audio/ProviderPill.tsx": {
+    "no-alert": {
+      "count": 3
+    }
+  },
+  "src/components/chat/AppSettingsModal.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/BgCommandInfo.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/components/chat/ChatBlockRenderer.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/components/chat/ChatFileContext.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/chat/ChatHistory.tsx": {
+    "react-hooks/refs": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/ChatInput.tsx": {
+    "react-hooks/exhaustive-deps": {
+      "count": 2
+    },
+    "react-hooks/immutability": {
+      "count": 4
+    },
+    "react-hooks/refs": {
+      "count": 5
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/ChatMessages.tsx": {
+    "react-hooks/immutability": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 3
+    }
+  },
+  "src/components/chat/ChatStatusBar.tsx": {
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    },
+    "no-alert": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/ChatTargetBanner.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/CodeBlock.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/DelegateTaskInfo.tsx": {
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/EngineSwitchBanner.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/InstallProgressBar.tsx": {
+    "react-hooks/purity": {
+      "count": 3
+    }
+  },
+  "src/components/chat/MachineUpdateBanner.tsx": {
+    "react-hooks/purity": {
+      "count": 1
+    }
+  },
+  "src/components/chat/MarkdownContent.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 7
+    },
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 2
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/PermissionDialog.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/components/chat/PlanReviewCard.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/components/chat/PresenceHalo.tsx": {
+    "no-console": {
+      "count": 4
+    },
+    "no-useless-assignment": {
+      "count": 2
+    },
+    "react-hooks/refs": {
+      "count": 2
+    }
+  },
+  "src/components/chat/QuestionDialog.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    }
+  },
+  "src/components/chat/RemoteFallbackBanner.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/SttLanguageMenu.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/chat/SubagentInfo.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/components/chat/ThinkingBlock.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 2
+    }
+  },
+  "src/components/chat/ToolActivity.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 10
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/artifacts/ArtifactWindows.tsx": {
+    "react-hooks/refs": {
+      "count": 3
+    }
+  },
+  "src/components/chat/media/AudioPlayer.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/media/DocumentFrame.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/media/DocumentPane.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 4
+    }
+  },
+  "src/components/chat/media/ImageGallery.tsx": {
+    "@typescript-eslint/no-empty-object-type": {
+      "count": 1
+    }
+  },
+  "src/components/chat/media/ImageLightbox.tsx": {
+    "react-hooks/refs": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/media/UiArtifact.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "react-hooks/refs": {
+      "count": 2
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/media/VideoPlayer.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 10
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 2
+    }
+  },
+  "src/components/chat/notifications/NotificationAgentHeader.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/chat/notifications/NotificationPanel.tsx": {
+    "@typescript-eslint/no-unused-vars": {
+      "count": 2
+    }
+  },
+  "src/components/chat/notifications/SwipeableRow.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/chat/plan/PlanView.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/components/chat/plan/WorkflowPanel.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 5
+    }
+  },
+  "src/components/chat/types.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 6
+    }
+  },
+  "src/components/common/TaskModelChip.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/common/TransferBar.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/departments/DepartmentsEditor.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 4
+    }
+  },
+  "src/components/engines/SubscriptionWindows.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/components/phone/CallLogModal.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/phone/PhoneServerPill.tsx": {
+    "no-alert": {
+      "count": 6
+    }
+  },
+  "src/components/sharing/SharePopover.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/components/ui/NavGroup.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/ui/popoverPosition.ts": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/usage/PoolCapSection.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/workspace/FileGrid.tsx": {
+    "react-hooks/purity": {
+      "count": 1
+    }
+  },
+  "src/components/workspace/FilePreviewBody.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/workspace/RecoverBinModal.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/components/workspace/SelectionModeBar.tsx": {
+    "react-hooks/static-components": {
+      "count": 4
+    }
+  },
+  "src/components/workspace/WorkspaceOverlay.tsx": {
+    "no-alert": {
+      "count": 6
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 4
+    }
+  },
+  "src/components/workspace/useWorkspaceKeyboardShortcuts.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/contexts/AuthContext.tsx": {
+    "no-console": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/contexts/SearchContext.tsx": {
+    "react-hooks/refs": {
+      "count": 4
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/contexts/ThemeContext.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    },
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/hooks/chatStream/liveStateBuilder.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/hooks/chatStream/types.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 8
+    }
+  },
+  "src/hooks/useActiveChats.ts": {
+    "react-hooks/purity": {
+      "count": 1
+    }
+  },
+  "src/hooks/useArtifactWindows.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "react-hooks/refs": {
+      "count": 2
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/hooks/useChatMessages.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 7
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/hooks/useChatNotifications.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 3
+    }
+  },
+  "src/hooks/useChatStream.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 33
+    },
+    "prefer-const": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 7
+    },
+    "react-hooks/immutability": {
+      "count": 4
+    },
+    "react-hooks/preserve-manual-memoization": {
+      "count": 4
+    },
+    "react-hooks/refs": {
+      "count": 3
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/hooks/useCollaboraIdle.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "react-hooks/refs": {
+      "count": 2
+    }
+  },
+  "src/hooks/useCollaboraLiveReload.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/hooks/useComposerHeight.ts": {
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/hooks/useDashboardWs.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
+    },
+    "no-console": {
+      "count": 3
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 7
+    },
+    "react-hooks/immutability": {
+      "count": 2
+    },
+    "react-hooks/refs": {
+      "count": 2
+    }
+  },
+  "src/hooks/useDelayMount.ts": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/hooks/useFcmPush.ts": {
+    "no-console": {
+      "count": 4
+    },
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/hooks/useFileThumbnail.ts": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/hooks/useInteractiveTerminal.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 9
+    },
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/hooks/useNotifications.ts": {
+    "no-console": {
+      "count": 4
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    }
+  },
+  "src/hooks/usePushSubscription.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "no-console": {
+      "count": 1
+    }
+  },
+  "src/hooks/useSpeechSession.ts": {
+    "no-console": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/hooks/useSwipeGesture.ts": {
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/hooks/useWakeWord.ts": {
+    "no-console": {
+      "count": 12
+    },
+    "react-hooks/refs": {
+      "count": 4
+    }
+  },
+  "src/hooks/useWorkspaceState.ts": {
+    "react-hooks/refs": {
+      "count": 12
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/lib/buildId.ts": {
+    "no-console": {
+      "count": 3
+    }
+  },
+  "src/lib/chatUploadQueue.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/lib/composerKeys.ts": {
+    "no-useless-assignment": {
+      "count": 1
+    }
+  },
+  "src/lib/displayReplay.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/lib/messageBlocks.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 7
+    },
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/lib/oauth.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/lib/ptyBrandColors.ts": {
+    "no-control-regex": {
+      "count": 1
+    }
+  },
+  "src/lib/tools/roles.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    }
+  },
+  "src/lib/uploadWithProgress.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 5
+    }
+  },
+  "src/pages/AcceptInvite.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/pages/AgentsPage.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/AuthCallback.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/ChangePassword.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/pages/LoginPage.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 6
+    },
+    "no-useless-assignment": {
+      "count": 1
+    }
+  },
+  "src/pages/NativePasskey.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/pages/ResetPassword.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/pages/Schedules.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
+    },
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/pages/Setup2FA.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/SetupWizard.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/pages/SharedChatPage.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/pages/Triggers.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
+    },
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/pages/UserSettings.aiEngines.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/UserSettings.general.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 8
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 3
+    }
+  },
+  "src/pages/UserSettings.integrations.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "no-alert": {
+      "count": 5
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/UserSettings.machines.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/AudioTab.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/ExecutionLayersTab.local.tsx": {
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/ExecutionLayersTab.rows.tsx": {
+    "no-alert": {
+      "count": 3
+    }
+  },
+  "src/pages/admin/ExecutionLayersTab.widgets.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/GeneralTab.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/McpServersPage.row.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "no-alert": {
+      "count": 5
+    }
+  },
+  "src/pages/admin/NotificationsPage.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 6
+    },
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/OffboardedArchivesCard.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/OtodockTab.tsx": {
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/PhoneServersTab.tsx": {
+    "no-alert": {
+      "count": 16
+    }
+  },
+  "src/pages/admin/PlatformPage.shared.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 4
+    }
+  },
+  "src/pages/admin/PlatformPage.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/RemoteMachinesPage.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    },
+    "no-alert": {
+      "count": 2
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/SecurityTab.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/SkillsPage.tsx": {
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/pages/admin/SystemSettingsTab.tsx": {
+    "no-alert": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/admin/UsagePage.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
+    }
+  },
+  "src/pages/admin/UsersPage.tsx": {
+    "no-alert": {
+      "count": 3
+    }
+  },
+  "src/pages/agent/AgentChat.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 6
+    },
+    "react-hooks/immutability": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 3
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/agent/AgentConfig.parts.tsx": {
+    "react-refresh/only-export-components": {
+      "count": 1
+    }
+  },
+  "src/pages/agent/AgentConfig.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 6
+    }
+  },
+  "src/pages/agent/AgentNotifications.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 5
+    },
+    "no-alert": {
+      "count": 1
+    }
+  },
+  "src/pages/agent/AgentSchedules.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
+    },
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/pages/agent/AgentTriggers.apiKeys.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 2
+    },
+    "no-alert": {
+      "count": 4
+    }
+  },
+  "src/pages/agent/AgentTriggers.modals.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 7
+    },
+    "no-alert": {
+      "count": 8
+    },
+    "no-useless-assignment": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 2
+    }
+  },
+  "src/pages/agent/AgentTriggers.tsx": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "no-alert": {
+      "count": 2
+    }
+  },
+  "src/pages/agent/chat/ChatComposerBar.tsx": {
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    }
+  },
+  "src/pages/agent/chat/ChatDocumentPane.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 2
+    },
+    "react-refresh/only-export-components": {
+      "count": 2
+    }
+  },
+  "src/pages/agent/chat/useAgentChatStream.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "react-hooks/immutability": {
+      "count": 1
+    },
+    "react-hooks/purity": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 2
+    }
+  },
+  "src/pages/agent/chat/useChatDuplexVoice.ts": {
+    "react-hooks/set-state-in-effect": {
+      "count": 1
+    }
+  },
+  "src/pages/agent/chat/useInteractiveHandlers.ts": {
+    "no-alert": {
+      "count": 1
+    },
+    "react-hooks/exhaustive-deps": {
+      "count": 4
+    }
+  },
+  "src/pages/agent/chat/useModelEngineSelection.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 7
+    }
+  },
+  "src/pages/agent/chat/useOverlayPanels.ts": {
+    "react-hooks/exhaustive-deps": {
+      "count": 1
+    },
+    "react-hooks/refs": {
+      "count": 1
+    },
+    "react-hooks/set-state-in-effect": {
+      "count": 2
+    }
+  },
+  "src/pages/agent/chat/useWarmupSends.ts": {
+    "react-hooks/refs": {
+      "count": 1
+    }
+  },
+  "src/pages/apps/AppPage.tsx": {
+    "react-hooks/set-state-in-effect": {
+      "count": 2
+    }
+  },
+  "src/sharehost/main.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    },
+    "no-useless-assignment": {
+      "count": 1
+    }
+  },
+  "src/store/documentPaneStore.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "src/store/transferStore.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 5
+    },
+    "@typescript-eslint/no-unused-vars": {
+      "count": 1
+    }
+  }
+}

@@ -1,5 +1,6 @@
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import type { FileNode } from '../../api/agents'
+import { canPickFolder } from '../../lib/droppedItems'
 import { toSandboxVirtualPath } from '../../lib/paths'
 import type { MenuAction } from './FileContextMenu'
 import type { WorkspaceSection } from './sections'
@@ -28,6 +29,9 @@ interface BuildEmptyActionsArgs {
   handleNewFolder: () => Promise<void>
   handlePaste: (destDir: string) => Promise<void>
   emptyUploadInputRef: RefObject<HTMLInputElement | null>
+  /** The folder picker's input; offered only where the browser has a
+   * folder picker (`canPickFolder`). */
+  emptyUploadFolderInputRef?: RefObject<HTMLInputElement | null>
   /** Re-fetch the workspace tree (and recover-bin list) on demand. */
   onRefresh: () => void
 }
@@ -153,12 +157,14 @@ export function buildEmptyActions({
   handleNewFolder,
   handlePaste,
   emptyUploadInputRef,
+  emptyUploadFolderInputRef,
   onRefresh,
 }: BuildEmptyActionsArgs): MenuAction[] {
   if (!activeSection) return []
   const dir = state.path || activeSection.pathPrefix
   const cb = actions.clipboard
   const acts: MenuAction[] = []
+  const folderInput = canPickFolder() ? emptyUploadFolderInputRef : undefined
   if (activeSection.canWrite) {
     acts.push({
       key: 'new-md',
@@ -174,10 +180,18 @@ export function buildEmptyActions({
     })
     acts.push({
       key: 'upload',
-      label: 'Upload',
+      label: folderInput ? 'Upload Files' : 'Upload',
       icon: <Icon name="upload" />,
       onClick: () => emptyUploadInputRef.current?.click(),
     })
+    if (folderInput) {
+      acts.push({
+        key: 'upload-folder',
+        label: 'Upload Folder',
+        icon: <Icon name="upload" />,
+        onClick: () => folderInput.current?.click(),
+      })
+    }
   }
   if (cb && cb.paths.length > 0 && activeSection.canWrite) {
     acts.push({

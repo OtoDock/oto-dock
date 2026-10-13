@@ -29,7 +29,7 @@ from services.billing import hosted_instances, relay_client
 from storage import database as db
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.account-api")
+logger = logging.getLogger("otodock.account-api")
 router = APIRouter()
 
 _STATE_KEY = "_otodock_connect_state"        # single in-flight connect CSRF state

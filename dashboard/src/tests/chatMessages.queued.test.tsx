@@ -77,6 +77,12 @@ describe('a chip waiting for its machine', () => {
       'The machine running this chat is reconnecting. Your message goes out when it is back.')
   })
 
+  it("says the message waits for a teammate's terminal to close", () => {
+    renderWaiting(QUEUE_WAITING.TERMINAL)
+    expect(screen.getByTestId('queued-waiting').textContent).toBe(
+      "A teammate's terminal is open on this chat. Your message goes out when it closes.")
+  })
+
   it('says nothing more once the machine is back', () => {
     renderWaiting(undefined)
     expect(screen.getByText('later')).toBeTruthy()

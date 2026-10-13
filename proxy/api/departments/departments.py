@@ -39,7 +39,7 @@ from storage.agents import agent_store
 from storage.agents import db_departments
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.departments")
+logger = logging.getLogger("otodock.departments")
 
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])

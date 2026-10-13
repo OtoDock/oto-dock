@@ -16,6 +16,7 @@ import logging
 
 from core import layout
 from core.execution_layer import AgentConfig, RemoteStartContext, RemoteStartPlan
+from core.sandbox import session_config_dir as _scd
 
 logger = logging.getLogger("remote-layer")
 
@@ -44,8 +45,8 @@ def _load_hook_scripts() -> dict[str, str]:
     # naive parent-count silently points at the wrong directory.
     hooks_dir = Path(app_config.HOOKS_DIR)
     scripts: dict[str, str] = {}
-    # The same four scripts the local sandbox installs (HOOK_SCRIPTS is the
-    # one list); a satellite older than 0.5.121 writes stop_tracker.py and
+    # The same scripts the local sandbox installs (HOOK_SCRIPTS is the one
+    # list); a satellite older than 0.5.121 writes stop_tracker.py and
     # never names it in its hook files — harmless.
     from core.sandbox.session_config_dir import HOOK_SCRIPTS
     for name in HOOK_SCRIPTS:
@@ -173,6 +174,14 @@ class RemoteStartPayloadMixin:
         # as bwrap on local. See proxy/services/path_roles.py.
         env.update(config.extra_env)
         env.update(config.credential_env)
+        # Where git's credential helper lives (the engine's config dir, in
+        # sandbox-virtual form the satellite translates like every path
+        # value) and the interpreter that runs it; satellite 0.5.139 sets
+        # both itself after the translation and prepends the wrappers'
+        # directory to PATH. The git entries the resolver writes expand them
+        # through the shell.
+        env["OTO_HOOKS_DIR"] = f"/{cwd_relative}/{engine.capabilities.runtime.config_dir_name}"
+        env["OTO_HOOK_PY"] = "python3"
 
         # Common payload fields. Hook scripts travel with every start_session
         # so satellites never need to have them pre-deployed — they live only
@@ -206,6 +215,9 @@ class RemoteStartPayloadMixin:
             # headless → satellite keeps its xterm-256color default).
             "term": config.term or "",
             "hook_scripts": _load_hook_scripts(),
+            # The command wrappers (satellite 0.5.139 writes them under the
+            # config dir's bin/; an older satellite ignores the key).
+            "command_wrappers": dict(_scd.COMMAND_WRAPPERS),
             "use_native_permissions": config.use_native_permissions,
             "multi_value_envs": config.multi_value_envs or {},
         }

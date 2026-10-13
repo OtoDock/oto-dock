@@ -30,7 +30,7 @@ from services.scheduler import scheduler, task_kinds
 from storage import database as task_store
 from core.session.visibility import is_synthetic_owner
 
-logger = logging.getLogger("claude-proxy.continuations")
+logger = logging.getLogger("otodock.continuations")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 

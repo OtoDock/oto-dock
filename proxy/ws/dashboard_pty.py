@@ -10,14 +10,21 @@ import asyncio
 import base64
 import logging
 import time
+from typing import TYPE_CHECKING
 from services.notifications import notification_manager
 from core import placement
 from core.session import interactive_session
 from core.events.artifact_events import artifact_event_from_perm_item
 from auth import roles
 from ws import wire_events as wire
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 # Minimum gap between two ``read_only`` explanations to one socket. A refused
 # keystroke must SAY why (a silently dead terminal is the worse failure), but a
@@ -80,7 +87,7 @@ class _PtyOutbox:
 
 
 
-class PtyViewerController:
+class PtyViewerController(_Host):
     """Interactive (PTY) viewer attach/detach: mirrors a live TUI session to
     this socket and forwards its prompts/artifacts/exit."""
 
@@ -360,11 +367,9 @@ class PtyViewerController:
             from core.session import otodock_session as _otodock
             sess.notify_status("reconnecting")
             _kick_reason = "taken over by the dashboard — run `otodock --resume` to return"
-            asyncio.create_task(
-                get_connection_manager().send_local_detach(
+            spawn(get_connection_manager().send_local_detach(
                     sess.target, vsid, reason=_kick_reason,
-                )
-            )
+                ), name="send_local_detach", owner="dashboard_pty")
             if sess._otodock_kick_timer is None:
                 sess._otodock_kick_timer = asyncio.get_running_loop().call_later(
                     2.0, _otodock.detach_local_session, vsid,

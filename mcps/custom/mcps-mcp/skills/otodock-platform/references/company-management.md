@@ -34,8 +34,9 @@ every agent in it, follows the department as agents join or leave, and ends when
 department is deleted (apps.md).
 
 **The company map**: the Agents page renders departments as a 3D map — amphitheater
-seating by level, activity-heat borders, a pulse on agents responding right now,
-delegation lines between agents. Zoom navigates (out = whole company, in = enter a
+seating by level, activity-heat borders, a pulse on agents responding right now (both
+follow the sessions the viewer may see, their own Active now list), delegation lines
+between agents. Zoom navigates (out = whole company, in = enter a
 department); Grid view groups by department with level badges; the choice roams across
 devices.
 
@@ -54,7 +55,8 @@ real files: deliverables copy into the target's `workspace/inbox/<sender>/` (pas
 delegate with a prompt to make the target act), and a delegated worker attaches its
 deliverables to its result (`attach_result_files`): they land in the delegating chat's
 `inbox/<worker>/` with no edge back and the result names them, with an Open per file
-in the chat. Admin caps live on the Delegation MCP row.
+in the chat. A worker's result arrives once its background commands and sub-agents have
+finished. Admin caps live on the Delegation MCP row.
 
 **Visibility is not delegation.** In a user's chat, an agent can read whatever that user
 could see on other agents (schedules, task history, sessions, triggers, notifications),

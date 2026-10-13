@@ -23,7 +23,7 @@ from services.scheduler.delivery_identity import _shared_chat_person, _standing_
 from auth import roles
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.scheduler")
+logger = logging.getLogger("otodock.scheduler")
 
 
 # Continuation coalescing: chat_id → the chat's last message id right after a

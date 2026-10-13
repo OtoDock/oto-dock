@@ -87,6 +87,15 @@ describe('local upload lifecycle', () => {
     expect(t.uploadFailed).toBe(true)
     expect(t.doneAt).not.toBeNull()
     expect(isTransferActive(t)).toBe(true) // linger window shows the failure
+    expect(t.uploadError).toBeUndefined()
+  })
+
+  it('failLocalUpload keeps the reason the row shows', () => {
+    S().beginLocalUpload({
+      clientId: 'local:r', agent: 'a1', targetDir: '', filename: 'mesitis', bytesTotal: 0,
+    })
+    S().failLocalUpload('local:r', "this item can't be read")
+    expect(S().byId['local:r'].uploadError).toBe("this item can't be read")
   })
 })
 

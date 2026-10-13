@@ -1,10 +1,16 @@
 import { lazy, Suspense, useEffect } from 'react'
+// The handler the shell calls with a held otodock:// link must exist before
+// dashboardReady below: the forms import this module lazily, so a page the
+// app recreated while the person consented would otherwise have none.
+import './lib/oauth'
+import AppToastHost from './components/AppToastHost'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import Layout from './components/Layout'
 import AgentLayout from './components/AgentLayout'
 import RequireAuth from './components/RequireAuth'
 import RequireRole from './components/RequireRole'
 import PlatformSetupGuard from './components/PlatformSetupGuard'
+import RouteBoundary from './components/RouteBoundary'
 import AgentGuard from './components/AgentGuard'
 import DefaultAgentRedirect from './components/DefaultAgentRedirect'
 import AuthCallback from './pages/AuthCallback'
@@ -102,6 +108,7 @@ export default function App() {
   return (
     <BrowserRouter>
       <NavigationGuard />
+      <AppToastHost />
       <Routes>
         {/* Public routes — no auth required */}
         <Route path="/auth/callback" element={<AuthCallback />} />
@@ -116,6 +123,8 @@ export default function App() {
           <Route path="setup-2fa" element={<Setup2FA />} />
           {/* Platform setup guard — blocks non-admin if no subscriptions configured */}
           <Route element={<PlatformSetupGuard />}>
+          {/* A crash in one page shows its card, never a blank app. */}
+          <Route element={<RouteBoundary />}>
           {/* Landing page: redirect to default agent chat */}
           <Route index element={<DefaultAgentRedirect />} />
 
@@ -183,6 +192,7 @@ export default function App() {
           {/* Old run deep links resolve to the chat page (task mode on) */}
           <Route path="runs/:runId" element={<RunRedirect />} />
           <Route path="conversations/:chatId" element={<ConversationView />} />
+          </Route>{/* end RouteBoundary */}
           </Route>{/* end PlatformSetupGuard */}
         </Route>
 

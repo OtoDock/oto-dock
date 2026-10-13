@@ -53,7 +53,7 @@ def test_a_public_address_or_name_over_http_is_refused():
 def test_the_verdict_is_kept_and_one_error_logged(monkeypatch, caplog):
     asked = []
     monkeypatch.setattr(daemon_url, "judge", lambda url: asked.append(url) or "refused")
-    with caplog.at_level(logging.ERROR, logger="claude-proxy.phone"):
+    with caplog.at_level(logging.ERROR, logger="otodock.phone"):
         for _ in range(3):
             assert asyncio.run(daemon_url.refusal("http://x.example:9093")) == "refused"
     assert len(asked) == 1

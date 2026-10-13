@@ -528,7 +528,7 @@ def test_reject_named_volume_declaration_without_external():
 
 
 @pytest.mark.parametrize(
-    "src", ["otodock-pgdata", "OtoDock-PgSock", "otodock-ssh-keys", "otodock-mcps"],
+    "src", ["otodock-pgdata", "OtoDock-PgSock", "otodock-ssh-keys", "otodock-mcps", "otodock-recover-bin"],
 )
 def test_reject_platform_volume_source_short_form(src):
     data = {"services": {"camoufox": {"build": ".", "volumes": [f"{src}:/mnt"]}}}

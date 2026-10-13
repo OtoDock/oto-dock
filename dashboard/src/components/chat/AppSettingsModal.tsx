@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { askNative, callNative } from '../../lib/nativeBridge'
+import { askNative, callNative, inAppShell, openPrivacyPolicy } from '../../lib/nativeBridge'
 
 interface Props {
   open: boolean
@@ -208,6 +208,16 @@ export default function AppSettingsModal({ open, onClose }: Props) {
           >
             Close
           </button>
+
+          {/* The stores require a link to the privacy policy inside the app. */}
+          {inAppShell() && (
+            <button
+              onClick={openPrivacyPolicy}
+              className="w-full mt-3 text-xs text-p-text-light underline hover:text-p-text"
+            >
+              Privacy policy
+            </button>
+          )}
         </div>
       </div>
     </>

@@ -18,13 +18,14 @@ reusable from both the dispatcher (real events) and ``dynamic_context``
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from auth.webhook_providers.base import NormalizedEvent
 
-logger = logging.getLogger("claude-proxy.event-normalizer")
+logger = logging.getLogger("otodock.event-normalizer")
 
 
 def walk_path(*, body: Any, headers: dict[str, str], path: str) -> str:
@@ -94,6 +95,7 @@ def normalize_event(
     headers: dict[str, str],
     manifest_block: dict,
     vendor_event_id: str = "",
+    global_event_id: str = "",
 ) -> "NormalizedEvent":
     """Apply a manifest's ``payload_normalization`` block to raw inbound.
 
@@ -124,6 +126,7 @@ def normalize_event(
     return NormalizedEvent(
         event_type=event_type,
         vendor_event_id=vendor_event_id,
+        global_event_id=global_event_id,
         actor=actor,
         subject=subject,
         target=target,
@@ -276,3 +279,23 @@ def resolve_catalog_keys(
         if matched:
             out.append(key)
     return out
+
+
+# A vendor key longer than this is hashed: the app-handler dedupe's unique
+# index is a btree, and Graph resource ids run long.
+_VENDOR_KEY_MAX = 200
+
+
+def vendor_event_key(provider_id: str, global_event_id: str) -> str:
+    """The ``event_id`` a vendor event fires its triggers with:
+    ``<provider>:<the vendor's own event id>``, the same for every
+    subscription that sees the event and for every redelivery of it, and
+    distinct across providers. "" when the vendor gives no id (no
+    cross-subscription dedupe, as before)."""
+    if not provider_id or not global_event_id:
+        return ""
+    key = f"{provider_id}:{global_event_id}"
+    if len(key) <= _VENDOR_KEY_MAX:
+        return key
+    digest = hashlib.sha256(global_event_id.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{provider_id}:sha256:{digest}"

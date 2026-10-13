@@ -4,6 +4,7 @@ Handlers run on a real aiohttp test server wired exactly like production
 (OutboundCallAPI app + auth middleware + attach_twilio), with the fake
 Twilio side driving signed HTTP/WS requests."""
 
+import asyncio
 import json
 import re
 
@@ -73,7 +74,7 @@ class Harness:
         self.active = 0
         self.api = OutboundCallAPI(self.call_manager, cfg)
 
-        async def _run_call(conn, uuid, route, is_outbound, caller_info):
+        async def _run_call(conn, uuid, route, is_outbound, caller_info, transfer=None):
             self.run_calls.append((conn, uuid, route, is_outbound, caller_info))
             await conn.close()
 
@@ -361,6 +362,149 @@ async def test_status_requires_signature_over_query_string(harness):
     resp = await harness.post_signed(path_qs, form, signature=bad)
     assert resp.status == 403
     assert call.status == CallStatus.DIALING
+
+
+# ── a transfer's Dial ended (the action callback) ───────────────────
+
+
+def _pending(call_sid="CAcall0001", report_uuid="row-9"):
+    from telephony.transfer import PendingDial, pending_dials
+    pending_dials.clear()
+    entry = PendingDial(
+        call_sid=call_sid, report_uuid=report_uuid, label="Manager", language="en",
+        unanswered_text="Nobody answered. Goodbye.", unreachable_text="Not possible. Goodbye.")
+    pending_dials.add(entry)
+    return entry
+
+
+async def _post_action(harness, **fields):
+    form = {"CallSid": "CAcall0001", "CallStatus": "in-progress",
+            "DialCallStatus": "completed", "DialCallSid": "CAchild01", **fields}
+    return await harness.post_signed(f"/v1/twilio/transfer/{SERVER_ID}", form)
+
+
+@pytest.fixture
+def transfer_reports(monkeypatch):
+    from calls import twilio_http
+    sent = []
+
+    async def _report(report_uuid, outcome):
+        sent.append((report_uuid, outcome))
+
+    monkeypatch.setattr(twilio_http, "report_transfer_outcome", _report)
+    return sent
+
+
+async def test_transfer_action_speaks_the_goodbye_that_fits_and_reports_a_failed_dial(
+        harness, transfer_reports):
+    entry = _pending()
+    resp = await _post_action(harness, DialCallStatus="no-answer")
+    assert resp.status == 200 and resp.content_type == "text/xml"
+    body = await resp.text()
+    assert "Nobody answered. Goodbye." in body and body.endswith("<Hangup/></Response>")
+    assert 'language="en-US"' in body
+    await asyncio.sleep(0)
+    assert transfer_reports == [("row-9", "transfer_failed")] and entry.failed
+
+    _pending()
+    body = await (await _post_action(harness, DialCallStatus="failed")).text()
+    assert "Not possible. Goodbye." in body
+    _pending()
+    body = await (await _post_action(harness, DialCallStatus="busy")).text()
+    assert "Not possible. Goodbye." in body
+    await asyncio.sleep(0)
+    assert len(transfer_reports) == 3
+
+
+async def test_transfer_action_is_silent_when_the_colleague_had_the_call(harness, transfer_reports):
+    entry = _pending()
+    body = await (await _post_action(harness, DialCallStatus="completed")).text()
+    assert body == "<Response><Hangup/></Response>"
+    await asyncio.sleep(0)
+    assert transfer_reports == [] and not entry.failed
+    from telephony.transfer import dial_outcome
+    assert dial_outcome("row-9") == ""
+
+
+async def test_transfer_action_with_the_caller_gone_reports_nothing(harness, transfer_reports):
+    """The caller hung up while the colleague rang: Twilio posts the action
+    with the parent completed and a Dial word that reads like a failure."""
+    entry = _pending()
+    body = await (await _post_action(
+        harness, CallStatus="completed", DialCallStatus="no-answer")).text()
+    assert body == "<Response><Hangup/></Response>"
+    await asyncio.sleep(0)
+    assert transfer_reports == [] and entry.outcome == "caller_gone" and not entry.failed
+
+
+async def test_transfer_action_for_an_unknown_call_hangs_up(harness, transfer_reports):
+    from telephony.transfer import pending_dials
+    pending_dials.clear()
+    body = await (await _post_action(harness, CallSid="CAnobody")).text()
+    assert body.endswith("<Response><Hangup/></Response>")
+    assert transfer_reports == []
+
+
+async def test_transfer_action_requires_the_signature(harness, transfer_reports):
+    _pending()
+    form = {"CallSid": "CAcall0001", "DialCallStatus": "failed"}
+    resp = await harness.post_signed(
+        f"/v1/twilio/transfer/{SERVER_ID}", form, signature="bogus")
+    assert resp.status == 403 and transfer_reports == []
+    assert (await harness.client.post(
+        f"/v1/twilio/transfer/{SERVER_ID}", data=form)).status == 403
+    assert (await harness.post_signed("/v1/twilio/transfer/99", form)).status == 403
+
+
+async def test_media_builds_the_transfer_with_the_routes_number_and_the_action(harness, monkeypatch):
+    """An inbound call's Dial presents Twilio's To and reports to the public
+    base; an outbound call's presents the route's From and keys the row by
+    the audio uuid."""
+    built = []
+    from calls import twilio_http
+
+    class Spy:
+        def __init__(self, server_cfg, call_sid, conn, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(twilio_http, "TwilioTransfer", Spy)
+    resp = await harness.post_signed(
+        f"/v1/twilio/inbound/{SERVER_ID}", inbound_form("CAin0001"))
+    token = re.search(r'value="([^"]+)"', await resp.text()).group(1)
+    ws = await _open_media_ws(harness, token)
+    await ws.close()
+    assert built[-1] == {
+        "caller_id": DID,
+        "action_url": f"{BASE}/v1/twilio/transfer/{SERVER_ID}",
+        "report_uuid": "CAtest",
+    } or built[-1]["caller_id"] == DID
+    assert built[-1]["action_url"] == f"{BASE}/v1/twilio/transfer/{SERVER_ID}"
+    assert built[-1]["report_uuid"] == _start_msg(token)["start"]["callSid"]
+
+    call = harness.call_manager.register_call(
+        phone_number="+306900000000", task_description="t")
+    call.route_id = "r-out"
+    harness.call_manager.update_status(call.call_id, CallStatus.DIALING)
+    ws = await _open_media_ws(harness, call.audio_uuid)
+    await ws.close()
+    assert built[-1]["caller_id"] == "+15550009999"
+    assert built[-1]["report_uuid"] == call.audio_uuid
+
+
+async def test_the_transfer_caller_id_fallback_takes_only_an_e164_did():
+    from calls.twilio_http import _transfer_caller_id
+
+    class R:
+        ami_caller_id = "+15550009999"
+        did = "1 (555) 123-4567"
+
+    assert _transfer_caller_id(R(), {"did": "+15551234567"}, False) == "+15551234567"
+    assert _transfer_caller_id(R(), {}, False) == ""          # a typed did is not E.164
+    R.did = "+15551234567"
+    assert _transfer_caller_id(R(), {}, False) == "+15551234567"
+    R.did = "00302101234567"
+    assert _transfer_caller_id(R(), {}, False) == "+302101234567"
+    assert _transfer_caller_id(R(), {"did": "+1"}, True) == "+15550009999"
 
 
 # ── outbound origination (REST) ────────────────────────────────────

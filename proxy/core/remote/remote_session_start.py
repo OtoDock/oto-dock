@@ -130,7 +130,8 @@ class RemoteSessionStartMixin:
         from core.credentials import mcp_gateway
         from core.remote import mcp_gateway_push
         creds = mcp_gateway.credentials_of(session_id)
-        if not creds:
+        cli = mcp_gateway.cli_credentials_of(session_id)
+        if not creds and not cli:
             return
         token = str((payload.get("env") or {}).get("PROXY_API_KEY") or "")
         claims = validate_session_token(token) or {}
@@ -138,14 +139,14 @@ class RemoteSessionStartMixin:
         sec = getattr(config, "security_context", None)
         try:
             await asyncio.to_thread(
-                mcp_gateway.write_descriptor, session_id, creds,
+                mcp_gateway.write_descriptor, session_id, creds, cli=cli,
                 machine_id=machine_id, token_hash=token_hash, agent=config.agent_name,
                 user_sub=str(claims.get("user_sub") or ""),
                 task_scope=str(getattr(sec, "session_scope", "") or "") if sec else "",
             )
         except Exception:
             logger.exception("gateway descriptor of %s not written", session_id[:8])
-        if getattr(plan, "gateway_mode", False) and token_hash:
+        if getattr(plan, "gateway_mode", False) and token_hash and creds:
             try:
                 await mcp_gateway_push.push_session(session_id, machine_id, token_hash)
             except Exception:

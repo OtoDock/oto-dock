@@ -671,4 +671,9 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                 if outcome:
                     results[name] = outcome
 
+    # Nothing installs yet (this runs before the satellite connects): the
+    # uv-managed interpreters no venv uses go.
+    removed = await asyncio.to_thread(mcp_installer.prune_uv_pythons, mcps_dir)
+    if removed:
+        logger.info("reconcile: removed unused uv interpreters: %s", removed)
     return results

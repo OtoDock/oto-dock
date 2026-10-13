@@ -7,17 +7,49 @@ call on that route will resolve to. Keeping ``get_provider_class`` resolved in
 this module (not core) lets both paths be faked together in tests.
 """
 
+import asyncio
 import contextlib
 import logging
 
 import config
 from audio.providers.registry import get_provider_class
 from audio.providers.tts.base import TTSProvider
+from audio.providers.turn.dispatcher import build_dispatcher
+from audio.providers.turn.smart_turn import prewarm_smart_turn
 from audio.streaming.lang import base_lang
 from config_manager import ConfigManager
 from fillers import filler_cache
 
 logger = logging.getLogger("pipeline.providers")
+
+
+def prewarm_turn_classifier(cfg: ConfigManager) -> None:
+    """Load the Smart Turn model ahead of any call. Synchronous and run off
+    the loop (a process's first load takes seconds); a no-op once loaded
+    and while Smart Turn is off. A failed load is logged here and again by
+    the dispatcher build, which then runs on Groq alone."""
+    if not cfg.smart_turn_enabled:
+        return
+    try:
+        prewarm_smart_turn(None, cfg.smart_turn_onnx_threads)
+    except Exception as e:
+        logger.warning(f"Smart Turn pre-warm failed: {e}")
+
+
+async def build_turn_classifier(cfg: ConfigManager):
+    """The per-call turn classifier: the Smart Turn load in a thread, the
+    dispatcher on the loop (its Groq client is cheap to build)."""
+    await asyncio.to_thread(prewarm_turn_classifier, cfg)
+    return build_dispatcher(
+        smart_turn_enabled=cfg.smart_turn_enabled,
+        smart_turn_threshold=cfg.smart_turn_threshold,
+        smart_turn_onnx_threads=cfg.smart_turn_onnx_threads,
+        smart_turn_audio_window_s=cfg.smart_turn_audio_window_s,
+        groq_api_key=cfg.groq_api_key,
+        groq_base_url=cfg.groq_base_url,
+        lang_map=cfg.lang_backend_map,
+        default_backend=cfg.turn_classifier_default_backend,
+    )
 
 
 def build_stt(cfg: ConfigManager, provider: dict | None):
@@ -39,8 +71,9 @@ def build_stt(cfg: ConfigManager, provider: dict | None):
             endpointing_ms=int(advanced.get("call_endpointing_ms", cfg.deepgram_endpointing_ms)),
             vad_silence_offset_ms=cfg.vad_silence_offset_ms,
         )
-        if advanced.get("model_id"):
-            kwargs["model"] = advanced["model_id"]
+        model = cls.live_model_id(advanced.get("model_id"))
+        if model:
+            kwargs["model"] = model
         return cls(**kwargs)
     return cls.from_row(
         {"credential_key": "_", "advanced": advanced, "voices": p.get("voices") or {}},
@@ -87,7 +120,6 @@ async def prewarm_fillers(cfg: ConfigManager) -> None:
     """
     backchannel = cfg.backchannel_phrases
     thinking = cfg.thinking_phrases
-    seen: set[tuple] = set()
     active_keys: set[tuple] = set()
     had_error = False
 
@@ -96,21 +128,22 @@ async def prewarm_fillers(cfg: ConfigManager) -> None:
         if not provider:
             continue  # no real TTS configured → nothing to synthesize
         locked = base_lang(route.language)
-        # Dedupe by (provider, language) — that pair fully determines the voice
-        # (select_voice) and thus the combo, so routes sharing it synth once.
-        dedup = (provider.get("id"), locked)
-        if dedup in seen:
-            continue
-        seen.add(dedup)
 
         tts = None
         try:
             # Object construction is cheap (no network); build it to resolve the
-            # voice exactly as a call would (English fallback), then only open the
-            # connection when this combo actually needs (re)synthesis.
+            # voice exactly as a call would (the route's pinned voice, else the
+            # map with its English fallback), then only open the connection
+            # when this combo actually needs (re)synthesis. Routes sharing a
+            # filler key synth once; two routes on one provider and language
+            # with different pinned voices are two combos.
             tts = build_tts(provider)
+            if route.voice_id:
+                tts.pin_voice(route.voice_id)
             tts.select_voice(locked)
             key = filler_key_for(provider, tts, locked)
+            if key in active_keys:
+                continue
             active_keys.add(key)
             if filler_cache.needs_synth(
                 key, backchannel_phrases=backchannel, thinking_phrases=thinking,
@@ -122,7 +155,7 @@ async def prewarm_fillers(cfg: ConfigManager) -> None:
                 )
         except Exception as e:
             had_error = True
-            logger.warning(f"Filler pre-warm failed for {dedup}: {e}")
+            logger.warning(f"Filler pre-warm failed for route {route.id} ({locked}): {e}")
         finally:
             if tts is not None:
                 with contextlib.suppress(Exception):

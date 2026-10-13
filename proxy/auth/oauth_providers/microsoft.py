@@ -34,7 +34,7 @@ import jwt
 
 from auth.oauth_providers.base import OAuthProvider, TokenSet, UserInfo
 
-logger = logging.getLogger("claude-proxy.oauth-providers.microsoft")
+logger = logging.getLogger("otodock.oauth-providers.microsoft")
 
 
 class MicrosoftOAuthProvider(OAuthProvider):

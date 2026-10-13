@@ -178,3 +178,33 @@ def test_a_skills_block_that_is_not_a_list_is_an_error_not_a_crash(tmp_path):
     out = ci.check_package(root)
     assert out["ok"] is False
     assert any("skills" in e for e in out["errors"]), out["errors"]
+
+
+def test_a_git_source_at_a_tag_is_a_catalog_warning(tmp_path):
+    root = _folder(tmp_path, _manifest(version="1.2.0", server={
+        "runtime": "python", "transport": "stdio", "command": "venv/bin/python",
+        "args": ["-m", "weather"], "source": "git+https://github.com/example/weather.git@v1.2.0",
+    }))
+    out = ci.check_package(root)
+    assert out["ok"] is True
+    assert any("full 40-character commit" in w for w in out["warnings"])
+    # The schema's own pattern error for the same field is not repeated.
+    assert not any(w.startswith("catalog schema: /server/source") for w in out["warnings"])
+
+
+def test_the_platform_floor_a_package_needs_is_computed_and_named(tmp_path):
+    root = _folder(tmp_path, _manifest(result_files={"tools": ["weather_map"], "subdir": "maps"}))
+    out = ci.check_package(root)
+    assert out["summary"]["platform_floor"] == "1.8.0"
+    assert any("platform_min_version should be at least 1.8.0" in w and "/result_files (1.8.0)" in w
+               for w in out["warnings"])
+    root = _folder(tmp_path, _manifest(result_files={"tools": ["weather_map"], "subdir": "maps"},
+                                       platform_min_version="1.8.0"))
+    assert not any("platform_min_version" in w for w in ci.check_package(root)["warnings"])
+
+
+def test_a_schema_violation_the_installer_lets_through_is_a_warning(tmp_path):
+    root = _folder(tmp_path, _manifest(audience="viewer"))
+    out = ci.check_package(root)
+    assert any(w.startswith("catalog schema: /audience") for w in out["warnings"])
+

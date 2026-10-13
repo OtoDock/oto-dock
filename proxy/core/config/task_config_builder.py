@@ -26,7 +26,7 @@ from core.session import session_kind
 from auth import roles
 from auth.providers import acting_role_of
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 class TaskIdentity(NamedTuple):
@@ -453,17 +453,13 @@ async def build_task_agent_config(
     ))
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
 
-    # For TOML (Codex): inject the resolved credential env INTO the config.toml
-    # env sections (Codex doesn't inherit parent env for MCP servers). Done after
-    # path_env + OTO_* are folded into credential_env so they all land in the file.
-    # bash-only env_injection (GH_TOKEN/GIT_CONFIG_*) is excluded — it stays in the
-    # daemon env for bash, never on disk. Mirrors core/config/config_builder.py.
-    if mcp_format == "toml" and mcp_config and credential_env:
-        mcp_config = await asyncio.to_thread(
-            mcp_registry.inject_credential_env_into_toml,
-            mcp_config, credential_env,
-            exclude_keys=bash_env_keys,
-        )
+    # A Codex config gets the credential environment written in, after
+    # path_env and OTO_* are folded in; the bash-only git entries stay out
+    # of the file. Mirrors core/config/config_builder.py.
+    mcp_config = await asyncio.to_thread(
+        mcp_registry.inject_toml_credentials, mcp_config, credential_env,
+        mcp_format=mcp_format, exclude_keys=bash_env_keys,
+    )
 
     # Attached knowledge libraries — same bake-at-build contract as
     # config_builder (fail-safe empty: policy denies mirror writes).
@@ -558,8 +554,8 @@ async def build_task_agent_config(
     # run's layer differs from the agent's engine (override_execution_path),
     # the agent-default model may be foreign to it and must not be stamped
     # (the provider 400s every turn).
-    resolved_model = (getattr(task, "override_model", None)
-                      or config.get_cli_model(agent_name, layer=execution_path))
+    resolved_model = config.resolve_run_model(
+        agent_name, getattr(task, "override_model", None), layer=execution_path)
     resolved_effort = config.get_cli_effort(agent_name)
 
     # PROXY_TASK_OWNER/USERNAME/SCOPE are now delivered to MCPs via manifest

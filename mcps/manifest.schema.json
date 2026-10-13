@@ -1,0 +1,1718 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.8.0/mcps/manifest.schema.json",
+  "title": "OtoDock MCP package manifest",
+  "description": "The catalog contract for the manifest.json of an OtoDock MCP package (OtoDock is a fair source project). It accepts every manifest the platform's parser (services/mcp/mcp_manifest_parse.py) and install gate (services/community/community_installer.py) accept, refuses what they refuse where JSON Schema can say it, and adds the community catalog's own rules: a git+ source pins a full commit, a remote source names its endpoint and a non-stdio transport. Unknown keys are allowed at the top level and in every block the parser leaves open: a catalog is additive.",
+  "$comment": "Custom annotation keywords. x-otodock-since: the platform release that first reads the field; an entry that gives the field a value (not null, empty or false) needs platform_min_version at least that release. x-otodock-floors (on server.source): a list of {pattern, since}; a value matching the pattern needs that release. Validators ignore both keywords.",
+  "type": "object",
+  "required": ["name", "label", "description", "version", "category", "server"],
+  "additionalProperties": true,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "The schema this manifest follows (this document's $id). Ignored by the platform."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "The canonical slug: the key for assignments, config, credentials and the tool namespace. The install gate takes letters, digits, '-' and '_'; validate_mcp_package and the catalog ask for lowercase ([a-z0-9][a-z0-9_-]*). Keep it equal to the folder name and never rename a shipped package."
+    },
+    "label": {
+      "type": "string",
+      "description": "The display name."
+    },
+    "description": {
+      "type": "string",
+      "description": "One line for the catalog card and the agent's tool list."
+    },
+    "version": {
+      "type": "string",
+      "description": "\"\" for an npm or PyPI package (the platform pins the installed release locally); the image tag for a docker runtime; the release a git+ source pins. Required non-empty for a docker runtime and a git+ source."
+    },
+    "category": {
+      "enum": ["core", "custom", "community"],
+      "description": "core and custom ship with the platform; a catalog entry is community."
+    },
+    "server": {
+      "$ref": "#/$defs/server"
+    },
+    "server_name": {
+      "type": "string",
+      "description": "The mcpServers key and tool namespace when it must differ from name (defaults to name)."
+    },
+    "author": {
+      "type": ["string", "null"],
+      "description": "Who wrote the server code the entry wraps, as its home shows it. Empty on bundled manifests."
+    },
+    "author_url": {
+      "type": ["string", "null"],
+      "description": "Where that code lives (https://..., the repository or the vendor's MCP page). The catalog's registry generator refuses a value that does not start with https://."
+    },
+    "credentials": {
+      "$ref": "#/$defs/credentials"
+    },
+    "config": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/configField" },
+      "description": "Admin-managed settings shown on the MCP's page. From 1.8.0 a non-empty default is in effect until an admin saves a value (older platforms deliver only saved values)."
+    },
+    "env": {
+      "$ref": "#/$defs/stringMapNotNull",
+      "description": "Static environment variables (template tokens such as ${mcp_dir} allowed)."
+    },
+    "agent_env": {
+      "$ref": "#/$defs/stringMapNotNull",
+      "description": "Per-session templated environment variables (${session.*} tokens)."
+    },
+    "path_env": {
+      "type": ["object", "null"],
+      "additionalProperties": { "$ref": "#/$defs/pathEnvEntry" },
+      "description": "Path-bearing environment variables by role. An entry that sets neither or both of role/values, or names an unknown role, is skipped at parse with a warning (not refused)."
+    },
+    "tool_arg_paths": {
+      "$ref": "#/$defs/toolArgPaths"
+    },
+    "instances": {
+      "$ref": "#/$defs/instances"
+    },
+    "assignment_mode": {
+      "type": "string",
+      "description": "auto (managers enable it per agent, the default) or explicit (an admin assigns it through an instance). Not validated by the parser."
+    },
+    "exclude_from": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Session contexts that never load the MCP: phone, task, terminal, meeting, external. Values are not validated; an unknown word excludes nothing."
+    },
+    "audience": {
+      "x-otodock-since": "1.7.1",
+      "enum": ["", "owner", "editor", "workspace"],
+      "description": "The tier of the agent this whole MCP is for (empty admits everyone). A 1.7.0 platform does not read it and admits every tier."
+    },
+    "requires_capability": {
+      "type": ["string", "null"],
+      "description": "A platform feature the MCP needs before it is assignable: audio_transcribe, audio_tts or phone_calls. An unknown token keeps the MCP hidden. Not for community packages."
+    },
+    "network_targets": {
+      "type": ["array", "null"],
+      "items": { "$ref": "#/$defs/networkTarget" },
+      "description": "The internal hosts a homelab MCP dials; the admin's _network_access toggle opens the sandbox to exactly those. An entry without host_key is dropped at parse."
+    },
+    "network_access_default": {
+      "type": "boolean",
+      "description": "Default state of the _network_access toggle (true)."
+    },
+    "data_dirs": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "sandbox": {
+      "$ref": "#/$defs/sandbox"
+    },
+    "hosted": {
+      "$ref": "#/$defs/hosted"
+    },
+    "system_requirements": {
+      "$ref": "#/$defs/systemRequirements"
+    },
+    "outputs": {
+      "type": ["array", "null"],
+      "items": { "$ref": "#/$defs/outputRelocation" },
+      "description": "Files the server writes into a shared folder that the platform moves into the session's workspace after matching tool calls. An entry without source or destination_template is dropped at parse."
+    },
+    "result_files": {
+      "x-otodock-since": "1.8.0",
+      "$ref": "#/$defs/resultFiles"
+    },
+    "skills": {
+      "type": ["array", "null"],
+      "items": { "$ref": "#/$defs/skill" },
+      "description": "Agent Skills bundled with the MCP."
+    },
+    "agent_context": {
+      "type": ["array", "null"],
+      "items": { "$ref": "#/$defs/agentContextBlock" },
+      "description": "Per-session prompt blocks with ${ns.key} tokens. Strict: an unknown key in a block or its builder refuses the manifest."
+    },
+    "costs": {
+      "$ref": "#/$defs/costs"
+    },
+    "permissions": {
+      "$ref": "#/$defs/permissions"
+    },
+    "tool_filter": {
+      "$ref": "#/$defs/toolFilter"
+    },
+    "always_load": {
+      "type": "boolean",
+      "description": "Direct-LLM deferred tool loading opt-out (strict bool, default false)."
+    },
+    "placement": {
+      "enum": ["any", "satellite_only"],
+      "description": "Device-local MCP class. Not for community packages."
+    },
+    "remote_policy": {
+      "enum": ["any", "admin_paired_only"]
+    },
+    "requires_display": {
+      "type": "boolean"
+    },
+    "device_capability": {
+      "enum": ["computer", "browser", "app", null],
+      "description": "Marks a device-control MCP. Not for community packages."
+    },
+    "companion_app": {
+      "$ref": "#/$defs/companionApp"
+    },
+    "device_high_risk_tools": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Tools pinned to the critical permission tier. Not for community packages."
+    },
+    "replaces": {
+      "type": ["array", "null"],
+      "items": { "$ref": "#/$defs/replacesEntry" },
+      "description": "The sources this entry supersedes, with the credential keys the new source renames. Information for the admin's switch, never an authorization. An entry carries it when its source changed: 1.6 and older converge onto the new source unasked and 1.7.0 refuses the move with no switch, so the entry needs 1.7.1.",
+      "x-otodock-since": "1.7.1"
+    },
+    "patched": {
+      "type": "boolean",
+      "description": "true when patches/*.patch ship and are applied after npm install."
+    },
+    "patch_note": {
+      "type": ["string", "null"]
+    },
+    "platform_min_version": {
+      "type": "string",
+      "description": "Catalog metadata: the oldest platform release that may install the entry (copied into registry.json, default 1.0.0). Compared by its leading MAJOR.MINOR.PATCH; an unparseable value counts as compatible."
+    },
+    "deprecated": {
+      "type": "boolean",
+      "description": "Catalog metadata (registry.json)."
+    },
+    "license": {
+      "type": "string",
+      "description": "Catalog metadata (registry.json, default MIT)."
+    },
+    "requires_system_packages": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Catalog metadata (registry.json)."
+    }
+  },
+  "allOf": [
+    { "$ref": "#/$defs/noMasterKeyReference" },
+    {
+      "$comment": "_validate_manifest: a community MCP whose runtime installs on the host (python, node) must name its package.",
+      "if": {
+        "required": ["category", "server"],
+        "properties": {
+          "category": { "const": "community" },
+          "server": {
+            "type": "object",
+            "required": ["runtime"],
+            "properties": { "runtime": { "$ref": "#/$defs/installedRuntimeWord" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "server": {
+            "required": ["source"],
+            "properties": { "source": { "minLength": 1 } }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "check_package: a docker runtime names its compose file and carries a version (the image tag).",
+      "if": {
+        "required": ["server"],
+        "properties": {
+          "server": {
+            "type": "object",
+            "required": ["runtime"],
+            "properties": { "runtime": { "$ref": "#/$defs/dockerRuntimeWord" } }
+          }
+        }
+      },
+      "then": {
+        "required": ["version"],
+        "properties": {
+          "version": { "minLength": 1 },
+          "server": {
+            "required": ["docker_compose"],
+            "properties": { "docker_compose": { "type": "string", "minLength": 1 } }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "check_package: a git+ source carries a version (the release its ref pins).",
+      "if": {
+        "required": ["server"],
+        "properties": {
+          "server": {
+            "type": "object",
+            "required": ["source"],
+            "properties": { "source": { "type": "string", "pattern": "^git\\+" } }
+          }
+        }
+      },
+      "then": {
+        "properties": { "version": { "minLength": 1 } }
+      }
+    },
+    {
+      "$comment": "mcp_validate_oauth: bearer_required needs a streamable-HTTP transport (sse refused since 1.7.1).",
+      "if": {
+        "required": ["credentials"],
+        "properties": {
+          "credentials": {
+            "type": "object",
+            "required": ["oauth"],
+            "properties": {
+              "oauth": {
+                "type": "object",
+                "required": ["bearer_required"],
+                "properties": { "bearer_required": { "const": true } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "server": {
+            "required": ["transport"],
+            "properties": { "transport": { "enum": ["http", "streamable_http", "streamable-http"] } }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "_validate_authorization_server: an https url_template with a literal host (the host must also match an entry of proposed_hosts, which JSON Schema cannot compare).",
+      "if": {
+        "required": ["credentials"],
+        "properties": {
+          "credentials": {
+            "type": "object",
+            "required": ["oauth"],
+            "properties": {
+              "oauth": {
+                "type": "object",
+                "required": ["authorization_server"],
+                "properties": { "authorization_server": { "type": "object" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "server": {
+            "required": ["url_template"],
+            "properties": {
+              "url_template": {
+                "type": "string",
+                "pattern": "^[Hh][Tt][Tt][Pp][Ss]://(?![^/?#]*\\$\\{)(?:[^/?#]*@)?[^/?#@:][^/?#@]*(?:[/?#]|$)"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "_validate_api_key_header: streamable HTTP, a literal http(s) url_template with a host (matching proposed_hosts: not expressible), never beside oauth.bearer_required or hosted.api_key_relay. value_from must name a declared password field or env instance field (not expressible).",
+      "if": {
+        "required": ["credentials"],
+        "properties": {
+          "credentials": {
+            "type": "object",
+            "required": ["api_key_header"],
+            "properties": { "api_key_header": { "type": "object" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "server": {
+            "required": ["transport", "url_template"],
+            "properties": {
+              "transport": { "enum": ["streamable_http", "streamable-http", "http"] },
+              "url_template": {
+                "type": "string",
+                "pattern": "^(?![\\s\\S]*\\$\\{)[Hh][Tt][Tt][Pp][Ss]?://(?:[^/?#]*@)?[^/?#@:][^/?#@]*(?:[/?#]|$)"
+              }
+            }
+          },
+          "credentials": {
+            "properties": {
+              "oauth": {
+                "not": {
+                  "type": "object",
+                  "required": ["bearer_required"],
+                  "properties": { "bearer_required": { "const": true } }
+                }
+              }
+            }
+          },
+          "hosted": {
+            "properties": { "api_key_relay": { "$ref": "#/$defs/falsy" } }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "_parse_hosted_block: an available api_key_relay needs a relay_path and env-delivered instances.",
+      "if": {
+        "required": ["hosted"],
+        "properties": {
+          "hosted": {
+            "type": "object",
+            "required": ["api_key_relay"],
+            "properties": {
+              "api_key_relay": {
+                "type": "object",
+                "required": ["available"],
+                "properties": { "available": { "const": true } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["instances"],
+        "properties": {
+          "instances": {
+            "type": "object",
+            "minProperties": 1,
+            "properties": { "delivery": { "const": "env" } }
+          },
+          "hosted": {
+            "properties": {
+              "api_key_relay": {
+                "required": ["relay_path"],
+                "properties": { "relay_path": { "minLength": 1 } }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "_parse_manifest: result_files and an outputs entry relocating every tool (after_tools absent, empty or holding '*') are refused together. A tool named by both is refused too (not expressible).",
+      "if": {
+        "required": ["result_files"],
+        "properties": { "result_files": { "type": "object" } }
+      },
+      "then": {
+        "properties": {
+          "outputs": {
+            "items": {
+              "required": ["after_tools"],
+              "properties": {
+                "after_tools": {
+                  "type": "array",
+                  "minItems": 1,
+                  "not": { "contains": { "const": "*" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "falsy": {
+      "enum": [null, false, 0, "", [], {}],
+      "description": "A value Python reads as false (the platform treats it as not declared)."
+    },
+    "stringOrFalsy": {
+      "anyOf": [{ "$ref": "#/$defs/falsy" }, { "type": "string" }]
+    },
+    "nonBlankString": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "envVarName": {
+      "type": "string",
+      "pattern": "^[A-Z_][A-Z0-9_]*$"
+    },
+    "hostPattern": {
+      "type": "string",
+      "pattern": "^[*A-Za-z0-9](?:[-A-Za-z0-9.*])*$",
+      "description": "A hostname, '*' allowed for wildcard labels (the bearer allowlist's fnmatch rule); no scheme, port or path."
+    },
+    "stringMap": {
+      "type": ["object", "null"],
+      "propertyNames": { "minLength": 1 },
+      "additionalProperties": { "type": "string" }
+    },
+    "stringMapNotNull": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "installedRuntimeWord": {
+      "type": "string",
+      "pattern": "^\\s*(?:[Pp][Yy][Tt][Hh][Oo][Nn]|[Nn][Oo][Dd][Ee])\\s*$",
+      "description": "python or node as runtime_of reads them (case-folded, stripped): installed into a venv or node_modules on the host that runs them."
+    },
+    "dockerRuntimeWord": {
+      "type": "string",
+      "pattern": "^\\s*[Dd][Oo][Cc][Kk][Ee][Rr]\\s*$"
+    },
+    "relativeFile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?![A-Za-z]:)(?!(?:[^/]*/)*\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f]+(?:/[^/\\\\\\u0000-\\u001f]+)*$",
+      "description": "A plain relative path to a file inside the MCP folder (skill_file_error): no leading or trailing '/', no empty, '.' or '..' segment, no backslash, no control character, no drive letter, at most 512 characters. The install gate also requires a regular file there (not expressible)."
+    },
+    "noMasterKeyReference": {
+      "$comment": "check_package: the manifest never references the master key (${platform.api_key} or ${proxy_api_key}), in any string or key.",
+      "not": {
+        "type": "string",
+        "pattern": "\\$\\{(?:platform\\.api_key|proxy_api_key)\\}"
+      },
+      "propertyNames": {
+        "not": { "pattern": "\\$\\{(?:platform\\.api_key|proxy_api_key)\\}" }
+      },
+      "additionalProperties": { "$ref": "#/$defs/noMasterKeyReference" },
+      "items": { "$ref": "#/$defs/noMasterKeyReference" }
+    },
+    "gitSourceIdentity": {
+      "$comment": "_validate_manifest via _git_identity: the source names one repository. The port of the URL's host (if any) is an integer 0-65535, and the fragment names at most one subdirectory.",
+      "type": "string",
+      "allOf": [
+        {
+          "pattern": "^git\\+(?:[A-Za-z0-9+.-]*://(?:[^/?#]*@)?(?:[^/?#@\\[\\]:]*(?::(?:0*(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4}))?)?|[^/?#@\\[\\]]*\\[[^/?#@\\[\\]]*\\][^/?#@\\[\\]:]*(?::(?:0*(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4}))?)?)(?:[/?#]|$)|(?![A-Za-z0-9+.-]*://))"
+        },
+        {
+          "not": {
+            "pattern": "^[^#]*#(?:[^&]*&)*subdirectory(?:=[^&]*)?&(?:[^&]*&)*subdirectory(?:=[^&]*)?(?:&|$)"
+          }
+        }
+      ]
+    },
+    "gitCatalogPin": {
+      "$comment": "Catalog rule (scripts/generate-registry.py GIT_COMMIT_RE): a git+ source pins the full 40-character lowercase-hex commit of a release, git+<url>@<commit>[#subdirectory=<dir>]. A tag can move upstream with no catalog change, and from 1.8.0 the weekly update builds a git+ entry's new ref unattended.",
+      "type": "string",
+      "pattern": "^git\\+[^#]+@[0-9a-f]{40}(#.*)?$"
+    },
+    "server": {
+      "type": "object",
+      "description": "How the MCP runs.",
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "description": "python, node, docker or none (context-only, no process). A remote (vendor-hosted) MCP declares none. Read case-folded; the parser does not validate the word, the install gate requires the key on a non-remote server."
+        },
+        "transport": {
+          "type": "string",
+          "description": "stdio (python, node), http (a container, streamable HTTP at /mcp/), streamable_http or streamable-http (a remote MCP), legacy sse, or none (context-only). Not validated by the parser except where a credential block needs streamable HTTP."
+        },
+        "command": {
+          "type": "string",
+          "description": "What to launch for a python or node runtime, relative to the folder (node, venv/bin/python). Required for those runtimes."
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Command arguments; ${mcp_dir} and the other template tokens allowed."
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^(?:npm:[^\\s-]|pypi:[^\\s-]|git\\+|docker:|remote:|$)",
+          "x-otodock-floors": [
+            { "pattern": "^pypi:[^@\\[]+\\[", "since": "1.8.0" }
+          ],
+          "description": "npm:<package>, pypi:<package> (with one group of extras, pypi:<package>[a,b], from 1.8.0), git+<url>@<commit>#subdirectory=<dir>, docker:<label> or remote:<host>. A catalog leaves npm and PyPI packages unpinned; the platform pins the installed release locally."
+        },
+        "docker_compose": {
+          "anyOf": [
+            { "type": "null" },
+            { "const": "" },
+            { "$ref": "#/$defs/relativeFile" }
+          ],
+          "description": "The compose file of a docker runtime, a plain relative path inside the folder."
+        },
+        "port": {
+          "type": "integer"
+        },
+        "health_endpoint": {
+          "type": "string"
+        },
+        "url_template": {
+          "type": "string",
+          "description": "A container's base URL (http://${docker_mcp_host}:${port}) or a remote MCP's endpoint (https://mcp.vendor.com/mcp), whose host is its identity."
+        },
+        "proxy_callbacks": {
+          "type": "boolean",
+          "description": "A Docker/HTTP MCP that calls back to the proxy hooks gets a per-session JWT. Not for community packages."
+        },
+        "service_name": {
+          "type": "string",
+          "description": "Service-DNS name of a docker runtime under Docker-Compose (defaults to name)."
+        },
+        "image": {
+          "type": "string",
+          "description": "The pre-built image a containerised proxy pulls (required for the Docker-Compose deployment)."
+        },
+        "version_constraint": {
+          "type": "string",
+          "description": "A PEP 440 specifier set bounding the automatic updates of an npm or PyPI package (\">=2,<3\"). An invalid one is read as unbounded."
+        },
+        "source_build": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "description": "For a pypi: source, the distributions the installer may build from a source distribution when no wheel fits (SOURCE_BUILD_RE)."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "git+ sources: the platform's identity rule and the catalog's pinned commit.",
+          "if": {
+            "required": ["source"],
+            "properties": { "source": { "type": "string", "pattern": "^git\\+" } }
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "allOf": [
+                  { "$ref": "#/$defs/gitSourceIdentity" },
+                  { "$ref": "#/$defs/gitCatalogPin" }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "$comment": "_validate_manifest: a remote source needs a url_template and a non-stdio transport; any other non-empty server block needs a runtime, and an installed runtime (python, node) a command.",
+          "if": {
+            "required": ["source"],
+            "properties": { "source": { "type": "string", "pattern": "^remote:" } }
+          },
+          "then": {
+            "required": ["url_template", "transport"],
+            "properties": {
+              "url_template": { "minLength": 1 },
+              "transport": { "not": { "const": "stdio" } }
+            }
+          },
+          "else": {
+            "if": { "minProperties": 1 },
+            "then": {
+              "required": ["runtime"],
+              "if": {
+                "required": ["runtime"],
+                "properties": { "runtime": { "$ref": "#/$defs/installedRuntimeWord" } }
+              },
+              "then": { "required": ["command"] }
+            }
+          }
+        }
+      ]
+    },
+    "credentials": {
+      "type": "object",
+      "description": "What the MCP needs to authenticate.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "none, per_user (each person enters their own) or infra (an admin enters them once). Not validated by the parser."
+        },
+        "label": { "type": "string" },
+        "description": { "type": "string" },
+        "fields": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/credentialField" }
+        },
+        "server_config_fields": {
+          "type": ["array", "null"],
+          "items": { "type": "object" }
+        },
+        "service_account": {
+          "type": "boolean",
+          "description": "A manager may lend an account to agent-scope sessions."
+        },
+        "ui_type": { "type": "string" },
+        "oauth": { "$ref": "#/$defs/oauth" },
+        "webhooks": { "$ref": "#/$defs/webhooks" },
+        "api_key_header": {
+          "x-otodock-since": "1.7.1",
+          "$ref": "#/$defs/apiKeyHeader"
+        }
+      }
+    },
+    "credentialField": {
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "label": { "type": "string" },
+        "input_type": { "type": "string" },
+        "required": {
+          "type": "boolean",
+          "description": "A field is required unless it declares false (enforced from 1.8.0; older platforms treat every field as optional, so false degrades safely)."
+        }
+      }
+    },
+    "oauth": {
+      "type": ["object", "null"],
+      "description": "An OAuth provider (mcp_validate_oauth._validate_oauth_services). Strict where the validator is; keys it does not know stay open.",
+      "required": ["provider_id", "flows"],
+      "properties": {
+        "provider_id": { "$ref": "#/$defs/nonBlankString" },
+        "flows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "authorization_code",
+              "authorization_code_pkce",
+              "device_code",
+              "client_credentials",
+              "service_account",
+              "personal_access_token"
+            ]
+          }
+        },
+        "authorization_url": { "$ref": "#/$defs/stringOrFalsy" },
+        "token_url": { "$ref": "#/$defs/stringOrFalsy" },
+        "revoke_url": { "$ref": "#/$defs/stringOrFalsy" },
+        "userinfo_url": { "$ref": "#/$defs/stringOrFalsy" },
+        "device_authorization_url": { "$ref": "#/$defs/stringOrFalsy" },
+        "tenant_id": { "$ref": "#/$defs/stringOrFalsy" },
+        "userinfo_method": { "enum": ["GET", "POST", null] },
+        "userinfo_body": { "type": ["object", "null"] },
+        "userinfo_headers": { "$ref": "#/$defs/stringMap" },
+        "authorize_params": { "$ref": "#/$defs/stringMap" },
+        "userinfo_email_field": { "type": "string" },
+        "userinfo_name_field": { "type": "string" },
+        "userinfo_id_field": { "type": "string" },
+        "userinfo_auth_scheme": { "type": "string" },
+        "pat_instructions_url": { "type": "string" },
+        "pat_description": { "type": "string" },
+        "pat_placeholder": { "type": "string" },
+        "app_credential": { "type": "string" },
+        "app_credential_fields": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/credentialField" }
+        },
+        "token_format": {
+          "type": ["object", "null"],
+          "properties": {
+            "schema": { "const": "generic_oauth_v1" },
+            "filename_pattern": { "$ref": "#/$defs/nonBlankString" },
+            "aliases": {
+              "type": ["object", "null"],
+              "propertyNames": { "pattern": "\\S" },
+              "additionalProperties": { "$ref": "#/$defs/nonBlankString" }
+            }
+          }
+        },
+        "app_credential_variants": {
+          "type": ["object", "null"],
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "authorization_code",
+              "authorization_code_pkce",
+              "device_code",
+              "client_credentials",
+              "service_account",
+              "personal_access_token"
+            ]
+          },
+          "additionalProperties": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "account_credential_keys": {
+          "type": ["object", "null"],
+          "properties": {
+            "email": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/nonBlankString" }] },
+            "services": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/nonBlankString" }] }
+          }
+        },
+        "refresh": {
+          "type": ["object", "null"],
+          "properties": {
+            "strategy": { "enum": ["lazy", "eager"] },
+            "min_remaining_seconds": { "type": "integer", "exclusiveMinimum": 0 }
+          }
+        },
+        "supports_multi_account": { "type": "boolean" },
+        "registered_app_required": { "type": "boolean" },
+        "bearer_required": {
+          "type": "boolean",
+          "description": "A remote MCP whose requests carry the bound account's bearer, added by the credential gateway. Needs proposed_hosts and a streamable-HTTP transport."
+        },
+        "proposed_hosts": {
+          "type": ["array", "null"],
+          "description": "The hosts the manifest proposes for bearer injection; an admin approves them."
+        },
+        "env_injection": { "$ref": "#/$defs/envInjection" },
+        "mcp_env_injection": { "$ref": "#/$defs/envInjection" },
+        "git_credential_helper": {
+          "type": ["object", "null"],
+          "required": ["host", "helper"],
+          "properties": {
+            "host": { "$ref": "#/$defs/nonBlankString" },
+            "helper": { "$ref": "#/$defs/nonBlankString" }
+          }
+        },
+        "base_scopes": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "services": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/oauthService" }
+        },
+        "authorization_server": {
+          "x-otodock-since": "1.7.1",
+          "$ref": "#/$defs/authorizationServer"
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "The validator rejects the older singular key and the 'provider' spelling.",
+          "not": {
+            "anyOf": [
+              { "required": ["flow"] },
+              { "required": ["provider"], "not": { "required": ["provider_id"] } }
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": ["bearer_required"],
+            "properties": { "bearer_required": { "const": true } }
+          },
+          "then": {
+            "required": ["proposed_hosts"],
+            "properties": {
+              "proposed_hosts": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "$ref": "#/$defs/hostPattern" }
+              }
+            }
+          }
+        },
+        {
+          "$comment": "Google scopes are URLs under https://www.googleapis.com/auth/ (or openid).",
+          "if": {
+            "required": ["provider_id"],
+            "properties": { "provider_id": { "const": "google" } }
+          },
+          "then": {
+            "properties": {
+              "base_scopes": {
+                "items": { "pattern": "^(?:openid$|https://www\\.googleapis\\.com/auth/.)" }
+              },
+              "services": {
+                "items": {
+                  "properties": {
+                    "scopes": {
+                      "items": { "pattern": "^(?:openid$|https://www\\.googleapis\\.com/auth/.)" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "$comment": "_validate_authorization_server: one PKCE flow, the bearer, an https userinfo_url if any, not a hardcoded provider, none of the keys a registered client cannot use.",
+          "if": {
+            "required": ["authorization_server"],
+            "properties": { "authorization_server": { "type": "object" } }
+          },
+          "then": {
+            "required": ["bearer_required"],
+            "properties": {
+              "flows": { "const": ["authorization_code_pkce"] },
+              "bearer_required": { "const": true },
+              "provider_id": { "not": { "enum": ["google", "slack", "microsoft", "zoom", "facebook"] } },
+              "userinfo_url": {
+                "anyOf": [
+                  { "$ref": "#/$defs/falsy" },
+                  { "type": "string", "pattern": "^[Hh][Tt][Tt][Pp][Ss]:" }
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                { "required": ["device_authorization_url"] },
+                { "required": ["app_credential_variants"] },
+                { "required": ["authorize_params"] },
+                { "required": ["env_injection"] },
+                { "required": ["mcp_env_injection"] },
+                { "required": ["git_credential_helper"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "envInjection": {
+      "type": ["array", "null"],
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/envVarName" }
+    },
+    "oauthService": {
+      "type": "object",
+      "required": ["key", "label", "description", "scopes"],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/nonBlankString",
+          "description": "Unique within services (not expressible)."
+        },
+        "label": { "$ref": "#/$defs/nonBlankString" },
+        "description": { "$ref": "#/$defs/nonBlankString" },
+        "scopes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "capabilities": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "requires_admin_consent": { "type": "boolean" },
+        "requires_user_oauth": { "type": "boolean" }
+      }
+    },
+    "authorizationServer": {
+      "type": ["object", "null"],
+      "description": "The MCP server names its own authorization server (RFC 9728, RFC 8414) and the install registers itself there (RFC 7591). A 1.7.0 proxy accepts the block and ignores it.",
+      "properties": {
+        "registration": { "enum": ["dynamic"] },
+        "confidential": { "type": "boolean" },
+        "accepts_app_tokens": { "type": "boolean" },
+        "issuer": {
+          "anyOf": [
+            { "$ref": "#/$defs/falsy" },
+            { "type": "string", "pattern": "^[Hh][Tt][Tt][Pp][Ss]://[^/?#]+[^?#]*\\??#?$" }
+          ]
+        },
+        "client_name": { "type": ["string", "null"] },
+        "scopes": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "identity": {
+          "type": ["object", "null"],
+          "minProperties": 1,
+          "propertyNames": { "enum": ["label_field", "display_field", "id_field"] },
+          "additionalProperties": { "$ref": "#/$defs/nonBlankString" }
+        }
+      }
+    },
+    "apiKeyHeader": {
+      "type": ["object", "null"],
+      "description": "A header-style API key for a vendor-hosted MCP server, added by the credential gateway on the way out. A 1.7.0 platform loads the MCP without adding the header.",
+      "required": ["name", "value_from", "proposed_hosts"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,63}$",
+          "not": {
+            "pattern": "^(?:[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-.*|[Aa][Cc][Cc][Ee][Pp][Tt].*|[Mm][Cc][Pp]-.*|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-.*|[Xx]-[Rr][Ee][Aa][Ll]-[Ii][Pp]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-.*)$"
+          },
+          "description": "The HTTP header the gateway adds; never one the platform owns or strips."
+        },
+        "value_from": {
+          "$ref": "#/$defs/envVarName",
+          "description": "A credentials.fields key with input_type password (credentials.type per_user or infra) or an env-delivered instances.fields key."
+        },
+        "proposed_hosts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/hostPattern" }
+        }
+      }
+    },
+    "webhooks": {
+      "type": ["object", "null"],
+      "description": "A vendor webhook receiver (mcp_validate_webhooks). Validated only when available is true. When credentials.oauth is declared too, its provider_id must equal oauth.provider_id (not expressible).",
+      "properties": {
+        "available": { "type": "boolean" }
+      },
+      "if": {
+        "required": ["available"],
+        "properties": { "available": { "const": true } }
+      },
+      "then": {
+        "required": [
+          "provider_id",
+          "signature",
+          "url_verification",
+          "registration",
+          "event_catalog",
+          "payload_normalization",
+          "vendor_target_spec"
+        ],
+        "properties": {
+          "provider_id": {
+            "type": "string",
+            "pattern": "\\S",
+            "not": { "enum": ["agent", "user", "relay"] }
+          },
+          "signature": { "$ref": "#/$defs/webhookSignature" },
+          "url_verification": { "$ref": "#/$defs/webhookUrlVerification" },
+          "registration": { "$ref": "#/$defs/webhookRegistration" },
+          "event_catalog": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/webhookEvent" }
+          },
+          "payload_normalization": { "$ref": "#/$defs/webhookPayloadNormalization" },
+          "vendor_target_spec": { "$ref": "#/$defs/webhookVendorTargetSpec" },
+          "event_id_field": { "$ref": "#/$defs/stringOrFalsy" },
+          "workspace_id_path": {
+            "anyOf": [
+              { "$ref": "#/$defs/falsy" },
+              { "type": "string", "pattern": "^(?:body|headers)\\." }
+            ]
+          },
+          "enrichment": { "$ref": "#/$defs/webhookEnrichment" }
+        },
+        "if": {
+          "required": ["url_verification"],
+          "properties": {
+            "url_verification": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "verification_token_capture" } }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "signature": {
+              "required": ["per_subscription_secret"],
+              "properties": { "per_subscription_secret": { "const": true } }
+            }
+          }
+        }
+      }
+    },
+    "webhookSignature": {
+      "type": "object",
+      "required": ["algorithm"],
+      "properties": {
+        "algorithm": { "enum": ["hmac-sha1", "hmac-sha256", "hmac-sha512", "client_state_echo"] },
+        "header": { "type": "string" },
+        "prefix": { "type": "string" },
+        "version_prefix": { "type": "string" },
+        "signed_payload_template": { "type": "string" },
+        "timestamp_header": { "type": "string" },
+        "secret_credential_key": { "type": "string" },
+        "timestamp_format": { "enum": ["unix", "unix_ms", "iso8601"] },
+        "max_age_seconds": { "type": "integer", "minimum": 0 },
+        "per_subscription_secret": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["algorithm"],
+            "properties": { "algorithm": { "const": "client_state_echo" } }
+          },
+          "else": {
+            "required": ["header"],
+            "properties": { "header": { "pattern": "\\S" } }
+          }
+        },
+        {
+          "if": {
+            "required": ["per_subscription_secret"],
+            "properties": { "per_subscription_secret": { "const": true } }
+          },
+          "else": {
+            "required": ["secret_credential_key"],
+            "properties": { "secret_credential_key": { "pattern": "\\S" } }
+          }
+        }
+      ]
+    },
+    "webhookUrlVerification": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "none",
+            "slack_challenge",
+            "ms_graph_validation_token",
+            "zoom_endpoint_validation",
+            "verification_token_capture"
+          ]
+        },
+        "request_field": { "type": "string" },
+        "request_source": { "type": "string" },
+        "response_field": { "type": "string" },
+        "response_content_type": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": { "kind": { "const": "none" } }
+          },
+          "else": {
+            "required": ["request_field", "request_source", "response_field", "response_content_type"],
+            "properties": {
+              "request_field": { "pattern": "\\S" },
+              "request_source": { "enum": ["body", "query"] },
+              "response_field": { "pattern": "\\S" },
+              "response_content_type": { "pattern": "\\S" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": { "kind": { "const": "verification_token_capture" } }
+          },
+          "then": {
+            "properties": { "request_source": { "const": "body" } }
+          }
+        }
+      ]
+    },
+    "webhookCall": {
+      "type": "object",
+      "required": ["method", "url_template"],
+      "properties": {
+        "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+        "url_template": { "$ref": "#/$defs/nonBlankString" },
+        "headers": {
+          "type": ["object", "null"],
+          "propertyNames": { "pattern": "\\S" },
+          "additionalProperties": { "type": "string" }
+        },
+        "body_template": { "type": ["object", "string", "null"] },
+        "expected_status": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+        },
+        "response_id_path": { "$ref": "#/$defs/stringOrFalsy" },
+        "success_path": { "$ref": "#/$defs/stringOrFalsy" }
+      }
+    },
+    "webhookRegistration": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["auto", "manual"] },
+        "manual_instructions_url": { "type": "string" },
+        "lifetime_seconds": { "type": ["integer", "null"], "exclusiveMinimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["mode"],
+            "properties": { "mode": { "const": "manual" } }
+          },
+          "then": {
+            "required": ["manual_instructions_url"],
+            "properties": { "manual_instructions_url": { "pattern": "\\S" } }
+          }
+        },
+        {
+          "if": {
+            "required": ["mode"],
+            "properties": { "mode": { "const": "auto" } }
+          },
+          "then": {
+            "required": ["create"],
+            "properties": {
+              "create": { "$ref": "#/$defs/webhookCall" },
+              "delete": {
+                "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/webhookCall" }]
+              },
+              "renew": {
+                "anyOf": [
+                  { "type": "null" },
+                  {
+                    "$ref": "#/$defs/webhookCall",
+                    "properties": {
+                      "renew_before_seconds": { "type": "integer", "exclusiveMinimum": 0 }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "webhookEvent": {
+      "type": "object",
+      "required": ["key", "label"],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/nonBlankString",
+          "description": "Unique within event_catalog (not expressible)."
+        },
+        "label": { "$ref": "#/$defs/nonBlankString" },
+        "description": { "type": "string" },
+        "required_scopes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "subevents": {
+          "type": ["array", "null"],
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "default_selected": { "type": "boolean" },
+        "delivery": { "enum": ["user", "bot"] },
+        "admin_only": { "type": "boolean" },
+        "match": {
+          "type": ["object", "null"],
+          "required": ["event_type"],
+          "properties": {
+            "event_type": { "$ref": "#/$defs/nonBlankString" },
+            "conditions": {
+              "type": ["object", "null"],
+              "propertyNames": { "pattern": "^(?:body|headers)\\." },
+              "additionalProperties": {
+                "anyOf": [
+                  { "type": "string" },
+                  { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                ]
+              }
+            }
+          }
+        },
+        "resource_contains": {
+          "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/nonBlankString" }]
+        },
+        "vendor_create_fields": {
+          "type": ["object", "null"],
+          "minProperties": 1,
+          "propertyNames": { "pattern": "\\S" },
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "webhookPayloadNormalization": {
+      "type": "object",
+      "required": ["event_type_path"],
+      "properties": {
+        "event_type_path": { "$ref": "#/$defs/nonBlankString" },
+        "actor": { "$ref": "#/$defs/webhookNormalizedEntity" },
+        "subject": { "$ref": "#/$defs/webhookNormalizedEntity" },
+        "target": { "$ref": "#/$defs/webhookNormalizedEntity" }
+      }
+    },
+    "webhookNormalizedEntity": {
+      "type": ["object", "null"],
+      "properties": {
+        "type": { "type": "string" }
+      },
+      "patternProperties": {
+        "_path$": {
+          "anyOf": [
+            { "type": "string" },
+            { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          ]
+        }
+      }
+    },
+    "webhookVendorTargetSpec": {
+      "type": "object",
+      "required": ["kind", "label"],
+      "properties": {
+        "kind": { "enum": ["free_text", "remote_list", "static_list"] },
+        "label": { "$ref": "#/$defs/nonBlankString" },
+        "account_extra_key": { "$ref": "#/$defs/stringOrFalsy" },
+        "target_kinds": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["key", "label"],
+            "properties": {
+              "key": { "$ref": "#/$defs/nonBlankString" },
+              "label": { "$ref": "#/$defs/nonBlankString" },
+              "placeholder": { "type": ["string", "null"] },
+              "validation_regex": { "type": ["string", "null"] },
+              "help_text": { "type": ["string", "null"] },
+              "required_scopes": {
+                "type": ["array", "null"],
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "registration": {
+                "type": ["object", "null"],
+                "minProperties": 1,
+                "propertyNames": { "enum": ["create", "delete", "renew"] },
+                "additionalProperties": { "type": "object", "minProperties": 1 }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": { "kind": { "const": "remote_list" } }
+          },
+          "then": {
+            "required": ["list_endpoint"],
+            "properties": {
+              "list_endpoint": {
+                "$ref": "#/$defs/webhookCall",
+                "required": ["items_path", "id_field", "label_field"],
+                "properties": {
+                  "items_path": { "$ref": "#/$defs/nonBlankString" },
+                  "id_field": { "$ref": "#/$defs/nonBlankString" },
+                  "label_field": { "$ref": "#/$defs/nonBlankString" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": { "kind": { "const": "static_list" } }
+          },
+          "then": {
+            "required": ["static_options"],
+            "properties": {
+              "static_options": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["value", "label"],
+                  "properties": {
+                    "value": { "$ref": "#/$defs/nonBlankString" },
+                    "label": { "$ref": "#/$defs/nonBlankString" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "webhookEnrichment": {
+      "type": ["object", "null"],
+      "required": ["lookups"],
+      "properties": {
+        "lookups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["source_field", "request", "outputs"],
+            "properties": {
+              "source_field": { "type": "string", "pattern": "^(?:actor|subject|target)\\." },
+              "request": { "$ref": "#/$defs/webhookCall" },
+              "outputs": {
+                "type": "object",
+                "minProperties": 1,
+                "propertyNames": { "pattern": "^(?:actor|subject|target)\\." },
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": "string" },
+                    { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                  ]
+                }
+              },
+              "ttl_seconds": { "type": ["integer", "null"], "exclusiveMinimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "configField": {
+      "type": "object",
+      "required": ["key"],
+      "properties": {
+        "key": { "type": "string" },
+        "label": { "type": "string" },
+        "input_type": { "type": "string" },
+        "default": {
+          "description": "In effect until an admin saves a value (1.8.0): a string as written, a number as its text, a bool as true/false; an empty string or any other type sets nothing."
+        },
+        "required": { "type": "boolean" },
+        "user_overridable": { "type": "boolean" },
+        "description": { "type": "string" }
+      }
+    },
+    "pathEnvEntry": {
+      "type": "object",
+      "description": "Either {role, subpath} (one path) or {values: [{role, subpath}], join} (joined paths). Roles: workspace, user_root, shared_workspace, config, knowledge_dir, credentials_dir (subpath required). Invalid entries are skipped at parse, not refused.",
+      "properties": {
+        "role": { "type": "string" },
+        "subpath": { "type": "string" },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": { "type": "string" },
+              "subpath": { "type": "string" }
+            }
+          }
+        },
+        "join": { "type": "string" }
+      }
+    },
+    "toolArgPaths": {
+      "type": ["object", "null"],
+      "description": "Which tool arguments carry paths: {\"<tool>\": {\"<json_path>\": {mode, optional, relative_anchor}}}. json_path is a JSONPath subset: name, a.b, name[*] and their combinations.",
+      "propertyNames": { "minLength": 1 },
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": {
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*|\\[\\*\\])*$"
+        },
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "mode": { "enum": ["read", "write"] },
+            "optional": { "type": "boolean" },
+            "relative_anchor": {
+              "anyOf": [
+                { "$ref": "#/$defs/falsy" },
+                { "type": "string", "pattern": "^/" }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "instances": {
+      "type": ["object", "null"],
+      "description": "Per-instance, per-agent configuration (pair with assignment_mode explicit).",
+      "properties": {
+        "delivery": {
+          "type": "string",
+          "description": "env (default), config_file or none. Not validated by the parser."
+        },
+        "fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/instanceField" }
+        },
+        "config_file_arg": { "type": "string" },
+        "config_file_name": { "type": "string" },
+        "transform": { "type": "string" },
+        "max_instances": {
+          "type": "integer",
+          "description": "0 = unlimited (default), 1 = single-instance."
+        }
+      }
+    },
+    "instanceField": {
+      "type": "object",
+      "required": ["key"],
+      "properties": {
+        "key": { "type": "string" },
+        "label": { "type": "string" },
+        "input_type": {
+          "type": "string",
+          "description": "text, url, number, password, ssh_key_select, phone_route_outbound_select."
+        },
+        "default": { "type": ["string", "number", "boolean", "null"] },
+        "required": { "type": "boolean" },
+        "secret": { "type": "boolean" }
+      }
+    },
+    "networkTarget": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "config, instance, per_user_credential or infra_credential (default config)."
+        },
+        "host_key": { "type": "string" },
+        "port_key": { "type": ["string", "null"] },
+        "port_default": { "type": ["integer", "null"] }
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "mounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "type": "string",
+                "description": "Only ${mcp_dir} is resolved; the host must sit under the agent's dir or mcps/."
+              },
+              "sandbox": { "type": "string" },
+              "mode": { "type": "string", "description": "ro (default) or rw." }
+            }
+          }
+        }
+      }
+    },
+    "hosted": {
+      "type": ["object", "null"],
+      "description": "OtoDock's hosted-relay offering. Not for community packages outside the entries OtoDock maintains.",
+      "properties": {
+        "oauth_app": {
+          "type": ["object", "null"],
+          "properties": {
+            "available": { "type": "boolean" },
+            "default_mode": { "enum": ["self_managed", "hosted"] }
+          }
+        },
+        "api_key_relay": {
+          "type": ["object", "null"],
+          "properties": {
+            "available": { "type": "boolean" },
+            "default_mode": { "enum": ["self_managed", "hosted"] },
+            "relay_path": { "type": "string" },
+            "min_balance_to_enable_usd": { "type": "number" },
+            "billing_setup_url": { "type": "string" }
+          }
+        }
+      }
+    },
+    "systemRequirements": {
+      "type": ["object", "null"],
+      "properties": {
+        "debian": { "type": "array", "items": { "type": "string" } },
+        "ubuntu": { "type": "array", "items": { "type": "string" } },
+        "rhel": { "type": "array", "items": { "type": "string" } },
+        "arch": { "type": "array", "items": { "type": "string" } },
+        "macos_brew": { "type": "array", "items": { "type": "string" } },
+        "node_min": { "type": ["string", "number"] },
+        "notes": { "type": "string" }
+      }
+    },
+    "outputRelocation": {
+      "type": "object",
+      "properties": {
+        "source": { "type": "string" },
+        "destination_template": { "type": "string" },
+        "after_tools": { "type": "array", "items": { "type": "string" } },
+        "keep_recent": { "type": ["integer", "null"] },
+        "gc_after": { "type": ["string", "null"] }
+      }
+    },
+    "resultFiles": {
+      "type": ["object", "null"],
+      "description": "The tools whose pictures and file blobs the platform keeps under subdir of the session's workspace and shows in the chat. An older platform ignores the key.",
+      "required": ["tools"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,128}$" }
+        },
+        "subdir": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "not": {
+            "pattern": "^(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Ii][Nn][Bb][Oo][Xx]|[Aa][Pp][Pp][Ss]|[Uu][Pp][Ll][Oo][Aa][Dd][Ss]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])$"
+          },
+          "description": "One plain folder name, not a Windows device name nor inbox, apps or uploads. Absent: the MCP's name when it qualifies, else mcp-files."
+        }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "required": ["id", "file"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The skill name: lowercase letters and digits in runs joined by single hyphens, at most 64 characters (SKILL_ID_RE). The install gate requires a non-empty string; an id outside the grammar is dropped at parse with a warning."
+        },
+        "file": { "$ref": "#/$defs/relativeFile" },
+        "description": { "type": "string" },
+        "loading": {
+          "description": "on_demand (default) or always. Another value falls back to on_demand at parse."
+        },
+        "default_exclude_from": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "audience": {
+          "x-otodock-since": "1.7.1",
+          "enum": ["", "owner", "editor", "workspace", null],
+          "description": "The tier the skill is for (empty = everyone). A 1.7.0 platform does not read it and gives the skill to every tier."
+        }
+      }
+    },
+    "replacesEntry": {
+      "type": "object",
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "A previous source (a package pointer, a container's previous server.image, a hosted MCP's previous host or URL), matched by identity."
+        },
+        "credentials": {
+          "type": ["object", "null"],
+          "description": "Old key to new key, both plain identifiers (no leading '_').",
+          "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9_]*$" },
+          "additionalProperties": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$" }
+        }
+      }
+    },
+    "costs": {
+      "type": ["object", "null"],
+      "description": "Per-tool prices, first matching rule wins.",
+      "required": ["currency", "provider", "rules"],
+      "properties": {
+        "currency": { "const": "USD" },
+        "provider": { "$ref": "#/$defs/nonBlankString" },
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["tool", "amount"],
+            "properties": {
+              "tool": { "$ref": "#/$defs/nonBlankString" },
+              "amount": { "type": "number", "minimum": 0 },
+              "match": {
+                "type": "object",
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": ["string", "number", "boolean", "null"] },
+                    {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": { "type": ["string", "number", "boolean", "null"] }
+                    }
+                  ]
+                }
+              },
+              "multiply_by": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "permissions": {
+      "type": ["object", "null"],
+      "description": "Per-tool permission tiers, first matching rule wins. A catalog entry gets open honored only from exact tool-name rules.",
+      "properties": {
+        "default_tier": { "enum": ["open", "standard", "sensitive", "critical"] },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["tool", "tier"],
+            "additionalProperties": false,
+            "properties": {
+              "tool": {
+                "type": "string",
+                "pattern": "\\S",
+                "not": { "pattern": "^\\s*mcp__" },
+                "description": "A bare tool name, an fnmatch glob or '*'. An exact name appears once (not expressible)."
+              },
+              "tier": { "enum": ["open", "standard", "sensitive", "critical"] }
+            }
+          }
+        }
+      }
+    },
+    "agentContextBlock": {
+      "type": "object",
+      "required": ["template"],
+      "additionalProperties": false,
+      "properties": {
+        "template": { "$ref": "#/$defs/nonBlankString" },
+        "requires": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "scope": {
+          "type": "array",
+          "items": { "enum": ["user", "agent"] }
+        },
+        "builder": {
+          "type": ["object", "null"],
+          "required": ["tool"],
+          "additionalProperties": false,
+          "properties": {
+            "tool": { "type": "string", "pattern": "^mcp__[a-z0-9_-]+__[a-z0-9_-]+$" },
+            "args": { "type": "object" },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+            "account_label": { "type": "string" }
+          }
+        }
+      }
+    },
+    "toolFilter": {
+      "type": ["object", "null"],
+      "description": "For a container whose server takes a tool-filter regex. The platform writes the admin's regex bare to regex_env_var_name and the flag arg_name '<regex>' to env_var_name in the container's .env (the two names must differ). A no-op on stdio.",
+      "required": ["arg_name"],
+      "properties": {
+        "arg_name": { "type": "string", "pattern": "^--[a-z0-9][a-z0-9-]*$" },
+        "env_var_name": {
+          "$ref": "#/$defs/envVarName",
+          "description": "Default ENABLED_TOOLS_FLAG."
+        },
+        "regex_env_var_name": {
+          "x-otodock-since": "1.8.0",
+          "$ref": "#/$defs/envVarName",
+          "description": "Default ENABLED_TOOLS_REGEX. Before 1.8.0 the .env carries only the composed flag."
+        }
+      }
+    },
+    "companionApp": {
+      "type": ["object", "null"],
+      "description": "App-connector block (a running local program). Not for community packages.",
+      "properties": {
+        "program": { "type": "string" },
+        "connect": {
+          "anyOf": [
+            { "$ref": "#/$defs/falsy" },
+            {
+              "type": "object",
+              "properties": {
+                "host": { "type": "string" },
+                "transport": { "type": "string" },
+                "port": { "type": "integer" },
+                "port_discovery": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "plugin": {
+          "anyOf": [
+            { "$ref": "#/$defs/falsy" },
+            {
+              "type": "object",
+              "properties": {
+                "asset": { "type": "string" },
+                "min_plugin_version": { "type": "string" },
+                "supported_host_versions": {
+                  "type": ["array", "null"],
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          ]
+        },
+        "status_tool": { "type": "string" },
+        "auth": { "enum": ["none", "per_connection_token"] }
+      }
+    }
+  }
+}

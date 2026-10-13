@@ -275,3 +275,34 @@ def test_proxy_has_fd_and_pids_floors(base):
     nofile = proxy["ulimits"]["nofile"]
     assert nofile["soft"] == 65536 and nofile["hard"] == 524288
     assert "OTODOCK_PROXY_PIDS_LIMIT" in str(proxy["pids_limit"])
+
+
+# --- the platform's named volumes --------------------------------
+
+_BIN = "/opt/otodock/recover-bin"
+
+
+def test_recover_bin_is_a_named_volume_on_the_proxy_alone(base, phone):
+    # The bin's rows live in Postgres; without a volume a recreate leaves
+    # entries whose bytes are gone. It holds every person's deleted files, so
+    # no sidecar mounts it.
+    assert base["volumes"]["otodock-recover-bin"] == {"name": "otodock-recover-bin"}
+    assert f"otodock-recover-bin:{_BIN}" in _svc(base, "otodock-proxy")["volumes"]
+    init = _svc(base, "otodock-agents-init")
+    assert f"otodock-recover-bin:{_BIN}" in init["volumes"]
+    command = " ".join(init["command"])
+    assert re.search(rf"chown -R 1000:1000 [^;]*{_BIN}", command)
+    assert re.search(rf"chmod 0700 [^;]*{_BIN}", command)
+    for compose in (base, phone):
+        for name, svc in compose["services"].items():
+            if name in ("otodock-proxy", "otodock-agents-init"):
+                continue
+            assert not any("otodock-recover-bin" in str(v) for v in svc.get("volumes") or []), name
+
+
+def test_every_platform_volume_but_the_agents_tree_is_refused_to_mcps(base):
+    # A community MCP compose naming a platform volume is refused by the
+    # rewrite; the agents tree is reached through ${HOST_AGENTS_DIR} instead.
+    from services.mcp.compose_rewrite import _PLATFORM_VOLUMES
+    declared = {v.get("name", k) for k, v in base["volumes"].items()}
+    assert declared - {"otodock-agents"} <= _PLATFORM_VOLUMES

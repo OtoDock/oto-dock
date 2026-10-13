@@ -41,7 +41,7 @@ from storage import database as task_store
 from storage import db_apps
 from core import layout
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 RELEASES_DIRNAME = "app-releases"
 DATA_DIRNAME = "app-data"

@@ -128,6 +128,17 @@ def init_audio_telephony(conn) -> None:
             role TEXT NOT NULL DEFAULT 'viewer'
                 CHECK (role IN ('viewer', 'editor', 'manager')),
             remember_callers BOOLEAN NOT NULL DEFAULT TRUE,
+            -- Where the agent may hand the caller (``transfer_call``): the
+            -- admin's list of {label, number}; [] = no transfers on the line.
+            transfer_targets JSONB NOT NULL DEFAULT '[]',
+            -- Identify the caller's language on the first utterance and lock
+            -- the call to it; ``language`` stays the greeting's and the
+            -- fallback. Off on existing rows (run_migrations), on for routes
+            -- the form creates (the API model's default).
+            language_detect BOOLEAN NOT NULL DEFAULT FALSE,
+            -- A voice for this route only (the TTS provider's own id); ''
+            -- = the provider's voice for the call's language.
+            voice_id TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )

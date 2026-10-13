@@ -11,11 +11,12 @@ import asyncio
 import pytest
 
 from calls import pin_failures
+from calls.call_manager import CallStatus
 from calls.pin_failures import PinFailureStore
 from config_manager import ConfigManager
 from transport.base import FRAME_AUDIO, FRAME_DTMF, FRAME_HANGUP, TransportError
 
-from pipeline_fakes import FakeConn, FakeLLM, make_route
+from pipeline_fakes import FakeCall, FakeCallManager, FakeConn, FakeLLM, make_route
 
 pytestmark = pytest.mark.asyncio
 
@@ -126,6 +127,81 @@ async def test_overall_timeout_counts_one_failure(make_pipeline, fresh_store):
     assert p.state.call_outcome == "pin_timeout"
     assert conn.hangups == 1
     assert len(store._numbers["16085550100"]) == 1
+
+
+# -- the gate on an outbound call (a route tied to a user) ------------------
+
+def _outbound_gate(make_pipeline, *, frames, call=None, cfg=None):
+    conn = FakeConn(frames=frames, hold_open=True)
+    cm = FakeCallManager(call or FakeCall())
+    p = make_pipeline(
+        route=make_route(direction="outbound", pin="1234"), conn=conn,
+        caller_info={"phone": "+16085550100", "did": ""},
+        cfg=cfg or _cfg(pin_interdigit_timeout_s="0.2"),
+        call_manager=cm, outbound_call_id="c1",
+    )
+    return p, conn, cm
+
+
+async def test_an_outbound_gate_counts_wrong_codes_only(make_pipeline, fresh_store):
+    """A silent answer (a voicemail, a wrong pickup) is refused but counts
+    nothing toward the windows, or the user's own number would be refused
+    next; a wrong code counts as on an inbound call."""
+    store, _ = fresh_store
+    p, conn, _ = _outbound_gate(make_pipeline, frames=[])
+    assert await asyncio.wait_for(p._pin_gate(), timeout=10.0) is False
+    # Three silent rounds: a timeout, not a wrong code, so the record (and
+    # the lockout seed after a restart) counts nothing for it.
+    assert p.state.call_outcome == "pin_timeout" and conn.hangups == 1
+    assert p.state.pin_attempts == 3 and p.state.pin_failures == 0
+    assert "16085550100" not in store._numbers and not store._routes
+    cfg = _cfg(pin_entry_timeout_s="0.3", pin_interdigit_timeout_s="30")
+    p, conn, _ = _outbound_gate(make_pipeline, frames=[], cfg=cfg)
+    assert await p._pin_gate() is False
+    assert p.state.call_outcome == "pin_timeout" and "16085550100" not in store._numbers
+    p, conn, _ = _outbound_gate(make_pipeline, frames=_digits("9", "9", "9", "9", "#") * 3)
+    assert await p._pin_gate() is False
+    assert p.state.call_outcome == "pin_failed" and p.state.pin_failures == 3
+    assert len(store._numbers["16085550100"]) == 3
+
+
+async def test_a_refused_outbound_call_takes_the_client_and_fails_with_the_reason(make_pipeline, fresh_store):
+    """The pre-warmed client becomes the call's own so the record (and an
+    in-session chat) learns why the call ended; the cleanup closes it."""
+    client = FakeLLM(session_id="s1")
+    call = FakeCall(warmup_client=client)
+    p, conn, cm = _outbound_gate(make_pipeline, frames=_digits("9", "9", "9", "9", "#") * 3, call=call)
+    assert await p._pin_gate() is False
+    await p._settle_unadopted_outbound(adopt=True)
+    assert p.llm is client and call.warmup_client is None
+    await p._finalize_outbound_call()
+    assert cm.status is CallStatus.FAILED and "did not enter the PIN" in cm.error
+    assert call.pin_attempts == 3 and call.pin_outcome == "pin_failed"
+    assert p._in_session_ending() == "ended: the person who answered did not enter the PIN"
+    # A silent line reports the failures counted (none), never its rounds.
+    call = FakeCall(warmup_client=FakeLLM(session_id="s2"))
+    p, conn, cm = _outbound_gate(make_pipeline, frames=[], call=call)
+    assert await asyncio.wait_for(p._pin_gate(), timeout=10.0) is False
+    await p._settle_unadopted_outbound(adopt=True)
+    await p._finalize_outbound_call()
+    assert call.pin_attempts == 0 and call.pin_outcome == "pin_timeout"
+
+
+async def test_another_exit_before_adoption_closes_the_client_and_the_pre_generation(make_pipeline, monkeypatch):
+    from pipeline import outbound as plout
+    monkeypatch.setattr(plout, "UNADOPTED_OPENING_WAIT_S", 0.05)
+    closed = []
+
+    class Client(FakeLLM):
+        async def close(self):
+            closed.append(1)
+
+    call = FakeCall(warmup_client=Client(), opening_ready=False)
+    call.pregen_task = asyncio.create_task(asyncio.sleep(10))
+    p, conn, cm = _outbound_gate(make_pipeline, frames=[], call=call)
+    await p._settle_unadopted_outbound(adopt=False)
+    assert closed == [1] and call.warmup_client is None and p.llm is None
+    assert call.pregen_task.cancelled()
 
 
 async def test_hangup_mid_entry_records_no_failure(make_pipeline, fresh_store):
@@ -309,3 +385,59 @@ async def test_failed_gate_never_touches_stt_or_llm(make_pipeline, fresh_store):
     assert p.llm is None
     assert p.stt.started == []
     assert p.state._warmup_task is None
+
+
+# -- a hangup during the gate, per call kind ---------------------------------
+
+class _NoteClient(FakeLLM):
+    """A pre-warmed client that records the resume note and its close."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.notes: list[tuple[str, bool]] = []
+        self.closed = False
+
+    async def send_system_note(self, text, *, resume=False):
+        self.notes.append((text, resume))
+        return True
+
+    async def close(self):
+        self.closed = True
+
+
+_HANGUP_MID_ENTRY = _digits("1") + [(FRAME_HANGUP, b"")]
+
+
+async def test_an_inbound_hangup_during_the_gate_starts_no_session(make_pipeline, fresh_store):
+    p, conn = _gate_pipeline(make_pipeline, frames=_HANGUP_MID_ENTRY)
+    p.stt.needs_pre_connect = True
+    await p.run()
+    assert p.state.call_outcome == "hangup"
+    assert p.llm is None and p.stt.started == [] and p.state._warmup_task is None
+
+
+async def test_an_in_session_hangup_during_the_gate_sends_the_resume_note(make_pipeline, fresh_store):
+    """The client is adopted before the finalize, as for a refused code: the
+    chat's note names the hangup instead of the proxy's generic fallback,
+    the record fails with the reason, and the cleanup closes the client."""
+    client = _NoteClient(session_id="s1")
+    call = FakeCall(warmup_client=client)
+    p, conn, cm = _outbound_gate(make_pipeline, frames=_HANGUP_MID_ENTRY, call=call)
+    p._in_session = True
+    await p.run()
+    assert p.state.call_outcome == "hangup"
+    assert [(("the person hung up" in t), resume) for t, resume in client.notes] == [(True, True)]
+    assert client.prompts == []                       # no summary turn
+    assert cm.status is CallStatus.FAILED and "the person hung up" in cm.error
+    assert call.warmup_client is None and client.closed
+
+
+async def test_a_standalone_hangup_during_the_gate_closes_the_client(make_pipeline, fresh_store):
+    client = _NoteClient(session_id="s1")
+    call = FakeCall(warmup_client=client)
+    p, conn, cm = _outbound_gate(make_pipeline, frames=_HANGUP_MID_ENTRY, call=call)
+    await p.run()
+    assert p.state.call_outcome == "hangup"
+    assert client.notes == [] and client.prompts == []   # no chat to tell, no turn on a dead line
+    assert cm.status is CallStatus.FAILED
+    assert call.warmup_client is None and client.closed

@@ -24,7 +24,7 @@ def _blocking_call_for_the_test():
 
 @pytest.mark.asyncio
 async def test_stall_is_logged_with_loop_stack_and_counted(caplog):
-    caplog.set_level(logging.INFO, logger="claude-proxy.loop-watchdog")
+    caplog.set_level(logging.INFO, logger="otodock.loop-watchdog")
     assert wd.start(threshold_s=0.2)
     await asyncio.sleep(0.6)  # let the first tick land
 
@@ -60,7 +60,7 @@ async def test_disabled_when_threshold_zero():
 
 @pytest.mark.asyncio
 async def test_stop_before_tick_cancel_logs_nothing(caplog):
-    caplog.set_level(logging.INFO, logger="claude-proxy.loop-watchdog")
+    caplog.set_level(logging.INFO, logger="otodock.loop-watchdog")
     assert wd.start(threshold_s=0.2)
     await asyncio.sleep(0.6)
     wd.stop()  # flags the thread first, then cancels the tick task
@@ -85,7 +85,7 @@ def _short_block_for_the_test(seconds):
 
 @pytest.mark.asyncio
 async def test_a_short_stall_is_reported_once_with_its_stack(caplog):
-    caplog.set_level(logging.INFO, logger="claude-proxy.loop-watchdog")
+    caplog.set_level(logging.INFO, logger="otodock.loop-watchdog")
     assert wd.start(threshold_s=2.0, report_s=0.2)
     await asyncio.sleep(0.3)
     _short_block_for_the_test(0.4)
@@ -108,7 +108,7 @@ async def test_a_short_stall_is_reported_once_with_its_stack(caplog):
 
 @pytest.mark.asyncio
 async def test_short_stall_reports_are_rate_limited(caplog):
-    caplog.set_level(logging.INFO, logger="claude-proxy.loop-watchdog")
+    caplog.set_level(logging.INFO, logger="otodock.loop-watchdog")
     assert wd.start(threshold_s=2.0, report_s=0.1)
     await asyncio.sleep(0.2)
     for _ in range(8):

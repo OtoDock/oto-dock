@@ -36,7 +36,7 @@ import httpx
 import config
 from services.community import community_catalog
 
-logger = logging.getLogger("claude-proxy.community-icons")
+logger = logging.getLogger("otodock.community-icons")
 
 ICON_SIZE = 256
 ICON_MAX_BYTES = 256 * 1024

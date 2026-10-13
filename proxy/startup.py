@@ -27,7 +27,7 @@ from core.layers.cli import reap_idle_sessions
 from core.layers.direct import reap_idle_direct_sessions
 from core.layers.codex import reap_idle_codex_sessions
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Background tasks the lifespan owns — cancelled in ``_shutdown_cleanup`` so
 # their teardown never races the closed DB pool.
@@ -265,11 +265,13 @@ async def lifespan(app: FastAPI):
     # Initialize PostgreSQL schema (all tables + migrations). One
     # transaction; its DDL may wait on locks a running pg_dump holds, so the
     # pool's statement timeout does not apply to it, and it waits longer for
-    # a connection than a request would (Postgres may still be starting).
+    # a connection than a request would (Postgres may still be starting). A
+    # database a NEWER release migrated refuses the boot here
+    # (schema.platform_version_preflight), before any DDL of this release.
     with pg_pool.get_conn(timeout=60) as _pg_conn:
         _pg_conn.execute("SET LOCAL statement_timeout = 0")
-        pg_schema.init_schema(_pg_conn)
-        pg_schema.run_migrations(_pg_conn)
+        pg_schema.migrate_database(
+            _pg_conn, config.PINNED_OTODOCK_VERSION, allow_newer=config.ALLOW_NEWER_DATABASE)
         _pg_conn.commit()
         # Drift guard: one loud ERROR when the live DB is missing columns the
         # code expects (a CREATE TABLE-only addition never reaches existing
@@ -392,8 +394,22 @@ async def lifespan(app: FastAPI):
         L.set_license_key(config.OTODOCK_LICENSE_KEY)
         logger.info("Seeded license_key from OTODOCK_LICENSE_KEY (bootstrap)")
     # Phone server: seed default settings and routes if tables are empty
-    from services.phone.phone_config_seed import seed_phone_config
+    from services.phone.phone_config_seed import (
+        remap_retired_audio_models, remap_shipped_call_prompts, seed_phone_config,
+    )
     seed_phone_config()
+    # The audio providers' model ids: a retired id moves to its successor
+    # on every boot, a former default is cleared from the rows once (the
+    # LLM remap below, applied to audio). Idempotent; must never kill boot.
+    try:
+        remap_retired_audio_models()
+    except Exception:
+        logger.exception("audio model remaps failed (non-fatal)")
+    # A call prompt no admin ever edited follows the adapter's current text.
+    try:
+        remap_shipped_call_prompts()
+    except Exception:
+        logger.exception("call prompt remap failed (non-fatal)")
     # MCP Framework: discover manifests, seed DB, start Docker MCPs
     from services.mcp import mcp_registry
     from services.mcp import docker_manager
@@ -779,6 +795,11 @@ async def lifespan(app: FastAPI):
     from services.billing import license_check_worker
     license_check_worker.start_worker()
 
+    # The daily release check: admins are told when a newer release exists.
+    # Not started when air-gapped, on the cloud or switched off by its key.
+    from services.infra import release_check
+    release_check.start_worker()
+
     # Phone-server health + drift worker — probes verified phone servers'
     # adapters and reconciles their provisioned routes against the DB. No-op
     # until a phone server is added.
@@ -841,6 +862,11 @@ async def lifespan(app: FastAPI):
         await license_check_worker.stop_worker()
     except Exception:
         logger.exception("License check worker shutdown failed (continuing)")
+
+    try:
+        await release_check.stop_worker()
+    except Exception:
+        logger.exception("Release check worker shutdown failed (continuing)")
 
     try:
         await phone_health_worker.stop_worker()
@@ -970,12 +996,28 @@ async def _shutdown_cleanup(logger) -> None:
     # Cancel the lifespan's own background loops so their teardown doesn't
     # race the closed pool below (asyncio.run would cancel them anyway —
     # but only AFTER lifespan, with the pool already gone).
+    # Beside them, the fire-and-forget tasks started through
+    # core.background.spawn get a grace period to finish (most belong to the
+    # sessions closed above), then a cancel; both waits share the 3 s and the
+    # teardown still has the pool.
+    from core import background
     for task in _bg_tasks:
         task.cancel()
-    if _bg_tasks:
-        with contextlib.suppress(Exception):
-            await asyncio.wait(_bg_tasks, timeout=3)
+
+    async def _wait_bg_tasks() -> None:
+        if _bg_tasks:
+            with contextlib.suppress(Exception):
+                await asyncio.wait(_bg_tasks, timeout=3)
+
+    waited = await asyncio.gather(
+        _wait_bg_tasks(), background.cancel_all(grace=2.0, timeout=1.0),
+        return_exceptions=True,
+    )
     _bg_tasks.clear()
+    if isinstance(waited[1], BaseException):
+        logger.error(f"Shutdown: background task cancel failed (continuing): {waited[1]!r}")
+    elif waited[1]:
+        logger.info(f"Shutdown: cancelled {waited[1]} background task(s) still running after 2 s")
 
     scheduler.stop()
 

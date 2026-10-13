@@ -149,12 +149,12 @@ def test_codex_gets_read_only_without_plan():
     assert permission_to_sandbox("plan") == "read-only"
     assert permission_to_sandbox("judge", allow_full_fs=True) == "read-only"
     judge = CodexAppServerSession(session_id="s", agent_name="a", model="m", sandbox_mode="read-only",
-                                  working_dir="", config_dir="", plan_mode=False)
+                                  working_dir="", config_dir="", permission_mode="judge")
     plan = CodexAppServerSession(session_id="s2", agent_name="a", model="m", sandbox_mode="read-only",
-                                 working_dir="", config_dir="", plan_mode=True)
+                                 working_dir="", config_dir="", permission_mode="plan")
     assert judge._collaboration_mode() == {"mode": "default"}
     assert plan._collaboration_mode() == {"mode": "plan"}
-    judge.set_sandbox_mode("workspace-write", plan_mode=True)
+    judge.set_mode("plan", "read-only")
     assert judge._collaboration_mode() == {"mode": "plan"}
 
 

@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 import config
 from storage.pg import get_conn
 
-logger = logging.getLogger("claude-proxy.tombstones")
+logger = logging.getLogger("otodock.tombstones")
 
 
 def _now() -> datetime:
@@ -70,18 +70,39 @@ def get(agent_slug: str, rel_path: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
+# The origin of a delete the Windows hash bug made (satellite 0.5.130–0.5.143
+# listed only the files it had been sent, so the merge read the rest as
+# deleted there). The 1.8.0 migration turns those tombstones into holds: a
+# hold never authorizes a delete, and a fixed Windows satellite brings the
+# machine's copy back (``core/remote/file_sync.diff_manifests``).
+HOLD_ORIGIN = "windows-hash-hold"
+
+
 def load_for_agent(agent_slug: str) -> dict[str, float]:
     """Return ``{rel_path: deleted_at_mtime}`` for all LIVE tombstones of an agent.
 
     Expired tombstones are excluded — they no longer authorize a delete, so a
-    satellite file at that path is re-adopted (pulled) instead.
+    satellite file at that path is re-adopted (pulled) instead. Holds are
+    excluded too (``load_holds_for_agent``).
     """
     now_iso = _now().isoformat()
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT rel_path, deleted_at_mtime FROM file_tombstones "
-            "WHERE agent_slug=%s AND expires_at > %s",
-            (agent_slug, now_iso),
+            "WHERE agent_slug=%s AND expires_at > %s AND origin <> %s",
+            (agent_slug, now_iso, HOLD_ORIGIN),
+        ).fetchall()
+    return {r["rel_path"]: r["deleted_at_mtime"] for r in rows}
+
+
+def load_holds_for_agent(agent_slug: str) -> dict[str, float]:
+    """``{rel_path: deleted_at_mtime}`` of an agent's live holds."""
+    now_iso = _now().isoformat()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT rel_path, deleted_at_mtime FROM file_tombstones "
+            "WHERE agent_slug=%s AND expires_at > %s AND origin = %s",
+            (agent_slug, now_iso, HOLD_ORIGIN),
         ).fetchall()
     return {r["rel_path"]: r["deleted_at_mtime"] for r in rows}
 

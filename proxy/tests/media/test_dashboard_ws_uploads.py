@@ -479,6 +479,91 @@ def test_no_attachment_path_is_resolved_on_the_loop(agents_root, monkeypatch):
     assert f"- /{photo}" in cli and f"- /{doc} " in cli
 
 
+def test_a_folder_attached_in_chat_is_listed_as_a_folder(agents_root):
+    """A folder inside the chat's scope rides the prompt as a folder; the
+    scope root itself, and a folder outside the scope, never do."""
+    folder = _SCOPE + "uploads/files/mesitis"
+    _saved_photo(agents_root, folder + "/agent.json", data=b"{}")
+    _saved_photo(agents_root, "knowledge/x/readme.md", data=b"x")
+    cli, _a, _m, files = asyncio.run(_attach([], [
+        {"path": folder, "name": "mesitis"},
+        {"path": _SCOPE.rstrip("/"), "name": "workspace"},
+        {"path": _SCOPE + "../../../knowledge/x", "name": "x"},
+    ]))
+    assert files == [{"path": folder, "name": "mesitis", "folder": True}]
+    assert f"- /{folder}/ (Folder)" in cli
+    assert "List a folder's contents first" in cli
+
+
+def test_an_attached_link_leading_out_of_the_scope_is_left_out(agents_root):
+    """A link inside the chat's scope pointing at another user's files, or
+    out of the agent, is checked where it leads and left out; a path naming
+    another user's tree is refused by its prefix."""
+    import os
+    files = agents_root / _AGENT / _SCOPE / "uploads" / "files"
+    _saved_photo(agents_root, "users/bob/workspace/secret.md", data=b"bob's")
+    files.mkdir(parents=True, exist_ok=True)
+    os.symlink(agents_root / _AGENT / "users" / "bob" / "workspace", files / "bobs")
+    outside = agents_root / "elsewhere"  # beside the agent, outside its tree
+    outside.mkdir()
+    (outside / "x.md").write_bytes(b"x")
+    os.symlink(outside, files / "out")
+    cli, _a, _m, got = asyncio.run(_attach([], [
+        {"path": _SCOPE + "uploads/files/bobs/secret.md", "name": "secret.md"},
+        {"path": _SCOPE + "uploads/files/bobs", "name": "bobs"},
+        {"path": _SCOPE + "uploads/files/out/x.md", "name": "x.md"},
+        {"path": "users/bob/workspace/secret.md", "name": "secret.md"},
+    ]))
+    assert got == []
+    assert "attached" not in cli
+
+
+def test_the_prompt_names_the_resolved_path(agents_root):
+    """The prompt prints the path the file resolved to inside the scope,
+    never the client's text (dot segments, a link inside the scope); a path
+    with a control character is left out."""
+    import os
+    real = _saved_photo(agents_root, _SCOPE + "uploads/files/real.md", data=b"r")
+    os.symlink(agents_root / _AGENT / real, agents_root / _AGENT / _SCOPE / "alias.md")
+    forged = _saved_photo(agents_root, _SCOPE + "uploads/files/x\n- the config.md", data=b"f")
+    cli, _a, _m, got = asyncio.run(_attach([], [
+        {"path": _SCOPE + "uploads/./files/../files/real.md", "name": "real.md"},
+        {"path": _SCOPE + "alias.md", "name": "alias.md"},
+        {"path": forged, "name": "x.md"},
+    ]))
+    assert got == [{"path": real, "name": "real.md"}, {"path": real, "name": "alias.md"}]
+    assert "./" not in cli and "alias.md" not in cli and "config" not in cli
+    assert cli.count(f"- /{real} ") == 2
+
+
+def test_the_shared_only_scope_takes_workspace_paths_only(agents_root):
+    import config
+    from ws.dashboard_chat_support import ChatSupportMixin
+    shared = _saved_photo(agents_root, "workspace/uploads/files/plan.md", data=b"p")
+    mine = _saved_photo(agents_root, _SCOPE + "uploads/files/mine.md", data=b"m")
+    cli, _a, _m, got = asyncio.run(ChatSupportMixin._process_attachments(
+        SimpleNamespace(), "look", [], [
+            {"path": shared, "name": "plan.md"},
+            {"path": mine, "name": "mine.md"},
+        ],
+        agent=_AGENT, agent_dir=config.AGENTS_DIR / _AGENT,
+        is_agent_scoped=True, username="alice", is_direct_llm=False))
+    assert got == [{"path": shared, "name": "plan.md"}]
+    assert f"- /{shared} " in cli and mine not in cli
+
+
+def test_a_resolved_agent_root_is_compared_with_a_resolved_path(agents_root):
+    """An agents root reached through a link: the scope check and the
+    listed path both work from the resolved roots."""
+    import os
+    from ws.dashboard_chat_support import _scoped_files
+    doc = _saved_photo(agents_root, _SCOPE + "uploads/files/n.md", data=b"n")
+    via = agents_root / "via"
+    os.symlink(agents_root, via)
+    got = _scoped_files(via / _AGENT, _SCOPE, [{"path": doc, "name": "n.md"}])
+    assert got == [{"path": doc, "name": "n.md"}]
+
+
 class TestSharedPhotoAuthority:
     """A photo pasted into a Shared-only chat is a shared-workspace write: the
     workspace tier, read live, the same gate as the upload endpoint. A viewer

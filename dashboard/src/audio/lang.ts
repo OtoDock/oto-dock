@@ -12,6 +12,15 @@ export const LANGUAGES: { code: string; label: string }[] = [
   { code: 'it-IT', label: 'Italian' },
 ]
 
+// The stored dictation pick for "let the platform engine identify the
+// language" (the Automatic row). The browser recognizer needs a code and
+// keeps the browser language for it.
+export const AUTO_LANGUAGE = 'auto'
+
+export function isAutoLanguage(tag: string | null | undefined): boolean {
+  return (tag || '').trim().toLowerCase() === AUTO_LANGUAGE
+}
+
 export function baseLang(tag: string): string {
   return (tag || '').split('-')[0].toLowerCase()
 }

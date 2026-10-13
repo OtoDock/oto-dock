@@ -153,7 +153,10 @@ export default function McpServersPage() {
             {CATEGORY_LABEL[cat] || cat}
           </h2>
           <div className="space-y-2">
-            {grouped[cat].map(mcp => <McpRow key={mcp.name} mcp={mcp} updateInfo={updates[mcp.name]} />)}
+            {grouped[cat].map(mcp => (
+              <McpRow key={mcp.name} mcp={mcp} updateInfo={updates[mcp.name]}
+                autoUpdateEnabled={updateState?.auto_update_enabled ?? true} />
+            ))}
           </div>
         </div>
       ))}

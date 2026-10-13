@@ -17,6 +17,7 @@ from aiohttp import web
 
 import config
 from telephony.ami_client import AMIClient, AMIError
+from calls import pin_failures
 from calls.call_manager import CallManager, CallStatus
 from calls.call_registry import registry as call_registry
 from config_manager import ConfigManager
@@ -112,6 +113,10 @@ class OutboundCallAPI:
         self._app.router.add_post("/v1/calls/register", self._register_call)
         self._app.router.add_get("/health", self._health)
         self._runner: web.AppRunner | None = None
+        # The AMI event listeners (main wires them): an Originate tells them
+        # its ActionID so the PBX's OriginateResponse binds the call's
+        # channel for signalled DTMF. None in tests that build the API alone.
+        self.ami_manager = None
 
     def attach_twilio(self, twilio_api) -> None:
         """Register the Twilio signaling routes (webhook + media WS + status)
@@ -235,6 +240,18 @@ class OutboundCallAPI:
                 {"error": "too many concurrent outbound calls"}, status=429,
             )
 
+        # A PIN-gated route in a cooldown (the number's or the route's):
+        # refused before the dial, or the person would be rung to hear the
+        # lockout phrase.
+        if getattr(route, "pin", "") and (
+                pin_failures.store.number_locked(phone_number)
+                or pin_failures.store.route_locked(route.id)):
+            return web.json_response(
+                {"error": "PIN cooldown: too many wrong codes for this number or "
+                          "route recently; try again later"},
+                status=429,
+            )
+
         # Register the call
         call = self.call_manager.register_call(
             phone_number=phone_number,
@@ -243,6 +260,9 @@ class OutboundCallAPI:
         )
         # Attach route_id for resolution when AudioSocket connects
         call.route_id = route_id
+        # A call that runs inside the caller's chat: the live client attaches
+        # to that chat's session with this grant instead of warming its own.
+        call.in_session = fields.get("in_session")
 
         # Pre-warm the caller agent session on the proxy
         warmup_task = asyncio.create_task(
@@ -379,6 +399,15 @@ class OutboundCallAPI:
             await ami.login()
             caller_id = route.ami_caller_id or ""
             context = route.ami_outbound_context or "oto-audiosocket-outbound"
+            # The ActionID the PBX echoes on OriginateResponse: the persistent
+            # listener learns the dialled channel from it and binds the call's
+            # media leg to signalled DTMF (the PIN gate on an RFC2833 trunk).
+            action_id = call.audio_uuid.replace("-", "")
+            if self.ami_manager is not None:
+                server_key = self.ami_manager.resolve_server_key(
+                    getattr(route, "phone_server_id", None))
+                if server_key is not None:
+                    self.ami_manager.expect_originate(server_key, action_id, call.audio_uuid)
             response = await ami.originate(
                 phone_number=call.phone_number,
                 audio_uuid=call.audio_uuid,
@@ -386,6 +415,7 @@ class OutboundCallAPI:
                 context=context,
                 dial_prefix=route.dial_prefix or "",
                 timeout_ms=30000,
+                action_id=action_id,
             )
             if "Success" not in response.get("Response", ""):
                 raise AMIError(
@@ -418,6 +448,9 @@ class OutboundCallAPI:
         # session, and tearing it down is what made answered outbound calls
         # forget why they called. caller_info also threads trigger_slug /
         # ${trigger.*} enrichment into the OPENING, not just later turns.
+        # An outbound AMI call's media leg names no channel to Redirect: the
+        # prompt must not promise a transfer. Twilio moves either direction.
+        can_transfer = self.cfg.twilio_server(getattr(route, "phone_server_id", None)) is not None
         client = ProxyClient(
             model=route.agent,
             call_type="outbound",
@@ -430,8 +463,14 @@ class OutboundCallAPI:
                 "call_id": call.call_id,
                 "phase": "prewarmup",
             },
+            attach=call.in_session,
+            transfer_available=can_transfer,
         )
         stored = False  # True once the client is handed to the call for reuse
+        # The call tools during the opening: an end_call makes the opening
+        # the whole call (like a marker in it); the rest waits for the live
+        # pipeline, which takes the handler over when it adopts the client.
+        client.on_call_control = lambda frame: self._opening_call_control(call, client, frame)
         try:
             ws_ok = await client.connect()
             if not ws_ok:
@@ -461,8 +500,11 @@ class OutboundCallAPI:
                 f"Introduce yourself briefly and begin working on the task."
             )
 
+            # In the caller's chat the opening prompt is the daemon's, not a
+            # person's words: a system turn writes no user row there.
             full_response: list[str] = []
-            async for chunk in client.send_message(opening_prompt):
+            async for chunk in client.send_message(
+                    opening_prompt, system=call.in_session is not None):
                 if chunk is not None and isinstance(chunk, str):
                     full_response.append(chunk)
 
@@ -471,7 +513,10 @@ class OutboundCallAPI:
             # If the agent ended the call in its first turn (a "say X then hang
             # up" task), the opening carries [CALL_COMPLETE]. Record that BEFORE
             # stripping so the pipeline hangs up after playing the opening.
-            call.opening_completes_call = bool(
+            # An end_call raised while the opening streamed set the flag
+            # already (_opening_call_control): the marker search adds, never
+            # overwrites, or the opening plays and the line stays open.
+            call.opening_completes_call = call.opening_completes_call or bool(
                 re.search(r"\[CALL_COMPLETE\]", raw_text)
             )
 
@@ -506,6 +551,24 @@ class OutboundCallAPI:
                 with contextlib.suppress(Exception):
                     await client.close()
             call._opening_ready.set()
+
+    @staticmethod
+    def _opening_call_control(call, client, frame: dict) -> None:
+        """A call tool raised while the opening is still being generated."""
+        data = frame.get("data") or {}
+        request_id = str(data.get("request_id") or "")
+        action = str(data.get("action") or "")
+        if action == "end":
+            call.opening_completes_call = True
+            ok, message = True, (
+                "The call ends once your opening has played: say nothing more.")
+        elif action == "transfer":
+            ok, message = False, (
+                "Not during the opening: greet the person first, then transfer.")
+        else:
+            ok, message = False, "Not during the opening."
+        asyncio.get_running_loop().create_task(
+            client.send_call_control_result(request_id, ok, message))
 
     async def _close_warmup_client(self, call) -> None:
         """Tear down a pre-warmed caller client that no live pipeline adopted.

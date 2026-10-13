@@ -30,8 +30,13 @@ import { useCoarsePointer } from '../../hooks/useCoarsePointer'
 import { usePrimaryPointerCoarse } from '../../hooks/usePrimaryPointerCoarse'
 import { usePasteGuard } from '../../hooks/usePasteGuard'
 import { useComposerHeight } from '../../hooks/useComposerHeight'
-import { enterAction, insertNewline, isComposingKey } from '../../lib/composerKeys'
-import { useAuth } from '../../contexts/AuthContext'
+import {
+  canPickFolder, collectDropped, collectPicked, insideFolder, splitDropForAttach,
+  FOLDER_PICKER_ATTRS, type CollectedItems,
+} from '../../lib/droppedItems'
+import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
+import { enterAction, insertNewline, isComposingKey, pasteAttachesFiles } from '../../lib/composerKeys'
+import { useFlag } from '../../hooks/useFlag'
 import { useTransferStore } from '../../store/transferStore'
 import { saveDocumentPane, useDocumentPushStore } from '../../store/documentPaneStore'
 import { Bar, fmtSize, pct } from '../common/TransferBar'
@@ -40,10 +45,8 @@ import ImageLightbox from './media/ImageLightbox'
 
 // Any file type is accepted (no extension allowlist — see lib/fileTypes);
 // the universal cap mirrors proxy config OTODOCK_MAX_FILE_MB (default 1GB) —
-// one number for every file type, sync + upload.
-// Shipped default; the per-install override rides user.feature_flags
-// (upload_max_bytes) — see useUploadCap below.
-const MAX_FILE_SIZE = 1024 * 1024 * 1024 // 1 GB (universal)
+// one number for every file type, sync + upload: the per-install value rides
+// user.feature_flags (upload_max_bytes), its default is in hooks/useFlag.
 
 /** How long the composer says a send went out before the document saved. */
 export const DOC_NOTICE_MS = 8000
@@ -157,6 +160,10 @@ interface Props {
   onRemoveImage: (id: string) => void
   pendingFiles: PendingFile[]
   onAddFiles: (files: PendingFile[]) => void
+  /** Attach a folder as one chip (its files, their paths inside it), or a
+   * promise of it while a dropped folder is read (the chip shows at once);
+   * a host without it turns a dropped folder away with an error chip. */
+  onAddFolder?: (name: string, items: CollectedItems | Promise<CollectedItems>) => void
   onRemoveFile: (id: string) => void
   /** Re-queue a failed upload from its error chip. The affordance renders
    * only for retryable failures (a file over the upload cap stays
@@ -212,6 +219,11 @@ async function isCameraAvailable(): Promise<boolean> {
   return isMobile
 }
 
+/** A collected folder's items with their paths taken inside it. */
+function inside(got: CollectedItems, top: string): CollectedItems {
+  return { ...got, files: insideFolder(got.files, top) }
+}
+
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10)
 }
@@ -238,6 +250,7 @@ export default function ChatInput({
   onRemoveImage,
   pendingFiles,
   onAddFiles,
+  onAddFolder,
   onRemoveFile,
   onRetryFile,
   workspaceOpen,
@@ -258,8 +271,7 @@ export default function ChatInput({
   const presenceDebugPhase = presenceDebugParam()
   // Per-install universal upload cap (OTODOCK_MAX_FILE_MB) with the shipped
   // default as fallback.
-  const { user } = useAuth()
-  const uploadCap = user?.feature_flags?.upload_max_bytes ?? MAX_FILE_SIZE
+  const uploadCap = useFlag('upload_max_bytes')
   // Live mirror of the controlled value — the STT session's onFinal closure is
   // created once (when the mic starts) and would otherwise capture a stale
   // value, making each dictated phrase REPLACE the input instead of append.
@@ -297,6 +309,7 @@ export default function ChatInput({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
   const docInputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const plusBtnRef = useRef<HTMLButtonElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -591,6 +604,19 @@ export default function ChatInput({
     docInputRef.current?.click()
   }
 
+  const handleUploadFolder = () => {
+    setMenuOpen(false)
+    folderInputRef.current?.click()
+  }
+
+  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = e.target.files ? Array.from(e.target.files) : []
+    e.target.value = ''
+    if (!picked.length || !onAddFolder) return
+    const top = (picked[0].webkitRelativePath || picked[0].name).split('/')[0]
+    onAddFolder(top, inside(collectPicked(picked), top))
+  }
+
   const canSend =
     !disabled &&
     !sendDisabled &&
@@ -632,9 +658,15 @@ export default function ChatInput({
           </p>
         )}
         {/* relative wrapper: the PresenceHalo canvas positions against the
-            pill; the pill's explicit z-[1] keeps content above the glow
+            pill; the pill's explicit z-index keeps content above the glow
             (before, that layering only held by accident of backdrop-blur's
-            stacking context). */}
+            stacking context) and, at z-40, lifts the popups that open
+            upward from the pill (the language menu, the model dropdown,
+            the mic hints) above every layer of the chat column (the
+            floating document pane at z-15, the terminal's permission bar
+            at z-20, the artifact windows at z-30): a popup's top rows over
+            a live terminal used to be caught by those. Modals and toasts
+            stay fixed at z-50. */}
         <div className="relative">
         {presenceDebugPhase ? (
           // ?presenceDebug=<phase> forces the halo with synthetic levels —
@@ -646,7 +678,7 @@ export default function ChatInput({
           <PresenceHalo phase={voice.duplex.phase} getLevels={voice.duplex.getLevels} />
         )}
         <div
-          className="relative z-[1] bg-white/90 dark:bg-gray-900/90 backdrop-blur-xs rounded-xl border border-p-border-light dark:border-gray-700 shadow-xs p-2"
+          className="relative z-40 bg-white/90 dark:bg-gray-900/90 backdrop-blur-xs rounded-xl border border-p-border-light dark:border-gray-700 shadow-xs p-2"
           // Drop zone for EXTERNAL files only (dataTransfer carries 'Files').
           // Internal agent-path drags never do, so their native text insert
           // into the textarea keeps working untouched. preventDefault on the
@@ -668,11 +700,23 @@ export default function ChatInput({
           }}
           onDrop={(e) => {
             if (disabled) return
-            const files = e.dataTransfer?.files
+            // A dropped folder reaches `files` as a placeholder no upload can
+            // read: it is walked through its entry and attached as one chip.
+            const { files, folders } = splitDropForAttach(e.dataTransfer)
             setDragDepth(0)
-            if (!files?.length) return // internal path drag → textarea handles it
+            if (!files.length && !folders.length) return // internal path drag → textarea handles it
             e.preventDefault()
-            void ingestFiles(files)
+            for (const folder of folders) {
+              if (!onAddFolder) {
+                onAddFiles([{
+                  id: generateId(), name: folder.name, size: 0, folder: true,
+                  error: 'Folders upload in the workspace here',
+                }])
+                continue
+              }
+              onAddFolder(folder.name, collectDropped([folder]).then((got) => inside(got, folder.name)))
+            }
+            if (files.length) void ingestFiles(files)
           }}
         >
           {dragDepth > 0 && (
@@ -732,12 +776,12 @@ export default function ChatInput({
                 const subText = f.error
                   ? f.error
                   : f.queued
-                    ? 'Queued'
+                    ? (f.folder && f.fileCount == null ? 'Reading the folder…' : 'Queued')
                     : uploadingNow
                       ? `${uploadPct}% · ${fmtSize(f.uploadSent ?? 0)} of ${fmtSize(f.uploadTotal ?? f.size)}`
                       : syncing
                         ? 'Syncing to machines…'
-                        : null
+                        : f.note || null
                 return (
                   <div
                     key={f.id}
@@ -762,12 +806,16 @@ export default function ChatInput({
                       ) : (
                         <svg className="w-4 h-4 text-p-text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                d={f.folder ? FOLDER_ICON_PATH : FILE_ICON_PATH} />
                         </svg>
                       )}
                       <span className="text-xs text-p-text truncate max-w-[100px]">{f.name}</span>
-                      <span className="text-xs text-p-text-light shrink-0">{formatFileSize(f.size)}</span>
-                      {f.error && onRetryFile && f.size <= uploadCap && (
+                      <span className="text-xs text-p-text-light shrink-0">
+                        {f.folder
+                          ? f.fileCount == null ? 'Folder' : `${f.fileCount} file${f.fileCount === 1 ? '' : 's'}`
+                          : formatFileSize(f.size)}
+                      </span>
+                      {f.error && onRetryFile && ((f.file && f.size <= uploadCap) || f.folderFiles) && (
                         <button
                           onClick={() => onRetryFile(f.id)}
                           aria-label="Retry upload"
@@ -933,6 +981,18 @@ export default function ChatInput({
                     </svg>
                     Upload File
                   </button>
+                  {onAddFolder && canPickFolder() && (
+                    <button
+                      onClick={handleUploadFolder}
+                      className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-p-text
+                                 hover:bg-p-surface-hover transition-colors"
+                    >
+                      <svg className="w-4 h-4 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={FOLDER_ICON_PATH} />
+                      </svg>
+                      Upload Folder
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -974,10 +1034,15 @@ export default function ChatInput({
               onPaste={(e) => {
                 pasteGuard.onPaste()
                 // Ctrl/Cmd+V with files on the clipboard (screenshots, copied
-                // files) attaches them exactly like the + menu; plain text
-                // pastes are untouched.
+                // files) attaches them exactly like the + menu; a paste from
+                // an office suite (its text beside a picture of it) inserts
+                // the text instead, and plain text pastes are untouched.
                 const files = e.clipboardData?.files
-                if (files && files.length > 0 && !disabled) {
+                const clip = e.clipboardData
+                if (files && files.length > 0 && !disabled
+                    && pasteAttachesFiles(clip.getData?.('text/plain') ?? '', files,
+                                          (clip.getData?.('text/html') ?? '')
+                                          + (clip.getData?.('text/rtf') ?? ''))) {
                   e.preventDefault()
                   void ingestFiles(files)
                 }
@@ -985,7 +1050,7 @@ export default function ChatInput({
               placeholder={placeholder || 'Type a message...'}
               disabled={disabled}
               rows={1}
-              className="flex-1 resize-none rounded-lg px-3 py-2 text-sm pointer-coarse:text-base bg-transparent
+              className="flex-1 resize-none rounded-lg px-3 py-2 text-sm bg-transparent
                          focus:outline-hidden order-first basis-full
                          disabled:text-p-text-light placeholder:text-p-text-light"
             />
@@ -1079,6 +1144,14 @@ export default function ChatInput({
             multiple
             onChange={handleDocSelect}
             className="hidden"
+          />
+          {/* Hidden folder picker — desktop browsers only */}
+          <input
+            ref={folderInputRef}
+            type="file"
+            onChange={handleFolderSelect}
+            className="hidden"
+            {...FOLDER_PICKER_ATTRS}
           />
         </div>
         </div>

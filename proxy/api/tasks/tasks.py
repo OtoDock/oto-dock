@@ -32,7 +32,7 @@ from auth import roles
 from core.session import visibility as _vis
 from ws import wire_events as wire
 
-logger = logging.getLogger("claude-proxy.task-api")
+logger = logging.getLogger("otodock.task-api")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -722,7 +722,8 @@ def _make_model_resolver():
         # getattr, not attribute access: the listing also renders duck-typed
         # task defs (the scoping tests' minimal stubs), and task_config_builder
         # reads the same fields the same way.
-        override_model = getattr(t, "override_model", None) or ""
+        # The pin as the run will use it: a retired id as its successor.
+        override_model = config.live_model_id(getattr(t, "override_model", None) or "")
         override_path = getattr(t, "override_execution_path", None) or ""
         path = override_path or (_agent(t.agent).get("execution_path") or "")
         key = (t.agent, path)

@@ -49,8 +49,8 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   account already connected only refreshes it and the form says so; a refused paste
   offers Try again.
 - **Audio**: voice/dictation engine choice (only when the admin policy is *User
-  choice*), dictation language (also picked by holding the chat's microphone button),
-  device-native voice.
+  choice*), dictation language (**Automatic** lets the provider recognise it; also
+  picked by holding the chat's microphone button), device-native voice.
 - **Usage**: own platform-API usage vs own-subscription reference, daily chart,
   per-agent breakdown. Read-only.
 
@@ -121,9 +121,10 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   budgets (weekly/monthly).
 - **MCP Servers**: core/custom/community inventory; enable/config/instances/delete per
   tool; **Check Updates**; **Install** (ZIP); **Browse Community**. **Check Updates**
-  results stay on the page; an MCP whose catalog source changed shows the old and new
-  source, the credential plan and **Switch** *(admin)*; an install ahead of the catalog
-  shows **Revert to catalog**. An MCP whose vendor server signs people in
+  results stay on the page; the weekly run takes a release once it is seven days old
+  and **Update** applies it at once; an MCP whose catalog source changed shows the old
+  and new source, the credential plan and **Switch** *(admin)*; an install ahead of the
+  catalog shows **Revert to catalog**. An MCP whose vendor server signs people in
   itself shows this install's client registration at the vendor (client id,
   callback, times) with **Forget**.
 - **Skills**: installed skill packages; Check Updates / Update / Delete; **Browse
@@ -145,12 +146,13 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   - **AI Engines**: platform subscriptions, API keys, local endpoints, model lists +
     pricing per layer (Claude Code, Codex, Direct LLM) and, per custom/local model,
     its capability tier + one-line "good at" (builtins are fixed).
-  - **OtoDock**: license & billing.
+  - **OtoDock**: this install's version and whether a newer release is out; license &
+    billing.
   - **Audio**: chat audio policy; STT/TTS provider cards (keys, per-language voices,
     defaults).
   - **Phone**: phone servers (Twilio / FreePBX / Asterisk) · routes (agent, language,
-    PIN, call log) · call prompts · languages · turn classifier · infrastructure ·
-    advanced tuning.
+    the caller's language, transfer targets, PIN, call log) · call prompts · languages ·
+    turn classifier · infrastructure · advanced tuning.
   - **Security**: require 2FA, passkey mode, password policy, SMTP, Turnstile bot
     protection, OAuth bearer allowlist, **Sharing** (Sharing to agents · Sharing to
     departments · External links · Links without a password · User directory when
@@ -162,10 +164,11 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
     for ever, its own on/off; the list with each archive's size and date, and **Delete
     now**) · **Storage Quotas** (per-agent shared + per-user folder caps) · chat title
     generation (Auto: the first configured Direct LLM provider, Groq, then OpenAI,
-    then Anthropic, whose title model is Sonnet 5.5, then a local Ollama model; a
+    then Anthropic, whose title model is Haiku 5.5, then a local Ollama model; a
     pinned model keeps titling while its provider is configured) ·
-    **Automatic MCP Updates** (weekly, includes skill packages; never applies a catalog
-    source change, which waits for an admin's Switch, and never moves an install back).
+    **Automatic MCP Updates** (weekly, includes skill packages; takes a release once it
+    is seven days old; never applies a catalog source change, which waits for an
+    admin's Switch, and never moves an install back).
 
 ## Quick answers to frequent "where/who" questions
 
@@ -204,3 +207,8 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 | Retry a turn that stopped with a card | **Send again** on the card *(the chat's author; once no turn runs)* |
 | Sign in to a hosted MCP server that signs people in itself | User Settings → Integrations → Connected Accounts *(any)*; the install's registration at the vendor is under Admin → MCP Servers → Forget *(admin)* |
 | Switch a machine's automatic updates off | Admin → Remote Machines → the machine card *(admin)* |
+| See the running version, or whether a newer release is out | Setup → OtoDock *(admin)* |
+| Back up or restore the install | `backup.sh` and `restore.sh` on the server *(admin)* |
+| Let an agent transfer a caller, follow the caller's language, or ask for a PIN | Setup → Phone → the route *(admin)* |
+| Upload a whole folder | drop it on the chat or the workspace *(any)* |
+| "Connect from the address in DASHBOARD_PUBLIC_URL" when connecting an account | open the dashboard at that address *(any)* |

@@ -35,6 +35,8 @@ export interface ModelGroup {
 export interface LayerCatalogEntry {
   display_name: string
   models?: { value: string; label: string; tier?: number | null; tier_label?: string; good_at?: string }[]
+  auto_model?: string
+  model_successors?: Record<string, string>
 }
 
 /** Rank within an engine group: tier first (untiered last), catalog order
@@ -110,4 +112,39 @@ export function computeModelGroups(
     }
   }
   return groups.length > 0 ? groups : undefined
+}
+
+/** The model a NEW chat opens on when its seed (the person's sticky pick,
+ * else the agent's default) is not offered. In order: each candidate as it
+ * is, or as the model it runs as today (`model_successors`: a retired id's
+ * successor); then the engine's own default (`auto_model`, the first
+ * visible engine whose group offers it — the catalog's provider filter is
+ * not the resolver's, so it may be absent); then the first row. Never the
+ * first row while something better is offered: the groups are
+ * tier-ordered, so that row is the engine's most expensive model. Returns
+ * null when no group has a row. Nothing it returns is a person's pick, so
+ * the caller never writes it as the sticky choice. */
+export function pickSeedModel(
+  groups: ModelGroup[],
+  layers: Record<string, LayerCatalogEntry> | undefined,
+  candidates: string[],
+): { layer: string; model: string } | null {
+  const offers = (g: ModelGroup, model: string) =>
+    !!model && g.models.some((m) => m.value === `${g.layer}::${model}`)
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    for (const g of groups) {
+      if (offers(g, candidate)) return { layer: g.layer, model: candidate }
+      const live = layers?.[g.layer]?.model_successors?.[candidate]
+      if (live && offers(g, live)) return { layer: g.layer, model: live }
+    }
+  }
+  for (const g of groups) {
+    const auto = layers?.[g.layer]?.auto_model
+    if (auto && offers(g, auto)) return { layer: g.layer, model: auto }
+  }
+  const first = groups[0]?.models[0]
+  if (!first) return null
+  const sep = first.value.indexOf('::')
+  return { layer: first.value.slice(0, sep), model: first.value.slice(sep + 2) }
 }

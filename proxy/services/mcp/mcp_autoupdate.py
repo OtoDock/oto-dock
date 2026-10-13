@@ -5,7 +5,15 @@ window this applies every available **community-MCP** update:
 
   * stdio (npm/pypi) MCPs update immediately — running sessions keep their
     already-spawned subprocess, new sessions get the new version (graceful by
-    construction), so there is nothing to defer.
+    construction), so there is nothing to defer — to the newest release public
+    for ``mcp_updater.RELEASE_MIN_AGE`` (seven days): a younger one waits for a
+    later run or an admin's Update.
+  * git+ MCPs are built when the catalog pins the new ref to a full commit,
+    at once (the catalog's bump is a reviewed change, so no waiting period);
+    a tag or branch ref is never built unattended (it can move upstream with
+    no catalog change) and its offer waits. A failed build keeps the old
+    install (the installer's rollback) and is recorded ``failed``; paired
+    machines rebuild at their next sync.
   * docker MCPs share one long-lived container that a force-recreate would
     disrupt, so each is updated only when no live session holds it
     (``mcp_updater.mcp_in_use``); busy ones are deferred and re-checked, and if
@@ -40,12 +48,14 @@ import uuid
 from datetime import datetime, timezone
 
 import config
+from services.mcp import mcp_installer
 from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_updater
 from storage import database as task_store
 from storage.mcp import mcp_autoupdate_store as log_store
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy.mcp-autoupdate")
+logger = logging.getLogger("otodock.mcp-autoupdate")
 
 # Scheduling (module-level so tests can monkeypatch).
 LAST_RUN_KEY = "mcp_auto_update_last_run"
@@ -145,7 +155,7 @@ async def maybe_run_weekly() -> None:
     # Claim the slot up front so the next 60s tick sees "not due" even while the
     # run (incl. the multi-hour defer loop) is still in flight.
     await run_db(_set_last_run, now)
-    asyncio.create_task(_run_guarded(trigger="auto"))
+    spawn(_run_guarded(trigger="auto"), name="run_guarded", owner="mcp_autoupdate")
 
 
 async def _run_guarded(trigger: str) -> None:
@@ -220,6 +230,32 @@ async def run_auto_update(trigger: str = "auto") -> dict:
                     "mcp autoupdate: %s installed %s is ahead of the catalog %s; "
                     "left alone", name, info.get("current", "?"),
                     info.get("latest", "?"),
+                )
+                continue
+            if mcp_updater._is_git(targets[name]):
+                if not info.get("pinned_commit"):
+                    # A tag or a branch can move upstream with no catalog
+                    # change: never built unattended (the offer stays).
+                    logger.info(
+                        "mcp autoupdate: %s's catalog source pins no commit; %s → %s "
+                        "is left for an admin", name, info.get("current", "?"), info.get("latest", "?"),
+                    )
+                    continue
+                logger.info(
+                    "mcp autoupdate: building %s from %s to the catalog's commit %s (%s → %s)",
+                    name, _git_ref(targets[name]), str(info.get("catalog_ref") or "?")[:12],
+                    info.get("current", "?"), info.get("latest", "?"),
+                )
+                status, err = await _update_and_record(run_id, name, info, targets[name], trigger)
+                counts[status] = counts.get(status, 0) + 1
+                if status == log_store.STATUS_FAILED:
+                    failed.append((name, err))
+                continue
+            if _waits(info):
+                logger.info(
+                    "mcp autoupdate: %s %s waits for its release to settle "
+                    "(applies after %s)", name, info.get("latest", "?"),
+                    info.get("auto_after") or "an admin's Update",
                 )
                 continue
             if _mt.is_container(targets[name].server):
@@ -348,6 +384,32 @@ async def _process_docker_with_defer(
         await asyncio.sleep(DEFER_RECHECK_S)
 
 
+def _git_ref(manifest) -> str:
+    """The installed git ref, shortened for the log."""
+    parsed = mcp_installer.parse_source(getattr(manifest.server, "source", "") or "")
+    ref = parsed.version if parsed is not None else ""
+    return ref[:12] if ref else "no ref"
+
+
+def _waits(info: dict) -> bool:
+    """Whether an npm/pypi offer waits for its release to settle
+    (``mcp_updater.RELEASE_MIN_AGE``): a package offer with nothing settled
+    newer than the install, or a manifest change beside a package release
+    that has not settled (the converge waits whole). A row without the
+    ``settled`` field (a container, a skill, a check before 1.8.0) and a
+    rebuild never wait."""
+    if "settled" not in info or info.get("rebuild"):
+        # A venv the sandbox cannot run is repaired at once, on the settled
+        # release or the installed one (update_one decides).
+        return False
+    reason = info.get("reason")
+    if reason == "package":
+        return not info.get("settled")
+    if reason == "both":
+        return info.get("settled") != info.get("latest")
+    return False
+
+
 async def _update_and_record(run_id, name, info, manifest, trigger) -> tuple[str, str]:
     """Run one update, log the result, return (status, error)."""
     runtime = manifest.server.runtime
@@ -358,13 +420,18 @@ async def _update_and_record(run_id, name, info, manifest, trigger) -> tuple[str
         "mcp autoupdate: updating %s (reason=%s)", name, info.get("reason", "package"),
     )
     try:
-        result = await mcp_updater.update_one(name)
+        result = await mcp_updater.update_one(name, settled_only=True)
     except Exception as e:
         err = str(e)
         logger.warning("mcp autoupdate: %s failed: %s", name, err)
         _record(run_id, name, runtime, old_version, info.get("latest", ""),
                 log_store.STATUS_FAILED, err, trigger)
         return log_store.STATUS_FAILED, err
+
+    if result.get("status") == "waiting":
+        # A release published between the check and the update: no row.
+        logger.info("mcp autoupdate: %s waits for its release to settle", name)
+        return log_store.STATUS_NO_CHANGE, ""
 
     if result.get("status") == "updated":
         new_version = result.get("version", info.get("latest", ""))

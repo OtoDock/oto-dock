@@ -225,7 +225,8 @@ def test_the_claude_sandbox_copy_is_per_session_and_keeps_the_sentinel(tmp_path)
     assert vendor["headers"]["Authorization"] == SESSION_JWT_SENTINEL_BEARER
     assert "xoxb-real" not in (host_dir / "agent-abc123-sess-1234567.json").read_text()
     tool = written["mcpServers"]["tool"]
-    assert tool["command"] == "python3"
+    from core.sandbox.session_config_dir import sandbox_python
+    assert tool["command"] == sandbox_python()
     assert tool["args"][:3] == ["-I", "/users/alice/.claude/stdio_path_interceptor.py", "--"]
     assert mcp_broker.verify_token(tool["env"]["OTO_MCP_FETCH_TOKEN"]) == ("sess-1234567890ab", "tool")
 

@@ -14,9 +14,11 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import uuid
 from pathlib import Path
 import config
+from typing import TYPE_CHECKING
 from core.execution_layer import PERMISSION_MODES, PLAN_MODE
 from storage import database as task_store
 from storage.pg import run_db
@@ -51,6 +53,7 @@ from ws.dashboard import (
 )
 from ws.dashboard_chat_text import (
     _APP_ACTION_HEADER_RE, _TIME_PRELUDE_RE, _provider_switch_blocker, interactive_prelude,
+    live_model,
 )
 from core.session import session_kind, visibility as _vis
 from core.sandbox.session_config_dir import AgentStateRefused, refuse_agent_state_below_editor
@@ -62,7 +65,12 @@ from auth.providers import acting_role_of
 from ws import wire_events as wire
 from core import layout
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 # Which chats run as the agent, by id. A chat's owner and agent never
 # change, so one read per chat per process answers whether the drive gate
@@ -171,12 +179,24 @@ def _reattach_saved_photo(agent: str, agent_dir: Path, rel_path: str, expected_p
     }
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _scoped_files(agent_dir: Path, expected_prefix: str, files: list[dict]) -> list[dict]:
     """The attached files whose path stays inside the chat's scope root once
-    resolved and names a regular file, checked in one worker-thread job.
-    Nothing is read here: the agent opens the file in its own sandbox."""
+    resolved and names a regular file or a folder (a folder attached in
+    chat, marked ``folder: True``), checked in one worker-thread job. Each
+    is listed by its RESOLVED agent-relative path, never the client's text
+    (the prompt prints it), and a path with a control character is left
+    out. Nothing is read here: the agent opens the file in its own sandbox."""
     valid: list[dict] = []
-    expected_root = (agent_dir / expected_prefix).resolve()
+    try:
+        # Both roots resolved: ``relative_to`` against an unresolved one
+        # raises ValueError for a resolved path.
+        agent_root = agent_dir.resolve()
+        expected_root = (agent_dir / expected_prefix).resolve()
+    except OSError:
+        return valid
     for f in files:
         fpath = f.get("path", "")
         fname = f.get("name", "")
@@ -184,9 +204,16 @@ def _scoped_files(agent_dir: Path, expected_prefix: str, files: list[dict]) -> l
             continue
         try:
             full = (agent_dir / fpath).resolve()
-            if full.is_relative_to(expected_root) and full.is_file():
-                valid.append({"path": fpath, "name": fname})
-        except OSError:
+            if not full.is_relative_to(expected_root) or full == expected_root:
+                continue
+            rel = full.relative_to(agent_root).as_posix()
+            if _CONTROL_CHARS.search(rel) or _CONTROL_CHARS.search(fpath):
+                continue
+            if full.is_file():
+                valid.append({"path": rel, "name": fname})
+            elif full.is_dir():
+                valid.append({"path": rel, "name": fname, "folder": True})
+        except (OSError, ValueError):
             continue
     return valid
 
@@ -203,7 +230,7 @@ def _discard_photos(agent: str, rels: list[str]) -> None:
                            agent, rel, type(exc).__name__)
 
 
-class ChatSupportMixin:
+class ChatSupportMixin(_Host):
     """Support and controls: titles, first-prompt persistence, cancelled context,"""
 
     def _deterministic_title(self, text: str) -> str:
@@ -563,12 +590,18 @@ class ChatSupportMixin:
             from api.media.uploads import FILE_TYPE_LABELS
             valid_files = await asyncio.to_thread(_scoped_files, agent_dir, expected_prefix, files)
             if valid_files:
+                folders = sum(1 for vf in valid_files if vf.get("folder"))
                 cli_text += f"\n\nThe user has attached {len(valid_files)} file(s):\n"
                 for vf in valid_files:
+                    if vf.get("folder"):
+                        cli_text += f"- /{vf['path']}/ (Folder)\n"
+                        continue
                     ext = Path(vf["name"]).suffix.lower()
                     label = FILE_TYPE_LABELS.get(ext, "File")
                     cli_text += f"- /{vf['path']} ({label})\n"
                 cli_text += "\nRead the file(s) using the Read tool to see their contents.\n"
+                if folders:
+                    cli_text += "List a folder's contents first, then read what the task needs.\n"
         return cli_text, attached_images, image_meta, valid_files
 
     async def _flush_pending_control_requests(self):
@@ -877,7 +910,7 @@ class ChatSupportMixin:
         # support — the hook system uses session_state, not CLI's internal mode.
 
     async def _handle_model_change(self, msg: dict):
-        new_model = msg.get("model", "")
+        new_model = await live_model(msg.get("model", ""))
         if not new_model:
             await self._send_error("Model required")
             return

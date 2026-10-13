@@ -26,16 +26,30 @@ import logging
 import time
 
 from fastapi import WebSocket, WebSocketDisconnect, Query
+from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 import config
 from services.phone import phone_config
 from services.phone.phone_config import assemble_phone_config, _management_clients
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 _PING_INTERVAL_S = 30
 _PONG_TIMEOUT_S = 60
+
+# What the socket raises once the daemon's side is gone: a disconnect frame,
+# the websockets library's close, uvicorn's lost connection.
+_GONE = (WebSocketDisconnect, ConnectionClosed, ClientDisconnected)
+# While the socket opens, also the state error a send meets after uvicorn
+# skipped the handshake of a server that is stopping (a daemon reconnecting
+# during a proxy restart). Caught around the socket's own calls only.
+_GONE_WHILE_OPENING = (*_GONE, RuntimeError)
+
+
+def _gone_while_opening(e: BaseException) -> None:
+    logger.info("Phone management: the daemon's socket closed while opening (%s)",
+                type(e).__name__)
 
 
 async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(default="")):
@@ -48,20 +62,35 @@ async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(def
     bearer = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
     if key:
         logger.warning("phone WS: ignoring legacy ?key= query auth — use the Authorization header")
-    if not config.is_master_key(bearer):
-        await websocket.close(code=4001, reason="Invalid API key")
+    authorized = config.is_master_key(bearer)
+    try:
+        if not authorized:
+            await websocket.close(code=4001, reason="Invalid API key")
+            return
+        await websocket.accept()
+    except _GONE_WHILE_OPENING as e:
+        _gone_while_opening(e)
         return
-
-    await websocket.accept()
     logger.info("Phone management WebSocket connected")
 
-    _management_clients.add(websocket)
     last_pong = time.monotonic()
 
     try:
-        # Send full config immediately on connect
+        # Registered before the full config is assembled, so a change saved
+        # meanwhile reaches it as a push; the finally below unregisters it on
+        # every exit.
+        _management_clients.add(websocket)
         config_data = assemble_phone_config()
-        await websocket.send_json({"type": "config_full", "data": config_data})
+        try:
+            # Before the daemon's capabilities frame the push carries no
+            # outbound PIN; the frame below re-sends the full config.
+            await websocket.send_json({
+                "type": "config_full",
+                "data": phone_config.config_for_daemon(config_data, None),
+            })
+        except _GONE_WHILE_OPENING as e:
+            _gone_while_opening(e)
+            return
         logger.info(f"Phone management: sent config_full (version={config_data['version']})")
 
         # Concurrent read + ping loop
@@ -105,6 +134,13 @@ async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(def
                     logger.info(
                         f"Phone management: daemon capabilities {caps}"
                     )
+                    if caps.get(phone_config.OUTBOUND_PIN_CAPABILITY):
+                        # The connect-time push withheld the outbound PINs;
+                        # a daemon that gates outbound calls gets them now.
+                        await websocket.send_json({
+                            "type": "config_update",
+                            "data": phone_config.config_for_daemon(assemble_phone_config(), caps),
+                        })
 
                 elif msg_type == "duplex_open_failed":
                     from ws import duplex as ws_duplex
@@ -117,16 +153,17 @@ async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(def
                     config_data = assemble_phone_config()
                     await websocket.send_json({
                         "type": "config_full",
-                        "data": config_data,
+                        "data": phone_config.config_for_daemon(
+                            config_data, phone_config.management_capabilities(websocket)),
                     })
                     logger.info("Phone management: config re-pushed on request")
 
-        except (WebSocketDisconnect, ConnectionClosed):
+        except _GONE:
             pass
         finally:
             ping_task.cancel()
 
-    except (WebSocketDisconnect, ConnectionClosed):
+    except _GONE:
         pass
     except Exception as e:
         logger.error(f"Phone management WebSocket error: {e}", exc_info=True)

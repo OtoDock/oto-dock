@@ -78,6 +78,30 @@ def test_an_unreachable_platform_is_held_until_it_answers(gate, monkeypatch):
     assert gate._slept == [2.0, 4.0, 8.0]
 
 
+def test_a_crashed_gate_denies_the_call(tmp_path):
+    """The script's own crash prints a deny and exits 0: both CLIs read a
+    non-zero exit as "continue", and Claude Code's onFailure block cannot see
+    an exit 0 with no output. A JSON array on stdin is a payload main cannot
+    read (``inp.get``), the breadcrumb lands in OTO_HOOK_LOG."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    log = tmp_path / "hook-error.log"
+    env = {**os.environ, "PROXY_URL": "http://127.0.0.1:1", "PROXY_API_KEY": "k",
+           "OTO_HOOK_LOG": str(log)}
+    out = subprocess.run(
+        [sys.executable, "-I", str(PROXY_DIR / "hooks" / "permission_gate.py")],
+        input="[]", capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert out.returncode == 0, out.stderr
+    decision = json.loads(out.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert "gate error" in decision["permissionDecisionReason"]
+    assert "AttributeError" in log.read_text()
+
+
 def test_the_hold_ends_after_120_seconds_with_none(gate, monkeypatch):
     _answers(gate, monkeypatch, [_http(503)] * 50)
     assert gate._request_decision(object()) is None
@@ -130,3 +154,26 @@ def test_the_hold_counts_from_the_first_failure(gate, monkeypatch):
     monkeypatch.setattr(gate.urllib.request, "urlopen", urlopen)
     assert gate._request_decision(object()) == {"decision": "allow"}
     assert gate._slept == [600.0, 2.0]
+
+
+def test_the_gate_stamps_its_call_with_this_hosts_clock(gate, monkeypatch):
+    """The body carries ``hook_sent_at`` (the gate host's wall clock, the one
+    the CLI's transcript lines carry): a terminal parked on the dialog this
+    call opens ignores lines journaled before it."""
+    import json
+    sent = []
+
+    def urlopen(req, timeout=0):
+        sent.append(json.loads(req.data))
+        return _Resp(b'{"decision": "allow"}')
+
+    monkeypatch.setattr(gate.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(gate.time, "time", lambda: 1234.5)
+    monkeypatch.setenv("OTO_SESSION_ID", "s1")
+    monkeypatch.setenv("PROXY_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("PROXY_API_KEY", "k")
+    monkeypatch.setattr(gate.sys, "stdin", io.StringIO(json.dumps(
+        {"tool_name": "AskUserQuestion", "tool_input": {}, "permission_mode": "default"})))
+    monkeypatch.setattr(gate.sys, "stdout", io.StringIO())
+    gate.main()
+    assert sent and sent[0]["hook_sent_at"] == 1234.5 and sent[0]["tool_name"] == "AskUserQuestion"

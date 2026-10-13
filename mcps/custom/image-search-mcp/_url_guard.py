@@ -19,10 +19,12 @@ address that label resolves to must be publicly routable; an empty or
 failed resolution is a refusal. A redirect is the caller's: fetch with
 ``follow_redirects=False`` and validate every ``Location`` again.
 
-What it does not do, stated: the HTTP client resolves the name a second
+What it does not do, stated: an HTTP client resolves the name a second
 time when it connects, so a record that answers differently between the
-two lookups (DNS rebinding) is not caught here — closing that means
-pinning the checked address into the transport.
+two lookups (DNS rebinding) is not caught by this check alone. The proxy's
+callers fetch through ``pinned_http``, which judges every address again at
+the dial and connects only to the ones it judged; the MCP copies have no
+such transport.
 """
 
 from __future__ import annotations

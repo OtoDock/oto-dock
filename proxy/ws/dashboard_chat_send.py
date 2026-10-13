@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import config
+from typing import TYPE_CHECKING
 from core import placement
 from storage import database as task_store
 from storage.pg import run_db
@@ -21,7 +22,7 @@ from core.session.session_state import (
 )
 from core.events.common_events import TurnInput
 from core.events.stream_pump import (
-    _active_pumps,
+    _active_pumps, shelve_undelivered,
 )
 from core.session import warmup_registry, visibility as _vis, interactive_session
 # Imported by ws/dashboard.py AFTER its helpers are defined —
@@ -30,15 +31,22 @@ from ws.dashboard import (
     _role_and_layer,
 )
 from ws.dashboard_chat_text import (
-    HEAL_ANSWERED, HEAL_READY, HEAL_RECONNECTING, RECONNECTING_NOT_SENT, TurnDeferred,
+    HEAL_ANSWERED, HEAL_READY, HEAL_RECONNECTING, HEAL_REFUSED, LIVE_TERMINAL_REFUSED,
+    LIVE_TERMINAL_TYPED, RECONNECTING_NOT_SENT, TurnDeferred,
     _REVIVAL_WAIT_S, grace_layer,
 )
 from ws import wire_events as wire
+from core.background import spawn
 
-logger = logging.getLogger("claude-proxy")
+if TYPE_CHECKING:
+    from ws.dashboard_host import DashboardHost as _Host
+else:
+    _Host = object
+
+logger = logging.getLogger("otodock")
 
 
-class ChatSendMixin:
+class ChatSendMixin(_Host):
     """User sends: the chat turn itself, stop-and-send, delivery into a live"""
 
     async def _pool_cap_gate(self) -> str:
@@ -114,8 +122,9 @@ class ChatSendMixin:
         none, re-warmed when it died (a live interactive revival takes the
         send instead), recycled when a Shared-only chat changed sender, given
         the mode or model picked while it was away. ``HEAL_ANSWERED`` when the
-        send was answered here (typed into a live terminal or refused
-        read-only) and the caller stops; ``HEAL_RECONNECTING`` when its
+        send was typed into a live terminal, ``HEAL_REFUSED`` when a
+        teammate's live terminal refused it read-only (the caller stops
+        either way); ``HEAL_RECONNECTING`` when its
         machine is still reconnecting after the wait (nothing was touched,
         the send waits); else ``HEAL_READY``. ``msg`` is the composer frame a
         live terminal would take."""
@@ -143,8 +152,9 @@ class ChatSendMixin:
                 # below spawns a headless TWIN on the same session id whose
                 # stale sibling's eventual teardown wipes the survivor's
                 # permission/secret state (incident 2026-08-06, chat 9f56bf65).
-                if await self._deliver_chat_to_live_interactive(msg):
-                    return HEAL_ANSWERED
+                live = await self._deliver_chat_to_live_interactive(msg)
+                if live:
+                    return HEAL_REFUSED if live == LIVE_TERMINAL_REFUSED else HEAL_ANSWERED
                 # Single-flight: a warmup already in flight for this chat (the
                 # chat-open revival racing this send) owns the respawn — await
                 # it bounded, then re-check BOTH registries. Only a still-dead
@@ -164,8 +174,9 @@ class ChatSendMixin:
                             f"chat={self.chat_id} still running after "
                             f"{_REVIVAL_WAIT_S:.0f}s — falling back to auto-warm"
                         )
-                    if await self._deliver_chat_to_live_interactive(msg):
-                        return HEAL_ANSWERED
+                    live = await self._deliver_chat_to_live_interactive(msg)
+                    if live:
+                        return HEAL_REFUSED if live == LIVE_TERMINAL_REFUSED else HEAL_ANSWERED
                     # The finished warmup may have bound a NEW session id to the
                     # chat row — adopt it (+ its layer) before re-checking.
                     _cur = await run_db(task_store.get_chat, self.chat_id) or {}
@@ -231,7 +242,7 @@ class ChatSendMixin:
                 _isess = interactive_session.get(self.session_id)
                 if _isess is not None and not _isess.may_drive(self.user_sub):
                     await self._send_pty_read_only(_isess)
-                    return HEAL_ANSWERED
+                    return HEAL_REFUSED
                 pump = _active_pumps.get(self.chat_id)
                 turn_in_flight = bool(pump and not pump.is_done)
                 if not turn_in_flight and not self._session_serves_sender(self.session_id):
@@ -355,20 +366,33 @@ class ChatSendMixin:
                                label="abort_flags_restore")
 
     @staticmethod
-    async def _push_batch_attachments(agent: str, batch: TurnInput) -> None:
-        """The batch's photos and files, pushed again to the agent's machines
-        before its turn: one uploaded while the chat's machine was away never
-        reached it, and the reconnect takes the session back without the
-        reconcile a session start runs."""
+    async def _push_batch_attachments(agent: str, batch: TurnInput, session_id: str) -> None:
+        """The batch's photos and files, pushed before its turn to the
+        chat's own machine when it lacks them: one uploaded while that
+        machine was away never reached it, and the reconnect takes the
+        session back without the reconcile a session start runs. A session
+        the remote layer does not hold now (local, or remote but untracked)
+        pushes nothing: its next start reconciles the files. The fan-out's
+        isolation check still decides whether the machine may hold each."""
         rels = [m.get("path") or "" for m in batch.image_meta] + [
             f.get("path") or "" for f in batch.files]
         if not any(rels):
             return
-        from api.media.uploads import _push_upload_to_active_remote_sessions
+        from core.remote import remote_file_flow
+        machine = remote_file_flow.remote_machine_id(session_id)
+        if not machine:
+            return
+        from services.remote import workspace_fanout
         agent_dir = config.get_agent_dir(agent)
         for rel in filter(None, rels):
             try:
-                await _push_upload_to_active_remote_sessions(agent, rel, agent_dir / rel)
+                size = (agent_dir / rel).stat().st_size
+                held = await remote_file_flow.stat_probe(session_id, rel)
+                if held and held.get("exists") and held.get("size") == size:
+                    continue  # an upload path is written once
+                await workspace_fanout.fan_out_write(
+                    agent, rel, agent_dir / rel, include_idle=True,
+                    transfer_kind="upload", only_machine_id=machine)
             except Exception:
                 logger.warning(f"queued turn: attachment {rel} not pushed again", exc_info=True)
 
@@ -383,7 +407,8 @@ class ChatSendMixin:
         cap, then the turn headless (``_start_new_stream`` with the
         producer that drains the chat queue), on a session that serves this
         person (a Shared-only session warmed by someone else is closed and
-        re-warmed as them). Never a live terminal. Returns
+        re-warmed as them). A live terminal takes the batch only when it is
+        the person's own (typed in); a teammate's makes it wait. Returns
         ``(DELIVERY_SENT, "")``, ``(DELIVERY_GATED, why)`` (the items go back
         with the card) or ``(DELIVERY_DEFERRED, why)`` (they wait for the
         next pump end or touch), from ``input_queue``."""
@@ -405,8 +430,28 @@ class ChatSendMixin:
         refusal = await self._sender_refusal(chat_id, chat)
         if refusal:
             return input_queue.DELIVERY_GATED, refusal
-        if interactive_session.find_live_for_chat(chat_id) is not None:
-            return input_queue.DELIVERY_DEFERRED, "a live terminal drives the chat"
+        live_term = interactive_session.find_live_for_chat(chat_id)
+        if live_term is not None:
+            if not live_term.may_drive(self.user_sub):
+                # It waits for the teammate's terminal to close (the close arms
+                # the queue); its chip says so.
+                for qi in taken:
+                    qi.waiting = input_queue.WAITING_TERMINAL
+                return input_queue.DELIVERY_DEFERRED, "a teammate's live terminal drives the chat"
+            # The person's own terminal (the one their interactive warmup
+            # opened): the batch is typed into it, as their send to it is,
+            # and its one row stands for the queued ones.
+            batch = TurnInput.combine([qi.item for qi in taken])
+            await self._type_into_terminal(live_term, chat_id, batch.text, batch.cli_text,
+                                           batch.event_meta)
+            q = await input_queue.loaded(chat_id)
+            await q.drop_job(taken)
+            input_queue.fan_out(chat_id, {"type": wire.QUEUE_SENT,
+                                          "queue_ids": [qi.queue_id for qi in taken],
+                                          "message_ids": [], "text": batch.text,
+                                          **batch.frame_fields()},
+                                authors=(self.user_sub,))
+            return input_queue.DELIVERY_SENT, ""
         layer = await self._resolve_layer_for_chat_async(chat_id)
         sid = chat.get("session_id") or ""
         if layer is None or not sid:
@@ -424,7 +469,7 @@ class ChatSendMixin:
                         f"sender, closed so the turn re-warms as its author")
             await layer.close_session(sid)
         batch = TurnInput.combine([qi.item for qi in taken])
-        await self._push_batch_attachments(chat.get("agent") or "", batch)
+        await self._push_batch_attachments(chat.get("agent") or "", batch, sid)
         prompt, consumed = await self._prepared_prompt(chat_id, batch.cli_text,
                                                        new_text=batch.text)
         rows_first = asyncio.get_running_loop().create_future()
@@ -509,8 +554,8 @@ class ChatSendMixin:
                     # for this chat (fresh-satellite MCP install in progress),
                     # attach our WS as a listener + replay history so the UI
                     # catches up. The eventual warmup_ready reaches us via the
-                    # registry; the user will need to re-send this message
-                    # after the session is ready (frontend store handles that).
+                    # registry, and this message waits in the chat's queue
+                    # behind the warmup's first turn.
                     inflight = warmup_registry.get(msg_chat_id)
                     if inflight is not None:
                         await warmup_registry.attach_listener(msg_chat_id, self._send)
@@ -526,7 +571,7 @@ class ChatSendMixin:
                             f"warmup chat={msg_chat_id}, replayed "
                             f"{len(inflight.event_history)} events"
                         )
-                        return
+                        # The message itself waits in the chat's queue (below).
 
                     self.chat_id = msg_chat_id
                     self.agent_name = chat["agent"]
@@ -578,6 +623,21 @@ class ChatSendMixin:
                             f"WS dashboard _handle_chat: recovered state from msg.chat_id "
                             f"(no warmup/resume seen on this WS), chat={self.chat_id}, agent={self.agent_name}"
                         )
+
+        # A chat still getting ready (its warmup, or its first turn enqueued
+        # and not started): the message waits in the chat's queue behind that
+        # first turn, whose producer drains it next. A send the page marked
+        # ``queue_only`` came from its own "Getting ready" (the first turn's
+        # ``done`` ends that); any other page (a second tab) sent it as a turn
+        # of its own, so ``done`` frees its composer and the chip shows it.
+        if (not server_kick and not artifact_framed and self.chat_id
+                and input_queue.getting_ready(self.chat_id)):
+            item = await self._prepare_turn_input(text, images, files)
+            if item is not None:
+                await self._queue_for_next_turn(self.chat_id, item, msg.get("queue_id"))
+            if not msg.get("queue_only"):
+                await self._send({"type": wire.DONE, "chat_id": self.chat_id})
+            return
 
         # The chat's turn starters take turns: with a pump driving the chat,
         # or another starter bringing one up (a queued message's delivery, a
@@ -824,11 +884,16 @@ class ChatSendMixin:
                 images=attached_images or None,
             )
         except TurnDeferred:
-            # The machine dropped between the heal and the start: the row is
-            # written, so the person is told to send it again.
+            # The machine dropped between the heal and the start: the rows are
+            # written (the waiting messages taken with this one included), so
+            # the person is told to send them again, and the card keeps their
+            # text for a reload.
             self._restore_abort_flags(_cid, sent["consumed"])
             if q is not None:
                 q.release(claim)
+            if not artifact_framed:
+                shelve_undelivered(_cid, [qi.item for qi in taken] + [turn_input],
+                                   reason=wire.UNDELIVERED_QUEUED)
             await self._send_reconnecting_line(self.chat_id or "")
             await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
             return
@@ -860,7 +925,8 @@ class ChatSendMixin:
         if flags is None or flags["fired"] or self.layer is None:
             return
         flags["fired"] = True
-        asyncio.create_task(self._fire_stop_and_send(pump, flags))
+        spawn(self._fire_stop_and_send(pump, flags),
+              name="fire_stop_and_send", owner="dashboard_chat_send")
 
     async def _fire_stop_and_send(self, pump, flags: dict) -> None:
         # Pre-flight re-checks (the ack await above yielded the loop): the
@@ -893,25 +959,27 @@ class ChatSendMixin:
             logger.warning("stop-and-send: interrupt attempt failed",
                            exc_info=True)
 
-    async def _deliver_chat_to_live_interactive(self, msg: dict) -> bool:
+    async def _deliver_chat_to_live_interactive(self, msg: dict) -> str:
         """Deliver a composer ``chat`` frame to a LIVE interactive session on
-        the viewed chat, if one exists. Returns True when the send was handled
-        (typed into the PTY, held by its question-parked queue, or refused
-        read-only) — the caller must NOT warm. Delivery mirrors the server-side
+        the viewed chat, if one exists. ``LIVE_TERMINAL_TYPED`` when the send
+        was handled (typed into the PTY, held by its question-parked queue, or
+        answered with an error), ``LIVE_TERMINAL_REFUSED`` when the terminal is
+        a teammate's this person may not drive, "" when no live terminal is
+        there; a truthy answer means the caller must NOT warm. Delivery mirrors the server-side
         first-prompt submit in ``_spawn_tail`` (persist the raw row, stamp the
         time prelude, note the stamped bytes so the tailer's duplicate-skip
         matches the journaled user line byte-for-byte)."""
         if not self.chat_id:
-            return False
+            return ""
         isess = interactive_session.get(self.session_id) if self.session_id else None
         if isess is None or not isess.alive or isess.chat_id != self.chat_id:
             # Session-id drift: a revival may have re-warmed under a new id.
             isess = interactive_session.find_live_for_chat(self.chat_id)
         if isess is None or not isess.alive:
-            return False
+            return ""
         if not isess.may_drive(self.user_sub):
             await self._send_pty_read_only(isess)
-            return True
+            return LIVE_TERMINAL_REFUSED
 
         text = msg.get("text", "")
         cli_text = text
@@ -933,7 +1001,7 @@ class ChatSendMixin:
                 )
             except AttachmentsRefused as e:
                 await self._send_error(str(e))
-                return True
+                return LIVE_TERMINAL_TYPED
 
         # Adopt the live session + tell the client it is interactive so it
         # attaches the terminal (same frame shape as the resume re-attach) —
@@ -958,18 +1026,34 @@ class ChatSendMixin:
 
         # A _server_kick's prompt was persisted at _do_warmup send-time; an
         # artifact-framed turn's distinct row was persisted by its handler.
-        if not msg.get("_server_kick") and not msg.get("_artifact_framed"):
-            event_meta = {}
-            if image_meta:
-                event_meta["images"] = image_meta
-            if valid_files:
-                event_meta["files"] = valid_files
+        event_meta = {}
+        if image_meta:
+            event_meta["images"] = image_meta
+        if valid_files:
+            event_meta["files"] = valid_files
+        await self._type_into_terminal(
+            isess, self.chat_id, text, cli_text, event_meta,
+            row=not msg.get("_server_kick") and not msg.get("_artifact_framed"))
+        logger.info(
+            f"WS dashboard _handle_chat: delivered composer send to live "
+            f"interactive session={self.session_id[:8]}, chat={self.chat_id[:8]}"
+        )
+        return LIVE_TERMINAL_TYPED
+
+    async def _type_into_terminal(self, isess, chat_id: str, text: str, cli_text: str,
+                                  event_meta: dict, *, row: bool = True) -> None:
+        """A composer message typed into the live terminal ``isess`` on
+        ``chat_id``: its row (the raw text, unless the caller wrote it), the
+        time and focus preludes on what the terminal gets, the stamped bytes
+        noted so the tailer's duplicate-skip matches the journaled user line
+        byte for byte, then a bracketed paste and CR."""
+        if row:
             # Awaited: the row must exist before note_sent_prompt below, or
             # the tailer's duplicate-skip and the row race.
             await chat_writer.submit(
-                self.chat_id,
+                chat_id,
                 functools.partial(
-                    task_store.add_chat_message, self.chat_id, "user", text,
+                    task_store.add_chat_message, chat_id, "user", text,
                     event_data=json.dumps(event_meta) if event_meta else "",
                     author_sub=self.user_sub,
                 ),
@@ -986,21 +1070,17 @@ class ChatSendMixin:
                 connection_id=getattr(self, "notify_connection_id", "") or None,
             )
         except Exception:
-            logger.debug("focus line unavailable for chat %s", self.chat_id, exc_info=True)
-        stamped = self._interactive_prelude(cli_text, session_id=self.session_id, focus_line=focus)
+            logger.debug("focus line unavailable for chat %s", chat_id, exc_info=True)
+        stamped = self._interactive_prelude(cli_text, session_id=isess.session_id,
+                                            focus_line=focus)
         from core.session.transcript_tool_events import note_sent_prompt
-        note_sent_prompt(self.chat_id, stamped)
+        note_sent_prompt(chat_id, stamped)
         # Bracketed paste + CR (the composer's own framing): the question-
         # parked hold in deliver_dashboard_input strips exactly this shape.
         isess.deliver_dashboard_input(
             ("\x1b[200~" + stamped + "\x1b[201~\r").encode("utf-8"),
             composer=True, sender_sub=self.user_sub,
         )
-        logger.info(
-            f"WS dashboard _handle_chat: delivered composer send to live "
-            f"interactive session={self.session_id[:8]}, chat={self.chat_id[:8]}"
-        )
-        return True
 
     async def _handle_artifact_interaction(self, msg: dict):
         """Between-turns entry for a display_ui backchannel send (the

@@ -47,3 +47,28 @@ def test_lookup_failure_fails_open():
     not block legitimate model changes."""
     with patch("storage.billing.subscription_store.list_models", side_effect=RuntimeError("db down")):
         assert _model_allowed_for_path("gpt-5.5", "codex-cli") is True
+
+
+# A frame can name a model the engine no longer serves (a stale page, the
+# browser's sticky pick, the New Chat pre-warm's raw agent default): it is
+# read as the model it runs as today, and a model the engine still does not
+# serve falls to the engine's own default — never its first row, which the
+# tier-ordered catalog makes its most expensive model.
+
+def test_a_frame_names_a_retired_model_as_its_successor():
+    import asyncio
+    from ws.dashboard_chat_text import live_model
+    with patch("storage.billing.subscription_store.custom_model_exists", return_value=False):
+        assert asyncio.run(live_model("claude-opus-5")) == "claude-opus-5-5"
+    assert asyncio.run(live_model("claude-sonnet-5-5")) == "claude-sonnet-5-5"
+    assert asyncio.run(live_model("")) == ""
+
+
+def test_the_fallback_is_the_engine_default_not_the_first_row():
+    import ws.dashboard  # noqa: F401 — module import order
+    from ws.dashboard_warmup import _engine_default_model
+    with patch("config.resolve_layer_default_model", return_value="claude-opus-5-5") as res:
+        assert _engine_default_model("claude-code-cli") == "claude-opus-5-5"
+        res.assert_called_once_with("claude-code-cli")
+    with patch("config.resolve_layer_default_model", side_effect=RuntimeError("nothing enabled")):
+        assert _engine_default_model("claude-code-cli") == ""

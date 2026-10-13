@@ -38,7 +38,7 @@ from services.scripts.runner import scrub
 from storage import database as task_store
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.apps")
+logger = logging.getLogger("otodock.apps")
 
 HEALTH_TIMEOUT_S = 20.0
 IDLE_STOP_S = 10 * 60

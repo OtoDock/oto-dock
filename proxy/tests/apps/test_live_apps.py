@@ -376,6 +376,31 @@ def test_prelude_matchers_strip_the_focus_line_for_titles():
     assert deterministic_title('say [The user is looking at the app "x" (x) right now.]').startswith("say")
 
 
+def test_prelude_matchers_strip_a_task_runs_parallel_activity_line():
+    # A task run's first prompt carries the parallel-activity line after the
+    # time; a satellite single-lines a Codex launch prompt.
+    import ws.dashboard  # noqa: F401 — module import order
+    from core.session.codex_rollout_tailer import _title_from_prompt as codex_title, _user_row_key
+    from core.session.transcript_tailer import _title_from_prompt
+    from services.title_generator import deterministic_title
+    from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
+    stamp = "[Current time: Friday, October 9, 2026 06:00 (6:00 AM) UTC (UTC+00:00)]"
+    parallel = ("[Parallel activity — for awareness only, no action needed: sibling "
+                "sessions: 'Fix [bug]' (generating). Check one only if your work depends "
+                "on it (peek_session / get_task_result).]")
+    for text in (f"{stamp}\n\n{parallel}\n\nsummarise the inbox",
+                 f"{stamp} {parallel} summarise the inbox"):
+        assert _title_from_prompt(text) == "summarise the inbox"
+        assert codex_title(text) == "summarise the inbox"
+        assert deterministic_title(text) == "summarise the inbox"
+        assert _user_row_key(text) == "summarise the inbox"
+        out = text
+        for _ in range(3):
+            out = ws_re.sub("", out, count=1)
+        assert out == "summarise the inbox"
+    assert _title_from_prompt(f"see {parallel}").startswith("see")
+
+
 def test_duplex_prompt_carries_the_focus_line_first():
     import ws.dashboard  # noqa: F401 — module import order
     from ws import duplex_attach

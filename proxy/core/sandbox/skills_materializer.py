@@ -62,7 +62,7 @@ import yaml
 
 from services.infra import safe_fs
 
-logger = logging.getLogger("claude-proxy.sandbox")
+logger = logging.getLogger("otodock.sandbox")
 
 _MARKER_NAME = ".oto-skill.json"
 _QUARANTINE_DIR = ".quarantine"

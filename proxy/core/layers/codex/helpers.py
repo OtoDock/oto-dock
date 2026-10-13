@@ -100,18 +100,20 @@ def with_local_provider_note(system_prompt: str, provider: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 def codex_hooks_floor(client_type: str, interactive: bool = False) -> bool:
-    """Whether a Codex app-server session runs ``permission_gate.py`` as its
-    PreToolUse hook (the command-level permission FLOOR).
+    """Whether a Codex app-server session's PreToolUse hook
+    (``permission_gate.py``, the command-level permission FLOOR) judges every
+    call: nobody answers its approval bridge.
 
     True for every kind ``core/session/session_kind.py`` declares unattended
     (task / phone / meeting / trigger / internal / app — ``session_kind.attended()``
     answers; an unrecorded kind counts as attended): nobody answers an
-    approval, so under ``approvalPolicy: never``
-    the JSON-RPC approval bridge never fires and the hook is the only gate);
-    False for attended dashboard chats (the bridge alone gates — both would
-    double-gate) and for the interactive TUI, which trusts its hook by CLI
-    flag instead. ONE rule for the local layer (``layer.py``) and the remote
-    start payload (``codex_hooks_floor`` field, satellite >= 0.5.118) so a
+    approval, so the hook is the gate in every mode. False for attended
+    dashboard chats, whose hook judges only the turns Codex runs under
+    ``never`` (Don't Ask, auto: ``OTO_HOOK_BRIDGED``) while the bridge asks
+    the person in the others, and for the interactive TUI, which trusts its
+    hook by CLI flag instead. ONE rule for the local layer (``layer.py``) and
+    the remote start payload (``codex_hooks_floor`` field, satellite >=
+    0.5.118; ``codex_attended_floor`` for the attended rest, 0.5.143) so a
     session is floored the same way wherever it runs.
     """
     return not session_kind.attended(client_type) and not interactive
@@ -189,8 +191,8 @@ _EFFORT_TO_CODEX: dict[str, str] = {
 # must not inherit the unlock, and "gpt-6-sol" does not match "gpt-6.1-sol".
 # The retired 5.6 Sol / Luna and GPT-6 Sol prefixes stay: a custom re-add,
 # or a live session whose row remaps at the next boot, keeps its ceiling
-# (Codex 0.160.0 catalog: GPT-6.1 Sol and GPT-6 Sol low…max + ultra, GPT-6
-# Luna low…max).
+# (Codex 0.160.0 and 0.162.1 catalogs: GPT-6.1 Sol and GPT-6 Sol low…max +
+# ultra, GPT-6 Luna low…max).
 _MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna")
 _ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol")
 
@@ -249,7 +251,7 @@ def build_auth_json(token: str, *, auth_blob: dict) -> dict:
 
 def will_retry(params) -> bool:
     """Whether Codex retries the error an ``error`` notification reports.
-    The flag sits at the params' top level (0.156.1 and 0.160.0 schema); older builds
+    The flag sits at the params' top level (0.156.1 to 0.162.1 schema); older builds
     nested it in ``error``."""
     if not isinstance(params, dict):
         return False

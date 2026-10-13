@@ -16,11 +16,11 @@ uvicorn
 # The headless browser of the app checks (render.py): the package bundles
 # Playwright's driver; the browser itself is installed by the Dockerfile
 # (chromium-headless-shell under PLAYWRIGHT_BROWSERS_PATH).
-playwright>=1.62,<2
+playwright>=1.63,<2
 # Equation pipeline: LaTeX → MathML → OMML (docx) / SVG (pdf) / PNG (pptx, xlsx)
 lxml>=5.0
 latex2mathml>=3.78
 mathml2omml>=0.0.2
 ziamath>=0.13
-cairosvg>=2.7
+cairosvg>=2.9.1
 dwml>=0.3

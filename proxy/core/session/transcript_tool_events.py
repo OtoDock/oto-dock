@@ -32,7 +32,7 @@ import threading
 from core.events import tool_roles
 from core.session import session_kind
 
-logger = logging.getLogger("claude-proxy.transcript_tool_events")
+logger = logging.getLogger("otodock.transcript_tool_events")
 
 # Result-content cap before persisting — the PostToolUse hook's exact policy,
 # so interactive rows carry the same truncation the pump stores headless.
@@ -237,8 +237,9 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
     subscription that served the session (the pool's binding, ``'default'``
     when unbound — e.g. admin OAuth outside the pool), scope follows the chat
     row's agent (Shared-only → agent scope). Cost is computed from
-    ``get_model_pricing`` (DB → registry → provider default) because the CLIs
-    only emit a cost figure on headless result events — and ``message_count=1``
+    ``config.price_usage`` (the model's rates: DB → registry → provider
+    default, a long-context tier applied) because the CLIs only emit a cost
+    figure on headless result events — and ``message_count=1``
     keeps a $0 row through ``record_turn_usage``'s filter (pump parity: token
     counts survive even when pricing resolves to zero). Batch granularity (not
     turn) is deliberate: pool routing consumes a SUM, and a batch is the
@@ -258,7 +259,7 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
         from core.session.session_state import get_session_client_type
         from services.billing import usage_service
         from services.engines import subscription_pool
-        from config import get_model_pricing, get_model_provider
+        from config import get_model_provider, price_usage
 
         agent = rec.get("agent", "")
         scope = "agent" if _vis.is_shared_only(agent) else "user"
@@ -281,10 +282,10 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
             if not model:
                 model = rec.get("model") or ""
             provider = get_model_provider(model) or "anthropic"
-            p_in, p_out, p_cw, p_cr = get_model_pricing(model, provider)
-            cost = (acc["input_tokens"] * p_in + acc["output_tokens"] * p_out
-                    + acc["cache_write"] * p_cw + acc["cache_read"] * p_cr
-                    ) / 1_000_000
+            cost = price_usage(
+                model, provider,
+                input_tokens=acc["input_tokens"], output_tokens=acc["output_tokens"],
+                cache_write_tokens=acc["cache_write"], cache_read_tokens=acc["cache_read"])
             rows.append({
                 "user_sub": user_sub,
                 "agent": agent,

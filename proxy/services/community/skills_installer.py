@@ -61,7 +61,7 @@ from services.mcp import mcp_manifest_types as _mt
 from services.mcp.mcp_manifest_types import SKILL_ID_MAX_LEN, SKILL_ID_RE
 from storage.mcp import mcp_store
 
-logger = logging.getLogger("claude-proxy.skills-installer")
+logger = logging.getLogger("otodock.skills-installer")
 
 SKILLS_TARBALL_URL = (
     "https://api.github.com/repos/OtoDock/community-skills/tarball/main"

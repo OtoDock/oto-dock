@@ -43,9 +43,10 @@ def authed(monkeypatch):
     """Bypass the proxy auth gate so the proxying-behaviour tests don't have to
     mint a real session cookie — the gate itself is covered separately below."""
     from api.media import collabora_proxy
-    monkeypatch.setattr(
-        collabora_proxy, "_collabora_authorized", lambda scope, cookies: True,
-    )
+
+    async def _yes(scope, cookies):
+        return True
+    monkeypatch.setattr(collabora_proxy, "_collabora_authorized", _yes)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +298,128 @@ def test_http_403_without_session_or_wopi_token(app_with_router, subpath_mode):
     with TestClient(app_with_router) as client:
         r = client.get("/collabora/browser/dist/cool.html")
     assert r.status_code == 403
+
+
+def _cookie(sub, *, iat=None, exp_in=3600, jti="sign-in-1"):
+    import time as _time
+    import jwt
+    import config
+    now = int(_time.time())
+    iat = now if iat is None else iat
+    return jwt.encode({"purpose": "session", "sub": sub, "iat": iat, "exp": now + exp_in,
+                       "jti": jti}, config.JWT_SECRET, algorithm="HS256")
+
+
+@pytest.fixture
+def relay_people(temp_db, monkeypatch):
+    """Two local accounts: one free, one held by the forced password change."""
+    from api.media import wopi
+    from storage import database as task_store
+    wopi._holder_answers.clear()
+    free = task_store.create_local_user("free@t.com", "Free", "Free", "member", "x")
+    held = task_store.create_local_user("held@t.com", "Held", "Held", "member", "x",
+                                        must_change_password=True)
+    yield free, held
+    wopi._holder_answers.clear()
+
+
+def test_the_gate_judges_the_person_behind_the_cookie(app_with_router, subpath_mode, relay_people, monkeypatch):
+    """A cookie whose signature holds is not enough: a sign out everywhere
+    (the person's token epoch), a person held by the forced password change
+    and a person who is gone are refused, as on every HTTP route."""
+    import time as _time
+    from unittest.mock import AsyncMock
+    from api.media import wopi
+    from storage import database as task_store
+    free, held = relay_people
+    upstream = MagicMock(status_code=200, content=b"cool", headers={"content-type": "text/html"})
+    monkeypatch.setattr("httpx.AsyncClient.request", AsyncMock(return_value=upstream))
+    with TestClient(app_with_router) as client:
+        def get(sub, **kw):
+            client.cookies.set("session", _cookie(sub, **kw))
+            try:
+                return client.get("/collabora/browser/dist/cool.html").status_code
+            finally:
+                client.cookies.clear()
+        assert get(free, iat=int(_time.time()) - 3) == 200
+        assert get(held) == 403
+        assert get("gone-sub") == 403
+        task_store.bump_token_epoch(free)
+        wopi._holder_answers.clear()
+        assert get(free, iat=int(_time.time()) - 3) == 403
+
+
+def test_the_gate_judges_the_person_behind_a_wopi_token(app_with_router, subpath_mode, relay_people, monkeypatch):
+    from unittest.mock import AsyncMock
+    from api.media import wopi
+    free, held = relay_people
+    upstream = MagicMock(status_code=200, content=b"x", headers={})
+    monkeypatch.setattr("httpx.AsyncClient.request", AsyncMock(return_value=upstream))
+    with TestClient(app_with_router) as client:
+        for sub, status in ((free, 200), (held, 403), ("agent", 200)):
+            token, _ = wopi.create_wopi_token("a/workspace/x.docx", sub, "N", "edit", "a")
+            assert client.get(f"/collabora/cool/x?access_token={token}").status_code == status, sub
+
+
+@pytest.mark.asyncio
+async def test_an_open_socket_is_rejudged_without_the_cookies_expiry(relay_people, monkeypatch):
+    """The open editor socket keeps the handshake's cookie, which the
+    sliding refresh never renews: its expiry does not end the socket, its
+    revocation, its person's epoch or the forced change do."""
+    import time as _time
+    from api.media import collabora_proxy, wopi
+    from auth import session_revocation
+    from storage import database as task_store
+    free, held = relay_people
+    now = int(_time.time())
+    expired = _cookie(free, iat=now - 3, exp_in=-60, jti="sign-in-old")
+    assert await collabora_proxy._socket_still_authorized({}, {"session": expired}) is True
+    assert await collabora_proxy._socket_still_authorized({}, {"session": _cookie(held)}) is False
+    session_revocation.revoke({"jti": "sign-in-old", "sub": free, "iat": now - 3, "exp": now + 60},
+                              lifetime_s=120)
+    try:
+        assert await collabora_proxy._socket_still_authorized({}, {"session": expired}) is False
+    finally:
+        session_revocation.reset_for_tests()
+    task_store.bump_token_epoch(free)
+    wopi._holder_answers.clear()
+    assert await collabora_proxy._socket_still_authorized(
+        {}, {"session": _cookie(free, iat=now - 3, jti="other")}) is False
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_cannot_be_read_keeps_an_open_socket(relay_people, monkeypatch):
+    """A store blip at the 60 s recheck must not drop every live editor: only
+    a person known to no longer hold closes the socket (a new request is
+    refused meanwhile)."""
+    from api.media import collabora_proxy, wopi
+    free, _held = relay_people
+
+    def _down(sub, iat):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(wopi, "_person_holds_now", _down)
+    cookie = {"session": _cookie(free)}
+    assert await collabora_proxy._socket_still_authorized({}, cookie) is True
+    assert await collabora_proxy._collabora_authorized({}, cookie) is False
+
+
+@pytest.mark.asyncio
+async def test_a_socket_whose_sign_in_ended_is_closed_at_its_recheck(monkeypatch):
+    from unittest.mock import AsyncMock
+    from api.media import collabora_proxy
+    answers = iter([True, False])
+
+    async def _judge(scope, cookies):
+        return next(answers)
+
+    monkeypatch.setattr(collabora_proxy, "_RELAY_REVALIDATE_S", 0.01)
+    monkeypatch.setattr(collabora_proxy, "_socket_still_authorized", _judge)
+    ws, upstream = MagicMock(), MagicMock()
+    ws.close, upstream.close = AsyncMock(), AsyncMock()
+    await collabora_proxy._close_when_unauthorized(ws, upstream, {}, {}, "cool/x/ws")
+    upstream.close.assert_awaited_once()
+    ws.close.assert_awaited_once_with(code=1008, reason="sign-in ended")
 
 
 def test_http_404_admin_and_metrics_endpoints(app_with_router, subpath_mode, authed):

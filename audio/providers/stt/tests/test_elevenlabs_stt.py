@@ -47,13 +47,16 @@ def test_validate_advanced():
     assert set(bad) == {"call_endpointing_ms", "chat_endpointing_ms", "silence_gate_rms"}
 
 
-def test_default_advanced_settings_surface_models_and_gate():
+def test_default_advanced_settings_surface_the_gate_and_the_model_ids_stay_placeholders():
     d = ElevenLabsSTT.default_advanced_settings()
-    assert d["model_id"] == "scribe_v2_realtime"
-    assert d["batch_model_id"] == "scribe_v2"
     assert d["chat_endpointing_ms"] == 1500
     assert d["call_endpointing_ms"] == 500
     assert d["silence_gate_rms"] == 300
+    # The model ids are placeholders the pill shows, never stored by a
+    # creation or a Restore: a row that stores none follows a later default.
+    assert "model_id" not in d and "batch_model_id" not in d
+    assert ElevenLabsSTT.default_model_ids() == {
+        "model_id": "scribe_v2_realtime", "batch_model_id": "scribe_v2"}
 
 
 # ── Silence gate (anti-hallucination) ──────────────────────────────
@@ -155,6 +158,54 @@ async def test_transcribe_file_maps_words_and_duration(monkeypatch):
     assert [w.word for w in result.words] == ["Καλημέρα", "κόσμε"]  # word-type only
     assert result.audio_seconds == 1.5  # last word end
     assert result.provider_used == "elevenlabs"
+
+
+async def test_transcribe_file_reports_the_identified_language_confidence(monkeypatch):
+    _mock_client_factory(monkeypatch, lambda request: httpx.Response(200, json=SCRIBE_RESPONSE))
+    stt = ElevenLabsSTT(api_key="k")
+    # No language given: Scribe named it, and its probability rides along.
+    result = await stt.transcribe_file(b"fake-bytes")
+    assert result.language == "el" and result.language_confidence == 0.97
+    # A language given is not an identification.
+    given = await stt.transcribe_file(b"fake-bytes", language="el-GR")
+    assert given.language_confidence == 0.0
+
+
+async def test_identify_language_is_the_batch_answer(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.content
+        return httpx.Response(200, json=SCRIBE_RESPONSE)
+
+    _mock_client_factory(monkeypatch, handler)
+    stt = ElevenLabsSTT(api_key="k")
+    guess = await stt.identify_language(b"RIFF-wav")
+    assert (guess.language, guess.confidence, guess.text) == ("el", 0.97, "Καλημέρα κόσμε")
+    assert b"language_code" not in seen["body"]      # the engine names the language
+
+
+def test_to_elevenlabs_lang_auto_omits_the_param():
+    assert _to_elevenlabs_lang("auto") is None
+
+
+async def test_restart_reopens_with_the_stored_parameters(monkeypatch):
+    stt = ElevenLabsSTT(api_key="k")
+    stt._active_rate = 8000
+    stt._interim_results = True
+    stt._endpointing_override = 400
+    calls = []
+
+    async def fake_close():
+        calls.append("close")
+
+    async def fake_start(*, language, sample_rate=None, interim_results=False, endpointing_ms=None):
+        calls.append(("start", language, sample_rate, interim_results, endpointing_ms))
+
+    monkeypatch.setattr(stt, "close", fake_close)
+    monkeypatch.setattr(stt, "start", fake_start)
+    assert await stt.restart("de") is True
+    assert calls == ["close", ("start", "de", 8000, True, 400)]
 
 
 async def test_transcribe_file_auth_error(monkeypatch):

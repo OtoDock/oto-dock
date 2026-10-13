@@ -61,7 +61,7 @@ from ws.dashboard import (
 from core.session import session_kind
 from auth.providers import acting_role_of
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 
 class ResumeUnavailable(RuntimeError):

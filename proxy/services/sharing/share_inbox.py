@@ -17,7 +17,7 @@ import logging
 from storage.automation import notification_store
 from storage.sharing import share_store
 
-logger = logging.getLogger("claude-proxy.shares")
+logger = logging.getLogger("otodock.shares")
 
 
 def targets_for(share: dict) -> dict[str, set[str]]:

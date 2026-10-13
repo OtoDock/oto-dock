@@ -23,7 +23,7 @@ from auth.providers import UserContext, get_current_user, require_admin, require
 from services.community import community_catalog, community_installer
 from auth import roles
 
-logger = logging.getLogger("claude-proxy.community-api")
+logger = logging.getLogger("otodock.community-api")
 router = APIRouter(dependencies=[Depends(require_user)])
 
 

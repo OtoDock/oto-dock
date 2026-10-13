@@ -100,6 +100,22 @@ describe('ChatInput attachments', () => {
     expect(props.onAddFiles).not.toHaveBeenCalled()
   })
 
+  it('a paste from an office suite inserts its text and attaches nothing', async () => {
+    const props = baseProps()
+    const { container } = render(<ChatInput {...props} />)
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement
+    const plain = 'Q3 revenue\t1200\nQ4 revenue\t1500'
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        files: [makeFile('image.png', 100, 'image/png')],
+        getData: (kind: string) => (kind === 'text/plain' ? plain : ''),
+      },
+    })
+    await new Promise((r) => setTimeout(r, 50))
+    expect(props.onAddImages).not.toHaveBeenCalled()
+    expect(props.onAddFiles).not.toHaveBeenCalled()
+  })
+
   it('dropping an external file on the composer attaches it', async () => {
     const props = baseProps()
     const { container } = render(<ChatInput {...props} />)
@@ -145,6 +161,59 @@ describe('ChatInput attachments', () => {
     expect(retries).toHaveLength(1) // the over-cap chip is remove-only
     fireEvent.click(retries[0])
     expect(props.onRetryFile).toHaveBeenCalledWith('e1')
+  })
+
+  it('a folder chip says Folder while it is read, retries from its files, notes what it lost', () => {
+    const props = baseProps()
+    const files = [{ file: makeFile('a.md', 600), relDir: '' }, { file: makeFile('b.md', 600), relDir: '' }]
+    props.pendingFiles = [
+      { id: 'r', name: 'reading', size: 0, folder: true, uploading: true, queued: true },
+      // 1200 bytes in all, over the 1000-byte cap: a folder's own files are what the cap checks.
+      { id: 'f', name: 'failed', size: 1200, folder: true, fileCount: 2, folderFiles: files, error: 'b.md: HTTP 500' },
+      { id: 'x', name: 'refused', size: 0, folder: true, fileCount: 0, error: 'An empty folder: nothing to attach' },
+      { id: 'g', name: 'good', size: 7, folder: true, fileCount: 1, uploadedPath: 'w/good', note: '1 folder left out (.git)' },
+    ]
+    const { container } = render(<ChatInput {...props} />)
+    expect(container.textContent).toContain('readingFolder')
+    expect(container.textContent).toContain('Reading the folder…')
+    expect(container.textContent).toContain('1 folder left out (.git)')
+    const retries = screen.getAllByLabelText('Retry upload')
+    expect(retries).toHaveLength(1)
+    fireEvent.click(retries[0])
+    expect(props.onRetryFile).toHaveBeenCalledWith('f')
+  })
+
+  it('a dropped folder is handed over at once, its walk as a promise', async () => {
+    const onAddFolder = vi.fn()
+    const { container } = render(<ChatInput {...baseProps()} onAddFolder={onAddFolder} />)
+    const entry = {
+      isFile: false, isDirectory: true, name: 'mesitis',
+      createReader: () => {
+        let read = false
+        return {
+          readEntries: (ok: (e: unknown[]) => void) => {
+            ok(read ? [] : [{
+              isFile: true, isDirectory: false, name: 'a.md',
+              file: (got: (f: File) => void) => got(makeFile('a.md', 3)),
+            }])
+            read = true
+          },
+        }
+      },
+    }
+    fireEvent.drop(composerPill(container), {
+      dataTransfer: {
+        types: ['Files'],
+        items: [{ kind: 'file', getAsFile: () => null, webkitGetAsEntry: () => entry }],
+        files: [],
+      },
+    })
+    expect(onAddFolder).toHaveBeenCalledTimes(1)
+    const [name, walk] = onAddFolder.mock.calls[0]
+    expect(name).toBe('mesitis')
+    expect(walk).toBeInstanceOf(Promise)
+    const got = await walk
+    expect(got.files.map((f: { relDir: string; file: File }) => [f.relDir, f.file.name])).toEqual([['', 'a.md']])
   })
 
   it('tapping an image tile opens the lightbox at that photo', () => {

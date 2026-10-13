@@ -283,3 +283,89 @@ def test_only_the_live_pump_of_the_push_names_the_person(temp_db, hook, people):
     people("chat-a", "bob-sub")
     assert _claims(hook())["user_sub"] == "bob-sub"
 
+
+
+
+def test_the_pushed_token_opens_only_its_push_and_a_new_push_mints_again(temp_db, hook, tmp_path):
+    from api.hooks import preview
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    first = hook()
+    assert _claims(first)["generation"] == _opened(first)[1]
+    assert hook()["access_token"] == first["access_token"]   # same document: reused
+    (tmp_path / "agents" / "test-agent" / "workspace" / "report.docx").write_bytes(b"new bytes")
+    second = hook()
+    assert _opened(second)[1] > _opened(first)[1]
+    assert _claims(second)["generation"] == _opened(second)[1]
+    assert second["access_token"] != first["access_token"]
+    assert len(preview._wopi_token_cache) == 1               # replaced, not grown
+
+
+def test_a_meeting_participants_push_keeps_the_agents_token(temp_db, hook, people, monkeypatch):
+    """A participant's push streams through the meeting's pump (no person)
+    into the parent chat, where a person's own turn may have a pump of
+    another session: the token stays the agent's."""
+    from api.hooks import routing
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: {
+        "pump_session_id": "meeting-1", "parent_chat_id": "chat-a", "agent_slug": "test-agent",
+        "parent_session_id": "sess-a"} if sid == "sess-p" else None)
+    monkeypatch.setattr(routing, "resolve_hook_chat_id",
+                        AsyncMock(side_effect={"sess-p": "chat-a", "sess-a": "chat-a"}.get))
+    people("chat-a", "bob-sub", session="sess-a")
+    assert _claims(hook("sess-p"))["user_sub"] == "agent"
+    people("chat-a", "", session="meeting-1")
+    assert _claims(hook("sess-p"))["user_sub"] == "agent"
+
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_the_write_notes_the_next_document_before_it_announces_the_change(
+    temp_db, hook, tmp_path, monkeypatch, remote,
+):
+    """A pane that mints on the write's file_updated opens the document of
+    the push that follows (noted first), and that push reuses it, so the
+    pane loads once. On a remote session the note comes before the push to
+    the machine, the announcement after it."""
+    from api.hooks import hooks as hooks_mod, lifecycle, preview
+    from core.remote import remote_file_flow
+    from services.notifications import notification_manager
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    first = hook()
+    doc = tmp_path / "agents" / "test-agent" / "workspace" / "report.docx"
+    doc.write_bytes(b"the agent's next write")
+    order = []
+
+    async def _broadcast(agent, rel, **kw):
+        order.append(("file_updated", preview.pushed_generation(first["file_id"])))
+
+    async def _push_back(sid, rel):
+        order.append(("push_back", preview.pushed_generation(first["file_id"])))
+        return True
+
+    from auth.path_policy import SecurityContext
+    monkeypatch.setattr(lifecycle, "verify_session_match_async", _pass_async)
+    # The remote push is refused for a path the session may not write: an
+    # editor writes the shared workspace, judged under the same agents root.
+    monkeypatch.setattr("auth.path_policy._AGENTS_DIR", (tmp_path / "agents").resolve())
+    monkeypatch.setattr(lifecycle, "get_session_security", lambda sid: SecurityContext(
+        role="editor", username="u", agent="test-agent", is_admin_agent=False))
+    monkeypatch.setattr(remote_file_flow, "is_remote_session", lambda sid: remote)
+    monkeypatch.setattr(remote_file_flow, "push_back", _push_back)
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", _broadcast)
+    app = FastAPI()
+    app.include_router(hooks_mod.router)
+    resp = TestClient(app).post("/v1/hooks/file-written", json={
+        "session_id": "sess-a", "path": "test-agent/workspace/report.docx",
+    }, headers={"Authorization": "Bearer test"})
+    assert resp.status_code == 200
+    noted = preview.pushed_generation(first["file_id"])
+    assert noted > first["generation"]
+    expected = [("push_back", noted)] if remote else []
+    assert order == expected + [("file_updated", noted)]
+    assert _opened(hook()) == ("test-agent/workspace/report.docx", noted)
+    # The same bytes written again: no change, nothing announced.
+    order.clear()
+    TestClient(app).post("/v1/hooks/file-written", json={
+        "session_id": "sess-a", "path": "test-agent/workspace/report.docx",
+    }, headers={"Authorization": "Bearer test"})
+    assert [o for o in order if o[0] == "file_updated"] == []

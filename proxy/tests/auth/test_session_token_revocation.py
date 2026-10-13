@@ -136,17 +136,22 @@ def test_the_holder_check_agrees_with_the_resolver():
 
 
 def test_every_password_change_closes_the_persons_chats(monkeypatch):
-    """A changed password ends the person's warm chats, whichever route
-    changed it: the reset link, the self-service change and the admin
-    reset. The chats re-warm with fresh tokens on the next message."""
+    """A changed password ends the person's warm chats and forgets the
+    holder cache's answers for them, whichever route changed it: the reset
+    link, the self-service change and the admin reset. The chats re-warm
+    with fresh tokens on the next message."""
     from unittest.mock import AsyncMock
 
     from auth.password import hash_password
     from auth.providers import create_session_jwt
     from services.agents import offboarding_sessions
 
+    from auth import token_holder
+
     closer = AsyncMock(return_value=0)
     monkeypatch.setattr(offboarding_sessions, "close_person_sessions", closer)
+    forgot: list[str] = []
+    monkeypatch.setattr(token_holder, "forget", forgot.append)
     first = "correct-horse-battery-77"
     sub = db.create_local_user("p@revoke.test", "P", "p-user", "member", hash_password(first))
     adm = db.create_local_user("a@revoke.test", "A", "a-user", "admin", hash_password(first))
@@ -175,3 +180,6 @@ def test_every_password_change_closes_the_persons_chats(monkeypatch):
     assert closer.await_count == 3
     for call in closer.await_args_list:
         assert call.args == (sub, person["username"], "password_changed")
+    # The holder cache forgets the person at each change: a pass cached for
+    # a token the change just ended does not live out its minute.
+    assert forgot == [sub, sub, sub]

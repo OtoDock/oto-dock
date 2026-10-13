@@ -20,7 +20,7 @@ import httpx
 
 from auth.oauth_providers.base import OAuthProvider, TokenSet, UserInfo
 
-logger = logging.getLogger("claude-proxy.oauth-providers.google")
+logger = logging.getLogger("otodock.oauth-providers.google")
 
 
 class GoogleOAuthProvider(OAuthProvider):

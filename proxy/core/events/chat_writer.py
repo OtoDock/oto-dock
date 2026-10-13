@@ -36,7 +36,7 @@ from typing import Any, Callable
 
 from storage.pg import run_db
 
-logger = logging.getLogger("claude-proxy.chat-writer")
+logger = logging.getLogger("otodock.chat-writer")
 
 
 class _Lane:

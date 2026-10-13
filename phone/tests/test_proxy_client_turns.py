@@ -3,8 +3,8 @@
 Drives _recv_loop/_ws_send_message with a duck-typed WebSocket, pinning the
 client half of the /ws/phone turn protocol: frames are routed by turn id (a
 barged-in turn's tail must never be spoken as the next answer), warmup
-replies flow through the control queue, and abort_turn() is turn-scoped —
-Direct always; proxy mode only over a live WS (interrupt semantics: the
+replies flow through the control queue, and abort_turn() is turn-scoped and
+goes over the live WS in both modes (interrupt semantics on proxy mode: the
 partial turn stays in history, so abort_erases_turn is Direct-only).
 """
 
@@ -80,7 +80,7 @@ def test_warmup_reply_routes_via_control_queue():
                  "data": {"session_id": "s1", "llm_mode": "direct"}})
         c._recv_task = asyncio.create_task(c._recv_loop())
 
-        sid = await c._ws_warmup()
+        sid = await c.warmup_session()
         assert sid == "s1"
         assert c.session_id == "s1"
         # The PIN-gate result always rides the warmup (False by default).
@@ -101,7 +101,7 @@ def test_warmup_carries_the_pin_gate_result():
         c._ws.push({"type": "warmup_ready",
                     "data": {"session_id": "s2", "llm_mode": "direct"}})
         c._recv_task = asyncio.create_task(c._recv_loop())
-        assert await c._ws_warmup() == "s2"
+        assert await c.warmup_session() == "s2"
         sent = c._ws.sent[-1]
         assert sent["pin_verified"] is True and sent["caller_phone"] == "+3021"
         c._ws.end()
@@ -132,22 +132,59 @@ def test_abort_turn_proxy_mode_sends_abort_over_ws():
     asyncio.run(run())
 
 
-def test_abort_turn_is_noop_in_proxy_mode_without_ws():
-    """HTTP-SSE fallback has no signalling channel — proxy mode degrades to
-    run-to-completion, and the local history is never popped."""
+def test_abort_turn_is_noop_without_ws():
+    """No socket, no signalling channel in either mode; the local history is
+    never touched."""
     async def run():
-        c = ProxyClient(llm_mode="proxy")  # no WS
-        c.messages.append({"role": "user", "content": "unanswered"})
-        assert not c.supports_abort
-        await c.abort_turn()
-        assert c.messages == [{"role": "user", "content": "unanswered"}]
+        for mode in ("proxy", "direct"):
+            c = ProxyClient(llm_mode=mode)  # no WS
+            c.messages.append({"role": "user", "content": "unanswered"})
+            assert not c.supports_abort
+            await c.abort_turn()
+            assert c.messages == [{"role": "user", "content": "unanswered"}]
     asyncio.run(run())
 
 
-def test_abort_turn_http_fallback_pops_unanswered_user_message():
+def test_a_client_with_no_socket_has_no_other_transport(monkeypatch):
+    """A failed connect marks the proxy lost; the warmup answers None, a turn
+    yields nothing (the pipeline ends the call, no error speech), the close
+    sends nothing."""
+    import proxy.client as pc
+
+    async def refuse(*a, **kw):
+        raise OSError("refused")
+    monkeypatch.setattr(pc.websockets, "connect", refuse)
+
     async def run():
-        c = ProxyClient(llm_mode="direct")  # no WS → HTTP fallback shape
-        c.messages.append({"role": "user", "content": "unanswered"})
-        await c.abort_turn()
-        assert c.messages == []
+        c = ProxyClient(llm_mode="proxy")
+        assert await c.connect() is False
+        assert c.proxy_lost is True and not hasattr(c, "_http")
+        assert await c.warmup_session() is None
+        said = [chunk async for chunk in c.send_message("hello")]
+        assert said == []
+        assert await c.send_system_note("x") is False
+        c.session_id = "s-1"
+        assert await c.close_session() is False
+        await c.close()
     asyncio.run(run())
+
+
+def test_the_daemons_own_close_is_not_a_loss():
+    """The receive loop's end marks the proxy lost and tells the pipeline,
+    except when the daemon itself is closing the call."""
+    seen = []
+
+    async def run():
+        c = _client(llm_mode="proxy")
+        c.on_proxy_lost = lambda: seen.append("lost")
+        c._recv_task = asyncio.create_task(c._recv_loop())
+        await asyncio.sleep(0)
+        c._ws.close = _async_noop
+        await c.close()
+        return c
+    c = asyncio.run(run())
+    assert c.proxy_lost is False and seen == []
+
+
+async def _async_noop(*a, **kw):
+    return None

@@ -230,6 +230,28 @@ class RemoteExecutionLayer(
                     session_id[:8], e,
                 )
 
+    async def answer_engine_prompt(
+        self, session_id: str, request_id: str, approved: bool, tool_input: dict,
+    ) -> None:
+        """The satellite writes the answer into the CLI's stdin. ``response``
+        carries it in the shape the CLI parses for a satellite that writes it
+        as given; an older one builds its own from ``approved``."""
+        info = self._sessions.get(session_id)
+        if info is None:
+            return
+        from core.session.engine_prompts import answer_frame
+        try:
+            await self._cm.send_fire_and_forget(info.machine_id, {
+                "type": "control_response",
+                "session_id": session_id,
+                "request_id": request_id,
+                "approved": approved,
+                "response": answer_frame(request_id, approved, tool_input)["response"],
+            })
+        except Exception as e:
+            logger.warning("Remote engine prompt answer failed for session %s: %s",
+                           session_id[:8], e)
+
     async def change_model(self, session_id: str, model: str) -> None:
         """The model change reaches the satellite in the engine's shape
         (``RemoteEngineAdapter.control_request``): Claude's stdin control

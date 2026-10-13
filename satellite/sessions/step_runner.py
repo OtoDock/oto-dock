@@ -29,7 +29,9 @@ import signal
 import time
 from pathlib import Path
 
-from ..config import force_rmtree, kill_process_tree, otodock_dir
+from ..config import (
+    force_rmtree, kill_process_tree, otodock_dir, reap_descendants, snapshot_descendants,
+)
 from ..host.auth_paths import is_safe_slug
 from ..host.env_hygiene import curate_satellite_env
 from .. import config
@@ -46,6 +48,8 @@ _FLUSH_BYTES = 4096
 _FLUSH_S = 0.3
 # After the script exits: how long its output may keep draining.
 _DRAIN_S = 5.0
+# A timed-out step's grace between its SIGTERM and its SIGKILL.
+_KILL_GRACE_S = 5.0
 _DELIVERY_RE = re.compile(r"^[0-9a-f-]{36}$")
 _REL_RE = re.compile(
     rf"^({layout.WORKSPACE}|{layout.USERS}/[a-z0-9][a-z0-9_.-]{{0,63}}/{layout.WORKSPACE}|{layout.KNOWLEDGE})$"
@@ -281,7 +285,18 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
             await asyncio.wait_for(_exited(), timeout=plan["timeout"])
         except asyncio.TimeoutError:
             timed_out = True
-            kill_process_tree(proc.pid, timeout=5.0)
+            # A script that exited inside the last poll has nothing to signal,
+            # and its pid may already name another process.
+            running_still = proc.returncode is None
+            if running_still and config.HOST.posix:
+                stray = _signal_step(proc, signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(_exited(), timeout=_KILL_GRACE_S)
+                except asyncio.TimeoutError:
+                    _signal_step(proc, signal.SIGKILL)
+                await asyncio.to_thread(reap_descendants, stray, _KILL_GRACE_S)
+            elif running_still:
+                kill_process_tree(proc.pid, timeout=5.0)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(_exited(), timeout=10.0)
         try:
@@ -315,15 +330,58 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
             logger.warning("step %s: scratch dir not removed", plan["delivery"][:8], exc_info=True)
 
 
+def _signal_step(proc: asyncio.subprocess.Process, sig: int) -> list:
+    """``sig`` to a POSIX step's whole process group at once: the script
+    leads a group of its own (``start_new_session``), so the shell and its
+    children receive it together and the shell cannot run another line
+    between its child's death and its own, as it could under a child-first
+    tree walk on a loaded machine. The local run's group kill is the same.
+    The descendants that left the group (``setsid``) are snapshotted first
+    and get it too; the snapshot is returned for the caller to reap."""
+    import psutil
+
+    stray = snapshot_descendants(proc.pid)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, sig)
+    for child in stray:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            child.send_signal(sig)
+    return stray
+
+
+def _kill_later(proc: asyncio.subprocess.Process, stray: list) -> None:
+    """SIGKILL to what is left of a step ``_KILL_GRACE_S`` after its SIGTERM,
+    as the timeout does: a script that traps or ignores TERM, or a
+    descendant that left the group, does not outlive a dropped link."""
+    import psutil
+
+    def _kill() -> None:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        for child in stray:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.kill()
+
+    try:
+        asyncio.get_running_loop().call_later(_KILL_GRACE_S, _kill)
+    except RuntimeError:
+        _kill()
+
+
 def kill_running(running: dict[str, asyncio.subprocess.Process], reason: str) -> int:
-    """Every running step's tree killed (the link dropped, the satellite
-    stops); the runner's wait sees the exit and the ack, if it can still be
-    sent, says so."""
+    """Every running step told to end (the link dropped, the satellite
+    stops): SIGTERM to its group on POSIX and SIGKILL to what is left after
+    the grace, the tree walk elsewhere; the runner's wait sees the exit and
+    the ack, if it can still be sent, says so."""
     n = 0
     for delivery, proc in list(running.items()):
         if proc.returncode is None:
             try:
-                kill_process_tree(proc.pid, timeout=5.0)
+                if config.HOST.posix:
+                    _kill_later(proc, _signal_step(proc, signal.SIGTERM))
+                else:
+                    kill_process_tree(proc.pid, timeout=5.0)
                 n += 1
             except Exception:
                 logger.warning("step %s: kill failed (%s)", delivery[:8], reason, exc_info=True)

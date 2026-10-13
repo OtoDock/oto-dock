@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { rollbackNoticeText, useApps, useHideAppForMe, usePurgeApp, useReorderApps, useRollbackApp, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
 import { GRANTEE_KIND, useHideShare, usePatchShare, useUnhideShare } from '../../api/shares'
+import { toastError } from '../../lib/http/apiJson'
 import { roleLabel } from '../../lib/permissions'
 import { onFileUpdate } from '../../lib/fileUpdates'
 import { onAppDeployed } from '../../lib/appLive'
@@ -598,9 +599,13 @@ export default function AppsOverlay({
             <button
               onClick={() => {
                 const id = confirmRemove.shareId
+                const what = `“${active.title || active.slug}” was not removed`
                 setConfirmRemove(null)
                 setActiveId(null)
-                patchShare.mutate({ id, revoke: true })
+                // The tab is gone at once: a refusal (a decline or the
+                // sharer's revoke landed first) shows as a toast, and the
+                // refetch brings the chip back.
+                patchShare.mutateAsync({ id, revoke: true }).catch(toastError(what))
               }}
               className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
             >
@@ -639,7 +644,7 @@ export default function AppsOverlay({
             onChange={(e) => setDeleteTyped(e.target.value)}
             placeholder={active.slug}
             aria-label="Type the app's slug to confirm"
-            className="w-36 rounded-md border border-p-border-light bg-p-bg px-2 py-1 font-mono pointer-coarse:text-base text-p-text"
+            className="w-36 rounded-md border border-p-border-light bg-p-bg px-2 py-1 font-mono text-p-text"
           />
           <div className="ml-auto flex shrink-0 items-center gap-2">
             <button

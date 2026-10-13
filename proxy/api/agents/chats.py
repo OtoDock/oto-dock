@@ -26,7 +26,7 @@ from core.session import visibility as _vis
 from ws import chat_phase
 from core import layout
 
-logger = logging.getLogger("claude-proxy.chat-api")
+logger = logging.getLogger("otodock.chat-api")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -385,22 +385,32 @@ async def list_active_chats(
     literal path isn't captured by the param route.
     """
     u = require_auth(user)
+    return {"chats": await viewer_active_rows(u)}
+
+
+async def viewer_active_rows(u: UserContext) -> list[dict]:
+    """The Active-now rows this viewer may see right now: the open turns,
+    the warmups and the recent finished-unread chats, through
+    ``_shape_active_row``'s gates. The agents map reads its live pulse from
+    the same rows (``api/agents/activity.py``), so it shows a viewer exactly
+    what the Active-now list shows them.
+
+    The in-memory snapshot on the loop, the rows in one batched job, and
+    a 1 s memo keyed by everything the rows depend on besides the
+    database (the viewer and the id sets): the tabs of one person seeding
+    at once share one job, and a tab that navigates away cancels nobody's."""
     from core.session.session_state import streaming_chat_ids as pump_streaming
     from core.session import interactive_session, warmup_registry
     from datetime import datetime, timedelta, timezone
 
-    # The in-memory snapshot on the loop, the rows in one batched job, and
-    # a 1 s memo keyed by everything the rows depend on besides the
-    # database (the viewer and the id sets): the tabs of one person seeding
-    # at once share one job, and a tab that navigates away cancels nobody's.
     streaming = list(pump_streaming()) + list(interactive_session.streaming_chat_ids())
     warming = list(warmup_registry.inflight_chat_ids())
     since = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     key = (u.sub, u.acting_sub, u.role, u.kind, u.agent, u.is_api_key,
            tuple(sorted(u.agents)), tuple(sorted(u.agent_roles.items())),
            tuple(sorted(set(streaming))), tuple(sorted(set(warming))))
-    return {"chats": await _active_memo.get(
-        key, lambda: run_db(_active_rows, u, streaming, warming, since))}
+    return await _active_memo.get(
+        key, lambda: run_db(_active_rows, u, streaming, warming, since))
 
 
 _ACTIVE_MEMO_TTL_S = 1.0
@@ -522,10 +532,11 @@ async def search_chats(
     q: str = Query(..., min_length=1),
     agent: str | None = Query(None),
     kind: str = Query("chats", pattern="^(chats|tasks)$"),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=100),
     user: UserContext | None = Depends(get_current_user),
 ):
-    """FTS over chat titles + content. Search follows the sidebar mode:
+    """FTS over chat titles + content, newest first (every word of ``q`` as a
+    prefix, parsed like the index). Search follows the sidebar mode:
     kind=chats scopes to the viewer's history owner and excludes task-run
     chats; kind=tasks searches the agent's task-run chats under the run
     permission rules (same gating as the kind=tasks listing). One executor

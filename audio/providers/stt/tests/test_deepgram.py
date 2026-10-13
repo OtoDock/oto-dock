@@ -1,5 +1,6 @@
 """DeepgramSTT contract tests (no network — construction + pure surface only)."""
 
+import asyncio
 from audio.providers.stt.deepgram import DeepgramSTT
 
 
@@ -473,3 +474,159 @@ def test_send_skip_warning_rate_limited(caplog):
     skips = [r for r in caplog.records if "send skipped" in r.message]
     assert len(skips) == 1
     assert stt._send_skips == 50
+
+
+# ── The SDK's own logger (no network) ────────────────────────────────────
+
+
+def _sdk_connection():
+    from deepgram import DeepgramClient
+    return DeepgramClient(api_key="k" * 40).listen.asyncwebsocket.v("1")
+
+
+def test_the_sdk_logs_once_through_the_process_and_drops_its_finish_noise(caplog):
+    """The pinned SDK builds each connection's logger with its own bare
+    stderr handler (every record printed twice) and logs the task it just
+    cancelled at ERROR on every finish."""
+    import logging
+    from audio.providers.stt.deepgram import _route_sdk_logger
+
+    conn = _sdk_connection()
+    assert conn._logger.handlers and conn._logger is not logging.getLogger(conn._logger.name)
+    _route_sdk_logger(conn)
+    _route_sdk_logger(conn)
+    assert conn._logger.handlers == [] and len(conn._logger.filters) == 1
+    with caplog.at_level(logging.DEBUG):
+        conn._logger.error("tasks cancelled error: %s", "")
+        conn._logger.error("send() failed - ConnectionClosed: %s", "1006")
+    seen = [r.getMessage() for r in caplog.records if r.name == conn._logger.name]
+    assert seen == ["send() failed - ConnectionClosed: 1006"]
+
+
+def test_start_routes_the_connections_logger():
+    import asyncio
+    from types import SimpleNamespace
+
+    conn = _sdk_connection()
+
+    async def _start(options):
+        return True
+
+    conn.start = _start
+    stt = DeepgramSTT(api_key="k")
+    stt._client = SimpleNamespace(listen=SimpleNamespace(
+        asyncwebsocket=SimpleNamespace(v=lambda _version: conn)))
+    asyncio.run(stt.start("en"))
+    assert conn._logger.handlers == []
+
+
+def test_to_deepgram_lang_auto_is_the_code_switching_stream():
+    from audio.providers.stt.deepgram import _to_deepgram_lang
+    assert _to_deepgram_lang("auto") == "multi"
+
+
+def test_streams_language_follows_the_identification_set():
+    stt = DeepgramSTT(api_key="x")
+    assert stt.streams_language("el") and stt.streams_language("en-US") and stt.streams_language("de")
+    assert not stt.streams_language("xx") and not stt.streams_language("")
+
+
+async def test_identify_language_reads_the_batch_answer(monkeypatch):
+    from audio.providers.stt.base import TranscriptResult
+    stt = DeepgramSTT(api_key="x")
+    seen = {}
+
+    async def fake_transcribe(audio, *, language=None):
+        seen["language"] = language
+        return TranscriptResult(text="Καλημέρα σας", language="el", audio_seconds=1.4,
+                                provider_used="deepgram", language_confidence=0.93)
+
+    monkeypatch.setattr(stt, "transcribe_file", fake_transcribe)
+    guess = await stt.identify_language(b"RIFF")
+    assert seen["language"] is None                 # no language given: the engine names it
+    assert (guess.language, guess.confidence, guess.text) == ("el", 0.93, "Καλημέρα σας")
+
+
+async def test_identify_language_without_an_answer_is_none(monkeypatch):
+    from audio.providers.stt.base import TranscriptResult
+
+    async def fake_transcribe(audio, *, language=None):
+        return TranscriptResult(text="", language="", audio_seconds=0.0)
+
+    stt = DeepgramSTT(api_key="x")
+    monkeypatch.setattr(stt, "transcribe_file", fake_transcribe)
+    assert await stt.identify_language(b"RIFF") is None
+
+
+class _OldConnection:
+    """The connection a restart replaces: its finish is awaited off the
+    caller's path, after the new stream is open."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def finish(self):
+        self.calls.append("finish-old")
+
+
+async def test_restart_opens_the_new_stream_before_the_old_one_closes(monkeypatch):
+    stt = DeepgramSTT(api_key="x")
+    stt._active_rate = 8000
+    stt._interim_results = True
+    stt._endpointing_override = 350
+    stt._is_open = True
+    calls = []
+    stt._connection = _OldConnection(calls)
+
+    async def fake_start(*, language, sample_rate=None, interim_results=False, endpointing_ms=None):
+        calls.append(("start", language, sample_rate, interim_results, endpointing_ms))
+
+    monkeypatch.setattr(stt, "start", fake_start)
+    assert await stt.restart("el") is True
+    assert calls == [("start", "el", 8000, True, 350)]      # the old one is still open here
+    await asyncio.sleep(0)
+    assert calls[-1] == "finish-old"                          # closed in the background
+    assert stt._is_open is True
+
+
+async def test_restart_reports_a_failed_start_and_closes_the_old_stream(monkeypatch):
+    stt = DeepgramSTT(api_key="x")
+    stt._is_open = True
+    calls = []
+    stt._connection = _OldConnection(calls)
+
+    async def fake_start(**kw):
+        raise RuntimeError("socket refused")
+
+    monkeypatch.setattr(stt, "start", fake_start)
+    assert await stt.restart("el") is False
+    assert stt._is_open is False
+    await asyncio.sleep(0)
+    assert calls == ["finish-old"]
+
+
+async def test_a_call_mode_final_clears_the_partial_it_covers():
+    """Outside dictation mode a final ends its partial's life: the call
+    pipeline's drains fall back to ``latest_interim`` when the queue is
+    empty, and a partial left here was appended once per drain (every call
+    dispatched its words two or three times)."""
+    stt = DeepgramSTT(api_key="k")
+    await stt._on_transcript(None, _res("καλησπέρα", False, words=_timed("καλησπέρα", 0.2)))
+    assert stt.latest_interim == "καλησπέρα"
+    await stt._on_transcript(None, _res("Καλησπέρα μας και", True, start=0.0, end=1.4))
+    assert stt.latest_interim == ""
+    assert stt.drain_transcript() == "Καλησπέρα μας και"
+    assert stt.latest_interim == ""          # nothing for a second drain to repeat
+
+
+async def test_a_transcript_from_a_replaced_connection_is_ignored():
+    """The Transcript handler is generation-bound like Error and Close: a
+    late result of the stream a restart replaced never lands in the new
+    stream's queue (the dictation restart replays audio the old stream was
+    still transcribing)."""
+    stt = DeepgramSTT(api_key="k")
+    stt._connection_gen = 2
+    await stt._on_transcript(None, _res("old stream", True, start=0.0, end=1.0), _gen=1)
+    assert stt.drain_transcript() is None
+    await stt._on_transcript(None, _res("new stream", True, start=0.0, end=1.0), _gen=2)
+    assert stt.drain_transcript() == "new stream"

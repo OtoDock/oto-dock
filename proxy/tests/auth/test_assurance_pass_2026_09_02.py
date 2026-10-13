@@ -111,6 +111,41 @@ def test_rate_limiter_record_does_not_wipe_active_block():
     rl.clear_rate_limit(bucket, key)
 
 
+def test_a_tag_gives_back_its_own_attempts_of_the_live_window_only():
+    """``release_tag`` returns what one tag counted in the live window: a
+    window roll starts the tags afresh with the count (by either path), so a
+    tag never gives back attempts of a newer window, and a block in force
+    stays."""
+    from auth import rate_limiter as rl
+    bucket, key = "share_unlock_ip", "tag-test-key"
+    rl.clear_rate_limit(bucket, key)
+    rule = config.RATE_LIMIT_RULES[bucket]
+    rl.record_attempt(bucket, key, tag="a")
+    rl.record_attempt(bucket, key, tag="a")
+    rl.record_attempt(bucket, key, tag="b")
+    rl.release_tag(bucket, key, "a")
+    assert rl._attempts[(bucket, key)]["count"] == 1
+    rl.release_tag(bucket, key, "a")
+    assert rl._attempts[(bucket, key)]["count"] == 1
+    # The window lapses: the roll on the next record forgets b's attempt.
+    rl._attempts[(bucket, key)]["first_at"] = time.time() - rule["window"] - 1
+    rl.record_attempt(bucket, key, tag="c")
+    rl.release_tag(bucket, key, "b")
+    assert rl._attempts[(bucket, key)]["count"] == 1
+    # The roll on a check forgets them too.
+    rl._attempts[(bucket, key)]["first_at"] = time.time() - rule["window"] - 1
+    assert rl.check_rate_limit(bucket, key)[0]
+    assert "tags" not in rl._attempts[(bucket, key)]
+    # A block in force stays whatever is given back.
+    for _ in range(rule["max"]):
+        rl.record_attempt(bucket, key, tag="d")
+    assert not rl.check_rate_limit(bucket, key)[0]
+    rl.release_tag(bucket, key, "d")
+    assert rl._attempts[(bucket, key)]["count"] == 0
+    assert not rl.check_rate_limit(bucket, key)[0]
+    rl.clear_rate_limit(bucket, key)
+
+
 # --- sandbox: symlink-refusing literal path guard ----------------------------
 
 def test_a_bucket_keeps_a_bounded_number_of_keys(monkeypatch):

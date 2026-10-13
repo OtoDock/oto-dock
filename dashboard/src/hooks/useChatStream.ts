@@ -309,6 +309,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   // while the flag was still armed from the turn-opening send and its chip
   // silently vanished until the post-turn drain.
   const sentWithBubbleRef = useRef<string | null>(null)
+  // That send's queue id (``sendMessage`` mints it): a `queued` frame naming
+  // it is that message whatever its text, and a teammate's message with the
+  // same text is not.
+  const sentWithBubbleIdRef = useRef<string | null>(null)
   // The turn ended on an error (a pump's `error` frame, which names the
   // chat and its ending): the card renders live from the frame, so the
   // `done` that follows must not refetch the history (a full remount of the
@@ -470,6 +474,15 @@ export function useChatStream(options: UseChatStreamOptions) {
         return
       }
       options.onChatMoved?.(data)
+    },
+
+    onChatViewOnly: (data) => {
+      // The frame names the viewed chat (per-chat routed); a stale one for a
+      // chat the user left is dropped like a moved ack.
+      if (data && data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
+        return
+      }
+      options.onChatViewOnly?.(data)
     },
 
     onEngineSwitched: (data) => {
@@ -1482,6 +1495,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // discarding, or via abort/error/warmup-failed below), onQueued/onQueueSent
       // suppress a same-text queued message.
       sentWithBubbleRef.current = null
+      sentWithBubbleIdRef.current = null
       if (discardingRef.current) return
       paintHeldHistory()
       abortedRef.current = false  // terminal frame — straggler window over
@@ -1598,7 +1612,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
 
     onError: (message, ending) => {
-      sentWithBubbleRef.current = null  // turn ended — clear the bubble-dedup marker
+      sentWithBubbleRef.current = null
+      sentWithBubbleIdRef.current = null  // turn ended — clear the bubble-dedup marker
       if (discardingRef.current) return
       paintHeldHistory()
       // If we were warming up, the session failed to start — reset state so the
@@ -1640,9 +1655,14 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
         return
       }
+      // A refusal before any chat was minted (a send below the editor role
+      // on a Shared-only agent) belongs to the new-chat page: once the page
+      // is on a chat it is another chat's.
+      if (!data.chat_id && chatIdRef.current) return
       // Cold-start that set the optimistic-bubble marker just failed — clear it
       // so the next queued message isn't suppressed.
       sentWithBubbleRef.current = null
+      sentWithBubbleIdRef.current = null
       // Page tail: clear warmup state so input re-enables (chat); unblock the
       // loading spinner (task).
       options.onWarmupFailedReset?.()
@@ -1711,8 +1731,12 @@ export function useChatStream(options: UseChatStreamOptions) {
         // The chip is in the store (the socket hook files it by chat). A
         // send the page showed as a new turn that the proxy queued instead
         // (another turn drives the chat): its bubble becomes the chip.
-        if (sentWithBubbleRef.current === data.text) {
+        const mine = sentWithBubbleIdRef.current
+          ? sentWithBubbleIdRef.current === data.queue_id
+          : sentWithBubbleRef.current === data.text
+        if (mine) {
           sentWithBubbleRef.current = null
+          sentWithBubbleIdRef.current = null
           setMessages((prev) => {
             const n = prev.length
             if (n >= 2 && prev[n - 1].role === 'assistant' && prev[n - 1].blocks.length === 0
@@ -1743,6 +1767,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // don't duplicate — just refresh the timer for the actual streaming start.
       if (sentWithBubbleRef.current === data.text) {
         sentWithBubbleRef.current = null
+        sentWithBubbleIdRef.current = null
         setTurnStartTime(Date.now())
         return
       }
@@ -1849,7 +1874,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
 
     onAborted: (data) => {
-      sentWithBubbleRef.current = null  // turn ended — clear the bubble-dedup marker
+      sentWithBubbleRef.current = null
+      sentWithBubbleIdRef.current = null  // turn ended — clear the bubble-dedup marker
       if (discardingRef.current) return
       paintHeldHistory()
       // The actual cleanup ran in handleAbort already (proactive — so the UI
@@ -2480,6 +2506,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     abortedRef,
     discardingRef,
     sentWithBubbleRef,
+    sentWithBubbleIdRef,
     erroredRef,
     meetingSpeakerRef,
     // handlers

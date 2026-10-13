@@ -255,6 +255,27 @@ def test_no_turn_complete_when_last_is_tool_use(tmp_path, _capture):
     assert stats["turn_complete"] is False
 
 
+def test_the_signal_carries_its_lines_own_time(tmp_path, _capture):
+    """``last_signal_at`` is the journal time of the line behind the signal
+    (the clock of the host the CLI runs on): a terminal parked on a dialog
+    compares it with the gate's own stamp. A line without a time gives None."""
+    from datetime import datetime
+    path = _write(
+        tmp_path,
+        _line({"type": "user", "uuid": "u-ts", "timestamp": "2026-10-09T01:00:00.000Z",
+               "message": {"role": "user", "content": "do a thing"}}),
+        _line({"type": "assistant", "uuid": "a-ts", "timestamp": "2026-10-09T01:00:01.250Z",
+               "message": {"role": "assistant", "stop_reason": "tool_use",
+                           "content": [{"type": "tool_use", "id": "t9", "name": "Bash",
+                                        "input": {}}]}}),
+    )
+    stats = T.tail_transcript("sts", "cts", path)
+    assert stats["last_signal"] == "tool_use"
+    assert stats["last_signal_at"] == datetime.fromisoformat("2026-10-09T01:00:01.250+00:00").timestamp()
+    stats = T.tail_transcript("sts2", "cts2", _write(tmp_path, _user("no time here")))
+    assert stats["last_signal"] == "user" and stats["last_signal_at"] is None
+
+
 def test_interrupt_marker_closes_turn_and_is_not_persisted(tmp_path, _capture):
     # ESC / dashboard Stop mid-turn: the CLI writes "[Request interrupted by
     # user for tool use]" (tool-phase; a single text block) instead of a result
@@ -1038,7 +1059,8 @@ def test_usage_one_row_per_batch_deduped_by_message_id(tmp_path, _capture, _usag
     (row,) = _usage_env
     assert row["input_tokens"] == 1010 and row["output_tokens"] == 2020
     assert row["cache_read"] == 500 and row["cache_write"] == 300
-    # (1010*10 + 2020*50 + 300*12.5 + 500*1.0) / 1e6
+    # Per million tokens: 1010 input at 10, 2020 output at 50, 300 cache
+    # writes at 12.5 and 500 cache reads at 1.0.
     assert row["cost_usd"] == pytest.approx(0.115350)
     assert row["source_key"] == "sub-abc"
     assert row["model"] == "claude-fable-5" and row["provider"] == "anthropic"

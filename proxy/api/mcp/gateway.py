@@ -29,7 +29,7 @@ from auth.session_token import validate_session_token
 from core.credentials import mcp_gateway
 from core.session.session_state import session_token_refusal
 
-logger = logging.getLogger("claude-proxy.mcp-gateway")
+logger = logging.getLogger("otodock.mcp-gateway")
 router = APIRouter()
 
 _DISCONNECT_POLL_S = 5.0

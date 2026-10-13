@@ -39,9 +39,9 @@ from datetime import datetime, timedelta, timezone
 import jwt
 
 import config
-from core.credentials.mcp_gateway import GatewayCredential
+from core.credentials.mcp_gateway import CliCredential, GatewayCredential
 
-logger = logging.getLogger("claude-proxy")
+logger = logging.getLogger("otodock")
 
 # Capability-token lifetime — SHORT by design (NOT the 24h session-JWT TTL). The
 # wrapper fetches once, at MCP-child startup, immediately after the token is
@@ -65,10 +65,13 @@ _file_store: dict[str, dict[str, "SessionFile"]] = {}
 class SecretBundle:
     """The secret material one MCP needs: env vars a stdio MCP fetches at
     spawn, or the gateway credential an HTTP MCP's requests receive on the
-    way out (never both: an HTTP MCP has no process to fetch)."""
+    way out (never both: an HTTP MCP has no process to fetch), and the
+    credential the session's command-line tools (``git``, ``gh``) fetch per
+    command when the manifest names a host for them."""
 
     env: dict[str, str] = field(default_factory=dict)
     gateway: GatewayCredential | None = None
+    cli: CliCredential | None = None
 
 
 @dataclass
@@ -107,6 +110,19 @@ def get(session_id: str, mcp: str) -> "SecretBundle | None":
 def bundles_of(session_id: str) -> dict[str, "SecretBundle"]:
     """Every bundle a session holds, by MCP key (a copy)."""
     return dict(_store.get(session_id, {}))
+
+
+def cli_credential(session_id: str, host: str) -> "CliCredential | None":
+    """The command-line credential a session holds for ``host`` (the git
+    helper's and the command wrappers' lookup), or None."""
+    want = (host or "").strip().lower()
+    if not want:
+        return None
+    for bundle in _store.get(session_id, {}).values():
+        cred = getattr(bundle, "cli", None)
+        if cred is not None and cred.host.lower() == want:
+            return cred
+    return None
 
 
 def purge_session(session_id: str) -> None:

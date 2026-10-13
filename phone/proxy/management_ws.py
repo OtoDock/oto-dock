@@ -120,6 +120,17 @@ class ManagementWSClient:
         await self._config_ready.wait()
         return self._config
 
+    def latest_config(self) -> dict:
+        """The newest push the socket holds: ``config_full`` or the
+        ``config_update`` that followed it (the proxy answers the capabilities
+        frame with one within milliseconds), whether or not a handler existed
+        when it landed."""
+        return self._config
+
+    @property
+    def config_version(self) -> int:
+        return self._config_version
+
     def stop(self) -> None:
         """Signal the client to stop reconnecting."""
         self._running = False

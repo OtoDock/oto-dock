@@ -15,7 +15,7 @@ from services.billing import relay_client
 from services.mcp import mcp_registry
 from storage.mcp import mcp_store
 
-logger = logging.getLogger("claude-proxy.hosted-instances")
+logger = logging.getLogger("otodock.hosted-instances")
 
 
 def _relay_mcp_names() -> set[str]:

@@ -46,15 +46,16 @@ vi.mock('@/components/sharing/SharePopover', () => ({
 }))
 // The share mutations a placed row uses (SHARING.md); the apps-route ones
 // stay real so a plain row's hide still posts to its own route.
-const shareCalls = vi.hoisted(() => ({ hide: vi.fn(), unhide: vi.fn(), patch: vi.fn() }))
+const shareCalls = vi.hoisted(() => ({ hide: vi.fn(), unhide: vi.fn(), patch: vi.fn(async () => ({})) }))
 vi.mock('@/api/shares', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/shares')>()),
   useHideShare: () => ({ mutate: shareCalls.hide }),
   useUnhideShare: () => ({ mutate: shareCalls.unhide }),
-  usePatchShare: () => ({ mutate: shareCalls.patch }),
+  usePatchShare: () => ({ mutate: shareCalls.patch, mutateAsync: shareCalls.patch }),
 }))
 
 import AppsOverlay from '@/components/apps/AppsOverlay'
+import { onAppToast } from '@/lib/appToasts'
 import { appChipClass, unpinWords } from '@/components/apps/appRow'
 import { rollbackNoticeText } from '@/api/apps'
 
@@ -353,6 +354,20 @@ describe('AppsOverlay — a row placed here by a share (SHARING.md)', () => {
     expect(shareCalls.patch).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Remove from this agent' }))
     expect(shareCalls.patch).toHaveBeenCalledWith({ id: 'sh-1', revoke: true })
+  })
+
+  it('a removal the server refuses says so in a toast and the chip comes back with the list', async () => {
+    shareCalls.patch.mockRejectedValueOnce(new Error('Share not found'))
+    const toasts: unknown[] = []
+    const off = onAppToast((t) => toasts.push(t))
+    appsData.current = [mkApp('brief'), placed({ placement: { ...placement, can_remove: true } })]
+    renderOverlay()
+    fireEvent.click(screen.getByRole('button', { name: /register/ }))
+    openMenu('register')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove from this agent' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Remove from this agent' })) })
+    off()
+    expect(toasts).toEqual([{ title: '“register” was not removed', body: 'Share not found', severity: 'warning' }])
   })
 
   it('a hidden placed row restores through the share, and a placed row is never dragged', () => {

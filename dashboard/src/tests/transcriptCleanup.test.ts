@@ -28,6 +28,27 @@ describe('stripInjectedPreludes', () => {
   })
 })
 
+describe('stripInjectedPreludes on a task run', () => {
+  const parallel =
+    "[Parallel activity — for awareness only, no action needed: sibling sessions: 'Fix [bug] 2' (generating). " +
+    'Check one only if your work depends on it (peek_session / get_task_result).]'
+
+  it('strips the time and parallel-activity lines of a first prompt', () => {
+    const text = `[Current time: Friday, October 09, 2026 06:00 (6:00 AM) UTC (UTC+00:00)]\n\n${parallel}\n\nsummarise the inbox`
+    expect(stripInjectedPreludes(text)).toBe('summarise the inbox')
+  })
+
+  it('strips them when a satellite single-lined the prompt', () => {
+    const text = `[Current time: Friday, October 09, 2026 06:00 (6:00 AM) UTC (UTC+00:00)] ${parallel} summarise the inbox`
+    expect(stripInjectedPreludes(text)).toBe('summarise the inbox')
+  })
+
+  it('leaves a mid-message quote of the shape alone', () => {
+    const text = `see ${parallel}`
+    expect(stripInjectedPreludes(text)).toBe(text)
+  })
+})
+
 describe('cleanUserMessageText', () => {
   it('hides a pure slash-command record', () => {
     const row = '<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>'
