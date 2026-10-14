@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.8.0/mcps/manifest.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.8.1/mcps/manifest.schema.json",
   "title": "OtoDock MCP package manifest",
   "description": "The catalog contract for the manifest.json of an OtoDock MCP package (OtoDock is a fair source project). It accepts every manifest the platform's parser (services/mcp/mcp_manifest_parse.py) and install gate (services/community/community_installer.py) accept, refuses what they refuse where JSON Schema can say it, and adds the community catalog's own rules: a git+ source pins a full commit, a remote source names its endpoint and a non-stdio transport. Unknown keys are allowed at the top level and in every block the parser leaves open: a catalog is additive.",
   "$comment": "Custom annotation keywords. x-otodock-since: the platform release that first reads the field; an entry that gives the field a value (not null, empty or false) needs platform_min_version at least that release. x-otodock-floors (on server.source): a list of {pattern, since}; a value matching the pattern needs that release. Validators ignore both keywords.",

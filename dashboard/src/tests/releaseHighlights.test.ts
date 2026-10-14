@@ -34,6 +34,6 @@ describe('release/highlights.json', () => {
   it('every icon has a stroked path and a release without an entry has no cards', () => {
     for (const name of ICON_NAMES) expect(ICON_PATHS[name]).toMatch(/^M/)
     expect(highlightsFor('0.0.1')).toEqual({ everyone: [], admins: [] })
-    expect(highlightsFor('1.8.0-rc1')).toEqual(highlightsFor('1.8.0'))
+    expect(highlightsFor('1.8.1-rc1')).toEqual(highlightsFor('1.8.1'))
   })
 })

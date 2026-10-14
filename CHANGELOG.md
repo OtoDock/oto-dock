@@ -13,6 +13,15 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-10-14
+
+### Upgrade notes
+- None.
+
+### Changed
+- The box that opens after an update names each new feature in a line or two.
+- The README's first picture is captioned "Full office suite, plus photo and video editing."
+
 ## [1.8.0] - 2026-10-13
 
 ### Upgrade notes
@@ -1047,7 +1056,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/OtoDock/oto-dock/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/OtoDock/oto-dock/compare/v1.7.1...v1.8.0
 [1.7.1]: https://github.com/OtoDock/oto-dock/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/OtoDock/oto-dock/compare/v1.6.1...v1.7.0

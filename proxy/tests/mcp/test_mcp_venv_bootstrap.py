@@ -648,7 +648,10 @@ async def test_the_first_venv_is_pinned_to_the_proxy_and_inside_the_sandbox(fake
 
 
 @pytest.mark.asyncio
-async def test_a_failed_pin_is_recorded_and_waits_a_day(fake_mcps_root, caplog):
+async def test_a_failed_pin_is_recorded_and_waits_a_day(fake_mcps_root, caplog, monkeypatch):
+    # A pin can only fail where uv exists to attempt it: without uv the venv
+    # reads reconciled (the host decides, not the test's machine).
+    monkeypatch.setattr(mcp_venv_bootstrap, "find_uv", lambda: "/fake/uv")
     mcp_dir = _custom_py(fake_mcps_root)
     with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
                return_value=InstallResult(ok=True, log="ok", venv_python="")):
